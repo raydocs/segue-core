@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use segue_routing::{Network, Target};
 use thiserror::Error;
 use tokio::sync::watch;
-use segue_routing::{Network, Target};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConnectionId(u64);

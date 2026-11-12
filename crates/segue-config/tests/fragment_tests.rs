@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, FragmentPackets, FragmentRange, TcpFragmentSettings};
+use serde_json::{json, Value};
 
 /// A fragment mask folded from a dedicated freedom handler: the handler's own
 /// mask, which also carries the handler's `finalRules` for connections from a

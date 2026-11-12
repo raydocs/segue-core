@@ -5,12 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use segue_config::{
+    parse_xray_json, CoreConfig, InboundProtocol, OutboundSettings, StreamSecurity,
+};
+use segue_engine::{Core, RuntimeLogConfig, RuntimeLogger};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout, Duration, Instant};
-use segue_config::{parse_xray_json, CoreConfig, InboundProtocol, OutboundSettings, StreamSecurity};
-use segue_engine::{Core, RuntimeLogConfig, RuntimeLogger};
 
 const LIVE_SOCKS_TAG: &str = "live_socks";
 const LIVE_TARGETS_ENV: &str = "XRAY_REALITY_LIVE_TARGETS";

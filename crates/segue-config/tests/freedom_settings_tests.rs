@@ -4,11 +4,11 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU16;
 
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json, DiagnosticSeverity, FreedomNoise, FreedomNoiseFamily, FreedomNoisePacket,
     FreedomOutboundSettings, FreedomRedirect, OutboundSettings, TargetAddr,
 };
+use serde_json::{json, Value};
 
 fn parse(settings: Value) -> FreedomOutboundSettings {
     let raw = json!({"outbounds": [{"protocol": "freedom", "settings": settings}]}).to_string();

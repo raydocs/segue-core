@@ -3,6 +3,9 @@ mod relay;
 mod support;
 
 use relay::{no_delivery, Echo, Event, Relay, WAIT};
+use segue_proxy::wireguard::KeyMaterial;
+use segue_transport::{SocketHandle, SocketProtector};
+use segue_wireguard::{Client, Config, PeerConfig};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{
@@ -13,9 +16,6 @@ use std::{
 };
 use tokio::time::{timeout, Instant};
 use x25519_dalek::{PublicKey, StaticSecret};
-use segue_proxy::wireguard::KeyMaterial;
-use segue_transport::{SocketHandle, SocketProtector};
-use segue_wireguard::{Client, Config, PeerConfig};
 
 #[derive(Default)]
 struct Protector(AtomicUsize);

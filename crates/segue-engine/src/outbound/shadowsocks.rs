@@ -1,7 +1,7 @@
 use super::*;
+use segue_proxy::shadowsocks::{self as wire, Method};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex as AsyncMutex;
-use segue_proxy::shadowsocks::{self as wire, Method};
 
 #[derive(Debug, Clone)]
 pub struct Shadowsocks2022Outbound(Arc<Payload>);

@@ -1,7 +1,7 @@
 use super::*;
+use segue_routing::TargetAddr;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use segue_routing::TargetAddr;
 
 fn target() -> Target {
     Target::new(

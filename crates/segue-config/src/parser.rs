@@ -39,8 +39,8 @@ use std::{
 };
 
 use crate::surface;
-use serde_json::Value;
 use segue_routing::{DomainMatcherSet, DomainMatcherSetBuilder, IpMatcherSet, IpMatcherSetBuilder};
+use serde_json::Value;
 
 use crate::model::build_domain_matcher_set;
 use crate::{

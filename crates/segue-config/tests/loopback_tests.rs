@@ -1,7 +1,7 @@
 //! Xray `loopback` outbound settings, as Xray-core v26.10.31 reads them.
 
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, LoopbackOutboundSettings, OutboundSettings};
+use serde_json::{json, Value};
 
 fn config(outbound: Value) -> String {
     json!({"inbounds": [], "outbounds": [outbound]}).to_string()

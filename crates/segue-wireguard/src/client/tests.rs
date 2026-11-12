@@ -1,8 +1,8 @@
 use super::*;
 use gotatun::packet::Packet;
+use segue_proxy::wireguard::KeyMaterial;
 use smoltcp::wire::{IpProtocol, Ipv4Packet, TcpPacket, TcpSeqNumber};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use segue_proxy::wireguard::KeyMaterial;
 
 // Exercise real smoltcp state transitions through the same IP/command channels
 // used by the engine, without relying on a proxy server's FIN/RST translation.

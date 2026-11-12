@@ -22,12 +22,17 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(path)?;
     let config = KernelConfig::parse(&text)?;
     // One worker thread: the target is a phone VPN extension.
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     runtime.block_on(async {
         let dialer = Arc::new(EngineDialer::new(&config.outbounds)?);
         let listener = tokio::net::TcpListener::bind(config.listen).await?;
         eprintln!("segue-kernel: listening on {}", listener.local_addr()?);
-        let kernel = Arc::new(Kernel { rules: config.rules, dialer });
+        let kernel = Arc::new(Kernel {
+            rules: config.rules,
+            dialer,
+        });
         serve(listener, kernel).await?;
         Ok(())
     })

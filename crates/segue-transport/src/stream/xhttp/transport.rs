@@ -26,12 +26,12 @@ use bytes::Bytes;
 use futures_util::task::AtomicWaker;
 use http::{header, HeaderName, HeaderValue, Method, Request, Version};
 use rand::{rngs::OsRng, RngCore};
+use segue_routing::Target;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
-use segue_routing::Target;
 
 use super::super::http_headers::HeaderMap as XhttpHeaderMap;
 use super::config::{XhttpConfig, XhttpEndpoint, XhttpMode, XhttpRange};

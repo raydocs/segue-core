@@ -6,14 +6,14 @@ use super::support::{tls_settings, ReferenceServer, Task, DEADLINE};
 use crate::chrome_parrot_wire::{
     assert_chrome_first_flight, assert_stock_first_flight, RecordingRelay,
 };
+use segue_routing::{Network, Target, TargetAddr};
+use segue_transport::{hysteria::HysteriaClient, TlsConnector};
 use std::net::Ipv4Addr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
     time::timeout,
 };
-use segue_routing::{Network, Target, TargetAddr};
-use segue_transport::{hysteria::HysteriaClient, TlsConnector};
 
 #[tokio::test]
 #[ignore = "requires pinned reference; use check-chrome-parrot-interop.sh, check-hysteria-interop.sh or check-native-hysteria-interop.sh"]

@@ -9,11 +9,11 @@ use bytes::Bytes;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use http::{header, Method, Request};
 use rand::Rng as _;
+use segue_routing::{DnsHostTarget, DnsIpFilter, DomainHostIndex, DomainMatcherSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{watch, Notify};
 use tokio::time;
-use segue_routing::{DnsHostTarget, DnsIpFilter, DomainHostIndex, DomainMatcherSet};
 
 use crate::{
     canonicalize_socket_addr, connect_tcp_happy_eyeballs, BoxedTransportStream,
@@ -3173,13 +3173,13 @@ mod tests {
     use quinn::crypto::rustls::QuicServerConfig;
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, UdpSocket};
-    use tokio::sync::{oneshot, Barrier, Notify};
     use segue_routing::{
         Cidr, DnsIpFilter, DomainHostIndex, DomainMatcher, DomainMatcherSet, DomainNameMode,
         RegexMatcher,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, UdpSocket};
+    use tokio::sync::{oneshot, Barrier, Notify};
 
     use super::{
         build_dns_query_with_id, edns_opt_record, exchange_direct_https_candidates,

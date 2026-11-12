@@ -1,7 +1,7 @@
 //! Bounded Mux.Cool/XUDP frames from Xray-core v26.7.28.
 //! Decoding is stateless so a cancelled read never consumes a partial frame.
-use std::{io, net::IpAddr};
 use segue_routing::{Network, Target, TargetAddr};
+use std::{io, net::IpAddr};
 
 pub const MAX_METADATA: usize = 512;
 pub const MAX_PAYLOAD: usize = 8192;

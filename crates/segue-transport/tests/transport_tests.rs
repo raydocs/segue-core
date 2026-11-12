@@ -13,10 +13,6 @@ mod transport_tests {
         PublicKeyData,
     };
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-    use sha2::{Digest, Sha256};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
-    use tokio::net::TcpListener;
-    use tokio_rustls::TlsAcceptor;
     use segue_routing::{Network, Target, TargetAddr};
     use segue_transport::stream::TransportLayer;
     use segue_transport::{
@@ -24,6 +20,10 @@ mod transport_tests {
         RealityTlsEngine, ResolvedTcpConnector, SocketHandle, SocketProtector, TcpConnector,
         TlsClientConfig, TlsConnector, TransportConnector, TransportDialer, TransportError,
     };
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
 
     #[test]
     fn public_roots_exclude_compromised_emsign_c1_and_c3() {

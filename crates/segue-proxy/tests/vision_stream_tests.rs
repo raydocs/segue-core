@@ -3,10 +3,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use segue_proxy::vless::{
     unpad_vision_block, VisionCommand, VisionPadding, VisionStream, VisionStreamIo,
 };
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 const USER_ID: [u8; 16] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,

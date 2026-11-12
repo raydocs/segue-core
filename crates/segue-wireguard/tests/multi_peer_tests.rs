@@ -1,6 +1,8 @@
 #[path = "multi_peer/raw.rs"]
 mod raw;
 use raw::{key, reply, RawPeer};
+use segue_transport::{SocketHandle, SocketProtector};
+use segue_wireguard::{Client, Config};
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -9,8 +11,6 @@ use std::{
     time::Duration,
 };
 use tokio::time::timeout;
-use segue_transport::{SocketHandle, SocketProtector};
-use segue_wireguard::{Client, Config};
 
 #[derive(Default)]
 struct Protector(AtomicUsize);

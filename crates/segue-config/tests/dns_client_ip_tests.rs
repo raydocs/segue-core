@@ -3,8 +3,8 @@
 
 use std::net::IpAddr;
 
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, DiagnosticSeverity, DnsConfig, DnsServerConfig};
+use serde_json::{json, Value};
 
 fn dns(dns: Value) -> DnsConfig {
     let raw = json!({"dns": dns, "outbounds": [{"protocol": "freedom"}]}).to_string();

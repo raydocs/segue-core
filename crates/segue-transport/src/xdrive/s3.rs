@@ -12,9 +12,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
 use http::Method;
+use segue_proxy::go_url::{self, Encoding};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
-use segue_proxy::go_url::{self, Encoding};
 use zeroize::Zeroizing;
 
 use super::client::{ServiceError, ServiceRequest, ServiceResponse, ServiceUrl};

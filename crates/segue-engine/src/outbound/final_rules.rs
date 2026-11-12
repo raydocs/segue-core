@@ -11,11 +11,11 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use rand::Rng;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::{Instant, Sleep};
 use segue_config::{deciding_final_rule, FreedomFinalRule, FreedomRuleAction, Network};
 use segue_routing::{Target, TargetAddr};
 use segue_transport::{DnsResolver, TransportError, TransportStream};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::{Instant, Sleep};
 
 /// Xray-core's block delay when a rule sets none, in seconds.
 const DEFAULT_BLOCK_DELAY_SECS: (u32, u32) = (30, 90);

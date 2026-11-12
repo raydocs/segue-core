@@ -1,8 +1,8 @@
 //! A bounded loopback wire relay. It never decrypts or manufactures WireGuard
 //! traffic: only the official server and the production client hold sessions.
+use segue_wireguard::UdpSession;
 use std::{net::SocketAddr, time::Duration};
 use tokio::{net::UdpSocket, time::timeout};
-use segue_wireguard::UdpSession;
 
 pub const WAIT: Duration = Duration::from_secs(5);
 

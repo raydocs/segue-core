@@ -1,7 +1,7 @@
-use serde_json::{json, Value};
 use segue_config::profile_import::{
     import_profile, import_request, ImportError, ProfileFormat, MAX_REQUEST_BYTES, MAX_TEXT_BYTES,
 };
+use serde_json::{json, Value};
 
 const WG: &str = include_str!("../../../tests/fixtures/profile-import/wireguard.conf");
 const HY: &str = include_str!("../../../tests/fixtures/profile-import/hysteria2.txt");

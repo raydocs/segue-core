@@ -8,7 +8,6 @@
 //! stream, and later tunnels share that connection while it takes them, as
 //! Xray-core keeps one per proxy.
 use super::*;
-use std::sync::PoisonError;
 use segue_proxy::outbound::{
     encode_connect_request, encode_http2_connect_request, http_connect, Http2ConnectRequest,
     HttpAccount, HttpClientError, HttpHeaderTemplate,
@@ -16,6 +15,7 @@ use segue_proxy::outbound::{
 use segue_transport::stream::{
     apply_masquerade, HeaderMap, Http2ConnectClient, Http2ConnectError, PrefixedStream,
 };
+use std::sync::PoisonError;
 use zeroize::Zeroizing;
 
 const ALPN_HTTP11: &[u8] = b"http/1.1";

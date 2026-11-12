@@ -1,9 +1,9 @@
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json, HttpOutboundSettings, OutboundProtocol, OutboundSettings, StreamSecurity,
     StreamTransport, TargetAddr,
 };
 use segue_proxy::outbound::HttpAccount;
+use serde_json::{json, Value};
 
 const USER: &str = "synthetic-http-user";
 const PASS: &str = "synthetic-http-pass";

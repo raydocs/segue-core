@@ -19,6 +19,31 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use segue_config::{
+    compile_dns_domain_matchers, parse_xray_json, CoreConfig, DnsHostTarget, DnsOutboundRule,
+    DnsOutboundRuleAction, DnsOutboundSettings, DomainMatcher, InboundConfig, InboundProtocol,
+    IpCidr, Network as ConfigNetwork, OutboundConfig, OutboundProxySettings, OutboundSettings,
+    RoutingBalancer, RoutingBalancerStrategy, RoutingConfig, RoutingDomainStrategy,
+    RoutingPortRange, RoutingRule, RoutingRuleTarget, StreamSecurity, StreamSettings,
+    StreamTransport, MAX_CONFIG_DOMAIN_MATCHERS,
+};
+use segue_engine::{
+    CompiledDnsOutboundPolicy, Core, DnsOutboundDecision, OutboundRouter, StartupProbeOptions,
+};
+use segue_proxy::vless::{
+    encode_udp_packet, encode_xudp_keep_packet, read_udp_packet, read_xudp_packet,
+    unpad_vision_block, VisionCommand, VisionPadding,
+};
+use segue_routing::{
+    Cidr, DnsIpFilter, DomainHostIndex, DomainMatcherSet, DomainNameMode, IpMatcherSet,
+    Network as RoutingNetwork, Target, TargetAddr as RoutingTargetAddr,
+};
+use segue_transport::{
+    select_name_server_indices, CachingDnsResolver, CompiledNameServerPolicies, DnsLookup,
+    DnsResolver, NameServer, NameServerPolicy, TransportError,
+};
+use segue_tun::TunTcpOpenErrorEvent;
+use segue_utls::{normalize_reality_supported_fingerprint, XRAY_REALITY_HYBRID_FINGERPRINTS};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use smoltcp::iface::{
@@ -47,31 +72,6 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
-use segue_config::{
-    compile_dns_domain_matchers, parse_xray_json, CoreConfig, DnsHostTarget, DnsOutboundRule,
-    DnsOutboundRuleAction, DnsOutboundSettings, DomainMatcher, InboundConfig, InboundProtocol,
-    IpCidr, Network as ConfigNetwork, OutboundConfig, OutboundProxySettings, OutboundSettings,
-    RoutingBalancer, RoutingBalancerStrategy, RoutingConfig, RoutingDomainStrategy,
-    RoutingPortRange, RoutingRule, RoutingRuleTarget, StreamSecurity, StreamSettings,
-    StreamTransport, MAX_CONFIG_DOMAIN_MATCHERS,
-};
-use segue_engine::{
-    CompiledDnsOutboundPolicy, Core, DnsOutboundDecision, OutboundRouter, StartupProbeOptions,
-};
-use segue_proxy::vless::{
-    encode_udp_packet, encode_xudp_keep_packet, read_udp_packet, read_xudp_packet,
-    unpad_vision_block, VisionCommand, VisionPadding,
-};
-use segue_routing::{
-    Cidr, DnsIpFilter, DomainHostIndex, DomainMatcherSet, DomainNameMode, IpMatcherSet,
-    Network as RoutingNetwork, Target, TargetAddr as RoutingTargetAddr,
-};
-use segue_transport::{
-    select_name_server_indices, CachingDnsResolver, CompiledNameServerPolicies, DnsLookup,
-    DnsResolver, NameServer, NameServerPolicy, TransportError,
-};
-use segue_tun::TunTcpOpenErrorEvent;
-use segue_utls::{normalize_reality_supported_fingerprint, XRAY_REALITY_HYBRID_FINGERPRINTS};
 
 pub mod chart;
 mod process_metrics;

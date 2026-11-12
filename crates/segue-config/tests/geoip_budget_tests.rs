@@ -7,8 +7,8 @@ use std::{
 };
 
 use prost::Message;
-use serde_json::json;
 use segue_config::parse_xray_json_with_geodata_dirs;
+use serde_json::json;
 
 // Loyalsoldier's 202609082347 snapshot has this many CIDRs in geoip:us.
 // Generate documentation-only addresses instead of checking in that database.

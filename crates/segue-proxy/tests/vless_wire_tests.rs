@@ -1,10 +1,10 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use uuid::Uuid;
 use segue_proxy::vless::{
     encode_request_header, encode_udp_packet, encode_xudp_keep_packet, encode_xudp_new_packet,
     read_udp_packet, read_xudp_packet, VlessCommand, VlessRequest, WireError,
 };
 use segue_routing::{Network, Target, TargetAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use uuid::Uuid;
 
 #[test]
 fn encodes_vless_tcp_header_with_vision_flow() {

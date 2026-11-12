@@ -1,6 +1,6 @@
 use super::*;
-use std::sync::Mutex;
 use segue_transport::SrvRecord;
+use std::sync::Mutex;
 
 /// Answers lookups from fixed records, recording what is asked.
 #[derive(Default)]

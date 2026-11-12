@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, MuxUdp443};
+use serde_json::{json, Value};
 fn profile(mux: Value) -> Value {
     let mut config: Value =
         serde_json::from_str(include_str!("../../../tests/fixtures/configs/vmess.json")).unwrap();

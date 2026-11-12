@@ -2,8 +2,8 @@ use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
     Engine,
 };
-use serde_json::{json, Value};
 use segue_config::profile_import::{import_profile, import_request, ImportError, ProfileFormat};
+use serde_json::{json, Value};
 
 const FIXTURE: &str = include_str!("../../../tests/fixtures/profile-import/socks.txt");
 

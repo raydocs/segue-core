@@ -1,10 +1,10 @@
 use std::{net::IpAddr, time::Duration};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::time::timeout;
 use segue_routing::{Network as RoutingNetwork, Target, TargetAddr as RoutingTargetAddr};
 use segue_transport::stream::{apply_masquerade, serialize_request, HeaderMap};
 use segue_transport::{DnsResolver, TlsClientConfig, TlsConnector, TransportDialer};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 
 use crate::outbound::{
     open_tcp_stream_with_resolvers_and_dialer, OutboundGraph, OutboundHealthFailure,
@@ -776,9 +776,6 @@ mod https_tests {
     use async_trait::async_trait;
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-    use tokio_rustls::TlsAcceptor;
     use segue_config::{
         CoreConfig, InboundConfig, InboundProtocol, Network, OutboundConfig, OutboundSettings,
         RoutingConfig, StreamSecurity, StreamSettings, StreamTransport,
@@ -786,6 +783,9 @@ mod https_tests {
     use segue_transport::{
         DnsResolver, SocketHandle, SocketProtector, TlsConnector, TransportDialer, TransportError,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
 
     use super::*;
 

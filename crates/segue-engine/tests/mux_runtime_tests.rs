@@ -2,12 +2,12 @@
 mod hysteria_support;
 #[path = "trojan_runtime/support.rs"]
 mod support;
-use std::sync::atomic::Ordering;
-use support::*;
-use tokio::{io::AsyncReadExt, net::UdpSocket, time::timeout};
 use segue_engine::Core;
 use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
 use segue_routing::{Network, Target, TargetAddr};
+use std::sync::atomic::Ordering;
+use support::*;
+use tokio::{io::AsyncReadExt, net::UdpSocket, time::timeout};
 
 #[tokio::test]
 #[ignore = "requires pinned Xray; run scripts/check-mux-interop.sh"]

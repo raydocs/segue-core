@@ -8,14 +8,14 @@ use std::sync::Weak;
 use std::time::Instant;
 
 use rand::RngCore;
-use tokio::sync::{watch, Mutex as AsyncMutex};
-use tokio::task::JoinHandle;
 use segue_config::{MasqueOutboundSettings, MasqueSettings, XhttpXmuxSettings};
 use segue_transport::masque::{
     dial_h2, dial_h3, IpPrefix, MasqueError, MasqueH2Config, MasqueH3Config, MasqueRequest,
     MasqueTunnel, MasqueWarp, WriteOutcome, ESTABLISH_TIMEOUT, H2_KEEP_ALIVE, INITIAL_PACKET_SIZE,
     MIN_PACKET_SIZE, QUIC_CONNECTION_ID_LEN, QUIC_IDLE_TIMEOUT, QUIC_KEEP_ALIVE,
 };
+use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::task::JoinHandle;
 /// Xray's WARP dial: `quic.Transport.ConnectionIDLength = 20`.
 const WARP_CONNECTION_ID_LEN: u8 = 20;
 use segue_wireguard::Netstack;

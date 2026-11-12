@@ -2,6 +2,11 @@ use super::{
     network_change::Relay,
     support::{self, ReferenceServer, Task, DEADLINE, SALAMANDER_PASSWORD},
 };
+use segue_routing::{Network, Target, TargetAddr};
+use segue_transport::{
+    hysteria::{GeckoPacketSize, HysteriaClient},
+    SocketHandle, SocketProtector,
+};
 use std::{
     net::Ipv4Addr,
     sync::{
@@ -14,11 +19,6 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
     time::timeout,
-};
-use segue_routing::{Network, Target, TargetAddr};
-use segue_transport::{
-    hysteria::{GeckoPacketSize, HysteriaClient},
-    SocketHandle, SocketProtector,
 };
 
 #[derive(Default)]

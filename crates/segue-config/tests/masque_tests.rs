@@ -1,10 +1,10 @@
 //! The `masque` outbound and `masqueSettings`, read as Xray-core v26.10.31
 //! reads them.
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json, DiagnosticSeverity, MasqueSettings, OutboundSettings, StreamTransport,
     TargetAddr, XhttpRange, MASQUE_DEFAULT_XMUX,
 };
+use serde_json::{json, Value};
 
 fn config(outbound: Value) -> String {
     json!({"outbounds": [outbound]}).to_string()

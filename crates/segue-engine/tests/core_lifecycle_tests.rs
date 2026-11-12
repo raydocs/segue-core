@@ -1,10 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
-use uuid::Uuid;
 use segue_config::{
     CoreConfig, DnsFakeIpConfig, InboundConfig, InboundProtocol, IpCidr, Network, OutboundConfig,
     OutboundProxySettings, OutboundSettings, RoutingBalancer, RoutingBalancerStrategy,
@@ -15,6 +11,10 @@ use segue_engine::{
     Core, CoreError, CoreState, OutboundNodeKind, TunMtu, TunRuntimeOptions, TunRuntimeProfile,
 };
 use segue_transport::{SystemDnsResolver, TransportDialer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
+use uuid::Uuid;
 
 fn runtime_config() -> CoreConfig {
     CoreConfig {
@@ -557,8 +557,8 @@ async fn chrome_parrot_cases_xray_accepts_build_a_core() {
 /// request in its uplink, with no server there to answer.
 #[tokio::test(flavor = "multi_thread")]
 async fn xdrive_flows_announce_sessions_without_resolving_the_server() {
-    use serde_json::json;
     use segue_transport::{DnsResolver, TransportError};
+    use serde_json::json;
 
     struct Refuses;
     #[async_trait::async_trait]

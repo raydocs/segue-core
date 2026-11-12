@@ -5,10 +5,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use thiserror::Error;
-use tokio::net::TcpListener;
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use segue_config::{
     CoreConfig, DnsHostTarget, DnsIpFilter, DnsQueryStrategy as ConfigDnsQueryStrategy,
     DnsServerConfig, DnsServerEndpoint, DnsServerTransport as ConfigDnsServerTransport,
@@ -22,6 +18,10 @@ use segue_transport::{
     SystemRouteDnsResolver, TransportDialer, TransportError,
 };
 use segue_tun::{TunConfig, TunEndpoint};
+use thiserror::Error;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 mod connection;
 mod debug_log;
@@ -807,11 +807,16 @@ impl Core {
                 // any TCP carrier.
                 let tls_hello = fragment.packets == segue_config::FragmentPackets::TlsHello;
                 if outbound.stream.network != segue_config::Network::Tcp
-                    || matches!(outbound.settings, segue_config::OutboundSettings::Freedom(_))
-                        && (outbound.stream.security != segue_config::StreamSecurity::None
-                            || outbound.stream.transport != segue_config::StreamTransport::Raw)
+                    || matches!(
+                        outbound.settings,
+                        segue_config::OutboundSettings::Freedom(_)
+                    ) && (outbound.stream.security != segue_config::StreamSecurity::None
+                        || outbound.stream.transport != segue_config::StreamTransport::Raw)
                     || tls_hello
-                        && !matches!(outbound.settings, segue_config::OutboundSettings::Freedom(_))
+                        && !matches!(
+                            outbound.settings,
+                            segue_config::OutboundSettings::Freedom(_)
+                        )
                         && outbound.stream.security == segue_config::StreamSecurity::None
                     || matches!(&outbound.stream.transport, segue_config::StreamTransport::Xhttp(xhttp) if xhttp.download.is_some() || matches!(&outbound.stream.security, segue_config::StreamSecurity::Tls(tls) if tls.alpn == ["h3"]))
                     || matches!(

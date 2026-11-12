@@ -8,9 +8,9 @@ use crate::{
     RoutingDomainStrategy, RoutingLeastLoadCost, RoutingLeastLoadSettings, RoutingOrigin,
     RoutingRule, RoutingRuleTarget, RoutingUsers,
 };
+use segue_routing::{DomainMatcherSet, IpMatcherSet, RegexMatcher};
 use serde_json::Value;
 use std::collections::HashSet;
-use segue_routing::{DomainMatcherSet, IpMatcherSet, RegexMatcher};
 
 const MAX_ROUTING_BALANCERS: usize = 256;
 const MAX_ROUTING_BALANCER_SELECTORS: usize = 4_096;

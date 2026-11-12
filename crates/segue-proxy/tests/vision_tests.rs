@@ -1,8 +1,8 @@
 use bytes::BytesMut;
-use std::collections::HashSet;
 use segue_proxy::vless::{
     unpad_vision_block, VisionCommand, VisionError, VisionPadding, DEFAULT_VISION_SEED,
 };
+use std::collections::HashSet;
 
 #[test]
 fn vision_padding_round_trips_user_uuid_once() {

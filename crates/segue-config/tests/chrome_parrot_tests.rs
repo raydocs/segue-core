@@ -5,8 +5,8 @@
 //! (`scripts/check-chrome-parrot-interop.sh` rechecks it): a Go bool, null
 //! for false, on any transport, and nothing else.
 
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, StreamTransport};
+use serde_json::{json, Value};
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!(

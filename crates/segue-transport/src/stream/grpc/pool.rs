@@ -32,8 +32,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{watch, Mutex};
 use segue_routing::Target;
+use tokio::sync::{watch, Mutex};
 
 use super::config::GrpcConfig;
 use super::h2client::{

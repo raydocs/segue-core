@@ -1,9 +1,9 @@
 use std::fmt;
 use std::net::IpAddr;
 
+use segue_routing::{Network, Target, TargetAddr};
 use thiserror::Error;
 use tokio::io::AsyncRead;
-use segue_routing::{Network, Target, TargetAddr};
 use zeroize::Zeroizing;
 
 use super::http_message::{connect_target, read_http_request_head};

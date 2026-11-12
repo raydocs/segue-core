@@ -1,10 +1,10 @@
 //! `xdriveSettings` and the outbounds XDRIVE carries, read as Xray-core
 //! v26.10.31 reads them.
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json, xdrive_default_xmux, DiagnosticSeverity, StreamTransport, TargetAddr,
     XdriveService, XdriveSettings, XhttpRange,
 };
+use serde_json::{json, Value};
 
 const ENCRYPTION: &str =
     "mlkem768x25519plus.native.0rtt.XKbaq1BuzJKKKPxZbwgRpn-gYQbnhrYketgezASCL1I";

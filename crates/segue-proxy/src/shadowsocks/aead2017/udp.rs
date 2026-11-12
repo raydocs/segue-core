@@ -1,8 +1,8 @@
 use super::{Method, Records, TAG_LENGTH};
 use crate::shadowsocks::{address, MAX_UDP_WIRE_LENGTH};
 use rand::RngCore;
-use std::{io, sync::Arc};
 use segue_routing::{Network, Target};
+use std::{io, sync::Arc};
 use zeroize::Zeroizing;
 
 fn invalid(message: &'static str) -> io::Error {

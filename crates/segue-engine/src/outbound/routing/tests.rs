@@ -5,13 +5,13 @@ use std::sync::{
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
-use tokio::sync::{Notify, Semaphore};
 use segue_config::{parse_xray_json, CoreConfig};
 use segue_routing::{
     DnsHostTarget, DomainHostIndex, DomainMatcher, Network as RoutingNetwork, TargetAddr,
 };
 use segue_transport::{CachingDnsResolver, ConfiguredDnsResolver, DnsLookup, TransportError};
+use serde_json::{json, Value};
+use tokio::sync::{Notify, Semaphore};
 
 use super::super::OutboundRouter;
 use super::*;

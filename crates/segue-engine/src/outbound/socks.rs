@@ -5,15 +5,15 @@
 //! it, while datagrams use a plain, protected UDP socket connected to the
 //! relay, as in Xray-core. There is no Mux path.
 use super::*;
-use std::sync::atomic::AtomicBool;
-use tokio::io::AsyncReadExt;
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex as AsyncMutex;
 use segue_proxy::inbound::SocksAccount;
 use segue_proxy::outbound::{
     decode_socks5_udp_reply, encode_socks5_udp_request, socks5_connect, socks5_udp_associate,
     validate_connect_target,
 };
+use std::sync::atomic::AtomicBool;
+use tokio::io::AsyncReadExt;
+use tokio::net::UdpSocket;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Large enough for any UDP datagram, so a relay reply is never truncated.
 const UDP_RECEIVE_BUFFER_LENGTH: usize = 65_536;
@@ -321,8 +321,8 @@ impl UdpSession {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use serde_json::{json, Value};
     use segue_transport::{HappyEyeballsConfig, ResolvedTcpConnector};
+    use serde_json::{json, Value};
 
     fn outbound(stream: Value) -> OutboundConfig {
         let raw = json!({"outbounds":[{"protocol":"socks",

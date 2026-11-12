@@ -2,6 +2,8 @@
 use crate::hysteria_support as common;
 use common::server as tls;
 pub use common::{echo, socks, tcp_echo, udp_echo, Bootstrap, Protector};
+use segue_engine::Core;
+use segue_transport::{TlsConnector, TransportDialer};
 use serde_json::{json, Value};
 use std::{
     net::SocketAddr,
@@ -10,8 +12,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use segue_engine::Core;
-use segue_transport::{TlsConnector, TransportDialer};
 pub const PASSWORD: &str = "synthetic-local-trojan-test-password";
 pub const DEADLINE: Duration = Duration::from_secs(20);
 /// Far longer than sing-box takes from flushing its 101 to the hijack.

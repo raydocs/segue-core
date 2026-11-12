@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json_with_exclusive_geodata_dirs,
     tooling::{
@@ -9,6 +8,7 @@ use segue_config::{
     },
     DiagnosticSeverity,
 };
+use serde_json::{json, Value};
 
 #[path = "../../../tests/support/config_tooling.rs"]
 mod fixtures;

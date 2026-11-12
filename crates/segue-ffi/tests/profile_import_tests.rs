@@ -1,8 +1,8 @@
 use std::ffi::{CStr, CString};
 use std::ptr;
 
-use serde_json::{json, Value};
 use segue_ffi::*;
+use serde_json::{json, Value};
 
 const HY: &str = include_str!("../../../tests/fixtures/profile-import/hysteria2.txt");
 const WG: &str = include_str!("../../../tests/fixtures/profile-import/wireguard.conf");

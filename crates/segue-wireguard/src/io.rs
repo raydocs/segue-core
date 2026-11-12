@@ -4,6 +4,7 @@ use gotatun::{
     tun::{IpRecv, IpSend, MtuWatcher},
     udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams},
 };
+use segue_transport::SocketProtector;
 use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -16,7 +17,6 @@ use tokio::{
     net::UdpSocket,
     sync::{mpsc, watch, Notify},
 };
-use segue_transport::SocketProtector;
 fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "WireGuard closed")
 }

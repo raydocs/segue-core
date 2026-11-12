@@ -1,5 +1,5 @@
-use serde_json::Value;
 use segue_config::profile_import::{import_profile, ImportError, ProfileFormat};
+use serde_json::Value;
 
 const ID: &str = "6c027102-b0fb-4e85-a77c-9a0a8607101b";
 const PBK: &str = "kZ4NDkIZkxCcdw0iPsMfsjun8jdTfh4ngEuPlJ4yUY8";

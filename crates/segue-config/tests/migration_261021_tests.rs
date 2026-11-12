@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, OutboundSettings};
+use serde_json::{json, Value};
 
 fn hysteria() -> Value {
     serde_json::from_str(include_str!(

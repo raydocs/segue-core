@@ -1,6 +1,6 @@
 use super::*;
-use std::collections::BTreeMap;
 use segue_proxy::wireguard::AllowedIp;
+use std::collections::BTreeMap;
 
 type Fields<'a> = BTreeMap<String, Vec<&'a str>>;
 

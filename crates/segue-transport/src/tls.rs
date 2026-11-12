@@ -14,11 +14,11 @@ use rustls::{
     crypto, CertificateError, ClientConnection, DigitallySignedStruct, Error as RustlsError,
     SignatureScheme,
 };
+use segue_routing::{Target, TargetAddr};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsConnector as TokioTlsConnector;
 use x509_parser::prelude::{FromDer, X509Certificate};
-use segue_routing::{Target, TargetAddr};
 
 use crate::{
     connect_tcp_happy_eyeballs, connect_tcp_stream,

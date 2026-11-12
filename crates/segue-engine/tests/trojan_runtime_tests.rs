@@ -2,6 +2,8 @@
 mod hysteria_support;
 #[path = "trojan_runtime/support.rs"]
 mod support;
+use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
+use segue_routing::{Network, Target, TargetAddr};
 use std::sync::atomic::Ordering;
 use support::*;
 use tokio::{
@@ -9,8 +11,6 @@ use tokio::{
     net::{TcpStream, UdpSocket},
     time::timeout,
 };
-use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
-use segue_routing::{Network, Target, TargetAddr};
 
 #[tokio::test]
 #[ignore = "requires pinned Xray; run scripts/check-trojan-interop.sh"]
@@ -111,9 +111,9 @@ async fn trojan_runtime_carriers_socks_http_udp_accounting_and_close() {
 #[tokio::test]
 #[ignore = "requires pinned sing-box; run scripts/check-v08-independent-interop.sh"]
 async fn httpupgrade_independent_reference_rejects_default_websocket_key() {
-    use std::sync::Arc;
     use segue_engine::{open_tcp_stream_with_resolver_and_dialer, CoreError, OutboundRouter};
     use segue_transport::TransportError;
+    use std::sync::Arc;
     if !independent_reference() {
         return;
     }
@@ -154,9 +154,9 @@ async fn httpupgrade_independent_reference_rejects_default_websocket_key() {
 #[tokio::test]
 #[ignore = "requires pinned Xray; run scripts/check-trojan-interop.sh"]
 async fn trojan_runtime_rejects_wrong_password_and_untrusted_peer() {
-    use std::sync::Arc;
     use segue_engine::{open_tcp_stream_with_resolver_and_dialer, OutboundRouter};
     use segue_transport::TransportDialer;
+    use std::sync::Arc;
     let server = ReferenceServer::start("raw").await;
     timeout(DEADLINE, async {
         let (address, _echo) = tcp_echo().await;

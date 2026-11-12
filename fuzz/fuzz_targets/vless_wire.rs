@@ -1,11 +1,11 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use tokio::runtime::Builder;
 use segue_proxy::vless::{
     encode_udp_packet, encode_xudp_keep_packet, read_udp_packet, read_xudp_packet,
     unpad_vision_block,
 };
+use tokio::runtime::Builder;
 
 fuzz_target!(|data: &[u8]| {
     let mut user_id = [0_u8; 16];

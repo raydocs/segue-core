@@ -2,6 +2,8 @@
 mod hysteria_support;
 #[path = "trojan_runtime/support.rs"]
 mod support;
+use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
+use segue_routing::{Network, Target, TargetAddr};
 use std::sync::atomic::Ordering;
 use support::*;
 use tokio::{
@@ -9,14 +11,12 @@ use tokio::{
     net::{TcpStream, UdpSocket},
     time::timeout,
 };
-use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
-use segue_routing::{Network, Target, TargetAddr};
 
 #[tokio::test]
 #[ignore = "requires pinned reference; run scripts/check-shadowsocks2022-interop.sh"]
 async fn shadowsocks_runtime_udp_reopens_after_port_change_and_survives_server_restart() {
-    use std::sync::Arc;
     use segue_proxy::shadowsocks2022::{Method, UdpSession};
+    use std::sync::Arc;
 
     for (method, identity) in [
         ("2022-blake3-aes-128-gcm", false),

@@ -4,8 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use segue_config::{
     CoreConfig, DnsQueryStrategy, DnsServerConfig, InboundConfig, InboundProtocol, Network,
     OutboundConfig, OutboundSettings, PolicyConfig, PolicyLevelConfig, RoutingConfig, RoutingRule,
@@ -17,6 +15,8 @@ use segue_engine::{
     TunRuntimeOptions, MAX_OUTBOUND_PROBE_TIMEOUT,
 };
 use segue_transport::{DnsResolver, TransportDialer, TransportError};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 fn freedom(tag: &str) -> OutboundConfig {
     OutboundConfig {

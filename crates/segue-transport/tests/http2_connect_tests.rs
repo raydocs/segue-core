@@ -10,10 +10,10 @@ use bytes::Bytes;
 use h2::server::{self, SendResponse};
 use h2::RecvStream;
 use http::{Request, Response, StatusCode};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::time::timeout;
 use segue_transport::stream::{Http2ConnectClient, Http2ConnectError};
 use segue_transport::{set_memory_class, MemoryClass};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::time::timeout;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 

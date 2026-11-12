@@ -2,10 +2,10 @@
 
 use std::net::IpAddr;
 
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json, DiagnosticSeverity, InboundSniffingConfig, SniffingDestination,
 };
+use serde_json::{json, Value};
 
 fn config(sniffing: Value) -> String {
     json!({

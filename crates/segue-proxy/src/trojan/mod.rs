@@ -7,9 +7,9 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use segue_routing::{Network, Target, TargetAddr};
 use sha2::{Digest, Sha224};
 use thiserror::Error;
-use segue_routing::{Network, Target, TargetAddr};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Local credential work bound, in UTF-8 bytes.

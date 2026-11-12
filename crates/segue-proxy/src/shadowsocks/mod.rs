@@ -5,6 +5,7 @@ pub(crate) mod address;
 pub mod aead2017;
 
 use crate::shadowsocks2022;
+use segue_routing::Target;
 use std::{
     io,
     pin::Pin,
@@ -12,7 +13,6 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use segue_routing::Target;
 
 /// Largest datagram either codec emits or accepts.
 pub const MAX_UDP_WIRE_LENGTH: usize = shadowsocks2022::MAX_UDP_WIRE_LENGTH;

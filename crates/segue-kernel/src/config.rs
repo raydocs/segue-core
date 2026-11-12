@@ -43,7 +43,10 @@ impl KernelConfig {
         if !raw.listen.ip().is_loopback() {
             // The SOCKS entry point has no authentication; exposing it beyond
             // this host would make it an open proxy.
-            return Err(format!("listen must be a loopback address, got {}", raw.listen));
+            return Err(format!(
+                "listen must be a loopback address, got {}",
+                raw.listen
+            ));
         }
         let rules = raw
             .rules
@@ -57,7 +60,11 @@ impl KernelConfig {
                 return Err(format!("rule refers to unknown outbound {tag:?}"));
             }
         }
-        Ok(Self { listen: raw.listen, outbounds: raw.outbounds, rules })
+        Ok(Self {
+            listen: raw.listen,
+            outbounds: raw.outbounds,
+            rules,
+        })
     }
 }
 
@@ -67,7 +74,9 @@ mod tests {
 
     #[test]
     fn rejects_non_loopback_listen() {
-        let err = KernelConfig::parse(r#"{"listen":"0.0.0.0:1080","default":{"type":"direct"}}"#).err().unwrap();
+        let err = KernelConfig::parse(r#"{"listen":"0.0.0.0:1080","default":{"type":"direct"}}"#)
+            .err()
+            .unwrap();
         assert!(err.contains("loopback"), "{err}");
     }
 
@@ -83,6 +92,9 @@ mod tests {
 
     #[test]
     fn rejects_unknown_fields() {
-        assert!(KernelConfig::parse(r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},"dns":{}}"#).is_err());
+        assert!(KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},"dns":{}}"#
+        )
+        .is_err());
     }
 }

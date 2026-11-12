@@ -1,11 +1,11 @@
 use std::io;
 use std::time::Duration;
 
+use segue_config::CoreConfig;
 use tokio::io::{split, AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(test)]
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
-use segue_config::CoreConfig;
 
 use crate::connection::ConnectionTraffic;
 
@@ -353,12 +353,12 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-    use tokio::sync::mpsc;
     use segue_config::{
         CoreConfig, OutboundConfig, OutboundSettings, PolicyConfig, PolicyLevelConfig,
         StreamSecurity, StreamSettings, StreamTransport,
     };
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::sync::mpsc;
 
     use super::{
         copy_bidirectional_with_idle_timeout, copy_direction, effective_policy_for_level,

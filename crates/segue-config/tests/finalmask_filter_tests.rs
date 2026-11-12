@@ -4,10 +4,10 @@
 //! what `xray run -test` says of each case.
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json, parse_xray_json_with_exclusive_geodata_dirs, DiagnosticSeverity,
 };
+use serde_json::{json, Value};
 
 fn corpus() -> Value {
     serde_json::from_str(include_str!(
