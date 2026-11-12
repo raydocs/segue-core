@@ -1,0 +1,394 @@
+#[path = "hysteria_runtime/support.rs"]
+mod hysteria_support;
+#[path = "trojan_runtime/support.rs"]
+mod support;
+use std::sync::atomic::Ordering;
+use support::*;
+use tokio::{io::AsyncReadExt, net::UdpSocket, time::timeout};
+use xray_core_rs::Core;
+use xray_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
+use xray_routing::{Network, Target, TargetAddr};
+
+#[tokio::test]
+#[ignore = "requires pinned Xray; run scripts/check-mux-interop.sh"]
+async fn mux_runtime_selected_protocols_share_tcp_udp_and_close_children() {
+    for protocol in [
+        "vless",
+        "trojan",
+        "shadowsocks",
+        "shadowsocks-aead",
+        "vmess",
+    ] {
+        for carrier in ["raw", "ws", "httpupgrade", "grpc", "xhttp"] {
+            for separate_udp in [false, true] {
+                if carrier == "xhttp" && !separate_udp {
+                    continue;
+                }
+                eprintln!("Mux {protocol}/{carrier}, separate UDP pool: {separate_udp}");
+                let server = match protocol {
+                    "vless" => ReferenceServer::start_vless(carrier, "", false).await,
+                    "trojan" => ReferenceServer::start(carrier).await,
+                    "shadowsocks" => {
+                        ReferenceServer::start_shadowsocks(
+                            carrier,
+                            "2022-blake3-aes-128-gcm",
+                            false,
+                        )
+                        .await
+                    }
+                    "shadowsocks-aead" => {
+                        ReferenceServer::start_shadowsocks(carrier, "aes-256-gcm", false).await
+                    }
+                    _ => ReferenceServer::start_vmess(carrier, "aes-128-gcm", "").await,
+                };
+                timeout(DEADLINE,async {
+                let (tcp_addr,_tcp)=tcp_echo().await;
+                let (udp_addr,_udp)=udp_echo().await;
+                let (_,protector,bootstrap,dialer)=server.core();
+                let mut profile=server.profile();
+                profile["outbounds"][0]["mux"]=serde_json::json!({"enabled":true,"concurrency":if carrier == "xhttp" {-1} else {4},"xudpConcurrency":if separate_udp {4} else {0},"xudpProxyUDP443":"allow"});
+                let config=xray_config::parse_xray_json(&profile.to_string()).unwrap().config;
+                let mut core=Core::with_runtime_dependencies(config,bootstrap,dialer).unwrap();
+                core.start().await.unwrap();
+                let proxy=core.inbound_addr(Some("socks-in")).unwrap();
+                let mut streams=Vec::new();
+                for index in 0..6 {
+                    let (mut stream,_)=socks(proxy,1,"localhost",tcp_addr.port()).await;
+                    echo(&mut stream,&vec![index;8192]).await;
+                    streams.push(stream);
+                }
+                let (_control,relay)=socks(proxy,3,"0.0.0.0",0).await;
+                let udp=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let target=Target::new(TargetAddr::Ip(udp_addr.ip()),udp_addr.port(),Network::Udp);
+                for size in [1,4096,8192] {
+                    let payload=vec![0x5a;size];
+                    udp.send_to(&encode_socks5_udp_datagram(&target,&payload).unwrap(),relay).await.unwrap();
+                    let mut bytes=[0;9000];let n=udp.recv(&mut bytes).await.unwrap();
+                    let reply=parse_socks5_udp_datagram(&bytes[..n]).unwrap();
+                    assert_eq!(reply.payload.as_ref(),payload);assert_eq!(reply.target,target);
+                }
+                // Six TCP children share one Mux parent: like Xray-core's
+                // v26.11.9 handler, a concurrency of 4 runs as 128. A dedicated
+                // UDP pool adds one parent. H2 carriers share their protected
+                // socket.
+                assert_eq!(protector.0.load(Ordering::SeqCst),if matches!(carrier, "grpc" | "xhttp") {1} else if separate_udp {2} else {1});
+                let id=core.connection_snapshot().connections.iter().find(|c|c.network==Network::Udp).unwrap().id;
+                core.close_connection(id).unwrap();
+                for stream in &mut streams {echo(stream,b"siblings survive child close").await;}
+                core.stop().await.unwrap();
+                assert!(core.connection_snapshot().connections.is_empty());
+                for stream in &mut streams {assert!(stream.read_u8().await.is_err());}
+            }).await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires local reference; run protocol interop scripts"]
+async fn mux_runtime_ipv6_and_domain_datagrams_preserve_destination_identity() {
+    use std::net::Ipv6Addr;
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{TcpListener, TcpStream},
+    };
+    for protocol in ["vless", "trojan", "shadowsocks", "vmess"] {
+        for mux in [false, true] {
+            // The independent reference helper has no VLESS server.
+            if independent_reference() && (mux || protocol == "vless") {
+                continue;
+            }
+            eprintln!("IPv6/domain {protocol}, Mux={mux}");
+            let server = match protocol {
+                "vless" => ReferenceServer::start_vless("raw", "", false).await,
+                "trojan" => ReferenceServer::start("raw").await,
+                "shadowsocks" => {
+                    ReferenceServer::start_shadowsocks("raw", "2022-blake3-aes-256-gcm", false)
+                        .await
+                }
+                _ => ReferenceServer::start_vmess("raw", "chacha20-poly1305", "").await,
+            };
+            timeout(DEADLINE, async {
+                let tcp = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await.unwrap();
+                let tcp_addr = tcp.local_addr().unwrap();
+                let _tcp = hysteria_support::Task(tokio::spawn(async move {
+                    let (mut stream, _) = tcp.accept().await.unwrap();
+                    let (mut reader, mut writer) = stream.split();
+                    let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                }));
+                let udp_echo_v6 = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).await.unwrap();
+                let udp_addr_v6 = udp_echo_v6.local_addr().unwrap();
+                let _udp_v6 = hysteria_support::Task(tokio::spawn(async move {
+                    let mut bytes = [0; 8192];
+                    loop {
+                        let (n, peer) = udp_echo_v6.recv_from(&mut bytes).await.unwrap();
+                        udp_echo_v6.send_to(&bytes[..n], peer).await.unwrap();
+                    }
+                }));
+                let (udp_addr_v4, _udp_v4) = udp_echo().await;
+                let (_, _, bootstrap, dialer) = server.core();
+                let mut profile = server.profile();
+                if mux {
+                    profile["outbounds"][0]["mux"] = serde_json::json!({"enabled":true});
+                }
+                let mut core = Core::with_runtime_dependencies(
+                    xray_config::parse_xray_json(&profile.to_string())
+                        .unwrap()
+                        .config,
+                    bootstrap,
+                    dialer,
+                )
+                .unwrap();
+                core.start().await.unwrap();
+                let proxy = core.inbound_addr(Some("socks-in")).unwrap();
+                let mut tcp = TcpStream::connect(proxy).await.unwrap();
+                tcp.write_all(&[5, 1, 0]).await.unwrap();
+                let mut greeting = [0; 2];
+                tcp.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 0]);
+                let mut request = vec![5, 1, 0, 4];
+                request.extend(Ipv6Addr::LOCALHOST.octets());
+                request.extend(tcp_addr.port().to_be_bytes());
+                tcp.write_all(&request).await.unwrap();
+                let mut reply = [0; 10];
+                tcp.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+                echo(&mut tcp, b"IPv6 TCP through selected protocol").await;
+                let (_control, relay) = socks(proxy, 3, "0.0.0.0", 0).await;
+                let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                for target in [
+                    Target::new(
+                        TargetAddr::Ip(udp_addr_v6.ip()),
+                        udp_addr_v6.port(),
+                        Network::Udp,
+                    ),
+                    Target::new(
+                        TargetAddr::Domain("localhost".into()),
+                        udp_addr_v4.port(),
+                        Network::Udp,
+                    ),
+                ] {
+                    let bytes = b"IPv6 or domain UDP";
+                    udp.send_to(&encode_socks5_udp_datagram(&target, bytes).unwrap(), relay)
+                        .await
+                        .unwrap();
+                    let mut response = [0; 8192];
+                    let n = udp.recv(&mut response).await.unwrap();
+                    let packet = parse_socks5_udp_datagram(&response[..n]).unwrap();
+                    assert_eq!(packet.payload.as_ref(), bytes);
+                    assert_eq!(packet.target.port, target.port);
+                    match (&target.addr, &packet.target.addr) {
+                        (TargetAddr::Ip(expected), TargetAddr::Ip(actual)) => {
+                            assert_eq!(expected, actual)
+                        }
+                        (TargetAddr::Domain(expected), TargetAddr::Domain(actual)) => {
+                            assert_eq!(expected, actual)
+                        }
+                        (TargetAddr::Domain(_), TargetAddr::Ip(actual)) => {
+                            assert!(actual.is_loopback())
+                        }
+                        _ => panic!("UDP response changed address family"),
+                    }
+                }
+                core.stop().await.unwrap();
+                assert!(core.connection_snapshot().connections.is_empty());
+            })
+            .await
+            .unwrap();
+        }
+    }
+}
+
+/// Vision and VLESS encryption against the pinned VLESS inbound. A Vision
+/// account's Mux connection admits only UDP children there, so Vision pools
+/// XUDP while TCP keeps one Vision connection per stream. Encryption without
+/// a flow pools both, and Vision under encryption also works off raw TLS.
+#[tokio::test]
+#[ignore = "requires pinned Xray; run scripts/check-mux-interop.sh"]
+async fn mux_runtime_vless_vision_and_encryption_follow_the_pinned_inbound() {
+    for (carrier, flow, encrypted) in [
+        ("raw", "xtls-rprx-vision", false),
+        ("raw", "xtls-rprx-vision-udp443", false),
+        ("raw", "", true),
+        ("ws", "xtls-rprx-vision", true),
+        ("grpc", "xtls-rprx-vision", true),
+    ] {
+        eprintln!("Mux VLESS {carrier}, flow {flow:?}, encrypted: {encrypted}");
+        let vision = !flow.is_empty();
+        let server = ReferenceServer::start_vless(carrier, flow, encrypted).await;
+        timeout(DEADLINE, async {
+            let (tcp_addr, _tcp) = tcp_echo().await;
+            let (udp_addr, _udp) = udp_echo().await;
+            let (second_udp_addr, _second_udp) = udp_echo().await;
+            let (_, protector, bootstrap, dialer) = server.core();
+            let mut profile = server.profile();
+            profile["outbounds"][0]["mux"] = serde_json::json!({
+                "enabled": true,
+                "concurrency": if vision { -1 } else { 4 },
+                "xudpConcurrency": 4,
+                "xudpProxyUDP443": "allow",
+            });
+            let config = xray_config::parse_xray_json(&profile.to_string())
+                .unwrap()
+                .config;
+            let mut core = Core::with_runtime_dependencies(config, bootstrap, dialer).unwrap();
+            core.start().await.unwrap();
+            let proxy = core.inbound_addr(Some("socks-in")).unwrap();
+            let mut streams = Vec::new();
+            for index in 0..3 {
+                let (mut stream, _) = socks(proxy, 1, "localhost", tcp_addr.port()).await;
+                echo(&mut stream, &vec![index; 8192]).await;
+                streams.push(stream);
+            }
+            let tcp_dials = protector.0.load(Ordering::SeqCst);
+            let (_control, relay) = socks(proxy, 3, "0.0.0.0", 0).await;
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            // Two destinations are two UDP flows: native VLESS UDP would dial
+            // twice, while both XUDP children share one Mux parent.
+            for (addr, size) in [(udp_addr, 1), (second_udp_addr, 4096), (udp_addr, 8192)] {
+                let target = Target::new(TargetAddr::Ip(addr.ip()), addr.port(), Network::Udp);
+                let payload = vec![0x5a; size];
+                udp.send_to(
+                    &encode_socks5_udp_datagram(&target, &payload).unwrap(),
+                    relay,
+                )
+                .await
+                .unwrap();
+                let mut bytes = [0; 9000];
+                let n = udp.recv(&mut bytes).await.unwrap();
+                let reply = parse_socks5_udp_datagram(&bytes[..n]).unwrap();
+                assert_eq!(reply.payload.as_ref(), payload);
+                assert_eq!(reply.target, target);
+            }
+            let h2 = carrier == "grpc";
+            // Vision TCP is native, one carrier each (gRPC shares its H2
+            // socket); without a flow, the three streams share one parent.
+            let expected_tcp = if h2 || !vision { 1 } else { 3 };
+            assert_eq!(tcp_dials, expected_tcp);
+            // Both UDP flows share one dedicated XUDP parent.
+            assert_eq!(
+                protector.0.load(Ordering::SeqCst),
+                expected_tcp + usize::from(!h2)
+            );
+            let udp_flows = core
+                .connection_snapshot()
+                .connections
+                .iter()
+                .filter(|c| c.network == Network::Udp)
+                .map(|c| c.id)
+                .collect::<Vec<_>>();
+            assert_eq!(udp_flows.len(), 2);
+            core.close_connection(udp_flows[0]).unwrap();
+            for stream in &mut streams {
+                echo(stream, b"siblings survive child close").await;
+            }
+            core.stop().await.unwrap();
+            assert!(core.connection_snapshot().connections.is_empty());
+            for stream in &mut streams {
+                assert!(stream.read_u8().await.is_err());
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// Deterministic, non-repeating bytes so reordered or duplicated frames change
+/// the digest.
+fn bulk_payload(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires pinned Xray; run scripts/check-mux-interop.sh"]
+async fn mux_runtime_slow_reader_backpressures_bulk_download_without_reset() {
+    use sha2::{Digest, Sha256};
+    use std::{sync::Arc, time::Duration};
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
+    const LEN: usize = 16 * 1024 * 1024;
+    let payload = Arc::new(bulk_payload(LEN, 0x6d75_7866));
+    let expected = Sha256::digest(payload.as_slice());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bulk_port = listener.local_addr().unwrap().port();
+    let server_payload = payload.clone();
+    let _bulk = hysteria_support::Task(tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let payload = server_payload.clone();
+            tokio::spawn(async move {
+                if socket.write_all(&payload).await.is_ok() {
+                    let _ = socket.shutdown().await;
+                }
+            });
+        }
+    }));
+    for protocol in ["trojan", "shadowsocks", "vmess"] {
+        eprintln!("Mux slow reader {protocol}");
+        let server = match protocol {
+            "trojan" => ReferenceServer::start("raw").await,
+            "shadowsocks" => {
+                ReferenceServer::start_shadowsocks("raw", "2022-blake3-aes-128-gcm", false).await
+            }
+            _ => ReferenceServer::start_vmess("raw", "aes-128-gcm", "").await,
+        };
+        timeout(DEADLINE, async {
+            let (tcp_addr, _tcp) = tcp_echo().await;
+            let (_, protector, bootstrap, dialer) = server.core();
+            let mut profile = server.profile();
+            profile["outbounds"][0]["mux"] = serde_json::json!({"enabled":true,"concurrency":8});
+            let config = xray_config::parse_xray_json(&profile.to_string())
+                .unwrap()
+                .config;
+            let mut core = Core::with_runtime_dependencies(config, bootstrap, dialer).unwrap();
+            core.start().await.unwrap();
+            let proxy = core.inbound_addr(Some("socks-in")).unwrap();
+            let (mut sibling, _) = socks(proxy, 1, "localhost", tcp_addr.port()).await;
+            echo(&mut sibling, b"sibling before bulk").await;
+            let (mut slow, _) = socks(proxy, 1, "localhost", bulk_port).await;
+            let (mut fast, _) = socks(proxy, 1, "localhost", bulk_port).await;
+            let slow = async {
+                // Stall long enough for the server to fill every buffer up to
+                // the child queue, then keep reading slower than it sends.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let mut digest = Sha256::new();
+                let (mut total, mut chunk) = (0, vec![0; 16 * 1024]);
+                loop {
+                    let n = match slow.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    digest.update(&chunk[..n]);
+                    total += n;
+                    if total % (256 * 1024) < n {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
+                (total, digest.finalize())
+            };
+            let fast = async {
+                let mut bytes = Vec::with_capacity(LEN);
+                let _ = fast.read_to_end(&mut bytes).await;
+                (bytes.len(), Sha256::digest(&bytes))
+            };
+            let (slow, fast) = tokio::join!(slow, fast);
+            assert_eq!(slow.0, LEN, "slow child was cut short");
+            assert_eq!(slow.1, expected);
+            assert_eq!(fast.0, LEN, "fast sibling was cut short");
+            assert_eq!(fast.1, expected);
+            echo(&mut sibling, b"sibling after bulk").await;
+            // Every child shared one Mux parent.
+            assert_eq!(protector.0.load(Ordering::SeqCst), 1);
+            core.stop().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+}

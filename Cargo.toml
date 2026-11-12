@@ -1,0 +1,104 @@
+[workspace]
+members = [
+    "crates/xray-config",
+    "crates/xray-utls",
+    "crates/xray-routing",
+    "crates/xray-tun",
+    "crates/xray-proxy",
+    "crates/xray-vless-encryption",
+    "crates/xray-transport",
+    "crates/xray-wireguard",
+    "crates/xray-runtime",
+    "crates/xray-core-rs",
+    "crates/xray-ffi",
+    "crates/xray-cli",
+    "crates/xray-bench",
+    "fuzz",
+]
+resolver = "2"
+# `.claude` holds agent worktrees, each a checkout with its own workspace.
+# Without it here, cargo resolves their excluded vendor crates to this
+# workspace and fails ("believes it's in a workspace when it's not").
+exclude = ["vendor/gotatun", "vendor/smoltcp", "vendor/quinn", "vendor/h2", "vendor/h3", "vendor/shaped-rustls", ".claude"]
+
+[workspace.package]
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.96"
+license = "MPL-2.0"
+authors = ["raydocs"]
+repository = "https://github.com/raydocs/segue-core"
+publish = false
+
+[workspace.dependencies]
+aho-corasick = "1.1.4"
+aes = { version = "0.9", features = ["zeroize"] }
+aes-gcm = { version = "0.11", features = ["zeroize"] }
+async-compression = { version = "=0.4.42", default-features = false, features = ["gzip", "tokio"] }
+async-trait = "0.1"
+aws-lc-rs = { version = "=1.18.1", default-features = false, features = ["alloc", "non-fips", "prebuilt-nasm"] }
+base64 = "0.23.1"
+blake2 = "=0.11.0"
+blake3 = { version = "=1.8.5", features = ["zeroize", "pure"] }
+bytes = "1"
+chacha20 = { version = "0.10.2", default-features = false, features = ["xchacha"] }
+chacha20poly1305 = "0.11.0"
+crc32fast = "1.5"
+md-5 = { version = "0.11", features = ["zeroize"] }
+num-bigint = { version = "0.4", default-features = false, features = ["std"] }
+sha3 = { version = "0.11", features = ["zeroize"] }
+ctr = { version = "0.10.1", features = ["zeroize"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+ghash = { version = "0.6", features = ["zeroize"] }
+h2 = "0.4.16"
+h3 = "=0.0.8"
+h3-quinn = "=0.0.10"
+hkdf = "0.13"
+hmac = "0.13"
+http = "1"
+idna = "1"
+libc = "0.2"
+loom = "0.7"
+ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
+polyval = { version = "0.7", features = ["zeroize"] }
+prost = "0.14"
+rand = "0.8"
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+regex = "1"
+quinn = { version = "=0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# Named only for congestion-controller callback types; quinn selects the features.
+quinn-proto = { version = "=0.11.16", default-features = false }
+rustls = { version = "0.23.40", default-features = false, features = ["aws_lc_rs", "brotli", "logging", "ring", "std", "tls12", "zlib"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.11"
+sha2 = "0.11"
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+thiserror = "2"
+tokio = { version = "1.53.3", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "logging", "ring", "tls12"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+webpki-roots = "1.0.11"
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+x509-parser = { version = "0.18", default-features = false }
+zeroize = "1"
+zstd = { version = "0.14.3", default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "unwind"
+strip = "symbols"
+
+[profile.dev]
+panic = "unwind"
+
+[patch.crates-io]
+quinn = { path = "vendor/quinn" }
+smoltcp = { path = "vendor/smoltcp" }
+blake3 = { path = "vendor/blake3" }
+h3 = { path = "vendor/h3" }
+h3-quinn = { path = "vendor/h3-quinn" }
+quinn-proto = { path = "vendor/quinn-proto" }
+h2 = { path = "vendor/h2" }
+rustls = { path = "vendor/shaped-rustls/rustls" }

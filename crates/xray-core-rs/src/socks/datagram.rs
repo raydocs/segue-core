@@ -1,0 +1,74 @@
+use super::*;
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "SOCKS flow owns admission, client address, routing and shutdown"
+)]
+pub(super) async fn bridge(
+    target: Target,
+    client_visible_target: Option<Target>,
+    outbound: UdpOutbound,
+    context: SocksUdpFlowContext,
+    from_client: UdpIngress,
+    mut shutdown: watch::Receiver<bool>,
+    first_payload: Bytes,
+    pending_open_permit: OwnedSemaphorePermit,
+    connection: ConnectionLease,
+    mut connection_close: watch::Receiver<bool>,
+) {
+    let traffic = connection.traffic();
+    let flow = async {
+        let session = crate::outbound::datagram::open_within_handshake(
+            &context.config,
+            &outbound,
+            &target,
+            context.dns_resolvers.destination.as_ref(),
+            context.dns_resolvers.bootstrap.as_ref(),
+            context.transport_dialer.as_ref(),
+            context.global_id(&target),
+        )
+        .await?;
+        drop(pending_open_permit);
+        connection.mark_active();
+        crate::debug_log::log_access_accepted(
+            &context.runtime_logger,
+            &context.client_label(),
+            &target,
+            crate::debug_log::udp_outbound_label(&outbound),
+        );
+        crate::outbound::datagram::relay_udp(
+            session,
+            &target,
+            from_client,
+            first_payload,
+            &traffic,
+            SOCKS_UDP_FLOW_IDLE_TIMEOUT,
+            None,
+            |payload: bytes::Bytes, max_payload| {
+                crate::outbound::datagram::log_oversize_udp_datagram(
+                    &context.runtime_logger,
+                    "socks",
+                    payload.len(),
+                    max_payload,
+                );
+                std::future::ready(())
+            },
+            |source, payload| {
+                let source = client_visible_target.clone().unwrap_or(source);
+                let context = &context;
+                async move { context.deliver(&source, &payload).await }
+            },
+        )
+        .await
+    };
+    if *shutdown.borrow() || *connection_close.borrow() {
+        return;
+    }
+    tokio::select! {
+        biased;
+        () = wait_for_connection_close(&mut connection_close) => {},
+        _ = shutdown.changed() => {},
+        result = flow => { let _ = result; },
+    }
+    connection.finish();
+}

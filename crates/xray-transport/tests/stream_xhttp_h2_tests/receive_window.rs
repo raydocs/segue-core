@@ -1,0 +1,475 @@
+//! Receive credit, backpressure and latency regressions for issue #28.
+use super::*;
+use h2::SendStream;
+use tokio::time::{sleep_until, Instant};
+
+const STREAM_WINDOW: usize = 4 * 1024 * 1024;
+
+#[tokio::test(start_paused = true)]
+async fn configured_receive_windows_bound_unread_data_and_replenish_only_consumed_bytes() {
+    for window in [65535, 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024] {
+        let (client, mut server) = pair_with_window(server::Builder::new(), Some(window)).await;
+        let (mut body, mut send) = response_pair(&client, &mut server).await;
+        timeout(DEADLINE, send_bytes(&mut send, window as usize))
+            .await
+            .unwrap();
+        assert_blocked(&mut send).await;
+        let count = window as usize / 2;
+        let mut bytes = vec![0; count];
+        body.read_exact(&mut bytes).await.unwrap();
+        assert!(bytes.iter().all(|b| *b == 0xa5));
+        timeout(DEADLINE, send_bytes(&mut send, count))
+            .await
+            .unwrap();
+        assert_blocked(&mut send).await;
+        drop(body);
+        assert_eq!(
+            timeout(DEADLINE, poll_fn(|cx| send.poll_reset(cx)))
+                .await
+                .unwrap()
+                .unwrap(),
+            Reason::CANCEL
+        );
+        server.close().await;
+    }
+}
+
+#[tokio::test]
+async fn invalid_receive_window_is_rejected_before_writing_the_preface() {
+    for window in [0, 65534, 16 * 1024 * 1024 + 1, u32::MAX] {
+        let (client, mut server) = tokio::io::duplex(64);
+        assert!(matches!(
+            connect_h2_with_receive_window(Box::new(client), None, window).await,
+            Err(H2Error::Configuration(_))
+        ));
+        let mut wire = Vec::new();
+        server.read_to_end(&mut wire).await.unwrap();
+        assert!(wire.is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_larger_stream_override_does_not_raise_shared_connection_credit() {
+    let (client, mut server) =
+        pair_with_window(server::Builder::new(), Some(8 * 1024 * 1024)).await;
+    let mut stalled = Vec::new();
+    for _ in 0..2 {
+        let (body, mut send) = response_pair(&client, &mut server).await;
+        timeout(DEADLINE, send_bytes(&mut send, 8 * 1024 * 1024))
+            .await
+            .unwrap();
+        stalled.push((body, send));
+    }
+    let (mut victim, mut send) = response_pair(&client, &mut server).await;
+    assert_blocked(&mut send).await;
+    let (body, mut cancelled_send) = stalled.remove(0);
+    drop(body);
+    assert_eq!(
+        timeout(DEADLINE, poll_fn(|cx| cancelled_send.poll_reset(cx)))
+            .await
+            .unwrap()
+            .unwrap(),
+        Reason::CANCEL
+    );
+    timeout(DEADLINE, send_bytes(&mut send, 1)).await.unwrap();
+    let mut byte = [0];
+    timeout(DEADLINE, victim.read_exact(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(byte, [0xa5]);
+    drop(stalled);
+    drop(victim);
+    server.close().await;
+}
+
+async fn response_pair(
+    client: &H2Client,
+    server: &mut TestServer,
+) -> (impl tokio::io::AsyncRead + Unpin, SendStream<Bytes>) {
+    let pending = client
+        .start_fixed(
+            request(Method::GET, "http://example.test/window"),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+    let (_, mut respond) = server.accept().await.unwrap().unwrap();
+    let send = respond
+        .send_response(response(StatusCode::OK), false)
+        .unwrap();
+    (pending.open().await.unwrap(), send)
+}
+
+/// Credit for a sixteenth of the window goes back while the window is still
+/// open, not only after a third of it has been read.
+#[tokio::test(start_paused = true)]
+async fn a_sixteenth_of_the_window_read_returns_its_credit_while_the_window_is_open() {
+    let (client, mut server) = pair().await;
+    let (mut body, mut send) = response_pair(&client, &mut server).await;
+    timeout(DEADLINE, send_bytes(&mut send, STREAM_WINDOW / 4))
+        .await
+        .unwrap();
+
+    let mut bytes = vec![0; STREAM_WINDOW / 16];
+    body.read_exact(&mut bytes).await.unwrap();
+
+    timeout(
+        DEADLINE,
+        send_bytes(&mut send, STREAM_WINDOW * 3 / 4 + bytes.len()),
+    )
+    .await
+    .expect("reading a sixteenth of the window returns its credit");
+    assert_blocked(&mut send).await;
+    drop(body);
+    server.close().await;
+}
+
+/// A smaller read keeps its credit while the sender has window left, so a
+/// fast reader does not send a WINDOW_UPDATE for every read.
+#[tokio::test(start_paused = true)]
+async fn a_smaller_read_keeps_its_credit_while_the_window_is_open() {
+    let (client, mut server) = pair().await;
+    let (mut body, mut send) = response_pair(&client, &mut server).await;
+    timeout(DEADLINE, send_bytes(&mut send, STREAM_WINDOW / 4))
+        .await
+        .unwrap();
+
+    let mut bytes = vec![0; STREAM_WINDOW / 32];
+    body.read_exact(&mut bytes).await.unwrap();
+
+    timeout(DEADLINE, send_bytes(&mut send, STREAM_WINDOW * 3 / 4))
+        .await
+        .unwrap();
+    assert_blocked(&mut send).await;
+    drop(body);
+    server.close().await;
+}
+
+async fn send_bytes(send: &mut SendStream<Bytes>, mut count: usize) {
+    let chunk = Bytes::from(vec![0xa5; 16 * 1024]);
+    while count > 0 {
+        send.reserve_capacity(count.min(chunk.len()));
+        let granted = poll_fn(|cx| send.poll_capacity(cx)).await.unwrap().unwrap();
+        let take = granted.min(count).min(chunk.len());
+        assert!(take > 0);
+        send.send_data(chunk.slice(..take), false).unwrap();
+        count -= take;
+    }
+}
+
+async fn assert_blocked(send: &mut SendStream<Bytes>) {
+    send.reserve_capacity(1);
+    assert!(
+        timeout(
+            Duration::from_millis(25),
+            poll_fn(|cx| send.poll_capacity(cx))
+        )
+        .await
+        .is_err(),
+        "unread DATA must remain flow controlled"
+    );
+    send.reserve_capacity(0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unread_response_is_bounded_and_partial_reads_return_credit() {
+    let (client, mut server) = pair().await;
+    let (mut body, mut send) = response_pair(&client, &mut server).await;
+    timeout(DEADLINE, send_bytes(&mut send, STREAM_WINDOW))
+        .await
+        .expect("one stream must accept a mobile-path bandwidth-delay product");
+    assert_blocked(&mut send).await;
+
+    // Return enough credit for h2's coalesced WINDOW_UPDATE while reading in
+    // awkward pieces, including a partial DATA frame. Never grant unread bytes.
+    let mut read = 0;
+    let mut buffer = [0; 8191];
+    while read < STREAM_WINDOW / 2 {
+        let limit = buffer.len().min(STREAM_WINDOW / 2 - read);
+        let n = body.read(&mut buffer[..limit]).await.unwrap();
+        assert!(n > 0);
+        assert!(buffer[..n].iter().all(|byte| *byte == 0xa5));
+        read += n;
+    }
+    timeout(DEADLINE, send_bytes(&mut send, read))
+        .await
+        .expect("consumed bytes must replenish the stream");
+    assert_blocked(&mut send).await;
+    drop(body);
+    assert_eq!(
+        timeout(DEADLINE, poll_fn(|cx| send.poll_reset(cx)))
+            .await
+            .unwrap()
+            .unwrap(),
+        Reason::CANCEL
+    );
+    server.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_responses_share_a_bounded_connection_and_cancel_restores_progress() {
+    let (client, mut server) = pair().await;
+    let mut stalled = Vec::new();
+    for _ in 0..3 {
+        let (body, mut send) = response_pair(&client, &mut server).await;
+        timeout(DEADLINE, send_bytes(&mut send, STREAM_WINDOW))
+            .await
+            .unwrap();
+        stalled.push((body, send));
+    }
+    // Three entirely unread streams must leave room for a fast stream to
+    // recycle credit repeatedly, including beyond the connection's 16 MiB.
+    let (mut fast, mut send) = response_pair(&client, &mut server).await;
+    let sender = tokio::spawn(async move {
+        send_bytes(&mut send, 5 * STREAM_WINDOW + 1).await;
+        send.send_data(Bytes::new(), true).unwrap();
+    });
+    let mut received = Vec::new();
+    timeout(DEADLINE, fast.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.len(), 5 * STREAM_WINDOW + 1);
+    assert!(received.iter().all(|byte| *byte == 0xa5));
+    sender.await.unwrap();
+
+    // Four unread streams can fill the entire connection. This is an explicit
+    // memory/backpressure boundary, not a promise of unlimited stalled peers.
+    let (body, mut send) = response_pair(&client, &mut server).await;
+    timeout(DEADLINE, send_bytes(&mut send, STREAM_WINDOW))
+        .await
+        .unwrap();
+    stalled.push((body, send));
+    let (mut victim, mut send) = response_pair(&client, &mut server).await;
+    assert_blocked(&mut send).await;
+    let (body, mut cancelled_send) = stalled.remove(0);
+    drop(body);
+    assert_eq!(
+        timeout(DEADLINE, poll_fn(|cx| cancelled_send.poll_reset(cx)))
+            .await
+            .unwrap()
+            .unwrap(),
+        Reason::CANCEL
+    );
+    timeout(DEADLINE, send_bytes(&mut send, 1)).await.unwrap();
+    let mut byte = [0];
+    timeout(DEADLINE, victim.read_exact(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(byte, [0xa5]);
+    drop(stalled);
+    drop(victim);
+    server.close().await;
+}
+
+/// A delay line, not a per-chunk sleep: chunks already in flight have their
+/// own arrival times, so a larger window can actually pipeline DATA. Queues
+/// and duplex pipes are bounded, and both directions receive half the RTT.
+fn delay_direction(
+    mut read: tokio::io::ReadHalf<DuplexStream>,
+    mut write: tokio::io::WriteHalf<DuplexStream>,
+    delay: Duration,
+) -> [JoinHandle<()>; 2] {
+    let (tx, mut rx) = mpsc::channel::<(Instant, Vec<u8>)>(256);
+    let reader = tokio::spawn(async move {
+        loop {
+            let mut bytes = vec![0; 16 * 1024];
+            let Ok(n) = read.read(&mut bytes).await else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            bytes.truncate(n);
+            if tx.send((Instant::now() + delay, bytes)).await.is_err() {
+                break;
+            }
+        }
+    });
+    let writer = tokio::spawn(async move {
+        while let Some((arrival, bytes)) = rx.recv().await {
+            sleep_until(arrival).await;
+            if write.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+        let _ = write.shutdown().await;
+    });
+    [reader, writer]
+}
+
+#[tokio::test(start_paused = true)]
+async fn single_download_pipelines_across_a_113ms_path() {
+    let (client_io, client_wire) = tokio::io::duplex(1024 * 1024);
+    let (server_wire, server_io) = tokio::io::duplex(1024 * 1024);
+    let (client_read, client_write) = tokio::io::split(client_wire);
+    let (server_read, server_write) = tokio::io::split(server_wire);
+    let delay = Duration::from_micros(56_500);
+    let forward = delay_direction(client_read, server_write, delay);
+    let backward = delay_direction(server_read, client_write, delay);
+    let peer = tokio::spawn(async move {
+        let mut connection = server::handshake(server_io).await.unwrap();
+        let (_, mut respond) = connection.accept().await.unwrap().unwrap();
+        let mut send = respond
+            .send_response(response(StatusCode::OK), false)
+            .unwrap();
+        let sender = tokio::spawn(async move {
+            send_bytes(&mut send, 2 * STREAM_WINDOW).await;
+            send.send_data(Bytes::new(), true).unwrap();
+        });
+        while let Some(exchange) = connection.accept().await {
+            exchange.unwrap();
+        }
+        sender.await.unwrap();
+    });
+    let client = connect_h2(Box::new(client_io)).await.unwrap();
+    let started = Instant::now();
+    let mut body = client
+        .send_fixed(
+            request(Method::GET, "http://example.test/latency"),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+    let mut received = Vec::new();
+    timeout(Duration::from_secs(30), body.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(received.len(), 2 * STREAM_WINDOW);
+    assert!(received.iter().all(|byte| *byte == 0xa5));
+    // A 64 KiB window needs well over ten seconds; leave ample margin for
+    // handshake, WINDOW_UPDATE batching and the bounded simulated link.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "8 MiB took {elapsed:?} at RTT 113 ms"
+    );
+    eprintln!("XHTTP/H2: 8 MiB at simulated RTT 113 ms in {elapsed:?}");
+    drop(body);
+    drop(client);
+    peer.abort();
+    for task in forward.into_iter().chain(backward) {
+        task.abort();
+    }
+}
+
+const ADAPTIVE: H2ReceiveWindow = H2ReceiveWindow::Adaptive {
+    initial: 1024 * 1024,
+    max: 4 * 1024 * 1024,
+};
+
+async fn pair_over(
+    client_io: DuplexStream,
+    server_io: DuplexStream,
+    window: H2ReceiveWindow,
+) -> (H2Client, TestServer) {
+    let client = connect_h2_with_window(Box::new(client_io), None, window);
+    let server = server::Builder::new().handshake::<_, Bytes>(server_io);
+    let (client, server) = tokio::join!(client, server);
+    let (request_tx, requests) = mpsc::unbounded_channel();
+    let (commands, command_rx) = mpsc::unbounded_channel();
+    let driver = tokio::spawn(drive_server(server.unwrap(), request_tx, command_rx));
+    let server = TestServer {
+        requests,
+        commands: Some(commands),
+        driver: Some(driver),
+    };
+    (client.unwrap(), server)
+}
+
+/// A stalled reader on a constrained host pins the opening window, not Go's.
+#[tokio::test(start_paused = true)]
+async fn an_adaptive_window_holds_a_stalled_reader_to_its_opening_window() {
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let (client, mut server) = pair_over(client_io, server_io, ADAPTIVE).await;
+    let (body, mut send) = response_pair(&client, &mut server).await;
+
+    timeout(DEADLINE, send_bytes(&mut send, 1024 * 1024))
+        .await
+        .unwrap();
+    assert_blocked(&mut send).await;
+    drop(body);
+    server.close().await;
+}
+
+/// Two pipes joined by a relay that holds every byte for `one_way` in each
+/// direction.
+fn delayed_link(one_way: Duration) -> (DuplexStream, DuplexStream) {
+    let (client, client_side) = tokio::io::duplex(1 << 20);
+    let (server_side, server) = tokio::io::duplex(1 << 20);
+    let (client_read, client_write) = tokio::io::split(client_side);
+    let (server_read, server_write) = tokio::io::split(server_side);
+    tokio::spawn(delay(client_read, server_write, one_way));
+    tokio::spawn(delay(server_read, client_write, one_way));
+    (client, server)
+}
+
+async fn delay(
+    mut from: impl tokio::io::AsyncRead + Unpin,
+    mut to: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    one_way: Duration,
+) {
+    let (queue, mut queued) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+    let writer = tokio::spawn(async move {
+        while let Some((due, bytes)) = queued.recv().await {
+            sleep_until(due).await;
+            if to.write_all(&bytes).await.is_err() {
+                return;
+            }
+        }
+    });
+    let mut buffer = vec![0u8; 64 * 1024];
+    while let Ok(read @ 1..) = from.read(&mut buffer).await {
+        let _ = queue.send((Instant::now() + one_way, buffer[..read].to_vec()));
+    }
+    drop(queue);
+    let _ = writer.await;
+}
+
+/// Reads an 8 MiB response over a 40 ms round trip and returns how long it
+/// took on the paused clock.
+async fn download_over_a_long_link(window: H2ReceiveWindow) -> Duration {
+    const SIZE: usize = 8 * 1024 * 1024;
+
+    let (client_io, server_io) = delayed_link(Duration::from_millis(20));
+    let (client, mut server) = pair_over(client_io, server_io, window).await;
+    let (mut body, mut send) = response_pair(&client, &mut server).await;
+    let sender = tokio::spawn(async move {
+        send_bytes(&mut send, SIZE).await;
+        send.send_data(Bytes::new(), true).unwrap();
+    });
+
+    let started = Instant::now();
+    let mut received = Vec::with_capacity(SIZE);
+    timeout(DEADLINE, body.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(received.len(), SIZE);
+    sender.await.unwrap();
+    server.close().await;
+    elapsed
+}
+
+/// A reader that keeps up grows the adaptive window to Go's 4 MiB.
+///
+/// Held at the opening 1 MiB, the 8 MiB after the first window needs seven
+/// more round trips, 280 ms; growing to 4 MiB brings that under five.
+#[tokio::test(start_paused = true)]
+async fn an_adaptive_window_grows_for_a_reader_that_keeps_up() {
+    let fixed = download_over_a_long_link(H2ReceiveWindow::Fixed(1024 * 1024)).await;
+    let adaptive = download_over_a_long_link(ADAPTIVE).await;
+
+    assert!(
+        fixed >= Duration::from_millis(280),
+        "fixed 1 MiB took {fixed:?}"
+    );
+    assert!(
+        adaptive < Duration::from_millis(200),
+        "adaptive took {adaptive:?}"
+    );
+}

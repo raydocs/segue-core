@@ -1,0 +1,120 @@
+[package]
+name = "xray-rust-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license.workspace = true
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+tokio = { version = "1.52.3", features = ["io-util", "rt"] }
+xray-config = { path = "../crates/xray-config" }
+xray-core-rs = { path = "../crates/xray-core-rs", features = ["fuzzing"] }
+xray-ffi = { path = "../crates/xray-ffi" }
+xray-proxy = { path = "../crates/xray-proxy", features = ["fuzzing"] }
+xray-routing = { path = "../crates/xray-routing" }
+xray-transport = { path = "../crates/xray-transport", features = ["fuzzing"] }
+xray-tun = { path = "../crates/xray-tun" }
+xray-vless-encryption = { path = "../crates/xray-vless-encryption", features = ["fuzzing"] }
+
+[[bin]]
+name = "vless_encryption_records"
+path = "fuzz_targets/vless_encryption_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vless_encryption_handshake"
+path = "fuzz_targets/vless_encryption_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_json"
+path = "fuzz_targets/config_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_wire"
+path = "fuzz_targets/dns_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "profile_import"
+path = "fuzz_targets/profile_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v08_protocols"
+path = "fuzz_targets/v08_protocols.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v07_protocols"
+path = "fuzz_targets/v07_protocols.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vless_wire"
+path = "fuzz_targets/vless_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ffi_lifecycle"
+path = "fuzz_targets/ffi_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inbound_wire"
+path = "fuzz_targets/inbound_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_sniff"
+path = "fuzz_targets/quic_sniff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xhttp_framing"
+path = "fuzz_targets/xhttp_framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tun_queue"
+path = "fuzz_targets/tun_queue.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_decoders"
+path = "fuzz_targets/stream_decoders.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,805 @@
+//! Compilation and opening of independently owned XHTTP carriers.
+use super::*;
+
+#[derive(Debug)]
+pub(super) struct XhttpDownloadOutbound {
+    pub(super) server: Target,
+    pub(super) connector: ConnectorConfig,
+    pub(super) transport: XhttpTransport,
+    pub(super) happy_eyeballs: Option<HappyEyeballsConfig>,
+    pub(super) socket_options: DownloadSocketOptions,
+    /// The `addressPortStrategy` of the `sockopt` the leg dials with.
+    pub(super) address_port: xray_config::AddressPortStrategy,
+}
+
+/// The `sockopt` the download leg dials with, as Xray-core's XHTTP picks it.
+#[derive(Debug)]
+pub(super) enum DownloadSocketOptions {
+    /// The outbound's `sockopt` sets `penetrate`: the download leg takes it
+    /// whole, chaining included.
+    Upload,
+    /// The download leg's own `sockopt`, which never chains; `None` keeps
+    /// the dialer's defaults.
+    Own(Option<Arc<xray_transport::SocketOptions>>),
+}
+
+impl XhttpDownloadOutbound {
+    /// The dialer for the download leg: `upload`, the upload leg's own, or
+    /// `base`, the dialer the outbound was given, without its chain and with
+    /// the download leg's options.
+    pub(super) fn dialer<'a>(
+        &self,
+        base: &'a TransportDialer,
+        upload: &'a TransportDialer,
+    ) -> std::borrow::Cow<'a, TransportDialer> {
+        match &self.socket_options {
+            DownloadSocketOptions::Upload => std::borrow::Cow::Borrowed(upload),
+            DownloadSocketOptions::Own(options) => {
+                let base = if base.carries_tcp_through_outbound() {
+                    std::borrow::Cow::Owned(base.clone().without_resolved_tcp_connector())
+                } else {
+                    std::borrow::Cow::Borrowed(base)
+                };
+                match options {
+                    Some(options) => std::borrow::Cow::Owned(
+                        base.into_owned().with_socket_options(Arc::clone(options)),
+                    ),
+                    None => base,
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn build_xhttp_download(
+    stream: &StreamSettings,
+    unencrypted_payload: bool,
+) -> Result<Option<XhttpDownloadOutbound>, CoreError> {
+    let StreamTransport::Xhttp(up) = &stream.transport else {
+        return Ok(None);
+    };
+    let Some(download) = &up.download else {
+        return Ok(None);
+    };
+    let StreamTransport::Xhttp(settings) = &download.stream.transport else {
+        return Err(invalid_xhttp_configuration(
+            "downloadSettings requires XHTTP",
+        ));
+    };
+    if settings.download.is_some()
+        || up.mode == xray_config::XhttpMode::StreamOne
+        || download.port == 0
+        || download.stream.network != Network::Tcp
+    {
+        return Err(invalid_xhttp_configuration(
+            "invalid nested downloadSettings or stream-one combination",
+        ));
+    }
+    if stream.security != StreamSecurity::None && download.stream.security == StreamSecurity::None {
+        return Err(invalid_xhttp_configuration(
+            "protected upload cannot use plaintext download",
+        ));
+    }
+    if unencrypted_payload
+        && download.stream.security == StreamSecurity::None
+        && !download.address.is_xray_plaintext_server_exempt()
+    {
+        return Err(invalid_xhttp_configuration(
+            "unencrypted protocol download requires a private or test server",
+        ));
+    }
+    if matches!(&download.stream.security, StreamSecurity::Tls(tls) if tls.allow_insecure) {
+        return Err(invalid_xhttp_configuration(
+            "downloadSettings cannot disable TLS authentication",
+        ));
+    }
+    let penetrate = stream
+        .socket_options
+        .as_ref()
+        .is_some_and(|options| options.penetrate);
+    let addr = match &download.address {
+        TargetAddr::Ip(ip) => RoutingTargetAddr::Ip(*ip),
+        TargetAddr::Domain(domain) if !domain.is_empty() => {
+            RoutingTargetAddr::Domain(domain.clone())
+        }
+        _ => {
+            return Err(invalid_xhttp_configuration(
+                "downloadSettings address is empty",
+            ))
+        }
+    };
+    Ok(Some(XhttpDownloadOutbound {
+        server: Target::new(addr, download.port, RoutingNetwork::Tcp),
+        connector: carrier::build_connector(&download.stream.security, &download.address),
+        transport: build_xhttp_transport(settings, &download.stream, &download.address)?,
+        happy_eyeballs: happy_eyeballs_config(&download.stream),
+        socket_options: if penetrate {
+            DownloadSocketOptions::Upload
+        } else {
+            DownloadSocketOptions::Own(socket_options::compile(&download.stream))
+        },
+        address_port: carrier::address_port_strategy(if penetrate {
+            stream
+        } else {
+            &download.stream
+        }),
+    }))
+}
+
+/// The XHTTP transport `stream` describes: its security, its QUIC
+/// parameters and UDP masks when it selects HTTP/3.
+pub(super) fn build_xhttp_transport(
+    settings: &XhttpSettings,
+    stream: &xray_config::StreamSettings,
+    destination: &TargetAddr,
+) -> Result<XhttpTransport, CoreError> {
+    let security = &stream.security;
+    let quic_params = stream.quic_params.as_ref();
+    let noise = stream.udp_noise.as_ref();
+    let header_custom = stream.udp_header_custom.as_ref();
+    let sudoku = stream.udp_sudoku.as_ref();
+    let xdns = stream.udp_xdns.as_ref();
+    let http_version = xhttp_http_version(security)?;
+    let endpoint = xhttp_endpoint(settings, security, destination)?;
+    let config = xhttp_config(settings, matches!(security, StreamSecurity::Reality(_)))?;
+    let xmux = xhttp_xmux_policy(settings);
+    let mut h3_quic = if http_version == XhttpHttpVersion::Http3 {
+        xhttp_h3_quic_config(quic_params)?
+    } else {
+        // Xray retains finalmask.quicParams in every stream config but only
+        // consults it after exact `alpn: ["h3"]` selected the UDP path.
+        H3QuicConfig::default()
+    };
+
+    if noise.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration("UDP noise requires XHTTP H3"));
+    }
+    if header_custom.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "a header-custom UDP mask requires XHTTP H3",
+        ));
+    }
+    if sudoku.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "a sudoku UDP mask requires XHTTP H3",
+        ));
+    }
+    if xdns.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "an xdns UDP mask requires XHTTP H3",
+        ));
+    }
+    h3_quic.udp_noise = noise.map(udp_noise_config).transpose()?;
+    h3_quic.udp_header_custom = header_custom.map(super::carrier::quic_header_custom);
+    h3_quic.udp_sudoku = sudoku.map(super::carrier::quic_sudoku);
+    h3_quic.udp_xdns = xdns.map(super::carrier::xdns_config);
+    if stream.udp_realm.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "a realm UDP mask requires XHTTP H3",
+        ));
+    }
+    h3_quic.udp_realm = stream.udp_realm.as_ref().map(super::carrier::realm_config);
+    if stream.udp_xicmp.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "an xicmp UDP mask requires XHTTP H3",
+        ));
+    }
+    h3_quic.udp_xicmp = stream.udp_xicmp.as_ref().map(super::carrier::xicmp_config);
+    if stream.udp_salamander.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "a Salamander UDP mask requires XHTTP H3",
+        ));
+    }
+    h3_quic.udp_salamander = stream
+        .udp_salamander
+        .as_ref()
+        .map(super::carrier::quic_salamander)
+        .transpose()?;
+    XhttpTransport::new_with_h3_quic(config, endpoint, http_version, xmux, h3_quic)
+        .map_err(invalid_xhttp_configuration)
+}
+
+/// Xray's `decideHTTPVersion` decision, before a socket is opened.
+///
+/// HTTP/3 changes the destination to UDP inside the transport dialer. Every
+/// other TLS list follows Xray's HTTP/2 branch, including an empty or
+/// multi-value list; REALITY is always HTTP/2.
+pub(super) fn xhttp_http_version(security: &StreamSecurity) -> Result<XhttpHttpVersion, CoreError> {
+    match security {
+        StreamSecurity::None => Ok(XhttpHttpVersion::Http1),
+        StreamSecurity::Reality(_) => Ok(XhttpHttpVersion::Http2),
+        StreamSecurity::Tls(tls) => match tls.alpn.as_slice() {
+            [only] if only == "http/1.1" => Ok(XhttpHttpVersion::Http1),
+            [only] if only == "h3" => Ok(XhttpHttpVersion::Http3),
+            _ => Ok(XhttpHttpVersion::Http2),
+        },
+    }
+}
+
+/// Resolves XHTTP's request URL endpoint.
+///
+/// The native Xray HTTP client fixes the dial destination in its custom
+/// dialer and does not append the VLESS destination port to `URL.Host`.
+/// Non-default ports are appended only by Xray's optional browser dialer,
+/// which this runtime does not use. A port explicitly written in
+/// `xhttpSettings.host` remains part of the authority.
+pub(super) fn xhttp_endpoint(
+    settings: &XhttpSettings,
+    security: &StreamSecurity,
+    destination: &TargetAddr,
+) -> Result<XhttpEndpoint, CoreError> {
+    let scheme = match security {
+        StreamSecurity::None => XhttpScheme::Http,
+        StreamSecurity::Tls(_) | StreamSecurity::Reality(_) => XhttpScheme::Https,
+    };
+    let authority = settings
+        .host
+        .as_deref()
+        .filter(|host| !host.is_empty())
+        .or_else(|| match security {
+            StreamSecurity::Tls(tls) => tls
+                .server_name
+                .as_deref()
+                .filter(|server_name| !server_name.is_empty()),
+            StreamSecurity::Reality(reality) => {
+                (!reality.server_name.is_empty()).then_some(reality.server_name.as_str())
+            }
+            StreamSecurity::None => None,
+        })
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| xhttp_destination_authority(destination));
+
+    XhttpEndpoint::new(scheme, authority).map_err(invalid_xhttp_configuration)
+}
+
+pub(super) fn xhttp_destination_authority(destination: &TargetAddr) -> String {
+    match destination {
+        TargetAddr::Domain(domain) => domain.clone(),
+        TargetAddr::Ip(ip) => match ip.to_canonical() {
+            IpAddr::V4(address) => address.to_string(),
+            IpAddr::V6(address) => format!("[{address}]"),
+        },
+    }
+}
+
+pub(super) fn xhttp_config(
+    settings: &XhttpSettings,
+    is_reality: bool,
+) -> Result<XhttpConfig, CoreError> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in &settings.headers {
+        // Xray feeds the protobuf map through `http.Header.Add`. The JSON map
+        // can contain keys which differ only by case; config parsing MIME-
+        // canonicalizes both, so appending is what preserves both values.
+        headers.add(name, value);
+    }
+
+    // `noSSEHeader` and `serverMaxHeaderBytes` are deliberately absent. Both
+    // are inbound/server-only in Xray: the former changes hub response
+    // headers, while the latter caps listener request heads. The H1/H2 client
+    // engines retain their independent defensive 10 MiB response-head cap.
+    XhttpConfig::normalize(XhttpConfigInput {
+        h2_stream_receive_window: settings.h2_stream_receive_window,
+        mode: if is_reality
+            && settings.download.is_some()
+            && settings.mode == xray_config::XhttpMode::Auto
+        {
+            XhttpModeSelection::StreamUp
+        } else {
+            xhttp_mode_selection(settings.mode)
+        },
+        is_reality,
+        path: settings.path.clone(),
+        headers,
+        x_padding_bytes: xhttp_range(settings.x_padding_bytes),
+        x_padding_obfs_mode: settings.x_padding_obfs_mode,
+        x_padding_key: settings.x_padding_key.clone(),
+        x_padding_header: settings.x_padding_header.clone(),
+        x_padding_placement: xhttp_padding_placement(settings.x_padding_placement),
+        x_padding_method: xhttp_padding_method(settings.x_padding_method),
+        uplink_http_method: settings.uplink_http_method.clone(),
+        session_placement: xhttp_metadata_placement(settings.session_placement),
+        session_key: settings.session_key.clone(),
+        session_id_table: settings.session_id_table.clone(),
+        session_id_length: xhttp_range(settings.session_id_length),
+        seq_placement: xhttp_metadata_placement(settings.seq_placement),
+        seq_key: settings.seq_key.clone(),
+        uplink_data_placement: xhttp_uplink_data_placement(settings.uplink_data_placement),
+        uplink_data_key: settings.uplink_data_key.clone(),
+        uplink_chunk_size: xhttp_range(settings.uplink_chunk_size),
+        no_grpc_header: settings.no_grpc_header,
+        sc_max_each_post_bytes: xhttp_range(settings.sc_max_each_post_bytes),
+        sc_min_posts_interval_ms: xhttp_range(settings.sc_min_posts_interval_ms),
+        sc_max_buffered_posts: settings.sc_max_buffered_posts,
+        sc_stream_up_server_secs: xhttp_range(settings.sc_stream_up_server_secs),
+    })
+    .map_err(invalid_xhttp_configuration)
+}
+
+pub(super) fn invalid_xhttp_configuration(error: impl ToString) -> CoreError {
+    CoreError::InvalidXhttpConfiguration(error.to_string())
+}
+
+/// Maps Xray's QUIC surface into the phase-one HTTP/3 engine.
+///
+/// Defaults remain usable and interoperable, with the engine's diagnostics
+/// naming its Quinn-BBR approximation for the `standard` BBR profile. Debug
+/// side-effects and `brutal` over XHTTP are retained by the parser but
+/// rejected by `H3QuicConfig` (or here).
+pub(super) fn xhttp_h3_quic_config(
+    settings: Option<&QuicParamsSettings>,
+) -> Result<H3QuicConfig, CoreError> {
+    // Without quicParams Xray dials with ChromeParrot, as with
+    // `disableChromeParrot: false`.
+    let Some(settings) = settings else {
+        return Ok(H3QuicConfig {
+            chrome_parrot: true,
+            ..H3QuicConfig::default()
+        });
+    };
+    let mut config = H3QuicConfig {
+        chrome_parrot: !settings.disable_chrome_parrot,
+        ..H3QuicConfig::default()
+    };
+    config.initial_stream_receive_window = quic_u64_or_default(
+        "initStreamReceiveWindow",
+        settings.init_stream_receive_window,
+        config.initial_stream_receive_window,
+    )?;
+    config.max_stream_receive_window =
+        quic_optional_u64("maxStreamReceiveWindow", settings.max_stream_receive_window)?;
+    config.initial_connection_receive_window = quic_u64_or_default(
+        "initConnectionReceiveWindow",
+        settings.init_connection_receive_window,
+        config.initial_connection_receive_window,
+    )?;
+    config.max_connection_receive_window = quic_optional_u64(
+        "maxConnectionReceiveWindow",
+        settings.max_connection_receive_window,
+    )?;
+    match settings.max_idle_timeout_secs {
+        0 => {}
+        value if value > 0 => {
+            config.max_idle_timeout = Duration::from_secs(u64::try_from(value).map_err(|_| {
+                CoreError::InvalidXhttpConfiguration(
+                    "finalmask.quicParams.maxIdleTimeout is negative".to_owned(),
+                )
+            })?);
+        }
+        _ => {
+            return Err(CoreError::InvalidXhttpConfiguration(
+                "finalmask.quicParams.maxIdleTimeout is negative".to_owned(),
+            ));
+        }
+    }
+    config.keep_alive_interval = match settings.keep_alive_period_secs {
+        0 => None,
+        value if value > 0 => Some(Duration::from_secs(u64::try_from(value).map_err(|_| {
+            CoreError::InvalidXhttpConfiguration(
+                "finalmask.quicParams.keepAlivePeriod is negative".to_owned(),
+            )
+        })?)),
+        _ => {
+            return Err(CoreError::InvalidXhttpConfiguration(
+                "finalmask.quicParams.keepAlivePeriod is negative".to_owned(),
+            ));
+        }
+    };
+    config.max_incoming_bidirectional_streams = quic_incoming_streams_or_default(
+        "maxIncomingStreams",
+        settings.max_incoming_streams,
+        config.max_incoming_bidirectional_streams,
+    )?;
+    config.disable_path_mtu_discovery = settings.disable_path_mtu_discovery
+        || !cfg!(any(
+            target_os = "linux",
+            target_os = "windows",
+            target_os = "macos"
+        ));
+    config.disable_gso = settings.disable_gso;
+    config.congestion = match settings.congestion {
+        xray_config::QuicCongestion::Reno => H3Congestion::Reno,
+        // The XHTTP transport refuses it: only Hysteria announces rates.
+        xray_config::QuicCongestion::Brutal => H3Congestion::Brutal {
+            up_bytes_per_second: settings.brutal_up_bytes_per_sec,
+            bbr_profile: h3_bbr_profile(settings.bbr_profile),
+        },
+        xray_config::QuicCongestion::ForceBrutal => H3Congestion::ForceBrutal {
+            bytes_per_second: settings.brutal_up_bytes_per_sec,
+        },
+        xray_config::QuicCongestion::Default | xray_config::QuicCongestion::Bbr => {
+            bbr_congestion(settings.bbr_profile)
+        }
+    };
+    config.brutal_disable_loss_compensation = settings.brutal_disable_loss_compensation;
+    config.udp_hop = udp_hop_config(
+        &settings.udp_hop,
+        quic_i32_seconds("udpHop.interval.from", settings.udp_hop.interval.from)?,
+        quic_i32_seconds("udpHop.interval.to", settings.udp_hop.interval.to)?,
+    );
+    config.debug = settings.debug;
+    Ok(config)
+}
+
+/// A UDP hop's settings for the QUIC carrier, with its intervals already
+/// converted.
+pub(super) fn udp_hop_config(
+    hop: &xray_config::QuicUdpHopSettings,
+    interval_min: Duration,
+    interval_max: Duration,
+) -> H3UdpHopConfig {
+    H3UdpHopConfig {
+        ports: hop.ports.clone(),
+        interval_min,
+        interval_max,
+        local: hop.local,
+        remote: hop.remote,
+        remote_once: hop.remote_once,
+        remote_ips: hop
+            .remote_ips
+            .iter()
+            .map(|cidr| (cidr.network(), cidr.prefix()))
+            .collect(),
+    }
+}
+
+/// The BBR variant for Xray's `bbrProfile`.
+pub(super) fn bbr_congestion(profile: xray_config::QuicBbrProfile) -> H3Congestion {
+    H3Congestion::from_bbr_profile(h3_bbr_profile(profile))
+}
+
+pub(super) const fn h3_bbr_profile(profile: xray_config::QuicBbrProfile) -> H3BbrProfile {
+    match profile {
+        xray_config::QuicBbrProfile::Conservative => H3BbrProfile::Conservative,
+        xray_config::QuicBbrProfile::Standard => H3BbrProfile::Standard,
+        xray_config::QuicBbrProfile::Aggressive => H3BbrProfile::Aggressive,
+    }
+}
+
+pub(super) const QUIC_VARINT_MAX: u64 = (1_u64 << 62) - 1;
+pub(super) const QUIC_MAX_STREAM_COUNT: u64 = 1_u64 << 60;
+
+pub(super) fn quic_u64_or_default(
+    name: &'static str,
+    value: u64,
+    default: u64,
+) -> Result<u64, CoreError> {
+    if value == 0 {
+        Ok(default)
+    } else {
+        quic_varint(name, value)
+    }
+}
+
+pub(super) fn quic_optional_u64(name: &'static str, value: u64) -> Result<Option<u64>, CoreError> {
+    if value == 0 {
+        Ok(None)
+    } else {
+        quic_varint(name, value).map(Some)
+    }
+}
+
+pub(super) fn quic_varint(name: &'static str, value: u64) -> Result<u64, CoreError> {
+    if value <= QUIC_VARINT_MAX {
+        Ok(value)
+    } else {
+        Err(CoreError::InvalidXhttpConfiguration(format!(
+            "finalmask.quicParams.{name}={value} exceeds QUIC's 62-bit varint limit"
+        )))
+    }
+}
+
+pub(super) fn quic_incoming_streams_or_default(
+    name: &'static str,
+    value: i64,
+    default: u64,
+) -> Result<u64, CoreError> {
+    if value == 0 {
+        return Ok(default);
+    }
+    let value = u64::try_from(value).map_err(|_| {
+        CoreError::InvalidXhttpConfiguration(format!(
+            "finalmask.quicParams.{name}={value} cannot be negative"
+        ))
+    })?;
+    // quic-go clamps this transport parameter to the QUIC stream-count
+    // domain during config validation. Mirror that instead of allowing Quinn
+    // to emit a peer-invalid INITIAL_MAX_STREAMS value.
+    Ok(value.min(QUIC_MAX_STREAM_COUNT))
+}
+
+pub(super) fn quic_i32_seconds(name: &'static str, value: i32) -> Result<Duration, CoreError> {
+    let value = u64::try_from(value).map_err(|_| {
+        CoreError::InvalidXhttpConfiguration(format!(
+            "finalmask.quicParams.{name}={value} cannot be negative"
+        ))
+    })?;
+    Ok(Duration::from_secs(value))
+}
+
+pub(super) fn xhttp_xmux_policy(settings: &XhttpSettings) -> XhttpXmuxPolicy {
+    XhttpXmuxPolicy {
+        max_concurrency: xhttp_range(settings.xmux.max_concurrency),
+        max_connections: xhttp_range(settings.xmux.max_connections),
+        c_max_reuse_times: xhttp_range(settings.xmux.c_max_reuse_times),
+        h_max_request_times: xhttp_range(settings.xmux.h_max_request_times),
+        h_max_reusable_secs: xhttp_range(settings.xmux.h_max_reusable_secs),
+        h_keep_alive_period_secs: settings.xmux.h_keep_alive_period_secs,
+    }
+}
+
+pub(super) const fn xhttp_range(range: xray_config::XhttpRange) -> XhttpRange {
+    XhttpRange {
+        from: range.from,
+        to: range.to,
+    }
+}
+
+pub(super) const fn xhttp_mode_selection(mode: xray_config::XhttpMode) -> XhttpModeSelection {
+    match mode {
+        xray_config::XhttpMode::Auto => XhttpModeSelection::Auto,
+        xray_config::XhttpMode::PacketUp => XhttpModeSelection::PacketUp,
+        xray_config::XhttpMode::StreamUp => XhttpModeSelection::StreamUp,
+        xray_config::XhttpMode::StreamOne => XhttpModeSelection::StreamOne,
+    }
+}
+
+pub(super) const fn xhttp_padding_placement(
+    placement: xray_config::XhttpPaddingPlacement,
+) -> XhttpPaddingPlacement {
+    match placement {
+        xray_config::XhttpPaddingPlacement::Cookie => XhttpPaddingPlacement::Cookie,
+        xray_config::XhttpPaddingPlacement::Header => XhttpPaddingPlacement::Header,
+        xray_config::XhttpPaddingPlacement::Query => XhttpPaddingPlacement::Query,
+        xray_config::XhttpPaddingPlacement::QueryInHeader => XhttpPaddingPlacement::QueryInHeader,
+    }
+}
+
+pub(super) const fn xhttp_padding_method(
+    method: xray_config::XhttpPaddingMethod,
+) -> XhttpPaddingMethod {
+    match method {
+        xray_config::XhttpPaddingMethod::RepeatX => XhttpPaddingMethod::RepeatX,
+        xray_config::XhttpPaddingMethod::Tokenish => XhttpPaddingMethod::Tokenish,
+    }
+}
+
+pub(super) const fn xhttp_metadata_placement(
+    placement: xray_config::XhttpPlacement,
+) -> XhttpMetadataPlacement {
+    match placement {
+        xray_config::XhttpPlacement::Path => XhttpMetadataPlacement::Path,
+        xray_config::XhttpPlacement::Cookie => XhttpMetadataPlacement::Cookie,
+        xray_config::XhttpPlacement::Header => XhttpMetadataPlacement::Header,
+        xray_config::XhttpPlacement::Query => XhttpMetadataPlacement::Query,
+    }
+}
+
+pub(super) const fn xhttp_uplink_data_placement(
+    placement: xray_config::XhttpUplinkDataPlacement,
+) -> XhttpUplinkDataPlacement {
+    match placement {
+        xray_config::XhttpUplinkDataPlacement::Auto => XhttpUplinkDataPlacement::Auto,
+        xray_config::XhttpUplinkDataPlacement::Body => XhttpUplinkDataPlacement::Body,
+        xray_config::XhttpUplinkDataPlacement::Cookie => XhttpUplinkDataPlacement::Cookie,
+        xray_config::XhttpUplinkDataPlacement::Header => XhttpUplinkDataPlacement::Header,
+    }
+}
+
+pub(super) fn udp_noise_config(
+    noise: &xray_config::UdpNoiseSettings,
+) -> Result<xray_transport::udp_noise::UdpNoiseConfig, CoreError> {
+    use xray_transport::udp_noise::{NoiseRange, NoiseSegment, UdpNoiseConfig, UdpNoiseItem};
+    let range = |r: xray_config::FragmentRange| NoiseRange {
+        from: r.from,
+        to: r.to,
+    };
+    let segment = |segment: &xray_config::NoiseSegment| match segment {
+        xray_config::NoiseSegment::Bytes(bytes) => NoiseSegment::Bytes(bytes.clone()),
+        xray_config::NoiseSegment::Random(size) => NoiseSegment::Random(range(*size)),
+        xray_config::NoiseSegment::RandomLetters(size) => NoiseSegment::RandomLetters(range(*size)),
+        xray_config::NoiseSegment::RandomDigits(size) => NoiseSegment::RandomDigits(range(*size)),
+        xray_config::NoiseSegment::Timestamp => NoiseSegment::Timestamp,
+        xray_config::NoiseSegment::Counter => NoiseSegment::Counter,
+        xray_config::NoiseSegment::Nonce => NoiseSegment::Nonce,
+    };
+    let config = UdpNoiseConfig {
+        reset_secs: range(noise.reset_secs),
+        before_salamander: noise.before_salamander,
+        items: noise
+            .items
+            .iter()
+            .map(|i| UdpNoiseItem {
+                packet: i.packet.clone(),
+                random_length: range(i.random_length),
+                random_bytes: range(i.random_bytes),
+                delay_ms: range(i.delay_ms),
+                segments: i.segments.iter().map(segment).collect(),
+            })
+            .collect(),
+    };
+    config.validate().map_err(invalid_xhttp_configuration)?;
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn config() -> Value {
+        json!({"outbounds":[{"tag":"split","protocol":"vless","settings":{"vnext":[{"address":"upload.test","port":443,"users":[{"id":"00010203-0405-0607-0809-0a0b0c0d0e0f","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"downloadSettings":{"address":"download.test","port":8443,"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3"]},"xhttpSettings":{"path":"/down"}}}}}]})
+    }
+
+    #[test]
+    fn independent_h2_window_settings_compile_without_changing_other_carriers() {
+        for alpn in ["h2", "h3"] {
+            let mut raw = config();
+            let up = &mut raw["outbounds"][0]["streamSettings"]["xhttpSettings"];
+            up["h2StreamReceiveWindow"] = json!(1048576);
+            up["downloadSettings"]["tlsSettings"]["alpn"] = json!([alpn]);
+            up["downloadSettings"]["xhttpSettings"]["h2StreamReceiveWindow"] = json!(8388608);
+            let parsed = xray_config::parse_xray_json(&raw.to_string()).unwrap();
+            let outbound = build_vless_tcp_outbound(&parsed.config.outbounds[0]).unwrap();
+            let TransportLayer::Xhttp(up) = outbound.transport_layer() else {
+                panic!("XHTTP")
+            };
+            let down = &outbound
+                .payload
+                .carrier
+                .download
+                .as_ref()
+                .unwrap()
+                .transport;
+            assert_eq!(up.config().h2_stream_receive_window, 1048576);
+            assert_eq!(down.config().h2_stream_receive_window, 8388608);
+            assert_eq!(up.http_version(), XhttpHttpVersion::Http1);
+            assert_eq!(
+                down.http_version(),
+                if alpn == "h2" {
+                    XhttpHttpVersion::Http2
+                } else {
+                    XhttpHttpVersion::Http3
+                }
+            );
+            assert!(!up.shares_xmux_with(down));
+            if alpn == "h3" {
+                let diagnostics = down.h3_quic_config().diagnostics().unwrap();
+                assert_eq!(diagnostics.stream_receive_window, 2 * 1024 * 1024);
+                assert_eq!(diagnostics.connection_receive_window, 3 * 1024 * 1024);
+            }
+        }
+    }
+
+    #[test]
+    fn independent_download_compiles_its_own_destination_tls_http_and_pool() {
+        let parsed = xray_config::parse_xray_json(&config().to_string()).unwrap();
+        let outbound = build_vless_tcp_outbound(&parsed.config.outbounds[0]).unwrap();
+        let down = outbound.payload.carrier.download.as_ref().unwrap();
+        assert_eq!(down.server.port, 8443);
+        assert_eq!(target_domain(&down.server), Some("download.test"));
+        let ConnectorConfig::Tls(tls) = &down.connector else {
+            panic!("TLS")
+        };
+        assert_eq!(tls.server_name, "download.test");
+        assert_eq!(down.transport.http_version(), XhttpHttpVersion::Http3);
+        let TransportLayer::Xhttp(up) = outbound.transport_layer() else {
+            panic!("XHTTP")
+        };
+        assert_eq!(up.http_version(), XhttpHttpVersion::Http1);
+        assert!(!up.shares_xmux_with(&down.transport));
+    }
+
+    #[test]
+    fn reality_auto_selects_stream_up_only_when_download_is_present() {
+        let parsed = xray_config::parse_xray_json(&config().to_string()).unwrap();
+        let StreamTransport::Xhttp(mut settings) =
+            parsed.config.outbounds[0].stream.transport.clone()
+        else {
+            panic!("XHTTP")
+        };
+        assert_eq!(
+            xhttp_config(&settings, true).unwrap().mode,
+            xray_transport::stream::XhttpMode::StreamUp
+        );
+        settings.download = None;
+        assert_eq!(
+            xhttp_config(&settings, true).unwrap().mode,
+            xray_transport::stream::XhttpMode::StreamOne
+        );
+        assert_eq!(
+            xhttp_config(&settings, false).unwrap().mode,
+            xray_transport::stream::XhttpMode::PacketUp
+        );
+    }
+
+    #[test]
+    fn chain_rejects_split_download_as_both_entry_and_proxy_target() {
+        for target in [false, true] {
+            let mut config = config();
+            let mut other = json!({"tag":"other","protocol":"freedom"});
+            if target {
+                other["proxySettings"] = json!({"tag":"split","transportLayer":true});
+            } else {
+                config["outbounds"][0]["proxySettings"] =
+                    json!({"tag":"other","transportLayer":true});
+            }
+            config["outbounds"].as_array_mut().unwrap().push(other);
+            let parsed = xray_config::parse_xray_json(&config.to_string()).unwrap();
+            let router = OutboundRouter::new(Arc::new(parsed.config));
+            assert!(router.graph().validate_proxy_chains().is_err());
+        }
+    }
+
+    #[test]
+    fn programmatic_configs_cannot_bypass_the_download_security_or_depth_contract() {
+        for mutation in 0..5 {
+            let parsed = xray_config::parse_xray_json(&config().to_string()).unwrap();
+            let mut outbound = parsed.config.outbounds[0].clone();
+            let StreamTransport::Xhttp(up) = &mut outbound.stream.transport else {
+                panic!("XHTTP")
+            };
+            let down = up.download.as_mut().unwrap();
+            match mutation {
+                0 => down.port = 0,
+                1 => down.stream.network = Network::Udp,
+                2 => {
+                    if let StreamSecurity::Tls(tls) = &mut down.stream.security {
+                        tls.allow_insecure = true;
+                    }
+                }
+                3 => {
+                    let nested = down.clone();
+                    let StreamTransport::Xhttp(settings) = &mut down.stream.transport else {
+                        panic!("XHTTP")
+                    };
+                    settings.download = Some(nested);
+                }
+                4 => up.mode = xray_config::XhttpMode::StreamOne,
+                _ => unreachable!(),
+            }
+            assert!(
+                build_vless_tcp_outbound(&outbound).is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_download_resolution_never_opens_the_upload_socket() {
+        struct FailDownload;
+        #[async_trait]
+        impl DnsResolver for FailDownload {
+            async fn resolve(&self, domain: &str, port: u16) -> Result<SocketAddr, TransportError> {
+                if domain == "download.test" {
+                    Err(TransportError::NoResolvedAddress(domain.to_owned(), port))
+                } else {
+                    Ok(SocketAddr::from(([127, 0, 0, 1], port)))
+                }
+            }
+        }
+        struct RejectSocket;
+        impl xray_transport::SocketProtector for RejectSocket {
+            fn protect(&self, _: xray_transport::SocketHandle) -> io::Result<()> {
+                panic!("DNS failure must precede both socket dials")
+            }
+        }
+        let parsed = xray_config::parse_xray_json(&config().to_string()).unwrap();
+        let outbound = build_vless_tcp_outbound(&parsed.config.outbounds[0]).unwrap();
+        let dialer =
+            TransportDialer::system_with_socket_protector(Some(Arc::new(RejectSocket))).unwrap();
+        let target = Target::new(
+            RoutingTargetAddr::Ip(std::net::Ipv4Addr::LOCALHOST.into()),
+            80,
+            RoutingNetwork::Tcp,
+        );
+        let result = open_vless_tcp_stream_with_resolver_and_dialer(
+            &outbound,
+            &target,
+            &FailDownload,
+            &dialer,
+        )
+        .await;
+        assert!(matches!(result, Err(CoreError::Transport(_))));
+    }
+}

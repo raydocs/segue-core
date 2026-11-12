@@ -1,0 +1,948 @@
+//! Shared endpoint, authenticated connector and stream transport compilation.
+use super::*;
+use std::borrow::Cow;
+use xray_transport::stream::XhttpConnectTarget;
+
+#[derive(Clone, Copy)]
+pub(super) struct ServerConfigPaths {
+    pub(super) address: &'static str,
+    pub(super) endpoint: &'static str,
+}
+pub(super) const VLESS_PATHS: ServerConfigPaths = ServerConfigPaths {
+    address: "settings.vnext[0].address",
+    endpoint: "settings.vnext[0].address and settings.vnext[0].port",
+};
+pub(super) const TROJAN_PATHS: ServerConfigPaths = ServerConfigPaths {
+    address: "settings.address or settings.servers[0].address",
+    endpoint: "settings.address/port or settings.servers[0].address/port",
+};
+
+#[derive(Debug)]
+pub(super) struct StreamCarrier {
+    pub(super) server: Target,
+    pub(super) transport: ConnectorConfig,
+    pub(super) transport_layer: TransportLayer,
+    pub(super) download: Option<XhttpDownloadOutbound>,
+    pub(super) happy_eyeballs: Option<HappyEyeballsConfig>,
+    pub(super) fragment: Option<Arc<xray_transport::TcpFragmentConfig>>,
+    /// The final rules of a freedom fragment outbound folded into this one,
+    /// which a connection from a VLESS reverse proxy meets.
+    pub(super) folded_fragment_rules: Option<Arc<[xray_config::FreedomFinalRule]>>,
+    /// The `header-custom` TCP mask, run on every TCP carrier it opens.
+    pub(super) header_custom: Option<Arc<xray_transport::header_custom::HeaderCustomTcpConfig>>,
+    /// The `sudoku` TCP mask, outermost on every TCP carrier it opens.
+    pub(super) sudoku: Option<Arc<xray_transport::sudoku::SudokuConfig>>,
+    /// The `xmc` TCP mask, outermost on every TCP carrier it opens.
+    pub(super) xmc: Option<Arc<xray_transport::xmc::XmcConfig>>,
+    /// `sockopt`, for every socket the carrier opens.
+    pub(super) socket_options: Option<Arc<xray_transport::SocketOptions>>,
+    /// `sockopt.addressPortStrategy`, for the server's address and port.
+    pub(super) address_port: xray_config::AddressPortStrategy,
+}
+
+impl StreamCarrier {
+    pub(super) fn new(
+        stream: &StreamSettings,
+        server: &TargetAddr,
+        port: u16,
+        unencrypted_payload: bool,
+        paths: ServerConfigPaths,
+    ) -> Result<Self, CoreError> {
+        if stream.network != Network::Tcp {
+            return Err(CoreError::UnsupportedOutboundNetwork);
+        }
+        super::validate_udp_noise(stream)?;
+        let fragment = fragment_config(stream)?;
+        let header_custom = header_custom_config(stream.tcp_header_custom.as_ref());
+        let sudoku = stream
+            .tcp_sudoku
+            .as_ref()
+            .map(|mask| Arc::new(sudoku_config(mask)));
+        let xmc = stream.tcp_xmc.as_ref().map(xmc_config).transpose()?;
+        let transport = build_connector(&stream.security, server);
+        let transport_layer = build_transport_layer(stream, server, port, &transport, paths)?;
+        // Only TCP carriers take TCP masks; a split XHTTP download keeps its
+        // own dialer, which does not run the handshake.
+        if (header_custom.is_some() || sudoku.is_some() || xmc.is_some())
+            && (matches!(&transport_layer, TransportLayer::Xhttp(xhttp) if xhttp.http_version() == XhttpHttpVersion::Http3)
+                || matches!(transport_layer, TransportLayer::Kcp(_))
+                || matches!(&stream.transport, StreamTransport::Xhttp(xhttp) if xhttp.download.is_some()))
+        {
+            return Err(CoreError::UnsupportedOutboundNetwork);
+        }
+        // `tlshello` needs a TLS record to split; raw pieces go on any TCP
+        // carrier.
+        let tls_hello = stream
+            .tcp_fragment
+            .as_ref()
+            .is_some_and(|fragment| fragment.packets == xray_config::FragmentPackets::TlsHello);
+        if fragment.is_some()
+            && (tls_hello && matches!(transport, ConnectorConfig::Tcp)
+                || matches!(&transport_layer, TransportLayer::Xhttp(xhttp) if xhttp.http_version() == XhttpHttpVersion::Http3)
+                || matches!(transport_layer, TransportLayer::Kcp(_))
+                || matches!(&stream.transport, StreamTransport::Xhttp(xhttp) if xhttp.download.is_some()))
+        {
+            return Err(CoreError::UnsupportedOutboundNetwork);
+        }
+        let addr = match server {
+            TargetAddr::Ip(ip) => RoutingTargetAddr::Ip(*ip),
+            TargetAddr::Domain(domain) => RoutingTargetAddr::Domain(domain.clone()),
+        };
+        Ok(Self {
+            server: Target::new(addr, port, RoutingNetwork::Tcp),
+            transport_layer,
+            fragment,
+            folded_fragment_rules: stream
+                .tcp_fragment
+                .as_ref()
+                .and_then(|fragment| fragment.folded_final_rules.as_deref())
+                .map(Arc::from),
+            header_custom,
+            sudoku,
+            xmc,
+            transport,
+            download: build_xhttp_download(stream, unencrypted_payload)?,
+            happy_eyeballs: happy_eyeballs_config(stream),
+            socket_options: socket_options::compile(stream),
+            address_port: address_port_strategy(stream),
+        })
+    }
+
+    /// `dialer` with this carrier's socket options and fragment mask.
+    pub(super) fn dialer<'a>(&self, dialer: &'a TransportDialer) -> Cow<'a, TransportDialer> {
+        let dialer = socket_options::dialer(dialer, self.socket_options.as_ref());
+        let dialer = match &self.fragment {
+            Some(fragment) => Cow::Owned(dialer.into_owned().with_tcp_fragment(fragment.clone())),
+            None => dialer,
+        };
+        let dialer = match &self.header_custom {
+            Some(header) => Cow::Owned(dialer.into_owned().with_tcp_header_custom(header.clone())),
+            None => dialer,
+        };
+        let dialer = match &self.sudoku {
+            Some(sudoku) => Cow::Owned(dialer.into_owned().with_tcp_sudoku(sudoku.clone())),
+            None => dialer,
+        };
+        match &self.xmc {
+            Some(xmc) => Cow::Owned(dialer.into_owned().with_tcp_xmc(xmc.clone())),
+            None => dialer,
+        }
+    }
+    /// Whether every stream this carrier opens is a connection of its own.
+    /// gRPC's and XHTTP's streams share the connections their transport
+    /// keeps.
+    pub(super) fn opens_a_connection_per_stream(&self) -> bool {
+        !matches!(
+            self.transport_layer,
+            TransportLayer::Grpc(_) | TransportLayer::Xhttp(_)
+        )
+    }
+
+    /// Whether the streams share an XHTTP transport's connections.
+    pub(super) fn is_xhttp(&self) -> bool {
+        matches!(self.transport_layer, TransportLayer::Xhttp(_))
+    }
+
+    /// The server's candidates, after its `addressPortStrategy`.
+    pub(super) async fn resolve_server(
+        &self,
+        resolver: &dyn DnsResolver,
+        dialer: &TransportDialer,
+    ) -> Result<Vec<SocketAddr>, CoreError> {
+        // An XDRIVE session meets its server in the storage: Xray-core's dial
+        // never looks the server address up.
+        if matches!(self.transport_layer, TransportLayer::Xdrive(_)) {
+            return Ok(Vec::new());
+        }
+        address_port::resolve_server(&self.server, self.address_port, resolver, dialer).await
+    }
+
+    /// The XHTTP download server's candidates, after its leg's
+    /// `addressPortStrategy`.
+    pub(super) async fn resolve_download(
+        &self,
+        resolver: &dyn DnsResolver,
+        dialer: &TransportDialer,
+    ) -> Result<Vec<SocketAddr>, CoreError> {
+        match &self.download {
+            Some(down) => {
+                address_port::resolve_server(&down.server, down.address_port, resolver, dialer)
+                    .await
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub(super) async fn open(
+        &self,
+        candidates: &[SocketAddr],
+        download_candidates: &[SocketAddr],
+        dialer: &TransportDialer,
+    ) -> Result<BoxedTransportStream, CoreError> {
+        let base = dialer;
+        let dialer = self.dialer(base);
+        let dialer = dialer.as_ref();
+        if let Some(down) = &self.download {
+            let TransportLayer::Xhttp(up) = &self.transport_layer else {
+                return Err(invalid_xhttp_configuration(
+                    "split download requires XHTTP upload",
+                ));
+            };
+            let down_dialer = down.dialer(base, dialer);
+            return up
+                .open_split_stream(
+                    dialer,
+                    XhttpConnectTarget {
+                        connector: &self.transport,
+                        target: &self.server,
+                        candidates,
+                        happy_eyeballs: self.happy_eyeballs.as_ref(),
+                    },
+                    &down.transport,
+                    &down_dialer,
+                    XhttpConnectTarget {
+                        connector: &down.connector,
+                        target: &down.server,
+                        candidates: download_candidates,
+                        happy_eyeballs: down.happy_eyeballs.as_ref(),
+                    },
+                )
+                .await
+                .map_err(|e| CoreError::from(TransportError::Xhttp(e.to_string())));
+        }
+        Ok(dialer
+            .connect_stream(
+                &self.transport,
+                &self.transport_layer,
+                &self.server,
+                candidates,
+                self.happy_eyeballs.as_ref(),
+            )
+            .await?)
+    }
+}
+
+/// `stream`'s `sockopt.addressPortStrategy`.
+pub(super) fn address_port_strategy(stream: &StreamSettings) -> xray_config::AddressPortStrategy {
+    stream
+        .socket_options
+        .as_ref()
+        .map(|options| options.address_port_strategy)
+        .unwrap_or_default()
+}
+
+pub(super) fn build_connector(
+    security: &StreamSecurity,
+    destination: &TargetAddr,
+) -> ConnectorConfig {
+    match security {
+        StreamSecurity::None => ConnectorConfig::Tcp,
+        StreamSecurity::Tls(tls) => {
+            let server_name = match tls.server_name.as_deref() {
+                Some(name) if !name.is_empty() => name.to_owned(),
+                Some(_) | None => match destination {
+                    TargetAddr::Domain(domain) => domain.clone(),
+                    TargetAddr::Ip(ip) => ip.to_string(),
+                },
+            };
+
+            ConnectorConfig::Tls(TlsClientConfig {
+                server_name,
+                allow_insecure: tls.allow_insecure,
+                pinned_peer_cert_sha256: tls.pinned_peer_cert_sha256.clone(),
+                verify_peer_cert_by_name: tls.verify_peer_cert_by_name.clone(),
+                alpn: tls.alpn.clone(),
+                fingerprint: tls.fingerprint.clone(),
+            })
+        }
+        StreamSecurity::Reality(reality) => ConnectorConfig::Reality(RealityClientConfig {
+            server_name: reality.server_name.clone(),
+            fingerprint: reality.fingerprint.clone(),
+            public_key: reality.public_key,
+            short_id: reality.short_id.as_slice().to_vec(),
+            spider_x: reality.spider_x.clone(),
+            mldsa65_verify: reality.mldsa65_verify.clone(),
+        }),
+    }
+}
+
+/// Resolves the config's transport into the dial-ready one.
+///
+/// WebSocket and HTTPUpgrade's `Host` header follows Xray's precedence -- the
+/// transport's own `host`, else the TLS/REALITY server name, else the
+/// destination address -- and never carries a port. XHTTP resolves the same
+/// sources separately below because its scheme, authority validation, and
+/// native-client port rule belong to its request URL.
+///
+/// gRPC's `:authority` looks like the same question and is not: it has its own
+/// chain, its own view of REALITY, and a fallback that does carry the port.
+/// [`grpc_authority`] has it, and `host_fallback` below is the wrong answer to
+/// it in three separate ways.
+fn build_transport_layer(
+    stream: &StreamSettings,
+    server: &TargetAddr,
+    port: u16,
+    connector: &ConnectorConfig,
+    paths: ServerConfigPaths,
+) -> Result<TransportLayer, CoreError> {
+    check_xicmp_server(stream, server)?;
+    let host_fallback = || match connector {
+        ConnectorConfig::Tls(tls) if !tls.server_name.is_empty() => tls.server_name.clone(),
+        ConnectorConfig::Reality(reality) if !reality.server_name.is_empty() => {
+            reality.server_name.clone()
+        }
+        _ => match server {
+            TargetAddr::Domain(domain) => domain.clone(),
+            TargetAddr::Ip(ip) => ip.to_string(),
+        },
+    };
+
+    Ok(match &stream.transport {
+        StreamTransport::Raw => TransportLayer::Raw,
+        StreamTransport::Hysteria(_) | StreamTransport::Masque(_) => {
+            return Err(CoreError::UnsupportedOutboundNetwork)
+        }
+        StreamTransport::Xdrive(xdrive) => {
+            TransportLayer::Xdrive(super::xdrive::build_xdrive_transport(xdrive, stream)?)
+        }
+        StreamTransport::WebSocket(websocket) => TransportLayer::WebSocket(WebSocketConfig {
+            path: websocket.path.clone(),
+            host: websocket.host.clone().unwrap_or_else(host_fallback),
+            headers: websocket.headers.clone(),
+            early_data_bytes: websocket.early_data_bytes,
+            heartbeat_period_secs: websocket.heartbeat_period_secs,
+        }),
+        StreamTransport::HttpUpgrade(upgrade) => TransportLayer::HttpUpgrade(HttpUpgradeConfig {
+            path: upgrade.path.clone(),
+            host: upgrade.host.clone().unwrap_or_else(host_fallback),
+            headers: upgrade.headers.clone(),
+        }),
+        StreamTransport::Grpc(grpc) => TransportLayer::Grpc(GrpcTransport::new(GrpcConfig {
+            service_name: grpc.service_name.clone(),
+            multi_mode: grpc.multi_mode,
+            authority: grpc_authority(
+                grpc.authority.as_deref(),
+                &stream.security,
+                server,
+                port,
+                paths,
+            )?,
+            user_agent: grpc_user_agent(grpc.user_agent.as_deref())?,
+            idle_timeout_secs: grpc.idle_timeout_secs,
+            health_check_timeout_secs: grpc.health_check_timeout_secs,
+            permit_without_stream: grpc.permit_without_stream,
+            initial_windows_size: grpc.initial_windows_size,
+        })),
+        StreamTransport::Xhttp(xhttp) => {
+            TransportLayer::Xhttp(build_xhttp_transport(xhttp, stream, server)?)
+        }
+        StreamTransport::Kcp(kcp) => TransportLayer::Kcp(Arc::new(kcp_config(kcp, stream)?)),
+    })
+}
+
+/// mKCP's settings and masks, with the stream's noise and custom sequences.
+fn kcp_config(
+    kcp: &xray_config::KcpSettings,
+    stream: &StreamSettings,
+) -> Result<xray_transport::kcp::KcpConfig, CoreError> {
+    use xray_config::{KcpHeader, KcpMask};
+    use xray_transport::kcp::{KcpHeader as Header, KcpMask as Mask};
+    let masks = kcp
+        .masks
+        .iter()
+        .map(|mask| {
+            Ok(match mask {
+                KcpMask::Original => Mask::Original,
+                KcpMask::Aes128Gcm(password) => Mask::Aes128Gcm(password.clone()),
+                KcpMask::Noise => Mask::Noise,
+                KcpMask::HeaderCustom => {
+                    let header = stream
+                        .udp_header_custom
+                        .as_ref()
+                        .ok_or(CoreError::UnsupportedOutboundNetwork)?;
+                    Mask::HeaderCustom(udp_header_config(header))
+                }
+                KcpMask::Sudoku => {
+                    let sudoku = stream
+                        .udp_sudoku
+                        .as_ref()
+                        .ok_or(CoreError::UnsupportedOutboundNetwork)?;
+                    Mask::Sudoku(Arc::new(sudoku_config(&sudoku.mask)))
+                }
+                // A header mask beside mkcp-legacy's; Gecko's fragments are
+                // not built for mKCP.
+                KcpMask::Salamander => {
+                    let salamander = stream
+                        .udp_salamander
+                        .as_ref()
+                        .filter(|salamander| salamander.gecko_packet_size.is_none())
+                        .ok_or(CoreError::UnsupportedOutboundNetwork)?;
+                    Mask::Salamander(salamander.password.clone())
+                }
+                KcpMask::Header(header) => Mask::Header(match header {
+                    KcpHeader::Dns(domain) => Header::Dns(domain.clone()),
+                    KcpHeader::Dtls => Header::Dtls,
+                    KcpHeader::Srtp => Header::Srtp,
+                    KcpHeader::Utp => Header::Utp,
+                    KcpHeader::Wechat => Header::Wechat,
+                    KcpHeader::Wireguard => Header::Wireguard,
+                }),
+            })
+        })
+        .collect::<Result<_, CoreError>>()?;
+    Ok(xray_transport::kcp::KcpConfig {
+        mtu: kcp.mtu,
+        tti: kcp.tti,
+        uplink_capacity: kcp.uplink_capacity,
+        downlink_capacity: kcp.downlink_capacity,
+        cwnd_multiplier: kcp.cwnd_multiplier,
+        max_sending_window: kcp.max_sending_window,
+        masks,
+        noise: stream
+            .udp_noise
+            .as_ref()
+            .map(super::xhttp::udp_noise_config)
+            .transpose()?,
+        xdns: stream.udp_xdns.as_ref().map(xdns_config),
+        realm: stream.udp_realm.as_ref().map(realm_config),
+        xicmp: stream.udp_xicmp.as_ref().map(xicmp_config),
+    })
+}
+
+// The config keys the derived half of the `:authority` chain can come from, as
+// `CoreError::UnrepresentableGrpcAuthority` names them.
+//
+// Spelled as the paths the config parser reports its own errors under — the
+// address key verbatim (`crates/xray-config/src/parser.rs:2440`), and the TLS
+// server name as the object path the parser uses plus the key it accepts
+// inside it (`parser.rs:3211,3220`) — minus the `$.outbounds[N]` prefix this
+// layer no longer knows, so the message is something to search a profile for
+// rather than a description of it. `realitySettings.serverName` is not among
+// them on purpose: `dial.go:162` never reads it, for the reason `grpc_authority`
+// gives.
+//
+// `SERVER_ENDPOINT_KEYS` names a pair because the last-resort branch *composes*
+// its value out of two keys, and printing one of them next to `例え.jp:443`
+// would send the user looking for a `:443` that key does not hold.
+const TLS_SERVER_NAME_KEY: &str = "streamSettings.tlsSettings.serverName";
+
+/// The `:authority` one gRPC outbound dials with.
+///
+/// Xray's chain is `grpcSettings.authority`, else `tlsSettings.serverName`,
+/// else the destination *domain* and only when REALITY is absent, else the
+/// empty string (`Xray-core/transport/internet/grpc/dial.go:159-167`).
+///
+/// **Three ways this differs from `build_transport_layer`'s `host_fallback`**,
+/// which resolves the `Host` header for ws and httpupgrade and is the obvious
+/// thing to reuse here:
+///
+/// * REALITY's server name is not in the chain. `dial.go:162` reads
+///   `tlsConfig.ServerName`, and `tls.ConfigFromStreamSettings` returns nil for
+///   a REALITY stream because the type assertion on `SecuritySettings` fails
+///   (`transport/internet/tls/config.go:510-519`), so under REALITY the whole
+///   branch is skipped rather than answered with the REALITY SNI.
+/// * The destination branch needs the destination to be a domain. An IP one
+///   leaves the authority empty even with no REALITY in sight.
+/// * **The empty string is not an omitted header.** `initAuthority` walks past
+///   the dial option to the transport credentials, and Xray's are
+///   `insecure.NewCredentials()` (`dial.go:157`), whose `Info().ServerName` is
+///   empty (`grpc@v1.81.0/credentials/insecure/insecure.go:51-53`); the
+///   passthrough resolver is no `AuthorityOverrider` either, so the chain ends
+///   at `encodeAuthority(endpoint)` (`clientconn.go:1976-1986`) over the target
+///   Xray built as `passthrough:///host:port` (`dial.go:181-191`) — port
+///   included. Verified on the wire against grpc-go v1.81.0 for a domain, an
+///   IPv4 and an IPv6 destination. `encodeAuthority` leaves `:`, `[`, `]` and
+///   `@` unescaped (`clientconn.go:1889-1942`), which is why an IPv6 literal
+///   keeps its brackets instead of arriving as `%5B`. Under REALITY this
+///   fallback is the default path, not an edge case.
+///
+/// **The parse is split between the configured value and the derived ones**,
+/// because refusing an outbound over them is two different acts.
+///
+/// `grpcSettings.authority` is a string the user typed, and refusing it is the
+/// better of two bad options: [`xray_transport::stream::GrpcConfig::authority`]
+/// has the reasoning, which is that a `/` in it silently calls a gRPC method
+/// nobody configured. They can fix what they typed.
+///
+/// The other three are values *we* derive on their behalf, and
+/// `CoreError::InvalidGrpcAuthority` over one of those would blame a key their
+/// config does not contain. They get
+/// [`CoreError::UnrepresentableGrpcAuthority`], which names the key that
+/// actually produced the value.
+///
+/// **Both still refuse, because nothing else is reachable.** An IDN
+/// destination is the case that provokes the question — `Authority` rejects
+/// every byte above `0x7f` (`http-1.5.0/src/uri/authority.rs:493-516`), and
+/// grpc-go sends `例え.jp` verbatim, verified on the wire against v1.81.0 — and
+/// none of the alternatives survive contact with it:
+///
+/// * **Falling through the chain does not rescue it, it moves it.** The step
+///   after the destination domain is [`host_and_port`], which is that same
+///   domain with a `:443` appended, so it fails identically. The step after
+///   `tlsSettings.serverName` is the destination, which would answer — with a
+///   *different* authority than Xray sends, on a stream whose TLS layer is
+///   about to refuse the same name anyway (`TransportError::InvalidTlsServerName`).
+///   Sending the wrong authority to buy one extra failed handshake is not a
+///   trade worth making.
+/// * **Carrying it as a `String` only relocates the refusal.** `h2` reads
+///   `:authority` out of `Request::uri()` and nowhere else
+///   (`h2-0.4.15/src/frame/headers.rs:561-604`, `src/client.rs:1604-1664`), and
+///   an `http::Uri`'s authority *is* an [`Authority`]. A value this rejects is
+///   one no request can carry, so the only thing deferring the parse buys is
+///   the same failure once per dial, each behind a TCP connect and a TLS or
+///   REALITY handshake.
+/// * **Reproducing grpc-go's escaping does not help either.** `encodeAuthority`
+///   percent-escapes the `host:port` fallback, so upstream really does put
+///   `%E4%BE%8B%E3%81%88.jp:443` on the wire for an IDN destination under
+///   REALITY — also verified — and that form is *pure ASCII*. It still will not
+///   parse: `http` allows `%` only in userinfo or an IPv6 zone id and rejects
+///   it in a host (`authority.rs:503-514,564-567`).
+/// * **The IDNA A-label is the one form that would parse, and nothing here can
+///   build it.** `Authority::try_from("xn--r8jz45g.jp")` is `Ok` where the raw
+///   `例え.jp` is `InvalidUriChar` and grpc-go's escaping is
+///   `InvalidAuthority`, all three checked against `http` 1.5.0 — so punycode
+///   is a real escape hatch and it is still not reachable: no `idna` crate
+///   appears anywhere in this workspace's dependency graph. Adding one to
+///   convert silently would put an authority on the wire that upstream does
+///   not send, and under TLS the same name is refused a layer down regardless,
+///   since an IDN is not a rustls `ServerName` either
+///   (`crates/xray-transport/src/tls.rs:220`). A profile that wants the
+///   A-label can write it, and that already works.
+///
+/// So an IDN gRPC profile runs on xray-core and does not run here. That is a
+/// real parity gap, and it is a property of `http`/`h2`, not of this function;
+/// what this function owes the user is a message that names the address they
+/// wrote instead of a key they did not.
+fn grpc_authority(
+    configured: Option<&str>,
+    security: &StreamSecurity,
+    server: &TargetAddr,
+    port: u16,
+    paths: ServerConfigPaths,
+) -> Result<Authority, CoreError> {
+    // The config layer has already collapsed an empty `authority` to `None`,
+    // matching Go's inability to tell one from an absent key.
+    if let Some(configured) = configured {
+        return Authority::try_from(configured)
+            .map_err(|_| CoreError::InvalidGrpcAuthority(configured.to_owned()));
+    }
+
+    let (key, derived) = match configured_tls_server_name(security) {
+        Some(server_name) => (TLS_SERVER_NAME_KEY, server_name.to_owned()),
+        None => match server {
+            TargetAddr::Domain(domain) if !matches!(security, StreamSecurity::Reality(_)) => {
+                (paths.address, domain.clone())
+            }
+            _ => (paths.endpoint, host_and_port(server, port)),
+        },
+    };
+
+    Authority::try_from(derived.as_str()).map_err(|_| CoreError::UnrepresentableGrpcAuthority {
+        key,
+        value: derived,
+    })
+}
+
+/// The `user-agent` one gRPC outbound sends, through Xray's keyword table.
+///
+/// A wrapper over [`resolve_user_agent`] and not much else: what it adds is the
+/// error, and the error is the reason the resolution happens here rather than
+/// at the dial. [`xray_transport::stream::GrpcConfig::user_agent`] has why the
+/// value is refused at all — measured against grpc-go rather than reasoned
+/// about, and the short version is that every value refused here is a value
+/// whose every stream a grpc-go peer resets, so no profile that ran upstream
+/// stops running.
+///
+/// **Only [`CoreError::InvalidGrpcUserAgent`] and no derived-value twin**,
+/// which is where this parts company with [`grpc_authority`]. That chain has
+/// two error variants because three of its four branches produce a value the
+/// user never typed, and blaming `grpcSettings.authority` for the destination
+/// address would send them looking for a key their config does not hold. This
+/// one has no such branch: the three browser keywords resolve through the
+/// masquerade table to printable ASCII and `golang` to the empty string, so
+/// the only arm that can fail is the one that hands back the configured string
+/// verbatim. Naming the key is therefore always right, and the value in the
+/// message is always one they can search their profile for.
+fn grpc_user_agent(configured: Option<&str>) -> Result<HeaderValue, CoreError> {
+    resolve_user_agent(configured)
+        .map_err(|_| CoreError::InvalidGrpcUserAgent(configured.unwrap_or_default().to_owned()))
+}
+
+/// `tlsSettings.serverName`, read from the config the way `dial.go:162` reads
+/// it and not from the connector this outbound was built with.
+///
+/// The distinction has no effect on the resolved authority and every effect on
+/// which key gets blamed for it. `ConnectorConfig::Tls::server_name` is already
+/// the destination domain when the key is absent — `build_vless_tcp_outbound`
+/// substitutes it — where Xray's `tls.ConfigFromStreamSettings` hands
+/// `dial.go:162` the raw proto field, which is empty; the mutation that copies
+/// the domain in happens later, inside the dial closure, on a `*gotls.Config`
+/// the authority chain never sees (`dial.go:136-142`). Reading the connector
+/// therefore answers branch 2 with a value upstream answers branch 3 with,
+/// which is the same string, from a key the user may never have written. The
+/// difference is only observable once that key reaches a message, which is the
+/// last row of `a_derived_authority_is_not_refused_as_the_configured_one`.
+///
+/// The distinction becomes visible for a TLS stream over an IP destination:
+/// the connector carries that IP for certificate-name verification, while
+/// upstream gRPC still sees the raw absent/empty setting and falls through to
+/// `host:port`. Reading this function from the config preserves that split.
+fn configured_tls_server_name(security: &StreamSecurity) -> Option<&str> {
+    match security {
+        StreamSecurity::Tls(tls) => tls
+            .server_name
+            .as_deref()
+            .filter(|server_name| !server_name.is_empty()),
+        StreamSecurity::None | StreamSecurity::Reality(_) => None,
+    }
+}
+
+/// grpc-go's resolver-endpoint fallback, i.e. Go's `net.JoinHostPort` over the
+/// destination — which brackets an IPv6 literal, as `SocketAddr` does.
+///
+/// `to_canonical` is what makes the IPv4-mapped case agree: Go builds the host
+/// from `dest.Address.IP().String()` (`dial.go:181-186`), and `net.IP.String`
+/// writes a 16-byte address whose `To4()` matches as a dotted quad, where
+/// Rust's `Display` would keep `::ffff:`. Both fold exactly the v4-mapped
+/// prefix and nothing else, so the two agree everywhere once this is applied.
+fn host_and_port(server: &TargetAddr, port: u16) -> String {
+    match server {
+        TargetAddr::Domain(domain) => format!("{domain}:{port}"),
+        TargetAddr::Ip(ip) => SocketAddr::new(ip.to_canonical(), port).to_string(),
+    }
+}
+
+/// The transport's form of a `header-custom` TCP mask.
+pub(super) fn header_custom_config(
+    header: Option<&xray_config::HeaderCustomTcp>,
+) -> Option<Arc<xray_transport::header_custom::HeaderCustomTcpConfig>> {
+    header.map(|header| {
+        Arc::new(xray_transport::header_custom::HeaderCustomTcpConfig {
+            clients: header
+                .clients
+                .iter()
+                .map(|items| custom_items(items))
+                .collect(),
+            servers: header
+                .servers
+                .iter()
+                .map(|items| custom_items(items))
+                .collect(),
+        })
+    })
+}
+
+/// The `xmc` mask's settings, with the key its password derives, once per
+/// outbound.
+pub(super) fn xmc_config(
+    mask: &xray_config::XmcMask,
+) -> Result<Arc<xray_transport::xmc::XmcConfig>, CoreError> {
+    let profiles = mask
+        .profiles
+        .iter()
+        .map(|profile| xray_transport::xmc::XmcProfile {
+            username: profile.username.clone(),
+            uuid: profile.uuid,
+            textures_value: profile.textures_value.clone(),
+            textures_signature: profile.textures_signature.clone(),
+        })
+        .collect();
+    xray_transport::xmc::XmcConfig::new(mask.hostname.clone(), profiles, mask.password.as_str())
+        .map(Arc::new)
+        .map_err(|_| CoreError::UnsupportedOutboundNetwork)
+}
+
+/// The `sudoku` mask's settings, for either network.
+pub(super) fn sudoku_config(
+    mask: &xray_config::SudokuMask,
+) -> xray_transport::sudoku::SudokuConfig {
+    xray_transport::sudoku::SudokuConfig {
+        password: mask.password.to_string(),
+        ascii: mask.ascii.clone(),
+        custom_table: mask.custom_table.clone(),
+        custom_tables: mask.custom_tables.clone(),
+        padding_min: mask.padding_min,
+        padding_max: mask.padding_max,
+    }
+}
+
+/// A `header-custom` UDP mask's sequences.
+fn udp_header_config(
+    header: &xray_config::HeaderCustomUdp,
+) -> Arc<xray_transport::header_custom::HeaderCustomUdpConfig> {
+    Arc::new(xray_transport::header_custom::HeaderCustomUdpConfig {
+        standalone: header.standalone,
+        client: custom_items(&header.client),
+        server: custom_items(&header.server),
+    })
+}
+
+/// The `xdns` mask's client settings.
+pub(super) fn xdns_config(xdns: &xray_config::XdnsMask) -> Arc<xray_transport::xdns::XdnsConfig> {
+    use xray_transport::xdns::{XdnsDomain, XdnsResolver};
+    Arc::new(xray_transport::xdns::XdnsConfig {
+        domains: xdns
+            .domains
+            .iter()
+            .map(|domain| XdnsDomain {
+                name: domain.name.clone(),
+                len_limit: domain.len_limit,
+                label_limit: domain.label_limit,
+                types: domain.types.clone(),
+                edns0: domain.edns0,
+            })
+            .collect(),
+        resolvers: xdns
+            .resolvers
+            .iter()
+            .map(|resolver| match resolver.protocol {
+                xray_config::XdnsProtocol::Udp => XdnsResolver::Udp(vec![resolver.address]),
+                xray_config::XdnsProtocol::Tcp => XdnsResolver::Tcp(vec![resolver.address]),
+            })
+            .collect(),
+        extra_poll: xdns.extra_poll,
+    })
+}
+
+/// The `realm` mask's client settings. Its rendezvous's TLS names the
+/// rendezvous host unless `tlsConfig` names a server, as Go's HTTP client
+/// does, and never shapes its hello: Xray-core's client uses Go's own TLS.
+pub(super) fn realm_config(
+    realm: &xray_config::RealmMask,
+) -> Arc<xray_transport::realm::RealmConfig> {
+    use xray_transport::realm::{RealmConfig, RealmFamily, RealmScheme, RealmStunServer};
+    let scheme = match realm.scheme {
+        xray_config::RealmScheme::Https => RealmScheme::Https,
+        xray_config::RealmScheme::Http => RealmScheme::Http,
+    };
+    let tls = (scheme == RealmScheme::Https).then(|| {
+        let settings = realm.tls.as_ref();
+        TlsClientConfig {
+            server_name: settings
+                .and_then(|tls| tls.server_name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| realm.host.clone()),
+            allow_insecure: false,
+            pinned_peer_cert_sha256: settings
+                .map(|tls| tls.pinned_peer_cert_sha256.clone())
+                .unwrap_or_default(),
+            verify_peer_cert_by_name: settings
+                .map(|tls| tls.verify_peer_cert_by_name.clone())
+                .unwrap_or_default(),
+            alpn: Vec::new(),
+            fingerprint: None,
+        }
+    });
+    Arc::new(RealmConfig {
+        scheme,
+        host: realm.host.clone(),
+        port_text: realm.port_text.clone(),
+        port: realm.port,
+        token: Arc::new(realm.token.clone()),
+        id: realm.id.clone(),
+        stun_servers: realm
+            .stun_servers
+            .iter()
+            .map(|server| RealmStunServer {
+                host: server.host.clone(),
+                port_text: server.port_text.clone(),
+                port: server.port,
+            })
+            .collect(),
+        tls,
+        family: match realm.ip_mode {
+            xray_config::RealmIpMode::Dual => RealmFamily::Dual,
+            xray_config::RealmIpMode::V4 => RealmFamily::V4,
+            xray_config::RealmIpMode::V6 => RealmFamily::V6,
+        },
+    })
+}
+
+/// The `xicmp` mask's client settings.
+pub(super) fn xicmp_config(
+    xicmp: &xray_config::XicmpMask,
+) -> Arc<xray_transport::xicmp::XicmpConfig> {
+    Arc::new(xray_transport::xicmp::XicmpConfig {
+        dgram: xicmp.dgram,
+        ips: xicmp.ips.clone(),
+    })
+}
+
+/// Xray-core's xicmp client sends to its `ips`, else to the outbound's
+/// address, which it never resolves: a name there fails every dial.
+pub(super) fn check_xicmp_server(
+    stream: &StreamSettings,
+    server: &TargetAddr,
+) -> Result<(), CoreError> {
+    match (&stream.udp_xicmp, server) {
+        (Some(xicmp), TargetAddr::Domain(_)) if xicmp.ips.is_empty() => {
+            Err(CoreError::UnsupportedOutboundNetwork)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A QUIC carrier's `sudoku` UDP mask, at its place among the carrier's
+/// other masks.
+pub(super) fn quic_sudoku(
+    sudoku: &xray_config::UdpSudoku,
+) -> xray_transport::hysteria::SudokuCarrier {
+    xray_transport::hysteria::SudokuCarrier {
+        config: Arc::new(sudoku_config(&sudoku.mask)),
+        before_salamander: sudoku.before_salamander,
+        before_noise: sudoku.before_noise,
+        before_header_custom: sudoku.before_header_custom,
+    }
+}
+
+/// A QUIC carrier's `header-custom` UDP mask, at its place among the
+/// carrier's other masks.
+pub(super) fn quic_header_custom(
+    header: &xray_config::HeaderCustomUdp,
+) -> xray_transport::hysteria::HeaderCustomCarrier {
+    xray_transport::hysteria::HeaderCustomCarrier {
+        config: udp_header_config(header),
+        before_salamander: header.before_salamander,
+        before_noise: header.before_noise,
+    }
+}
+
+fn custom_items(
+    items: &[xray_config::HeaderCustomItem],
+) -> Vec<xray_transport::header_custom::CustomItem> {
+    use xray_transport::header_custom::{CustomArg, CustomExpr, CustomItem};
+    fn expr(source: &xray_config::HeaderCustomExpr) -> CustomExpr {
+        CustomExpr {
+            op: source.op.clone(),
+            args: source
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    xray_config::HeaderCustomArg::Bytes(bytes) => CustomArg::Bytes(bytes.clone()),
+                    xray_config::HeaderCustomArg::U64(value) => CustomArg::U64(*value),
+                    xray_config::HeaderCustomArg::Reuse(name) => CustomArg::Reuse(name.clone()),
+                    xray_config::HeaderCustomArg::Metadata(name) => {
+                        CustomArg::Metadata(name.clone())
+                    }
+                    xray_config::HeaderCustomArg::Transform(inner) => {
+                        CustomArg::Transform(expr(inner))
+                    }
+                })
+                .collect(),
+        }
+    }
+    items
+        .iter()
+        .map(|item| CustomItem {
+            delay: item.delay,
+            rand: item.rand,
+            rand_range: (item.rand_range.0 as u8, item.rand_range.1 as u8),
+            packet: item.packet.clone(),
+            capture: item.capture.clone(),
+            reuse: item.reuse.clone(),
+            transform: item.transform.as_ref().map(expr),
+        })
+        .collect()
+}
+
+/// The Salamander mask of a QUIC carrier other than Hysteria, with Gecko's
+/// fragment sizes when its `packetSize` selects Gecko.
+pub(super) fn quic_salamander(
+    mask: &xray_config::SalamanderMask,
+) -> Result<xray_transport::hysteria::SalamanderCarrier, CoreError> {
+    if !(4..=4096).contains(&mask.password.len()) {
+        return Err(CoreError::UnsupportedOutboundNetwork);
+    }
+    let gecko = mask
+        .gecko_packet_size
+        .map(|size| {
+            let bound = |value: u32| u16::try_from(value).ok();
+            bound(size.from)
+                .zip(bound(size.to))
+                .and_then(|(min, max)| xray_transport::hysteria::GeckoPacketSize::new(min, max))
+                .ok_or(CoreError::UnsupportedOutboundNetwork)
+        })
+        .transpose()?;
+    Ok(xray_transport::hysteria::SalamanderCarrier {
+        password: Arc::new(mask.password.clone()),
+        gecko,
+    })
+}
+
+/// The UDP masks of a socket that carries plain datagrams, freedom's flows
+/// and WireGuard's, as Xray-core's `FinalMask.DialUDP` wraps it: `None`
+/// without masks. udphop and realm need a QUIC carrier.
+pub(crate) fn direct_udp_masks(
+    stream: &StreamSettings,
+) -> Result<Option<Arc<xray_transport::hysteria::HysteriaCarrierConfig>>, CoreError> {
+    if stream.udp_noise.is_none()
+        && stream.udp_header_custom.is_none()
+        && stream.udp_sudoku.is_none()
+        && stream.udp_xdns.is_none()
+        && stream.udp_realm.is_none()
+        && stream.udp_xicmp.is_none()
+        && stream.udp_salamander.is_none()
+    {
+        return Ok(None);
+    }
+    if stream.udp_realm.is_some()
+        || stream.quic_params.as_ref().is_some_and(|quic| {
+            quic.udp_hop.local || quic.udp_hop.remote || quic.udp_hop.remote_once
+        })
+    {
+        return Err(CoreError::UnsupportedOutboundNetwork);
+    }
+    let salamander = stream
+        .udp_salamander
+        .as_ref()
+        .map(quic_salamander)
+        .transpose()?;
+    let masks = xray_transport::hysteria::HysteriaCarrierConfig {
+        salamander_password: salamander.as_ref().map(|s| s.password.clone()),
+        gecko: salamander.and_then(|s| s.gecko),
+        noise: stream
+            .udp_noise
+            .as_ref()
+            .map(super::xhttp::udp_noise_config)
+            .transpose()?,
+        header_custom: stream.udp_header_custom.as_ref().map(quic_header_custom),
+        sudoku: stream.udp_sudoku.as_ref().map(quic_sudoku),
+        xdns: stream.udp_xdns.as_ref().map(xdns_config),
+        xicmp: stream.udp_xicmp.as_ref().map(xicmp_config),
+        ..Default::default()
+    };
+    xray_transport::MaskedUdpSocket::validate(&masks)
+        .map_err(|_| CoreError::UnsupportedOutboundNetwork)?;
+    Ok(Some(Arc::new(masks)))
+}
+
+pub(super) fn fragment_config(
+    stream: &StreamSettings,
+) -> Result<Option<Arc<xray_transport::TcpFragmentConfig>>, CoreError> {
+    stream
+        .tcp_fragment
+        .as_ref()
+        .map(|settings| {
+            let packets = match settings.packets {
+                xray_config::FragmentPackets::TlsHello => xray_transport::FragmentPackets::TlsHello,
+                xray_config::FragmentPackets::AllWrites => {
+                    xray_transport::FragmentPackets::AllWrites
+                }
+                xray_config::FragmentPackets::Writes { from, to } => {
+                    xray_transport::FragmentPackets::Writes(u64::from(from)..=u64::from(to))
+                }
+            };
+            xray_transport::TcpFragmentConfig::new(
+                settings.lengths.iter().map(|r| r.from..=r.to).collect(),
+                settings.delays_ms.iter().map(|r| r.from..=r.to).collect(),
+                settings.max_split.from..=settings.max_split.to,
+            )
+            .and_then(|config| config.with_packets(packets))
+            .map(Arc::new)
+            .map_err(|_| CoreError::UnsupportedOutboundNetwork)
+        })
+        .transpose()
+}
+
+#[cfg(test)]
+mod tests;

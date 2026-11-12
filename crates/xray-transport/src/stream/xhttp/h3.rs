@@ -1,0 +1,2881 @@
+//! HTTP/3 wire engine for outbound XHTTP.
+//!
+//! This first implementation owns one protected, single-destination QUIC v1
+//! endpoint, optionally hopping its UDP carrier across configured ports.
+//! Connection-pool policy belongs above this layer.
+
+use std::fmt;
+use std::future::{poll_fn, Future};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::task::{ready, Context, Poll};
+use std::time::Duration;
+
+use bytes::{Buf, Bytes, BytesMut};
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::task::AtomicWaker;
+use h3::client;
+use h3::error::Code;
+use http::{HeaderMap, Method, Request, StatusCode};
+use quinn::crypto::rustls::QuicClientConfig;
+use quinn::{ClientConfig, Endpoint, EndpointConfig, TransportConfig, VarInt};
+use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{sleep_until, Instant};
+
+use crate::quic_congestion::{
+    bbr_for_profile, quinn_bbr, BbrProfile, BrutalRate, ControllerSwitch, Installed,
+    SwitchedFactory, STANDARD_RUNS_XRAY_BBR,
+};
+use crate::{
+    canonicalize_socket_addr, memory_class, HappyEyeballsConfig, MemoryClass, SocketHandle,
+    SocketProtector, TransportError,
+};
+
+const QUIC_V1: u32 = 0x0000_0001;
+const MAX_UPLOAD_DATA_BYTES: usize = 16 * 1024;
+const RESPONSE_QUEUE_DEPTH: usize = 1;
+const MAX_RESPONSE_BATCH_BYTES: usize = 16 * 1024;
+const MAX_RESPONSE_BATCH_CHUNKS: usize = 16;
+const XRAY_INITIAL_STREAM_RECEIVE_WINDOW: u64 = 2 * 1024 * 1024;
+const XRAY_INITIAL_CONNECTION_RECEIVE_WINDOW: u64 = 3 * 1024 * 1024;
+/// apernet/quic-go's receive window ceilings, which Xray's XHTTP H3 dialer
+/// keeps when `quicParams` sets none (`internal/protocol/params.go`).
+const XRAY_MAX_STREAM_RECEIVE_WINDOW: u64 = 6 * 1024 * 1024;
+const XRAY_MAX_CONNECTION_RECEIVE_WINDOW: u64 = 15 * 1024 * 1024;
+/// quic-go keeps a connection window of at least 1.5 stream windows
+/// (`ConnectionFlowControlMultiplier`).
+const CONNECTION_FLOW_CONTROL_MULTIPLIER: f64 = 1.5;
+/// Datagrams an XHTTP H3 or DoQ endpoint reads per receive call.
+///
+/// Every XHTTP H3 request owns a QUIC connection and its own endpoint, and
+/// quinn sized each endpoint's receive buffer for 32 datagrams. With UDP GRO
+/// on Linux and Android a datagram holds up to 64 segments, so the buffer
+/// took 2.9 MiB, and when datagrams queue up the kernel writes up to 64 KiB
+/// into each slot it fills. Thirty-two downloads from Xray-core on Linux
+/// kept 43 MiB of these buffers resident, and glibc's `calloc` zeroes a
+/// reused one in full. Batches of eight down to one datagram moved as many
+/// bytes as 32 within run-to-run noise, with GRO and without it; with four,
+/// those downloads kept 2 MiB resident, and no endpoint's buffer exceeds
+/// 368 KiB.
+const XHTTP_RECEIVE_BATCH: usize = 4;
+/// A constrained host reads two at a time, for at most 184 KiB per endpoint.
+const CONSTRAINED_XHTTP_RECEIVE_BATCH: usize = 2;
+
+/// quic-go's `defaultMaxResponseHeaderBytes`, its advertised
+/// SETTINGS_MAX_FIELD_SECTION_SIZE when `MaxResponseHeaderBytes` is unset.
+const QUIC_GO_MAX_FIELD_SECTION_SIZE: u64 = 10 << 20;
+
+type H3SendRequest = client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+type H3SendHalf = client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+type H3RecvHalf = client::RequestStream<h3_quinn::RecvStream, Bytes>;
+
+/// QUIC versions understood by XHTTP configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H3QuicVersion {
+    V1,
+    V2,
+}
+
+/// Xray's `quicParams.bbrProfile`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum H3BbrProfile {
+    Conservative,
+    #[default]
+    Standard,
+    Aggressive,
+}
+
+impl H3BbrProfile {
+    fn sender_profile(self) -> BbrProfile {
+        match self {
+            Self::Conservative => BbrProfile::Conservative,
+            Self::Standard => BbrProfile::Standard,
+            Self::Aggressive => BbrProfile::Aggressive,
+        }
+    }
+}
+
+/// Congestion-control choices understood by XHTTP and Hysteria configuration.
+///
+/// Except for [`Self::Reno`] and, while it runs quinn's BBR,
+/// [`Self::BbrStandard`], which run from the first packet, a connection
+/// starts with NewReno, quic-go's default sender, and switches when Xray's
+/// dialer installs its controller: after the handshake on XHTTP, after
+/// authentication on Hysteria.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H3Congestion {
+    /// The `standard` profile: quinn's BBR implementation with Xray's
+    /// standard initial window, unless the port of Xray's sender is chosen
+    /// for it.
+    BbrStandard,
+    Reno,
+    /// Xray's BBR sender with its conservative profile.
+    BbrConservative,
+    /// Xray's BBR sender with its aggressive profile.
+    BbrAggressive,
+    /// Hysteria's default: Brutal at the lower of this rate and the receive
+    /// rate the server announces once both are nonzero, otherwise BBR with
+    /// `bbr_profile`. Only a Hysteria connection can negotiate it; XHTTP
+    /// rejects it.
+    Brutal {
+        up_bytes_per_second: u64,
+        bbr_profile: H3BbrProfile,
+    },
+    /// Brutal at this fixed rate, whatever the peer announces.
+    ForceBrutal {
+        bytes_per_second: u64,
+    },
+}
+
+impl H3Congestion {
+    /// The BBR this choice runs, if it is one.
+    pub fn from_bbr_profile(profile: H3BbrProfile) -> Self {
+        match profile {
+            H3BbrProfile::Conservative => Self::BbrConservative,
+            H3BbrProfile::Standard => Self::BbrStandard,
+            H3BbrProfile::Aggressive => Self::BbrAggressive,
+        }
+    }
+
+    /// Whether the connection starts with quic-go's default sender and
+    /// switches once up.
+    fn switches(self) -> bool {
+        match self {
+            Self::BbrStandard => STANDARD_RUNS_XRAY_BBR,
+            Self::Reno => false,
+            Self::BbrConservative
+            | Self::BbrAggressive
+            | Self::Brutal { .. }
+            | Self::ForceBrutal { .. } => true,
+        }
+    }
+}
+
+impl H3QuicConfig {
+    /// What Xray's dialer installs once the connection is up, given the
+    /// receive rate a Hysteria server announced, if any. `None` keeps the
+    /// controller the connection started with.
+    pub(crate) fn installed_controller(
+        &self,
+        server_receive_rate: Option<u64>,
+    ) -> Option<Installed> {
+        let brutal = |bytes_per_second| {
+            Installed::Brutal(BrutalRate {
+                bytes_per_second,
+                disable_loss_compensation: self.brutal_disable_loss_compensation,
+            })
+        };
+        match self.congestion {
+            H3Congestion::Reno => None,
+            H3Congestion::BbrStandard => {
+                STANDARD_RUNS_XRAY_BBR.then(|| bbr_for_profile(BbrProfile::Standard))
+            }
+            H3Congestion::BbrConservative => Some(bbr_for_profile(BbrProfile::Conservative)),
+            H3Congestion::BbrAggressive => Some(bbr_for_profile(BbrProfile::Aggressive)),
+            H3Congestion::ForceBrutal { bytes_per_second } => Some(brutal(bytes_per_second)),
+            // Xray: Brutal at min(brutalUp, server rate) once both are known.
+            H3Congestion::Brutal {
+                up_bytes_per_second,
+                bbr_profile,
+            } => Some(match server_receive_rate.unwrap_or(0) {
+                rate if up_bytes_per_second > 0 && rate > 0 => {
+                    brutal(up_bytes_per_second.min(rate))
+                }
+                _ => bbr_for_profile(bbr_profile.sender_profile()),
+            }),
+        }
+    }
+}
+
+/// UDP-hop policy for the QUIC carrier, Xray's `udphop` finalmask.
+///
+/// Its modes are Xray's. With `remote` or `remote_once` the first packet
+/// already goes to a random remote address: a port among `ports` and an IP in
+/// `remote_ips`. With `local` or `remote`, each interval moves the connection
+/// to a fresh protected socket, aimed with `remote` at a new remote address.
+/// Zero intervals default to 30 seconds; bounds below five seconds are
+/// rejected.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct H3UdpHopConfig {
+    pub ports: Vec<u16>,
+    pub interval_min: Duration,
+    pub interval_max: Duration,
+    /// Xray's `intervalLocal`: a new local socket at every interval.
+    pub local: bool,
+    /// Xray's `intervalRemote`: a new remote address at every interval.
+    pub remote: bool,
+    /// Xray's `perConnRemote`: a random remote address once per connection.
+    pub remote_once: bool,
+    /// Xray's `remoteIPs` as networks and prefix lengths. A new remote
+    /// address takes a random IP in one of those of the server's family;
+    /// without one it keeps the server's IP.
+    pub remote_ips: Vec<(IpAddr, u8)>,
+}
+
+impl H3UdpHopConfig {
+    /// Whether the hop changes anything at all.
+    pub fn is_active(&self) -> bool {
+        self.local || self.remote || self.remote_once
+    }
+
+    /// Whether it moves the connection on a timer.
+    pub fn hops_on_interval(&self) -> bool {
+        self.local || self.remote
+    }
+}
+
+/// QUIC transport settings supported by the phase-one engine.
+///
+/// Xray/quic-go auto-tunes its receive windows from the configured initial
+/// values (2 MiB per stream and 3 MiB per connection) up to larger maxima, and
+/// `XhttpReceiveWindow` does the same for XHTTP downloads. A `None` maximum
+/// is Xray's default, 6 MiB and 15 MiB, on a [`MemoryClass::Standard`] host;
+/// a constrained host keeps such windows at their initial size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H3QuicConfig {
+    pub version: H3QuicVersion,
+    pub initial_stream_receive_window: u64,
+    pub max_stream_receive_window: Option<u64>,
+    pub initial_connection_receive_window: u64,
+    pub max_connection_receive_window: Option<u64>,
+    pub max_idle_timeout: Duration,
+    pub keep_alive_interval: Option<Duration>,
+    pub max_incoming_bidirectional_streams: u64,
+    pub disable_path_mtu_discovery: bool,
+    /// `disableGSO`: send every datagram with its own system call.
+    pub disable_gso: bool,
+    pub congestion: H3Congestion,
+    /// `brutalDisableLossCompensation`: Brutal keeps its exact rate under loss.
+    pub brutal_disable_loss_compensation: bool,
+    pub udp_hop: H3UdpHopConfig,
+    pub udp_noise: Option<crate::udp_noise::UdpNoiseConfig>,
+    /// A `header-custom` UDP mask, at its place among the noise mask.
+    pub udp_header_custom: Option<crate::hysteria::HeaderCustomCarrier>,
+    /// A `sudoku` UDP mask, at its place among the other masks.
+    pub udp_sudoku: Option<crate::hysteria::SudokuCarrier>,
+    /// The `xdns` UDP mask, outside the others, carrying every datagram.
+    pub udp_xdns: Option<Arc<crate::xdns::XdnsConfig>>,
+    /// The `realm` UDP mask, outside the others: each connection's socket is
+    /// introduced to the server first.
+    pub udp_realm: Option<Arc<crate::realm::RealmConfig>>,
+    /// The `xicmp` UDP mask, outside the others, carrying every datagram in
+    /// ICMP echoes.
+    pub udp_xicmp: Option<Arc<crate::xicmp::XicmpConfig>>,
+    /// The `salamander` UDP mask, Gecko's fragments with it, at its place
+    /// among the noise, `header-custom` and `sudoku` masks.
+    pub udp_salamander: Option<crate::hysteria::SalamanderCarrier>,
+    pub debug: bool,
+    /// quic-go's `InitialPacketSize`: the first packets' size, never
+    /// lowered by black-hole detection. `None` keeps Quinn's 1200.
+    pub initial_packet_size: Option<u16>,
+    /// The length of the connection IDs this end issues, as quic-go's
+    /// `Transport.ConnectionIDLength`. `None` keeps the carrier's default.
+    pub connection_id_len: Option<u8>,
+    /// Xray-core's ChromeParrot: shape the handshake like Chrome's, as Xray's
+    /// Hysteria, XHTTP H3 and XDRIVE H3 dialers do unless
+    /// `quicParams.disableChromeParrot` is true.
+    ///
+    /// It pins quic-go's values: a 30 s idle timeout, 6 MiB stream and 15 MiB
+    /// connection windows (ceilings never below them), 100 bidirectional and
+    /// 103 unidirectional streams and 1250-byte Initial datagrams. It sends
+    /// from zero-length connection IDs to an 8-byte first destination ID,
+    /// turns on quinn-proto's `TransportConfig::chrome_parrot` packet shape,
+    /// and wants the TLS configuration from
+    /// `TlsConnector::h3_client_config_for` with the same flag, which carries
+    /// uTLS's Chrome QUIC ClientHello. Off by default here: the core sets it
+    /// from `disableChromeParrot`.
+    pub chrome_parrot: bool,
+}
+
+impl Default for H3QuicConfig {
+    fn default() -> Self {
+        Self {
+            version: H3QuicVersion::V1,
+            initial_stream_receive_window: XRAY_INITIAL_STREAM_RECEIVE_WINDOW,
+            max_stream_receive_window: None,
+            initial_connection_receive_window: XRAY_INITIAL_CONNECTION_RECEIVE_WINDOW,
+            max_connection_receive_window: None,
+            max_idle_timeout: Duration::from_secs(300),
+            keep_alive_interval: None,
+            max_incoming_bidirectional_streams: 0,
+            disable_path_mtu_discovery: !cfg!(any(
+                target_os = "linux",
+                target_os = "windows",
+                target_os = "macos"
+            )),
+            disable_gso: false,
+            congestion: H3Congestion::BbrStandard,
+            brutal_disable_loss_compensation: false,
+            udp_hop: H3UdpHopConfig::default(),
+            udp_noise: None,
+            udp_header_custom: None,
+            udp_sudoku: None,
+            udp_xdns: None,
+            udp_realm: None,
+            udp_xicmp: None,
+            udp_salamander: None,
+            debug: false,
+            initial_packet_size: None,
+            connection_id_len: None,
+            chrome_parrot: false,
+        }
+    }
+}
+
+/// Stable facts callers can log when selecting the phase-one H3 path.
+///
+/// The reported window sizes are the initial ones; `adaptive_receive_windows`
+/// says whether XHTTP downloads may grow them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H3Diagnostics {
+    pub quic_version: u32,
+    pub congestion: &'static str,
+    pub stream_receive_window: u64,
+    pub connection_receive_window: u64,
+    pub adaptive_receive_windows: bool,
+    pub udp_hop: bool,
+}
+
+impl H3QuicConfig {
+    /// Validates phase-one parity limits without opening a socket.
+    ///
+    /// The default reports initial 2 MiB/3 MiB receive windows. A maximum
+    /// below its initial window is rejected.
+    pub fn diagnostics(&self) -> Result<H3Diagnostics, H3Error> {
+        if let Some(noise) = &self.udp_noise {
+            noise.validate().map_err(H3Error::UdpSocket)?;
+        }
+        if self.udp_sudoku.is_some() {
+            self.hop_carrier().validate().map_err(|_| {
+                H3Error::UdpSocket(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an invalid sudoku UDP mask",
+                ))
+            })?;
+        }
+        if self.udp_header_custom.is_some() {
+            self.hop_carrier().validate().map_err(|_| {
+                H3Error::UdpSocket(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an invalid header-custom UDP mask, or one with udphop",
+                ))
+            })?;
+        }
+        if self.udp_xdns.is_some() {
+            self.hop_carrier().validate().map_err(|_| {
+                H3Error::UdpSocket(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an invalid xdns UDP mask, or one with udphop or sudoku",
+                ))
+            })?;
+        }
+        if self.udp_xicmp.is_some() {
+            self.hop_carrier().validate().map_err(|_| {
+                H3Error::UdpSocket(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an xicmp UDP mask with udphop, xdns, realm, header-custom or sudoku",
+                ))
+            })?;
+        }
+        if self.udp_realm.is_some() {
+            self.hop_carrier().validate().map_err(|_| {
+                H3Error::UdpSocket(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an invalid realm UDP mask, or one with udphop, xdns or header-custom",
+                ))
+            })?;
+        }
+        if self.version != H3QuicVersion::V1 {
+            return Err(H3Error::UnsupportedQuicVersion {
+                requested: self.version,
+            });
+        }
+        if self
+            .max_stream_receive_window
+            .is_some_and(|maximum| maximum < self.initial_stream_receive_window)
+            || self
+                .max_connection_receive_window
+                .is_some_and(|maximum| maximum < self.initial_connection_receive_window)
+        {
+            return Err(H3Error::ReceiveWindowMaximumBelowInitial {
+                initial_stream: self.initial_stream_receive_window,
+                max_stream: self.max_stream_receive_window,
+                initial_connection: self.initial_connection_receive_window,
+                max_connection: self.max_connection_receive_window,
+            });
+        }
+        if self.udp_hop.is_active() {
+            self.hop_carrier()
+                .validate()
+                .map_err(|_| H3Error::InvalidUdpHop {
+                    port_count: self.udp_hop.ports.len(),
+                    interval_min: self.udp_hop.interval_min,
+                    interval_max: self.udp_hop.interval_max,
+                })?;
+        }
+        if self.debug {
+            return Err(H3Error::UnsupportedDebugLogging);
+        }
+
+        let congestion = match self.congestion {
+            H3Congestion::BbrStandard if STANDARD_RUNS_XRAY_BBR => "xray-bbr-standard",
+            H3Congestion::BbrStandard => "quinn-bbr-standard-approximation",
+            H3Congestion::BbrConservative => "xray-bbr-conservative",
+            H3Congestion::BbrAggressive => "xray-bbr-aggressive",
+            H3Congestion::Reno => "new-reno",
+            H3Congestion::ForceBrutal { bytes_per_second } if bytes_per_second > 0 => "brutal",
+            H3Congestion::Brutal { .. } => "brutal-if-negotiated",
+            requested => return Err(H3Error::UnsupportedCongestion { requested }),
+        };
+        quinn_varint(
+            "initialStreamReceiveWindow",
+            self.initial_stream_receive_window,
+        )?;
+        quinn_varint(
+            "initialConnectionReceiveWindow",
+            self.initial_connection_receive_window,
+        )?;
+        quinn_varint(
+            "maxIncomingStreams",
+            self.max_incoming_bidirectional_streams,
+        )?;
+
+        Ok(H3Diagnostics {
+            quic_version: QUIC_V1,
+            congestion,
+            stream_receive_window: self.initial_stream_receive_window,
+            connection_receive_window: self.initial_connection_receive_window,
+            adaptive_receive_windows: self.receive_window(memory_class()).tunes,
+            udp_hop: self.udp_hop.hops_on_interval(),
+        })
+    }
+
+    /// The configuration a connection runs: with ChromeParrot, quic-go's
+    /// `populateConfig` replaces the idle timeout, the starting windows, the
+    /// incoming stream limit and the initial packet size with Chrome's, and
+    /// raises configured window ceilings to at least the starting windows.
+    pub(crate) fn populated(&self) -> std::borrow::Cow<'_, Self> {
+        use crate::chrome_parrot::{
+            INITIAL_CONNECTION_RECEIVE_WINDOW, INITIAL_PACKET_SIZE, INITIAL_STREAM_RECEIVE_WINDOW,
+            MAX_IDLE_TIMEOUT, MAX_INCOMING_STREAMS,
+        };
+        if !self.chrome_parrot {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut config = self.clone();
+        config.max_idle_timeout = MAX_IDLE_TIMEOUT;
+        config.initial_stream_receive_window = INITIAL_STREAM_RECEIVE_WINDOW;
+        config.initial_connection_receive_window = INITIAL_CONNECTION_RECEIVE_WINDOW;
+        config.max_stream_receive_window = config
+            .max_stream_receive_window
+            .map(|maximum| maximum.max(INITIAL_STREAM_RECEIVE_WINDOW));
+        config.max_connection_receive_window = config
+            .max_connection_receive_window
+            .map(|maximum| maximum.max(INITIAL_CONNECTION_RECEIVE_WINDOW));
+        config.max_incoming_bidirectional_streams = MAX_INCOMING_STREAMS;
+        config.initial_packet_size = Some(INITIAL_PACKET_SIZE);
+        std::borrow::Cow::Owned(config)
+    }
+
+    /// The carrier transforms this XHTTP connection applies itself: UDP hop,
+    /// Salamander, noise, a custom header and sudoku. Hysteria passes its own
+    /// carrier instead.
+    pub(crate) fn hop_carrier(&self) -> crate::hysteria::HysteriaCarrierConfig {
+        crate::hysteria::HysteriaCarrierConfig {
+            salamander_password: self
+                .udp_salamander
+                .as_ref()
+                .map(|salamander| salamander.password.clone()),
+            gecko: self
+                .udp_salamander
+                .as_ref()
+                .and_then(|salamander| salamander.gecko),
+            udp_hop: self.udp_hop.clone(),
+            noise: self.udp_noise.clone(),
+            header_custom: self.udp_header_custom.clone(),
+            sudoku: self.udp_sudoku.clone(),
+            xdns: self.udp_xdns.clone(),
+            realm: self.udp_realm.clone(),
+            xicmp: self.udp_xicmp.clone(),
+        }
+    }
+
+    /// The download window of a connection on a host of `class`.
+    fn receive_window(&self, class: MemoryClass) -> XhttpReceiveWindow {
+        let maximum = |configured: Option<u64>, xray: u64, initial: u64| {
+            configured.unwrap_or(match class {
+                MemoryClass::Standard => xray.max(initial),
+                MemoryClass::Constrained => initial,
+            })
+        };
+        XhttpReceiveWindow::new(
+            self.initial_stream_receive_window,
+            self.initial_connection_receive_window,
+            maximum(
+                self.max_stream_receive_window,
+                XRAY_MAX_STREAM_RECEIVE_WINDOW,
+                self.initial_stream_receive_window,
+            ),
+            maximum(
+                self.max_connection_receive_window,
+                XRAY_MAX_CONNECTION_RECEIVE_WINDOW,
+                self.initial_connection_receive_window,
+            ),
+            class,
+        )
+    }
+}
+
+/// Everything required to connect one protected HTTP/3 destination.
+#[derive(Clone)]
+pub struct H3ConnectConfig {
+    pub remote_addr: SocketAddr,
+    pub server_name: String,
+    pub tls_config: Arc<rustls::ClientConfig>,
+    pub socket_protector: Option<Arc<dyn SocketProtector>>,
+    pub quic: H3QuicConfig,
+    /// What a `realm` mask's introduction takes from the dial.
+    pub realm: Option<crate::realm::RealmEnv>,
+    /// The connection takes a fresh socket whenever these report that the
+    /// OS network changed, for the callers that keep it for long.
+    pub network_changes: Option<crate::NetworkChanges>,
+}
+
+impl fmt::Debug for H3ConnectConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("H3ConnectConfig")
+            .field("remote_addr", &self.remote_addr)
+            .field("server_name", &self.server_name)
+            .field("alpn_protocols", &self.tls_config.alpn_protocols)
+            .field("socket_protector", &self.socket_protector.is_some())
+            .field("quic", &self.quic)
+            .field("realm", &self.realm.is_some())
+            .field("network_changes", &self.network_changes.is_some())
+            .finish()
+    }
+}
+
+/// HTTP/3 connection, stream, and parity failures.
+#[derive(Debug, Error)]
+pub enum H3Error {
+    #[error("HTTP/3 requires at least one resolved UDP candidate")]
+    NoResolvedCandidate,
+    #[error("QUIC requires TLS ALPN to be exactly `{expected}`")]
+    InvalidAlpn { expected: &'static str },
+    #[error("QUIC version {requested:?} is not implemented; phase one is fail-closed on v1")]
+    UnsupportedQuicVersion { requested: H3QuicVersion },
+    #[error(
+        "a QUIC receive window maximum is below its initial size (stream {initial_stream}/{max_stream:?}, connection {initial_connection}/{max_connection:?})"
+    )]
+    ReceiveWindowMaximumBelowInitial {
+        initial_stream: u64,
+        max_stream: Option<u64>,
+        initial_connection: u64,
+        max_connection: Option<u64>,
+    },
+    #[error("QUIC congestion mode {requested:?} is not implemented without silent fallback")]
+    UnsupportedCongestion { requested: H3Congestion },
+    #[error(
+        "QUIC congestion `brutal` follows the receive rate a Hysteria server announces; over XHTTP H3 use bbr, reno or force-brutal"
+    )]
+    BrutalNeedsHysteria,
+    #[error(
+        "invalid QUIC UDP hop ({port_count} ports, interval {interval_min:?}-{interval_max:?}): ports must be nonzero and both bounds at least 5 seconds"
+    )]
+    InvalidUdpHop {
+        port_count: usize,
+        interval_min: Duration,
+        interval_max: Duration,
+    },
+    #[error("QUIC debug logging requires process-global quic-go hooks and is not implemented")]
+    UnsupportedDebugLogging,
+    #[error("invalid QUIC transport parameter `{name}`: {value}")]
+    InvalidTransportParameter { name: &'static str, value: u128 },
+    #[error("could not build QUIC TLS configuration: {0}")]
+    TlsConfig(String),
+    #[error("could not bind HTTP/3 UDP socket {addr}: {source}")]
+    UdpBind {
+        addr: SocketAddr,
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+    #[error("could not configure HTTP/3 UDP socket: {0}")]
+    UdpSocket(#[source] io::Error),
+    #[error("could not create QUIC endpoint: {0}")]
+    Endpoint(#[source] io::Error),
+    #[error("could not start QUIC connection: {0}")]
+    ConnectStart(#[source] quinn::ConnectError),
+    #[error("QUIC connection failed: {0}")]
+    Connect(#[source] quinn::ConnectionError),
+    #[error("HTTP/3 connection setup failed: {0}")]
+    Http3Connection(#[source] h3::error::ConnectionError),
+    #[error("HTTP/3 {context}: {source}")]
+    Http3Stream {
+        context: &'static str,
+        #[source]
+        source: h3::error::StreamError,
+    },
+    #[error("XHTTP HTTP/3 server returned status {status}")]
+    UnexpectedStatus { status: StatusCode },
+    #[error("HTTP/3 response was already consumed")]
+    ResponseConsumed,
+    #[error("HTTP/3 response task ended before delivering headers")]
+    ResponseTaskClosed,
+    #[error("HTTP/3 response consumer was dropped")]
+    ResponseConsumerDropped,
+    #[error("HTTP/3 request was cancelled")]
+    Cancelled,
+    #[error("HTTP/3 upload I/O failed: {0}")]
+    UploadIo(#[source] io::Error),
+}
+
+/// A reusable HTTP/3 client backed by one QUIC connection.
+#[derive(Clone)]
+pub struct H3Client {
+    send_request: H3SendRequest,
+    driver: Arc<H3ConnectionDriver>,
+    diagnostics: H3Diagnostics,
+}
+
+impl fmt::Debug for H3Client {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("H3Client")
+            .field("live", &self.is_live())
+            .field("local_addr", &self.local_addr())
+            .field("diagnostics", &self.diagnostics)
+            .finish_non_exhaustive()
+    }
+}
+
+struct H3ConnectionDriver {
+    endpoint: Endpoint,
+    connection: quinn::Connection,
+    send_window: XhttpSendWindow,
+    receive_window: XhttpReceiveWindow,
+    task: JoinHandle<h3::error::ConnectionError>,
+    hop: Option<JoinHandle<()>>,
+}
+
+impl H3ConnectionDriver {
+    fn update_send_window(&self) {
+        self.send_window.update(&self.connection);
+    }
+
+    fn record_download(&self, bytes: usize) {
+        self.receive_window.on_read(bytes, &self.connection);
+    }
+
+    fn record_caught_up(&self) {
+        self.receive_window.on_caught_up();
+    }
+}
+
+/// Bytes a QUIC connection may hold written but not yet acknowledged. quinn's
+/// default is 10 MB per connection; with one connection per XHTTP H3 request,
+/// a slow uplink made that 10 MB of memory per upload.
+pub(crate) const QUIC_INITIAL_SEND_WINDOW: u64 = 2 * 1024 * 1024;
+/// High bandwidth-delay paths may still grow to quinn's former 10 MB.
+pub(crate) const QUIC_MAX_SEND_WINDOW: u64 = 10_000_000;
+/// Uploaded bytes between send-window growth samples.
+pub(crate) const QUIC_SEND_WINDOW_SAMPLE_BYTES: usize = 1024 * 1024;
+
+/// One connection's send window, grown toward twice its congestion window.
+#[derive(Debug)]
+pub(crate) struct QuicSendWindow(AtomicU64);
+
+impl QuicSendWindow {
+    pub(crate) fn new() -> Self {
+        Self(AtomicU64::new(QUIC_INITIAL_SEND_WINDOW))
+    }
+
+    /// Called after another sample of uploaded bytes, never from an idle
+    /// timer, so a quiet connection keeps its small window.
+    pub(crate) fn grow(&self, connection: &quinn::Connection) {
+        let current = self.0.load(Ordering::Relaxed);
+        if current == QUIC_MAX_SEND_WINDOW {
+            return;
+        }
+        let target = connection
+            .stats()
+            .path
+            .cwnd
+            .saturating_mul(2)
+            .clamp(QUIC_INITIAL_SEND_WINDOW, QUIC_MAX_SEND_WINDOW);
+        if target > current {
+            connection.set_send_window(target);
+            self.0.store(target, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Bytes the send windows of uploading XHTTP H3 connections share: eight
+/// uploads keep the 2 MiB a lone one has.
+const XHTTP_SEND_BUDGET: u64 = 16 * 1024 * 1024;
+/// A constrained host shares a quarter as much and never grows past it.
+const CONSTRAINED_XHTTP_SEND_BUDGET: u64 = 4 * 1024 * 1024;
+/// No uploading connection's window falls below this; a new connection
+/// starts here until its first sample.
+const XHTTP_MIN_SEND_WINDOW: u64 = 128 * 1024;
+/// A connection counts as uploading or downloading for one to two periods
+/// after a sample.
+const TRANSFER_ACTIVITY_PERIOD_SECS: u64 = 1;
+
+static XHTTP_UPLOADS: TransferActivity = TransferActivity::new();
+
+/// One XHTTP H3 connection's send window, sized from its share of upload
+/// memory.
+///
+/// Every XHTTP H3 request owns a QUIC connection, and each used to keep a
+/// window of at least 2 MiB. Thirty-two uploads to a local server that
+/// drained slower than they wrote filled every one: 71 MiB of a 95 MiB heap
+/// waited in QUIC send buffers, while their congestion windows (243 KB
+/// median) could send a fraction of it. While `n` connections upload, each
+/// now keeps an `n`th of the budget, between 128 KiB and 2 MiB, and grows
+/// toward twice its congestion window up to an `n`th of 10 MB. A lone upload
+/// keeps the former 2 MiB to 10 MB range: a single fast loopback upload has
+/// less than 128 KiB in flight, but a window that small cost it 12–32% more
+/// CPU per byte. Eight lossless uploads sharing 8 MiB cost 2–4% more CPU
+/// per byte than with 2 MiB each.
+struct XhttpSendWindow {
+    window: AtomicU64,
+    /// The activity period in which this connection last counted.
+    period: AtomicU64,
+    class: MemoryClass,
+}
+
+impl XhttpSendWindow {
+    fn new(connection: &quinn::Connection, class: MemoryClass) -> Self {
+        connection.set_send_window(XHTTP_MIN_SEND_WINDOW);
+        Self {
+            window: AtomicU64::new(XHTTP_MIN_SEND_WINDOW),
+            period: AtomicU64::new(0),
+            class,
+        }
+    }
+
+    /// Uploaded bytes between samples: half the window, so a new connection
+    /// takes its share after its first 64 KiB.
+    fn sample_bytes(&self) -> usize {
+        let half = usize::try_from(self.window.load(Ordering::Relaxed) / 2).unwrap_or(usize::MAX);
+        half.clamp(64 * 1024, QUIC_SEND_WINDOW_SAMPLE_BYTES)
+    }
+
+    /// Called after another sample of uploaded bytes, never from an idle
+    /// timer: a quiet connection stops counting against the others' shares.
+    fn update(&self, connection: &quinn::Connection) {
+        let uploading = XHTTP_UPLOADS.mark(&self.period, std::time::Instant::now());
+        let target = xhttp_send_window(connection.stats().path.cwnd, uploading, self.class);
+        if target != self.window.load(Ordering::Relaxed) {
+            connection.set_send_window(target);
+            self.window.store(target, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The send window of a connection whose congestion window is `cwnd` while
+/// `uploading` connections upload.
+fn xhttp_send_window(cwnd: u64, uploading: u64, class: MemoryClass) -> u64 {
+    let uploading = uploading.max(1);
+    let (budget, ceiling) = match class {
+        MemoryClass::Standard => (XHTTP_SEND_BUDGET, QUIC_MAX_SEND_WINDOW),
+        MemoryClass::Constrained => (CONSTRAINED_XHTTP_SEND_BUDGET, CONSTRAINED_XHTTP_SEND_BUDGET),
+    };
+    let floor = (budget / uploading).clamp(XHTTP_MIN_SEND_WINDOW, QUIC_INITIAL_SEND_WINDOW);
+    let cap = (ceiling / uploading).max(floor);
+    cwnd.saturating_mul(2).clamp(floor, cap)
+}
+
+/// Counts the connections that sampled a transfer in one direction during
+/// the current or the previous activity period.
+struct TransferActivity {
+    epoch: OnceLock<std::time::Instant>,
+    periods: Mutex<ActivityPeriods>,
+}
+
+struct ActivityPeriods {
+    /// Starts at 1, so a connection's period 0 means it never counted.
+    current: u64,
+    in_current: u64,
+    in_previous: u64,
+}
+
+impl TransferActivity {
+    const fn new() -> Self {
+        Self {
+            epoch: OnceLock::new(),
+            periods: Mutex::new(ActivityPeriods {
+                current: 0,
+                in_current: 0,
+                in_previous: 0,
+            }),
+        }
+    }
+
+    /// Counts the connection whose last period is `last` as transferring at
+    /// `now`, and returns how many connections, itself included, transferred
+    /// during this period or the previous one.
+    fn mark(&self, last: &AtomicU64, now: std::time::Instant) -> u64 {
+        let epoch = *self.epoch.get_or_init(|| now);
+        let period =
+            now.saturating_duration_since(epoch).as_secs() / TRANSFER_ACTIVITY_PERIOD_SECS + 1;
+        let mut periods = lock_unpoisoned(&self.periods);
+        if period > periods.current {
+            periods.in_previous = if period == periods.current + 1 {
+                periods.in_current
+            } else {
+                0
+            };
+            periods.in_current = 0;
+            periods.current = period;
+        }
+        // A caller that read the clock before another one moved to the next
+        // period counts in the new one.
+        if last.swap(periods.current, Ordering::Relaxed) != periods.current {
+            periods.in_current += 1;
+        }
+        periods.in_current.max(periods.in_previous)
+    }
+}
+
+/// Bytes the stream windows of downloading XHTTP H3 connections share: eight
+/// downloads keep the 2 MiB a lone one starts with.
+const XHTTP_RECEIVE_BUDGET: u64 = 16 * 1024 * 1024;
+/// A constrained host shares a quarter as much.
+const CONSTRAINED_XHTTP_RECEIVE_BUDGET: u64 = 4 * 1024 * 1024;
+/// No downloading connection's stream window falls below this.
+const XHTTP_MIN_STREAM_RECEIVE_WINDOW: u64 = 128 * 1024;
+/// Downloaded bytes between samples of a connection's share; the first
+/// sample makes it count as downloading.
+const XHTTP_RECEIVE_SAMPLE_BYTES: u64 = 64 * 1024;
+/// Samples in a row in which a reader never found its stream empty before
+/// its window is held to its share.
+const XHTTP_BEHIND_SAMPLES: u32 = 4;
+/// And the least time since it last did, at least two round trips: a reader
+/// that drains what each round trip delivers keeps up, however large the
+/// bursts its endpoint hands it.
+const XHTTP_BEHIND_TIME: Duration = Duration::from_millis(10);
+
+static XHTTP_DOWNLOADS: TransferActivity = TransferActivity::new();
+
+/// One XHTTP H3 connection's download window: quic-go's auto-tuning, held to
+/// the connection's share of download memory while its reader falls behind.
+///
+/// quic-go doubles a stream's window when its reader consumed more than half
+/// of it within four round trips scaled by that fraction, and keeps the
+/// connection window at 1.5 stream windows at least (`maybeAdjustWindowSize`,
+/// `internal/flowcontrol/base_flow_controller.go`). The epoch here spans the
+/// connection; an XHTTP connection carries one download.
+///
+/// Every XHTTP H3 request owns a QUIC connection, and a reader slower than
+/// its server keeps the whole stream window filled: 32 downloads from
+/// Xray-core on Linux held 57 MiB in their 2 MiB windows. While `n`
+/// connections download, one whose reader has not found its stream empty
+/// for four samples and two round trips (10 ms at least) offers at most an
+/// `n`th of the budget, though never less than 128 KiB or than the reader
+/// took in the last two round trips, until it keeps up again; then its
+/// allowance doubles at every sample. A reader that keeps up holds little,
+/// since its window is in flight: capping it limited eight downloads over a
+/// 54 ms round trip to 1.4 instead of 3.5 Gbit/s. Counting samples alone
+/// was not enough there, because an endpoint hands over up to four datagrams
+/// of 64 coalesced segments at once, and a reader briefly behind on such a
+/// path still needs its window. A lone download still reaches its full
+/// auto-tuned window. The handshake still grants the configured window, as
+/// Xray's client does, and a smaller share applies once the reader has
+/// passed that credit.
+struct XhttpReceiveWindow {
+    class: MemoryClass,
+    max_stream: u64,
+    max_connection: u64,
+    /// Whether quic-go's auto-tuning may grow either window.
+    tunes: bool,
+    /// Bytes read since the share was last sampled.
+    unsampled: AtomicU64,
+    /// Whether a read found the stream empty since the last sample.
+    caught_up: AtomicBool,
+    /// The activity period in which this connection last counted.
+    period: AtomicU64,
+    tuning: Mutex<ReceiveTuning>,
+}
+
+struct ReceiveTuning {
+    /// The auto-tuned stream window.
+    stream: u64,
+    connection: u64,
+    /// This connection's share of the receive budget.
+    share: u64,
+    /// What the connection may offer beyond its share while its reader
+    /// keeps up.
+    allowance: u64,
+    /// Samples in a row in which the reader never found its stream empty.
+    behind: u32,
+    /// Bytes read in those samples.
+    behind_bytes: u64,
+    /// The sample at which the reader last had found its stream empty.
+    caught_up_at: std::time::Instant,
+    /// The stream window the connection offers: the auto-tuned one, held to
+    /// the larger of the share and the allowance.
+    offered: u64,
+    read: u64,
+    epoch_offset: u64,
+    epoch_start: std::time::Instant,
+}
+
+impl ReceiveTuning {
+    /// Takes the connection's new share at `now`, and whether its reader
+    /// found the stream empty since the last sample; `rtt` is read only when
+    /// the reader may have fallen behind.
+    fn resample(
+        &mut self,
+        share: u64,
+        caught_up: bool,
+        now: std::time::Instant,
+        rtt: impl FnOnce() -> Duration,
+    ) {
+        self.share = share;
+        if caught_up {
+            self.behind = 0;
+            self.behind_bytes = 0;
+            self.caught_up_at = now;
+            self.allowance = self.allowance.max(share).saturating_mul(2);
+            return;
+        }
+        self.behind = self.behind.saturating_add(1);
+        self.behind_bytes = self.behind_bytes.saturating_add(XHTTP_RECEIVE_SAMPLE_BYTES);
+        let since = now.saturating_duration_since(self.caught_up_at);
+        if self.behind < XHTTP_BEHIND_SAMPLES || since < XHTTP_BEHIND_TIME {
+            return;
+        }
+        let two_round_trips = rtt().saturating_mul(2);
+        if since >= two_round_trips {
+            // Never less than the reader takes in two round trips, so that
+            // holding it cannot slow it down.
+            let reads =
+                u128::from(self.behind_bytes) * two_round_trips.as_nanos() / since.as_nanos();
+            self.allowance = share.max(u64::try_from(reads).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// The stream window to offer from now on, if the tuned window, the
+    /// share or the allowance changed it.
+    fn reoffer(&mut self) -> Option<u64> {
+        let offered = self.stream.min(self.share.max(self.allowance));
+        (offered != self.offered).then(|| {
+            self.offered = offered;
+            offered
+        })
+    }
+}
+
+impl XhttpReceiveWindow {
+    fn new(
+        initial_stream: u64,
+        initial_connection: u64,
+        max_stream: u64,
+        max_connection: u64,
+        class: MemoryClass,
+    ) -> Self {
+        Self {
+            class,
+            max_stream,
+            max_connection,
+            tunes: max_stream > initial_stream || max_connection > initial_connection,
+            unsampled: AtomicU64::new(0),
+            caught_up: AtomicBool::new(false),
+            period: AtomicU64::new(0),
+            tuning: Mutex::new(ReceiveTuning {
+                stream: initial_stream,
+                connection: initial_connection,
+                share: u64::MAX,
+                allowance: u64::MAX,
+                behind: 0,
+                behind_bytes: 0,
+                caught_up_at: std::time::Instant::now(),
+                offered: initial_stream,
+                read: 0,
+                epoch_offset: 0,
+                epoch_start: std::time::Instant::now(),
+            }),
+        }
+    }
+
+    /// Counts `bytes` read from the download, samples the connection's share
+    /// every 64 KiB, and grows the windows when the reader consumed half the
+    /// stream window too quickly.
+    fn on_read(&self, bytes: usize, connection: &quinn::Connection) {
+        let bytes = bytes as u64;
+        let sample = self.unsampled.fetch_add(bytes, Ordering::Relaxed) + bytes
+            >= XHTTP_RECEIVE_SAMPLE_BYTES;
+        if !sample && !self.tunes {
+            return;
+        }
+        let mut tuning = lock_unpoisoned(&self.tuning);
+        // A read on another request of this connection may have taken the
+        // sample first.
+        if sample && self.unsampled.swap(0, Ordering::Relaxed) >= XHTTP_RECEIVE_SAMPLE_BYTES {
+            let now = std::time::Instant::now();
+            let downloading = XHTTP_DOWNLOADS.mark(&self.period, now);
+            tuning.resample(
+                xhttp_stream_receive_share(downloading, self.max_stream, self.class),
+                self.caught_up.swap(false, Ordering::Relaxed),
+                now,
+                || connection.rtt(),
+            );
+        }
+        if self.tunes {
+            self.tune(&mut tuning, bytes, connection);
+        }
+        if let Some(offered) = tuning.reoffer() {
+            connection.set_stream_receive_window(varint(offered));
+        }
+    }
+
+    /// Records that a read found the download's stream empty: the reader
+    /// keeps up, so its window waits in the network rather than in memory.
+    fn on_caught_up(&self) {
+        self.caught_up.store(true, Ordering::Relaxed);
+    }
+
+    fn tune(&self, tuning: &mut ReceiveTuning, bytes: u64, connection: &quinn::Connection) {
+        if tuning.stream >= self.max_stream && tuning.connection >= self.max_connection {
+            return;
+        }
+        tuning.read += bytes;
+        let in_epoch = tuning.read - tuning.epoch_offset;
+        // Checked first: reading the RTT takes the connection's lock.
+        if in_epoch <= tuning.stream / 2 {
+            return;
+        }
+        let rtt = connection.rtt();
+        if rtt.is_zero() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let fraction = in_epoch as f64 / tuning.stream as f64;
+        if now.duration_since(tuning.epoch_start) < rtt.mul_f64(4.0 * fraction)
+            && tuning.stream < self.max_stream
+        {
+            tuning.stream = (tuning.stream * 2).min(self.max_stream);
+            let wanted = ((tuning.stream as f64 * CONNECTION_FLOW_CONTROL_MULTIPLIER) as u64)
+                .min(self.max_connection);
+            if wanted > tuning.connection {
+                tuning.connection = wanted;
+                connection.set_receive_window(varint(wanted));
+            }
+        }
+        tuning.epoch_start = now;
+        tuning.epoch_offset = tuning.read;
+    }
+}
+
+/// The stream window each of `downloading` connections may offer: an equal
+/// share of the budget and at least 128 KiB, but for a lone download no less
+/// than its largest auto-tuned window, `max_stream`.
+fn xhttp_stream_receive_share(downloading: u64, max_stream: u64, class: MemoryClass) -> u64 {
+    let budget = match class {
+        MemoryClass::Standard => XHTTP_RECEIVE_BUDGET,
+        MemoryClass::Constrained => CONSTRAINED_XHTTP_RECEIVE_BUDGET,
+    };
+    (budget.max(max_stream) / downloading.max(1)).max(XHTTP_MIN_STREAM_RECEIVE_WINDOW)
+}
+
+fn varint(value: u64) -> VarInt {
+    VarInt::from_u64(value).unwrap_or(VarInt::MAX)
+}
+
+impl Drop for H3ConnectionDriver {
+    fn drop(&mut self) {
+        let code = VarInt::from_u32(Code::H3_NO_ERROR.value() as u32);
+        self.connection.close(code, b"XHTTP H3 client dropped");
+        self.endpoint.close(code, b"XHTTP H3 client dropped");
+        self.task.abort();
+        if let Some(hop) = &self.hop {
+            hop.abort();
+        }
+    }
+}
+
+impl H3Client {
+    /// A handle that opens request streams on the connection, for callers
+    /// that read every status themselves, such as XDRIVE's storages.
+    pub(crate) fn request_sender(&self) -> H3SendRequest {
+        self.send_request.clone()
+    }
+
+    /// Whether the HTTP/3 driver and underlying QUIC connection are live.
+    pub fn is_live(&self) -> bool {
+        !self.driver.task.is_finished() && self.driver.connection.close_reason().is_none()
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr, io::Error> {
+        self.driver.endpoint.local_addr()
+    }
+
+    pub fn diagnostics(&self) -> &H3Diagnostics {
+        &self.diagnostics
+    }
+
+    /// The congestion controller the connection runs now: `new-reno`,
+    /// `quinn-bbr`, `xray-bbr-<profile>` or `brutal`. For diagnostics and
+    /// tests.
+    #[doc(hidden)]
+    pub fn congestion_controller(&self) -> &'static str {
+        crate::quic_congestion::controller_name(self.driver.connection.congestion_state())
+    }
+
+    /// Sends a fixed body and validates its response while upload can progress.
+    pub async fn send_fixed(
+        &self,
+        request: Request<()>,
+        body: Bytes,
+    ) -> Result<H3ResponseBody, H3Error> {
+        if body.is_empty() {
+            return self.start_fixed(request, body).await?.open().await;
+        }
+
+        let (mut upload, response) = self.start_streaming(request).await?;
+        let (_, response) = tokio::try_join!(upload.send_owned(body), response.open())?;
+        Ok(response)
+    }
+
+    /// Completes a fixed upload and returns without waiting for response headers.
+    pub async fn start_fixed(
+        &self,
+        request: Request<()>,
+        body: Bytes,
+    ) -> Result<H3PendingResponse, H3Error> {
+        let (mut upload, response) = self.start_streaming(request).await?;
+        upload.send_owned(body).await?;
+        Ok(response)
+    }
+
+    /// Opens an independently backpressured upload and download pair.
+    pub async fn start_streaming(
+        &self,
+        request: Request<()>,
+    ) -> Result<(H3Upload, H3PendingResponse), H3Error> {
+        let response_is_bodyless = request.method() == Method::HEAD;
+        let expected_content_length = request
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let mut send_request = self.send_request.clone();
+        let request_stream =
+            send_request
+                .send_request(request)
+                .await
+                .map_err(|source| H3Error::Http3Stream {
+                    context: "request headers could not be sent",
+                    source,
+                })?;
+        let (send, recv) = request_stream.split();
+
+        let (cancel, _) = watch::channel(false);
+        let shared = Arc::new(ExchangeShared {
+            cancel,
+            _connection_guard: send_request,
+            driver: Arc::clone(&self.driver),
+        });
+        let upload_status = Arc::new(UploadWorkerStatus::new());
+        let (upload, upload_reader) = tokio::io::duplex(MAX_UPLOAD_DATA_BYTES);
+        let (upload_finished, upload_completion) = oneshot::channel();
+        let (response_headers, response_waiter) = oneshot::channel();
+        let (response_body, body_waiter) = mpsc::channel(RESPONSE_QUEUE_DEPTH);
+
+        tokio::spawn(drive_upload(
+            send,
+            upload_reader,
+            expected_content_length,
+            Arc::clone(&shared),
+            Arc::clone(&upload_status),
+            upload_finished,
+        ));
+        tokio::spawn(drive_response(
+            recv,
+            response_is_bodyless,
+            Arc::clone(&shared),
+            response_headers,
+            response_body,
+        ));
+
+        Ok((
+            H3Upload {
+                io: upload,
+                completion: Some(upload_completion),
+                finished: false,
+                accepted: 0,
+                status: upload_status,
+                shared: Arc::clone(&shared),
+            },
+            H3PendingResponse {
+                headers: Some(response_waiter),
+                body: Some(body_waiter),
+                response_is_bodyless,
+                cancel_on_drop: true,
+                shared,
+            },
+        ))
+    }
+}
+
+/// Connects one protected UDP destination and starts its HTTP/3 driver.
+pub async fn connect_h3(config: H3ConnectConfig) -> Result<H3Client, H3Error> {
+    let class = memory_class();
+    let receive_window = config.quic.populated().receive_window(class);
+    let carrier = config.quic.hop_carrier();
+    let protector = config.socket_protector.clone();
+    let network_changes = config.network_changes.clone();
+    let (endpoint, connection, diagnostics, wire_peer) =
+        connect_quic_transport(config, b"h3").await?;
+    let send_window = XhttpSendWindow::new(&connection, class);
+    let hop = move_udp_carrier(
+        &endpoint,
+        &connection,
+        carrier,
+        protector,
+        wire_peer,
+        CarrierSocket::Streams,
+        network_changes.as_ref(),
+    );
+    // quic-go's http3 client, which Xray's XHTTP H3 dial uses, opens its
+    // control stream with SETTINGS_MAX_FIELD_SECTION_SIZE = 10 MiB alone
+    // (`http3/client.go`, `defaultMaxResponseHeaderBytes`); h3 used to
+    // announce 2^62-1 next to four zero-valued extension settings. GREASE
+    // stays on for now: `drive_upload` learns of a STOP_SENDING that raced
+    // the request FIN only through the GREASE frame `finish` writes, because
+    // quinn's `finish` reports a stopped stream as success.
+    let (mut h3_connection, send_request) = client::builder()
+        .max_field_section_size(QUIC_GO_MAX_FIELD_SECTION_SIZE)
+        .build(h3_quinn::Connection::new(connection.clone()))
+        .await
+        .map_err(H3Error::Http3Connection)?;
+    let task = tokio::spawn(async move { poll_fn(|cx| h3_connection.poll_close(cx)).await });
+    let driver = Arc::new(H3ConnectionDriver {
+        endpoint,
+        connection,
+        send_window,
+        receive_window,
+        task,
+        hop,
+    });
+
+    Ok(H3Client {
+        send_request,
+        driver,
+        diagnostics,
+    })
+}
+
+/// What a connection's socket is set up for, at dial and at every rebind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarrierSocket {
+    /// Streams alone, XHTTP's: the receive batch every XHTTP endpoint has.
+    Streams,
+    /// QUIC datagrams as well, MASQUE's: the datagram socket buffers.
+    Datagrams,
+}
+
+/// Starts the task that moves one connection's carrier to a fresh socket:
+/// at every `udphop` interval, and whenever `network_changes` report that
+/// the OS network changed. `None` when the connection does neither. The
+/// task holds the connection, so its owner aborts it.
+pub(crate) fn move_udp_carrier(
+    endpoint: &Endpoint,
+    connection: &quinn::Connection,
+    carrier: crate::hysteria::HysteriaCarrierConfig,
+    protector: Option<Arc<dyn SocketProtector>>,
+    wire_peer: SocketAddr,
+    socket: CarrierSocket,
+    network_changes: Option<&crate::NetworkChanges>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    // A realm socket was introduced to the server and a new one needs a new
+    // introduction; xdns and xicmp carry nothing over the UDP socket. The
+    // next dial takes the new network.
+    let fixed = carrier.realm.is_some() || carrier.xdns.is_some() || carrier.xicmp.is_some();
+    let network = network_changes
+        .filter(|_| !fixed)
+        .map(crate::NetworkChanges::follow);
+    if carrier.next_interval().is_none() && network.is_none() {
+        return None;
+    }
+    Some(tokio::spawn(follow_udp_carrier(
+        endpoint.clone(),
+        connection.clone(),
+        carrier,
+        protector,
+        wire_peer,
+        socket,
+        network,
+    )))
+}
+
+/// Hops one connection's carrier as Xray's `udphop` finalmask does for any
+/// UDP transport, with these deliberate differences: the timer starts once
+/// the connection exists rather than at dial, every remote hop changes the
+/// port, a remote hop also takes a fresh local socket, Quinn keeps the
+/// previous socket until the new path authenticates, and the task ends with
+/// the connection. A failed hop keeps the current protected path until the
+/// next interval, as in Xray.
+///
+/// A change of the OS network takes a fresh socket towards the same peer,
+/// which Xray-core does not do: the old socket's network is gone, and the
+/// connection would otherwise sit out its idle timeout before a redial.
+async fn follow_udp_carrier(
+    endpoint: Endpoint,
+    connection: quinn::Connection,
+    carrier: crate::hysteria::HysteriaCarrierConfig,
+    protector: Option<Arc<dyn SocketProtector>>,
+    mut wire_peer: SocketAddr,
+    socket: CarrierSocket,
+    mut network: Option<tokio::sync::watch::Receiver<u64>>,
+) {
+    let logical_peer = connection.remote_address();
+    loop {
+        let hop = carrier.next_interval();
+        if hop.is_none() && network.is_none() {
+            return;
+        }
+        let next = tokio::select! {
+            _ = connection.closed() => return,
+            () = sleep_for(hop) => carrier.next_hop_peer(logical_peer, wire_peer),
+            changed = network_changed(&mut network) => {
+                if !changed {
+                    // The signal's owner is gone: only the hops are left.
+                    network = None;
+                    continue;
+                }
+                wire_peer
+            }
+        };
+        if rebind_carrier(
+            &endpoint,
+            logical_peer,
+            next,
+            &carrier,
+            protector.as_deref(),
+            socket,
+        )
+        .is_ok()
+        {
+            wire_peer = next;
+        }
+    }
+}
+
+async fn sleep_for(delay: Option<std::time::Duration>) {
+    match delay {
+        Some(delay) => tokio::time::sleep(delay).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether the network changed; `false` once nothing can report it.
+async fn network_changed(network: &mut Option<tokio::sync::watch::Receiver<u64>>) -> bool {
+    match network {
+        Some(network) => network.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+fn rebind_carrier(
+    endpoint: &Endpoint,
+    logical_peer: SocketAddr,
+    wire_peer: SocketAddr,
+    carrier: &crate::hysteria::HysteriaCarrierConfig,
+    protector: Option<&dyn SocketProtector>,
+    kind: CarrierSocket,
+) -> io::Result<()> {
+    let socket = StdUdpSocket::bind(unspecified_bind_addr(logical_peer))?;
+    if kind == CarrierSocket::Datagrams {
+        configure_quic_datagram_socket(&socket);
+    }
+    crate::protect_std_udp_socket(&socket, protector).map_err(io::Error::other)?;
+    socket.set_nonblocking(true)?;
+    let socket = if carrier.enabled() {
+        crate::hysteria::carrier::wrap(
+            socket,
+            logical_peer,
+            wire_peer,
+            carrier,
+            &Default::default(),
+        )?
+    } else {
+        direct_socket(socket, logical_peer)?
+    };
+    endpoint.rebind_abstract(match kind {
+        // Keep the receive batch every XHTTP endpoint starts with.
+        CarrierSocket::Streams => {
+            crate::quic_receive_batch::cap(socket, xhttp_receive_batch(memory_class()))
+        }
+        CarrierSocket::Datagrams => socket,
+    })
+}
+
+/// The socket of a connection without a carrier, as the dial makes it.
+fn direct_socket(
+    socket: StdUdpSocket,
+    remote: SocketAddr,
+) -> io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::connected_quic::wrap(socket, remote)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use quinn::Runtime as _;
+        let _ = remote;
+        quinn::TokioRuntime.wrap_udp_socket(socket)
+    }
+}
+
+fn unspecified_bind_addr(remote: SocketAddr) -> SocketAddr {
+    match remote.ip() {
+        IpAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
+        IpAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
+    }
+}
+
+/// Returns the endpoint, its connection, diagnostics and the carrier's first
+/// wire peer, which differs from the remote address only under UDP hop.
+pub(crate) async fn connect_quic_transport(
+    config: H3ConnectConfig,
+    expected_alpn: &'static [u8],
+) -> Result<(Endpoint, quinn::Connection, H3Diagnostics, SocketAddr), H3Error> {
+    connect_quic_transport_with_datagrams(
+        config,
+        expected_alpn,
+        None,
+        None,
+        Default::default(),
+        None,
+    )
+    .await
+}
+
+/// Optional receive/send byte budgets and advertised frame-size cap for QUIC datagrams.
+/// `None` preserves the existing XHTTP/DoQ transport configuration.
+///
+/// A congestion choice that switches once the connection is up does so with
+/// `switch` when the caller passes one, as Hysteria does after
+/// authentication; otherwise right after the handshake, as Xray's XHTTP
+/// dialer does after `DialEarly`. Hysteria's [`H3Congestion::Brutal`] needs
+/// the caller's switch.
+pub(crate) async fn connect_quic_transport_with_datagrams(
+    config: H3ConnectConfig,
+    expected_alpn: &'static [u8],
+    datagram_buffers: Option<(usize, usize, u16)>,
+    carrier: Option<&crate::hysteria::HysteriaCarrierConfig>,
+    session: crate::hysteria::carrier::CarrierSession,
+    switch: Option<&Arc<ControllerSwitch>>,
+) -> Result<(Endpoint, quinn::Connection, H3Diagnostics, SocketAddr), H3Error> {
+    drop(crate::tls::parse_tls_server_name(&config.server_name)?);
+    let mut config = config;
+    if config.quic.chrome_parrot {
+        config.quic = config.quic.populated().into_owned();
+    }
+    let diagnostics = config.quic.diagnostics()?;
+    if config.tls_config.alpn_protocols.len() != 1
+        || config.tls_config.alpn_protocols[0].as_slice() != expected_alpn
+    {
+        let expected = std::str::from_utf8(expected_alpn).unwrap_or("<binary>");
+        return Err(H3Error::InvalidAlpn { expected });
+    }
+
+    let own_carrier = config.quic.hop_carrier();
+    let carrier = carrier.or_else(|| own_carrier.enabled().then_some(&own_carrier));
+    if matches!(config.quic.congestion, H3Congestion::Brutal { .. }) && switch.is_none() {
+        return Err(H3Error::BrutalNeedsHysteria);
+    }
+    // Without the caller's switch, this connection installs its controller
+    // itself once the handshake completes.
+    let own_switch = (switch.is_none() && config.quic.congestion.switches())
+        .then(|| Arc::new(ControllerSwitch::default()));
+    let (endpoint_config, client_config) = build_quinn_config(
+        &config,
+        datagram_buffers,
+        carrier.map_or(0, |c| c.wire_overhead()),
+        switch.or(own_switch.as_ref()),
+    )?;
+    let remote_addr = canonicalize_socket_addr(config.remote_addr);
+    let realm = carrier.and_then(|carrier| carrier.realm.as_ref());
+    let (socket, realm_peer) = match realm {
+        // The realm mask introduces its own socket to the server first.
+        Some(realm) => {
+            let env = config.realm.as_ref().ok_or_else(|| {
+                H3Error::UdpSocket(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a realm UDP mask needs the dial's resolver",
+                ))
+            })?;
+            let udp =
+                crate::realm::RealmUdp::open(realm.family, config.socket_protector.as_deref())?;
+            // Boxed: the introduction would otherwise grow every dial's
+            // future.
+            let peer = Box::pin(crate::realm::establish(&udp, realm, env))
+                .await
+                .map_err(|error| H3Error::UdpSocket(io::Error::other(error)))?;
+            let socket = udp.into_std().map_err(H3Error::UdpSocket)?;
+            if datagram_buffers.is_some() {
+                configure_quic_datagram_socket(&socket);
+            }
+            (socket, Some(peer))
+        }
+        None => {
+            let bind_addr = unspecified_bind_addr(remote_addr);
+            let socket = StdUdpSocket::bind(bind_addr).map_err(|source| H3Error::UdpBind {
+                addr: bind_addr,
+                source,
+            })?;
+            if datagram_buffers.is_some() {
+                configure_quic_datagram_socket(&socket);
+            }
+            protect_quic_socket(&socket, config.socket_protector.as_deref())?;
+            socket.set_nonblocking(true).map_err(H3Error::UdpSocket)?;
+            (socket, None)
+        }
+    };
+
+    let mut wire_peer = remote_addr;
+    let mut session = session;
+    let socket = if let Some(carrier) = carrier.filter(|c| c.enabled()) {
+        // An xdns client opens with the connection, unless the caller's
+        // session brought one.
+        session
+            .open_xdns(carrier, config.socket_protector.clone())
+            .await
+            .map_err(H3Error::UdpSocket)?;
+        session
+            .open_xicmp(carrier, remote_addr.ip(), config.socket_protector.clone())
+            .await
+            .map_err(H3Error::UdpSocket)?;
+        wire_peer = realm_peer.unwrap_or_else(|| carrier.next_peer(remote_addr));
+        crate::hysteria::carrier::wrap(socket, remote_addr, wire_peer, carrier, &session)
+            .map_err(H3Error::UdpSocket)?
+    } else {
+        // Every connection owns its socket and talks to one peer, so XHTTP H3
+        // takes the connected send path too: an unconnected macOS socket looks
+        // up the route for every datagram, which made `sendmsg` the largest
+        // cost of an XHTTP H3 upload.
+        #[cfg(target_os = "macos")]
+        {
+            crate::connected_quic::wrap(socket, remote_addr).map_err(H3Error::UdpSocket)?
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            use quinn::Runtime as _;
+            quinn::TokioRuntime
+                .wrap_udp_socket(socket)
+                .map_err(H3Error::Endpoint)?
+        }
+    };
+    // XHTTP and DoQ open an endpoint for every connection; Hysteria keeps one
+    // endpoint, and quinn's batch, for all of its traffic.
+    let socket = if datagram_buffers.is_none() {
+        crate::quic_receive_batch::cap(socket, xhttp_receive_batch(memory_class()))
+    } else {
+        socket
+    };
+    let endpoint = Endpoint::new_with_abstract_socket(
+        endpoint_config,
+        None,
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(H3Error::Endpoint)?;
+    let connecting = endpoint
+        .connect_with(client_config, remote_addr, &config.server_name)
+        .map_err(H3Error::ConnectStart)?;
+    let connection = connecting.await.map_err(H3Error::Connect)?;
+    if let Some(own_switch) = own_switch {
+        if let Some(installed) = config.quic.installed_controller(None) {
+            own_switch.install(installed);
+        }
+    }
+    Ok((endpoint, connection, diagnostics, wire_peer))
+}
+
+/// Connects the first successful protected UDP candidate.
+///
+/// A missing or zero-delay Happy Eyeballs policy preserves the legacy first
+/// candidate behavior. When enabled, candidates use the shared stable family
+/// ordering plus the configured delay and concurrency bound. Socket
+/// protection failure is fatal because trying an unprotected fallback would
+/// leak QUIC outside the caller's VPN routing boundary.
+pub async fn connect_h3_candidates(
+    config: H3ConnectConfig,
+    candidates: &[SocketAddr],
+    happy_eyeballs: Option<&HappyEyeballsConfig>,
+) -> Result<H3Client, H3Error> {
+    let first = candidates
+        .first()
+        .copied()
+        .ok_or(H3Error::NoResolvedCandidate)?;
+    // A realm socket goes to the punched peer whatever the address: racing
+    // candidates would introduce several sockets for one connection.
+    let Some(happy_eyeballs) = happy_eyeballs.filter(|policy| {
+        !policy.try_delay.is_zero()
+            && candidates.len() >= 2
+            && config.quic.udp_realm.is_none()
+            && config.quic.udp_xicmp.is_none()
+    }) else {
+        let mut config = config;
+        config.remote_addr = first;
+        return connect_h3(config).await;
+    };
+
+    race_h3_candidates(candidates, happy_eyeballs, move |candidate| {
+        let mut config = config.clone();
+        config.remote_addr = candidate;
+        async move { connect_h3(config).await }
+    })
+    .await
+}
+
+async fn race_h3_candidates<T, Connect, ConnectFuture>(
+    candidates: &[SocketAddr],
+    policy: &HappyEyeballsConfig,
+    connect: Connect,
+) -> Result<T, H3Error>
+where
+    Connect: Fn(SocketAddr) -> ConnectFuture,
+    ConnectFuture: Future<Output = Result<T, H3Error>>,
+{
+    let ordered = policy.order_candidates(candidates);
+    let first = ordered
+        .first()
+        .copied()
+        .ok_or(H3Error::NoResolvedCandidate)?;
+    let mut attempts = FuturesUnordered::new();
+    attempts.push(connect(first));
+
+    let mut next_index = 1;
+    let mut next_launch_at = Instant::now().checked_add(policy.try_delay);
+    let mut last_error = None;
+    loop {
+        if attempts.is_empty() {
+            return Err(last_error.unwrap_or(H3Error::NoResolvedCandidate));
+        }
+
+        let result = if next_index < ordered.len() && attempts.len() < policy.max_concurrent.get() {
+            match next_launch_at {
+                Some(deadline) => {
+                    tokio::select! {
+                        result = attempts.next() => result,
+                        () = sleep_until(deadline) => {
+                            attempts.push(connect(ordered[next_index]));
+                            next_index += 1;
+                            next_launch_at = Instant::now().checked_add(policy.try_delay);
+                            continue;
+                        }
+                    }
+                }
+                None => attempts.next().await,
+            }
+        } else {
+            attempts.next().await
+        };
+
+        let Some(result) = result else {
+            return Err(last_error.unwrap_or(H3Error::NoResolvedCandidate));
+        };
+        match result {
+            Ok(client) => return Ok(client),
+            Err(error) if is_socket_protection_error(&error) => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+
+        if next_index < ordered.len() {
+            attempts.push(connect(ordered[next_index]));
+            next_index += 1;
+            next_launch_at = Instant::now().checked_add(policy.try_delay);
+        }
+    }
+}
+
+fn is_socket_protection_error(error: &H3Error) -> bool {
+    matches!(
+        error,
+        H3Error::Transport(TransportError::SocketProtection(_))
+    )
+}
+
+struct EmptyConnectionId;
+
+impl quinn::ConnectionIdGenerator for EmptyConnectionId {
+    fn generate_cid(&mut self) -> quinn::ConnectionId {
+        quinn::ConnectionId::new(&[])
+    }
+
+    fn cid_len(&self) -> usize {
+        0
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        None
+    }
+}
+
+fn build_quinn_config(
+    config: &H3ConnectConfig,
+    datagram_buffers: Option<(usize, usize, u16)>,
+    wire_overhead: usize,
+    switch: Option<&Arc<ControllerSwitch>>,
+) -> Result<(EndpointConfig, ClientConfig), H3Error> {
+    let mut endpoint = EndpointConfig::default();
+    endpoint.supported_versions(vec![QUIC_V1]);
+    if config.quic.chrome_parrot {
+        // Xray gives a ChromeParrot dial's Transport quic-go's
+        // ZeroLengthConnectionIDGenerator.
+        endpoint.cid_generator(|| Box::new(EmptyConnectionId));
+    } else if let Some(len) = config.quic.connection_id_len {
+        let len = usize::from(len);
+        endpoint
+            .cid_generator(move || Box::new(quinn_proto::RandomConnectionIdGenerator::new(len)));
+    } else if datagram_buffers.is_some() {
+        // Hysteria owns one connection per endpoint and keeps a fixed server
+        // address, so incoming packets need no connection ID for demultiplexing.
+        // This saves eight bytes per server packet. Local socket rebinds still
+        // address the server using its nonempty CID, as in native Hysteria.
+        endpoint.cid_generator(|| Box::new(EmptyConnectionId));
+    }
+
+    let stream_window = quinn_varint(
+        "initialStreamReceiveWindow",
+        config.quic.initial_stream_receive_window,
+    )?;
+    let connection_window = quinn_varint(
+        "initialConnectionReceiveWindow",
+        config.quic.initial_connection_receive_window,
+    )?;
+    let max_incoming = quinn_varint(
+        "maxIncomingStreams",
+        config.quic.max_incoming_bidirectional_streams,
+    )?;
+    let idle_timeout = config.quic.max_idle_timeout.try_into().map_err(|_| {
+        H3Error::InvalidTransportParameter {
+            name: "maxIdleTimeout",
+            value: config.quic.max_idle_timeout.as_millis(),
+        }
+    })?;
+
+    let mut transport = TransportConfig::default();
+    transport
+        .max_idle_timeout(Some(idle_timeout))
+        .keep_alive_interval(config.quic.keep_alive_interval)
+        .stream_receive_window(stream_window)
+        .receive_window(connection_window)
+        .max_concurrent_bidi_streams(max_incoming)
+        .send_window(QUIC_INITIAL_SEND_WINDOW);
+    if let Some((receive, send, frame_size)) = datagram_buffers {
+        transport.datagram_receive_buffer_size(Some(receive));
+        transport.datagram_send_buffer_size(send);
+        transport.advertised_datagram_frame_size(Some(frame_size));
+    }
+    if wire_overhead > 0 {
+        // Reserve Salamander's salt and a custom prefix within the normal
+        // IPv6-safe wire budget, never below QUIC's 1200-byte minimum.
+        let mut mtu = quinn::MtuDiscoveryConfig::default();
+        let budget = 1452usize.saturating_sub(wire_overhead).max(1200);
+        mtu.upper_bound(budget as u16);
+        transport.mtu_discovery_config(Some(mtu));
+    }
+    if let Some(size) = config.quic.initial_packet_size {
+        transport.initial_mtu(size).min_mtu(size);
+    }
+    if config.quic.disable_path_mtu_discovery {
+        transport.mtu_discovery_config(None);
+    }
+    // quic-go's `Transport.DisableGSO`.
+    transport.enable_segmentation_offload(!config.quic.disable_gso);
+    if config.quic.chrome_parrot {
+        transport
+            .chrome_parrot(true)
+            .max_concurrent_uni_streams(varint(crate::chrome_parrot::MAX_INCOMING_UNI_STREAMS));
+    }
+    match config.quic.congestion {
+        H3Congestion::BbrStandard if !STANDARD_RUNS_XRAY_BBR => {
+            transport.congestion_controller_factory(quinn_bbr());
+        }
+        H3Congestion::Reno => {
+            transport.congestion_controller_factory(Arc::new(
+                quinn::congestion::NewRenoConfig::default(),
+            ));
+        }
+        H3Congestion::ForceBrutal {
+            bytes_per_second: 0,
+        } => {
+            return Err(H3Error::UnsupportedCongestion {
+                requested: config.quic.congestion,
+            });
+        }
+        H3Congestion::BbrStandard
+        | H3Congestion::BbrConservative
+        | H3Congestion::BbrAggressive
+        | H3Congestion::Brutal { .. }
+        | H3Congestion::ForceBrutal { .. } => {
+            let Some(switch) = switch else {
+                return Err(match config.quic.congestion {
+                    H3Congestion::Brutal { .. } => H3Error::BrutalNeedsHysteria,
+                    requested => H3Error::UnsupportedCongestion { requested },
+                });
+            };
+            transport.congestion_controller_factory(Arc::new(SwitchedFactory(Arc::clone(switch))));
+        }
+    }
+
+    let crypto = QuicClientConfig::try_from(Arc::clone(&config.tls_config))
+        .map_err(|error| H3Error::TlsConfig(error.to_string()))?;
+    let mut client = ClientConfig::new(Arc::new(crypto));
+    client
+        .version(QUIC_V1)
+        .transport_config(Arc::new(transport));
+    if config.quic.chrome_parrot {
+        client.initial_dst_cid_provider(Arc::new(|| {
+            quinn::ConnectionIdGenerator::generate_cid(
+                &mut quinn_proto::RandomConnectionIdGenerator::new(
+                    crate::chrome_parrot::INITIAL_CONNECTION_ID_LEN,
+                ),
+            )
+        }));
+    }
+    Ok((endpoint, client))
+}
+
+fn quinn_varint(name: &'static str, value: u64) -> Result<VarInt, H3Error> {
+    VarInt::from_u64(value).map_err(|_| H3Error::InvalidTransportParameter {
+        name,
+        value: u128::from(value),
+    })
+}
+
+fn xhttp_receive_batch(class: MemoryClass) -> usize {
+    match class {
+        MemoryClass::Standard => XHTTP_RECEIVE_BATCH,
+        MemoryClass::Constrained => CONSTRAINED_XHTTP_RECEIVE_BATCH,
+    }
+}
+
+// Match the bounded carrier buffer request used by the Go QUIC references.
+// The OS can clamp/refuse it. These are kernel queues, not process RSS.
+pub(crate) fn configure_quic_datagram_socket(socket: &StdUdpSocket) {
+    let socket = socket2::SockRef::from(socket);
+    let _ = socket.set_recv_buffer_size(7 * 1024 * 1024);
+    let _ = socket.set_send_buffer_size(7 * 1024 * 1024);
+}
+
+fn protect_quic_socket(
+    socket: &StdUdpSocket,
+    protector: Option<&dyn SocketProtector>,
+) -> Result<(), H3Error> {
+    if let Some(protector) = protector {
+        protector
+            .protect(SocketHandle::from_std_udp_socket(socket))
+            .map_err(TransportError::SocketProtection)?;
+    }
+    Ok(())
+}
+
+struct ExchangeShared {
+    cancel: watch::Sender<bool>,
+    _connection_guard: H3SendRequest,
+    driver: Arc<H3ConnectionDriver>,
+}
+
+impl ExchangeShared {
+    fn cancel(&self) {
+        self.cancel.send_replace(true);
+    }
+
+    fn cancellation(&self) -> watch::Receiver<bool> {
+        self.cancel.subscribe()
+    }
+}
+
+async fn cancelled(receiver: &mut watch::Receiver<bool>) {
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn drive_upload(
+    mut send: H3SendHalf,
+    mut input: DuplexStream,
+    expected_content_length: Option<u64>,
+    shared: Arc<ExchangeShared>,
+    status: Arc<UploadWorkerStatus>,
+    completion: oneshot::Sender<Result<(), H3Error>>,
+) {
+    let mut cancellation = shared.cancellation();
+    let mut buffer = [0_u8; MAX_UPLOAD_DATA_BYTES];
+    let mut since_window_sample = 0_usize;
+    let result = loop {
+        let read = tokio::select! {
+            biased;
+            () = cancelled(&mut cancellation) => break Err(H3Error::Cancelled),
+            read = input.read(&mut buffer) => read,
+        };
+        let read = match read {
+            Ok(read) => read,
+            Err(source) => break Err(H3Error::UploadIo(source)),
+        };
+        if read == 0 {
+            break tokio::select! {
+                biased;
+                () = cancelled(&mut cancellation) => Err(H3Error::Cancelled),
+                result = send.finish() => match result {
+                    Ok(()) => Ok(()),
+                    // Xray-core stops reading a fixed-length H3 request with
+                    // H3_NO_ERROR as soon as it has consumed Content-Length.
+                    // That STOP_SENDING can race with our separate QUIC FIN.
+                    // Accept it only when every declared body byte has already
+                    // passed send_data. Unknown-length and partial uploads,
+                    // other codes, and send_data failures remain authoritative.
+                    Err(h3::error::StreamError::RemoteTerminate { code, .. })
+                        if code == Code::H3_NO_ERROR
+                            && expected_content_length
+                                == Some(status.delivered.load(Ordering::Acquire)) => Ok(()),
+                    Err(source) => Err(H3Error::Http3Stream {
+                        context: "request body could not be finished",
+                        source,
+                    }),
+                },
+            };
+        }
+
+        let data = Bytes::copy_from_slice(&buffer[..read]);
+        let sent = tokio::select! {
+            biased;
+            () = cancelled(&mut cancellation) => Err(H3Error::Cancelled),
+            result = send.send_data(data) => result.map_err(|source| H3Error::Http3Stream {
+                context: "request DATA could not be sent",
+                source,
+            }),
+        };
+        if let Err(error) = sent {
+            break Err(error);
+        }
+        status.delivered.fetch_add(read as u64, Ordering::Release);
+        status.waker.wake();
+        since_window_sample += read;
+        if since_window_sample >= shared.driver.send_window.sample_bytes() {
+            since_window_sample = 0;
+            shared.driver.update_send_window();
+        }
+    };
+
+    if result.is_err() {
+        send.stop_stream(Code::H3_REQUEST_CANCELLED);
+        shared.cancel();
+    }
+    if let Err(error) = &result {
+        status.fail(error);
+    }
+    status.done.store(true, Ordering::Release);
+    status.waker.wake();
+    let _ = completion.send(result);
+}
+
+enum BodyEvent {
+    Data(Bytes),
+    End(Option<HeaderMap>),
+    Error(H3Error),
+}
+
+async fn drive_response(
+    mut recv: H3RecvHalf,
+    response_is_bodyless: bool,
+    shared: Arc<ExchangeShared>,
+    headers: oneshot::Sender<Result<HeaderMap, H3Error>>,
+    body: mpsc::Sender<BodyEvent>,
+) {
+    let mut cancellation = shared.cancellation();
+    let mut headers = Some(headers);
+    let result = drive_response_inner(
+        &mut recv,
+        response_is_bodyless,
+        &mut cancellation,
+        &mut headers,
+        &body,
+        &shared.driver,
+    )
+    .await;
+
+    if let Err(error) = result {
+        recv.stop_sending(Code::H3_REQUEST_CANCELLED);
+        shared.cancel();
+        if let Some(headers) = headers.take() {
+            let _ = headers.send(Err(error));
+        } else {
+            let _ = body.try_send(BodyEvent::Error(error));
+        }
+    }
+}
+
+async fn drive_response_inner(
+    recv: &mut H3RecvHalf,
+    response_is_bodyless: bool,
+    cancellation: &mut watch::Receiver<bool>,
+    headers: &mut Option<oneshot::Sender<Result<HeaderMap, H3Error>>>,
+    body: &mpsc::Sender<BodyEvent>,
+    driver: &H3ConnectionDriver,
+) -> Result<(), H3Error> {
+    let response = tokio::select! {
+        biased;
+        () = cancelled(cancellation) => return Err(H3Error::Cancelled),
+        result = recv.recv_response() => result.map_err(|source| H3Error::Http3Stream {
+            context: "response headers could not be received",
+            source,
+        })?,
+    };
+    let (parts, ()) = response.into_parts();
+    if parts.status != StatusCode::OK {
+        return Err(H3Error::UnexpectedStatus {
+            status: parts.status,
+        });
+    }
+    headers
+        .take()
+        .ok_or(H3Error::ResponseTaskClosed)?
+        .send(Ok(parts.headers))
+        .map_err(|_| H3Error::ResponseConsumerDropped)?;
+
+    if response_is_bodyless {
+        recv.stop_sending(Code::H3_REQUEST_CANCELLED);
+        return Ok(());
+    }
+
+    let mut pending = Bytes::new();
+    loop {
+        if pending.is_empty() {
+            let data = tokio::select! {
+                biased;
+                () = cancelled(cancellation) => return Err(H3Error::Cancelled),
+                result = poll_fn(|cx| {
+                    let data = recv.poll_recv_data(cx);
+                    if data.is_pending() {
+                        // Nothing is buffered: the reader keeps up. A batch
+                        // that ended at its byte limit never polled for this,
+                        // so a burst buffered whole before the batches drained
+                        // it would otherwise look like a reader falling behind.
+                        driver.record_caught_up();
+                    }
+                    data
+                }) => result.map_err(|source| H3Error::Http3Stream {
+                    context: "response DATA could not be received",
+                    source,
+                })?,
+            };
+            let Some(mut data) = data else {
+                break;
+            };
+            pending = data.copy_to_bytes(data.remaining());
+            driver.record_download(pending.len());
+        }
+        let first = pending.split_to(pending.len().min(MAX_RESPONSE_BATCH_BYTES));
+        let mut combined: Option<BytesMut> = None;
+        let mut length = first.len();
+        let mut end = false;
+        let mut failure = None;
+        // HTTP/3 can expose one QUIC packet per DATA chunk. Pass immediately
+        // available chunks through the one-slot channel together, without
+        // waiting to fill a batch or changing transport flow-control credit.
+        for _ in 1..MAX_RESPONSE_BATCH_CHUNKS {
+            if length == MAX_RESPONSE_BATCH_BYTES || !pending.is_empty() {
+                break;
+            }
+            match poll_fn(|cx| Poll::Ready(recv.poll_recv_data(cx))).await {
+                Poll::Pending => {
+                    // Nothing more is buffered: the reader keeps up.
+                    driver.record_caught_up();
+                    break;
+                }
+                Poll::Ready(Ok(None)) => {
+                    end = true;
+                    break;
+                }
+                Poll::Ready(Err(source)) => {
+                    failure = Some(H3Error::Http3Stream {
+                        context: "response DATA could not be received",
+                        source,
+                    });
+                    break;
+                }
+                Poll::Ready(Ok(Some(mut data))) => {
+                    pending = data.copy_to_bytes(data.remaining());
+                    driver.record_download(pending.len());
+                    let take = pending.len().min(MAX_RESPONSE_BATCH_BYTES - length);
+                    if take != 0 {
+                        let buffer = combined.get_or_insert_with(|| {
+                            let mut buffer = BytesMut::with_capacity(MAX_RESPONSE_BATCH_BYTES);
+                            buffer.extend_from_slice(&first);
+                            buffer
+                        });
+                        buffer.extend_from_slice(&pending.split_to(take));
+                        length += take;
+                    }
+                }
+            }
+        }
+        let data = combined.map_or(first, BytesMut::freeze);
+        tokio::select! {
+            biased;
+            () = cancelled(cancellation) => return Err(H3Error::Cancelled),
+            result = body.send(BodyEvent::Data(data)) => {
+                result.map_err(|_| H3Error::ResponseConsumerDropped)?;
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if end {
+            break;
+        }
+    }
+
+    let trailers = tokio::select! {
+        biased;
+        () = cancelled(cancellation) => return Err(H3Error::Cancelled),
+        result = recv.recv_trailers() => result.map_err(|source| H3Error::Http3Stream {
+            context: "response trailers could not be received",
+            source,
+        })?,
+    };
+    tokio::select! {
+        biased;
+        () = cancelled(cancellation) => Err(H3Error::Cancelled),
+        result = body.send(BodyEvent::End(trailers)) => {
+            result.map_err(|_| H3Error::ResponseConsumerDropped)
+        }
+    }
+}
+
+/// Flow-controlled request body for a streaming HTTP/3 exchange.
+pub struct H3Upload {
+    io: DuplexStream,
+    completion: Option<oneshot::Receiver<Result<(), H3Error>>>,
+    finished: bool,
+    accepted: u64,
+    status: Arc<UploadWorkerStatus>,
+    shared: Arc<ExchangeShared>,
+}
+
+struct UploadWorkerStatus {
+    delivered: AtomicU64,
+    done: AtomicBool,
+    failure: Mutex<Option<UploadWorkerFailure>>,
+    waker: AtomicWaker,
+}
+
+impl UploadWorkerStatus {
+    fn new() -> Self {
+        Self {
+            delivered: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+            failure: Mutex::new(None),
+            waker: AtomicWaker::new(),
+        }
+    }
+
+    fn fail(&self, error: &H3Error) {
+        *lock_unpoisoned(&self.failure) = Some(UploadWorkerFailure {
+            kind: h3_io_error_kind(error),
+            message: error.to_string(),
+        });
+    }
+}
+
+struct UploadWorkerFailure {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl UploadWorkerFailure {
+    fn to_io_error(&self) -> io::Error {
+        io::Error::new(self.kind, self.message.clone())
+    }
+}
+
+impl fmt::Debug for H3Upload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("H3Upload")
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+impl H3Upload {
+    async fn send_owned(&mut self, body: Bytes) -> Result<(), H3Error> {
+        self.write_all(&body).await.map_err(H3Error::UploadIo)?;
+        self.shutdown().await.map_err(H3Error::UploadIo)
+    }
+
+    fn worker_error(&self) -> Option<io::Error> {
+        lock_unpoisoned(&self.status.failure)
+            .as_ref()
+            .map(UploadWorkerFailure::to_io_error)
+    }
+
+    fn poll_delivery(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(error) = self.worker_error() {
+            return Poll::Ready(Err(error));
+        }
+        if self.status.delivered.load(Ordering::Acquire) >= self.accepted {
+            return Poll::Ready(Ok(()));
+        }
+        if self.status.done.load(Ordering::Acquire) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "HTTP/3 upload worker stopped before delivering accepted bytes",
+            )));
+        }
+
+        self.status.waker.register(cx.waker());
+        if let Some(error) = self.worker_error() {
+            return Poll::Ready(Err(error));
+        }
+        if self.status.delivered.load(Ordering::Acquire) >= self.accepted {
+            Poll::Ready(Ok(()))
+        } else if self.status.done.load(Ordering::Acquire) {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "HTTP/3 upload worker stopped before delivering accepted bytes",
+            )))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for H3Upload {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.shared.cancel();
+        }
+    }
+}
+
+impl AsyncWrite for H3Upload {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "HTTP/3 request body is already closed",
+            )));
+        }
+        if let Some(error) = this.worker_error() {
+            return Poll::Ready(Err(error));
+        }
+        let result = Pin::new(&mut this.io).poll_write(cx, input);
+        match result {
+            Poll::Ready(Ok(written)) => {
+                this.accepted = this.accepted.saturating_add(written as u64);
+                Poll::Ready(Ok(written))
+            }
+            Poll::Ready(Err(error)) => {
+                this.shared.cancel();
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(error) = this.worker_error() {
+            this.shared.cancel();
+            return Poll::Ready(Err(error));
+        }
+        match Pin::new(&mut this.io).poll_flush(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                this.shared.cancel();
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Ok(())) => this.poll_delivery(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(Ok(()));
+        }
+        if let Poll::Ready(result) = Pin::new(&mut this.io).poll_shutdown(cx) {
+            if let Err(error) = result {
+                this.shared.cancel();
+                return Poll::Ready(Err(error));
+            }
+        } else {
+            return Poll::Pending;
+        }
+
+        let Some(completion) = &mut this.completion else {
+            this.shared.cancel();
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "HTTP/3 upload task ended without completion",
+            )));
+        };
+        match ready!(Pin::new(completion).poll(cx)) {
+            Ok(Ok(())) => {
+                this.finished = true;
+                this.completion = None;
+                Poll::Ready(Ok(()))
+            }
+            Ok(Err(error)) => {
+                this.shared.cancel();
+                Poll::Ready(Err(h3_io_error(error)))
+            }
+            Err(_) => {
+                this.shared.cancel();
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "HTTP/3 upload task stopped",
+                )))
+            }
+        }
+    }
+}
+
+/// Response headers that have not arrived yet.
+pub struct H3PendingResponse {
+    headers: Option<oneshot::Receiver<Result<HeaderMap, H3Error>>>,
+    body: Option<mpsc::Receiver<BodyEvent>>,
+    response_is_bodyless: bool,
+    cancel_on_drop: bool,
+    shared: Arc<ExchangeShared>,
+}
+
+impl fmt::Debug for H3PendingResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("H3PendingResponse")
+            .field("response_is_bodyless", &self.response_is_bodyless)
+            .field("consumed", &self.headers.is_none())
+            .finish_non_exhaustive()
+    }
+}
+
+impl H3PendingResponse {
+    pub async fn open(mut self) -> Result<H3ResponseBody, H3Error> {
+        let Some(headers) = self.headers.take() else {
+            self.cancel_on_drop = false;
+            return Err(H3Error::ResponseConsumed);
+        };
+        let headers = match headers.await {
+            Ok(Ok(headers)) => headers,
+            Ok(Err(error)) => {
+                self.cancel_on_drop = false;
+                return Err(error);
+            }
+            Err(_) => {
+                self.shared.cancel();
+                self.cancel_on_drop = false;
+                return Err(H3Error::ResponseTaskClosed);
+            }
+        };
+
+        self.cancel_on_drop = false;
+        let body = if self.response_is_bodyless {
+            None
+        } else {
+            self.body.take()
+        };
+        Ok(H3ResponseBody {
+            headers,
+            trailers: None,
+            body,
+            pending: Bytes::new(),
+            eof: self.response_is_bodyless,
+            failure: None,
+            shared: Arc::clone(&self.shared),
+        })
+    }
+}
+
+impl Drop for H3PendingResponse {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            self.shared.cancel();
+        }
+    }
+}
+
+/// Backpressured response body for one HTTP/3 request.
+pub struct H3ResponseBody {
+    headers: HeaderMap,
+    trailers: Option<HeaderMap>,
+    body: Option<mpsc::Receiver<BodyEvent>>,
+    pending: Bytes,
+    eof: bool,
+    failure: Option<String>,
+    shared: Arc<ExchangeShared>,
+}
+
+impl fmt::Debug for H3ResponseBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("H3ResponseBody")
+            .field("headers", &self.headers)
+            .field("trailers", &self.trailers)
+            .field("eof", &self.eof)
+            .field("failure", &self.failure)
+            .finish_non_exhaustive()
+    }
+}
+
+impl H3ResponseBody {
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    pub fn trailers(&self) -> Option<&HeaderMap> {
+        self.trailers.as_ref()
+    }
+
+    fn fail(&mut self, message: String) -> io::Error {
+        self.failure = Some(message.clone());
+        self.shared.cancel();
+        io::Error::new(io::ErrorKind::ConnectionReset, message)
+    }
+}
+
+impl Drop for H3ResponseBody {
+    fn drop(&mut self) {
+        if !self.eof {
+            self.shared.cancel();
+        }
+    }
+}
+
+impl AsyncRead for H3ResponseBody {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if output.remaining() == 0 || this.eof {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(failure) = &this.failure {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                failure.clone(),
+            )));
+        }
+
+        loop {
+            if !this.pending.is_empty() {
+                let copied = this.pending.len().min(output.remaining());
+                output.put_slice(&this.pending.split_to(copied));
+                return Poll::Ready(Ok(()));
+            }
+
+            let Some(body) = &mut this.body else {
+                return Poll::Ready(Err(
+                    this.fail("HTTP/3 response task ended before EOF".to_owned())
+                ));
+            };
+            match ready!(body.poll_recv(cx)) {
+                Some(BodyEvent::Data(data)) => {
+                    this.pending = data;
+                }
+                Some(BodyEvent::End(trailers)) => {
+                    this.trailers = trailers;
+                    this.body = None;
+                    this.eof = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Some(BodyEvent::Error(error)) => {
+                    this.body = None;
+                    return Poll::Ready(Err(this.fail(error.to_string())));
+                }
+                None => {
+                    this.body = None;
+                    return Poll::Ready(Err(
+                        this.fail("HTTP/3 response task ended before EOF".to_owned())
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn h3_io_error(error: H3Error) -> io::Error {
+    io::Error::new(h3_io_error_kind(&error), error)
+}
+
+fn h3_io_error_kind(error: &H3Error) -> io::ErrorKind {
+    match error {
+        H3Error::Cancelled => io::ErrorKind::ConnectionReset,
+        H3Error::UploadIo(source) => source.kind(),
+        _ => io::ErrorKind::BrokenPipe,
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+mod send_window_tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn one_upload_keeps_the_former_window_range() {
+        let window = |cwnd| xhttp_send_window(cwnd, 1, MemoryClass::Standard);
+        assert_eq!(window(64 * 1024), 2 * MIB);
+        assert_eq!(window(3_000_000), 6_000_000);
+        assert_eq!(window(8_000_000), QUIC_MAX_SEND_WINDOW);
+        assert_eq!(
+            xhttp_send_window(64 * 1024, 0, MemoryClass::Standard),
+            2 * MIB
+        );
+    }
+
+    #[test]
+    fn concurrent_uploads_split_the_budget_and_the_ceiling() {
+        let window = |cwnd, uploading| xhttp_send_window(cwnd, uploading, MemoryClass::Standard);
+        assert_eq!(window(1_500_000, 2), 3_000_000);
+        assert_eq!(window(0, 4), 2 * MIB);
+        assert_eq!(window(u64::MAX, 4), 2_500_000);
+        assert_eq!(window(0, 8), 2 * MIB);
+        assert_eq!(window(u64::MAX, 8), 2 * MIB);
+        assert_eq!(window(0, 16), MIB);
+        assert_eq!(window(0, 32), 512 * 1024);
+        assert_eq!(window(u64::MAX, 32), 512 * 1024);
+        assert_eq!(window(u64::MAX, 1000), XHTTP_MIN_SEND_WINDOW);
+    }
+
+    #[test]
+    fn a_constrained_host_shares_half_and_never_grows_past_it() {
+        let window = |cwnd, uploading| xhttp_send_window(cwnd, uploading, MemoryClass::Constrained);
+        assert_eq!(window(0, 1), 2 * MIB);
+        assert_eq!(window(u64::MAX, 1), 4 * MIB);
+        assert_eq!(window(u64::MAX, 2), 2 * MIB);
+        assert_eq!(window(u64::MAX, 8), 512 * 1024);
+    }
+
+    #[test]
+    fn transfer_activity_counts_each_connection_once_and_forgets_quiet_ones() {
+        let activity = TransferActivity::new();
+        let (first, second, third) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+        let start = std::time::Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+
+        assert_eq!(activity.mark(&first, at(0)), 1);
+        assert_eq!(activity.mark(&first, at(10)), 1);
+        assert_eq!(activity.mark(&second, at(20)), 2);
+        // The second connection still counts for the period after its sample.
+        assert_eq!(activity.mark(&first, at(1_100)), 2);
+        assert_eq!(activity.mark(&first, at(2_200)), 1);
+        // A clock read before another caller moved on counts in the new period.
+        assert_eq!(activity.mark(&second, at(1_900)), 2);
+        assert_eq!(activity.mark(&third, at(6_000)), 1);
+    }
+}
+
+#[cfg(test)]
+mod receive_window_tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn a_lone_download_keeps_its_largest_auto_tuned_window() {
+        let share = |max_stream| xhttp_stream_receive_share(1, max_stream, MemoryClass::Standard);
+        assert_eq!(share(XRAY_MAX_STREAM_RECEIVE_WINDOW), 16 * MIB);
+        // A configured maximum above the budget is still reachable alone.
+        assert_eq!(share(64 * MIB), 64 * MIB);
+        assert_eq!(
+            xhttp_stream_receive_share(0, XRAY_MAX_STREAM_RECEIVE_WINDOW, MemoryClass::Standard),
+            16 * MIB
+        );
+        // Two downloads may each still reach Xray's 6 MiB.
+        assert_eq!(
+            xhttp_stream_receive_share(2, XRAY_MAX_STREAM_RECEIVE_WINDOW, MemoryClass::Standard),
+            8 * MIB
+        );
+    }
+
+    #[test]
+    fn concurrent_downloads_split_the_budget() {
+        let share = |downloading| {
+            xhttp_stream_receive_share(
+                downloading,
+                XRAY_MAX_STREAM_RECEIVE_WINDOW,
+                MemoryClass::Standard,
+            )
+        };
+        assert_eq!(share(8), 2 * MIB);
+        assert_eq!(share(16), MIB);
+        assert_eq!(share(32), 512 * 1024);
+        assert_eq!(share(128), XHTTP_MIN_STREAM_RECEIVE_WINDOW);
+        assert_eq!(share(1000), XHTTP_MIN_STREAM_RECEIVE_WINDOW);
+        assert_eq!(
+            xhttp_stream_receive_share(32, 64 * MIB, MemoryClass::Standard),
+            2 * MIB
+        );
+    }
+
+    #[test]
+    fn a_constrained_host_shares_a_quarter() {
+        let share = |downloading| {
+            xhttp_stream_receive_share(
+                downloading,
+                XRAY_INITIAL_STREAM_RECEIVE_WINDOW,
+                MemoryClass::Constrained,
+            )
+        };
+        assert_eq!(share(1), 4 * MIB);
+        assert_eq!(share(2), 2 * MIB);
+        assert_eq!(share(8), 512 * 1024);
+        assert_eq!(share(32), XHTTP_MIN_STREAM_RECEIVE_WINDOW);
+    }
+
+    #[test]
+    fn a_reader_that_falls_behind_is_held_to_its_share() {
+        const SHARE: u64 = 512 * 1024;
+        let window = H3QuicConfig::default().receive_window(MemoryClass::Standard);
+        assert!(window.tunes);
+        let mut tuning = lock_unpoisoned(&window.tuning);
+        let start = tuning.caught_up_at;
+        let at = |millis| start + Duration::from_millis(millis);
+        let loopback = || Duration::from_millis(1);
+        // Until its reader falls behind, a connection offers its tuned window:
+        // four samples are not enough within the first 10 ms.
+        for millis in 1..=u64::from(XHTTP_BEHIND_SAMPLES) {
+            tuning.resample(SHARE, false, at(millis), loopback);
+            assert_eq!(tuning.reoffer(), None);
+        }
+        tuning.resample(SHARE, false, at(12), loopback);
+        assert_eq!(tuning.reoffer(), Some(SHARE));
+        tuning.stream = 4 * MIB;
+        assert_eq!(tuning.reoffer(), None);
+        // Keeping up again doubles its allowance at every sample.
+        for (millis, offered) in [(13, MIB), (14, 2 * MIB), (15, 4 * MIB)] {
+            tuning.resample(SHARE, true, at(millis), loopback);
+            assert_eq!(tuning.reoffer(), Some(offered));
+        }
+        // A sample behind is not yet falling behind.
+        tuning.resample(SHARE, false, at(16), loopback);
+        assert_eq!(tuning.reoffer(), None);
+
+        // A constrained host's window never grows, but its share applies.
+        let window = H3QuicConfig::default().receive_window(MemoryClass::Constrained);
+        assert!(!window.tunes);
+        let mut tuning = lock_unpoisoned(&window.tuning);
+        let share = xhttp_stream_receive_share(32, window.max_stream, window.class);
+        let start = tuning.caught_up_at;
+        for millis in 0..u64::from(XHTTP_BEHIND_SAMPLES) {
+            tuning.resample(
+                share,
+                false,
+                start + Duration::from_millis(10 + millis),
+                loopback,
+            );
+        }
+        assert_eq!(tuning.reoffer(), Some(XHTTP_MIN_STREAM_RECEIVE_WINDOW));
+    }
+
+    #[test]
+    fn a_reader_that_keeps_up_keeps_its_tuned_window() {
+        let window = H3QuicConfig::default().receive_window(MemoryClass::Standard);
+        let mut tuning = lock_unpoisoned(&window.tuning);
+        tuning.stream = XRAY_MAX_STREAM_RECEIVE_WINDOW;
+        assert_eq!(tuning.reoffer(), Some(XRAY_MAX_STREAM_RECEIVE_WINDOW));
+        // Its window waits in the network, so a small share does not hold it,
+        // nor does a 100 ms round trip's burst that keeps it from catching up
+        // for many samples.
+        let start = tuning.caught_up_at;
+        let long_path = || Duration::from_millis(100);
+        for burst in 0..10 {
+            let begin = start + Duration::from_millis(150 * burst);
+            tuning.resample(XHTTP_MIN_STREAM_RECEIVE_WINDOW, true, begin, long_path);
+            for sample in 1..=40 {
+                let now = begin + Duration::from_millis(3 * sample);
+                tuning.resample(XHTTP_MIN_STREAM_RECEIVE_WINDOW, false, now, long_path);
+                assert_eq!(tuning.reoffer(), None);
+            }
+        }
+        // Two round trips without catching up are falling behind, but the
+        // reader keeps what it took in them: 41 samples in 201 ms.
+        let now = start + Duration::from_millis(150 * 9 + 201);
+        tuning.resample(XHTTP_MIN_STREAM_RECEIVE_WINDOW, false, now, long_path);
+        let taken = 41 * XHTTP_RECEIVE_SAMPLE_BYTES * 200 / 201;
+        let offered = tuning.reoffer().expect("a held window");
+        assert!(
+            offered.abs_diff(taken) < 1024,
+            "offered {offered}, took {taken}"
+        );
+    }
+
+    #[test]
+    fn a_reader_behind_on_a_long_path_keeps_what_it_takes_per_round_trip() {
+        const SHARE: u64 = 512 * 1024;
+        let window = H3QuicConfig::default().receive_window(MemoryClass::Standard);
+        let mut tuning = lock_unpoisoned(&window.tuning);
+        tuning.stream = XRAY_MAX_STREAM_RECEIVE_WINDOW;
+        let start = tuning.caught_up_at;
+        // 3 MiB in 300 ms over a 50 ms round trip: 1 MiB in two round trips.
+        let path = || Duration::from_millis(50);
+        for sample in 1..=48 {
+            let now = start + Duration::from_micros(6250 * sample);
+            tuning.resample(SHARE, false, now, path);
+        }
+        assert_eq!(tuning.reoffer(), Some(MIB));
+        // On loopback the same reader takes less than its share in two round
+        // trips, so the share holds it.
+        let window = H3QuicConfig::default().receive_window(MemoryClass::Standard);
+        let mut tuning = lock_unpoisoned(&window.tuning);
+        let start = tuning.caught_up_at;
+        for sample in 1..=48 {
+            let now = start + Duration::from_micros(6250 * sample);
+            tuning.resample(SHARE, false, now, || Duration::from_millis(1));
+        }
+        assert_eq!(tuning.reoffer(), Some(SHARE));
+    }
+}
+
+#[cfg(test)]
+mod candidate_scheduler_tests {
+    use std::future::pending;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::num::NonZeroUsize;
+
+    use super::*;
+
+    fn addresses() -> [SocketAddr; 4] {
+        [
+            SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 443),
+            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 443),
+            SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 443),
+            SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 443),
+        ]
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidate_order_and_delay_are_applied_before_a_winner() {
+        let candidates = addresses();
+        let winner = candidates[0];
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn({
+            let starts = Arc::clone(&starts);
+            async move {
+                let policy = HappyEyeballsConfig {
+                    prioritize_ipv6: true,
+                    interleave: 1,
+                    try_delay: Duration::from_millis(10),
+                    max_concurrent: NonZeroUsize::new(2).expect("nonzero concurrency"),
+                };
+                race_h3_candidates(&candidates, &policy, move |candidate| {
+                    let starts = Arc::clone(&starts);
+                    async move {
+                        lock_unpoisoned(&starts).push(candidate);
+                        if candidate == winner {
+                            Ok(candidate)
+                        } else {
+                            pending::<Result<SocketAddr, H3Error>>().await
+                        }
+                    }
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *lock_unpoisoned(&starts),
+            vec![candidates[1]],
+            "IPv6 preference must select the first attempt"
+        );
+
+        tokio::time::advance(Duration::from_millis(9)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*lock_unpoisoned(&starts), vec![candidates[1]]);
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let selected = task
+            .await
+            .expect("candidate task")
+            .expect("second candidate");
+        assert_eq!(selected, winner);
+        assert_eq!(*lock_unpoisoned(&starts), vec![candidates[1], winner]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn max_concurrent_one_defers_the_next_candidate_until_failure() {
+        let candidates = addresses();
+        let first = candidates[0];
+        let second = candidates[1];
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn({
+            let starts = Arc::clone(&starts);
+            async move {
+                let policy = HappyEyeballsConfig {
+                    prioritize_ipv6: false,
+                    interleave: 1,
+                    try_delay: Duration::from_millis(10),
+                    max_concurrent: NonZeroUsize::MIN,
+                };
+                race_h3_candidates(&candidates, &policy, move |candidate| {
+                    let starts = Arc::clone(&starts);
+                    async move {
+                        lock_unpoisoned(&starts).push(candidate);
+                        if candidate == first {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Err(H3Error::NoResolvedCandidate)
+                        } else {
+                            Ok(candidate)
+                        }
+                    }
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(*lock_unpoisoned(&starts), vec![first]);
+
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *lock_unpoisoned(&starts),
+            vec![first],
+            "the delay must not exceed the concurrency bound"
+        );
+
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let selected = task
+            .await
+            .expect("candidate task")
+            .expect("fallback candidate");
+        assert_eq!(selected, second);
+        assert_eq!(*lock_unpoisoned(&starts), vec![first, second]);
+    }
+}
