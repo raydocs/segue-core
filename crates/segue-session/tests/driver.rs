@@ -680,3 +680,95 @@ async fn a_drain_cut_short_is_never_reported_clean() {
     let _ = client.await;
     relay.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_admitted_before_the_pool_ran_out_still_finish() {
+    // r5 N12/N13: the client pool is spent exactly once the sessions are
+    // admitted. Each must still move its request and the echo (its send
+    // floor and driver reserve were taken at admission); a new session is
+    // refused instead of being admitted without progress; after release the
+    // pool admits again.
+    use segue_session::pipe::pipe;
+    use segue_session::pool::{Grant, BLOCK};
+    const N: usize = 4;
+    const LEN: usize = 64 << 10;
+    let cfg = Config::default();
+    let pool = Pool::new(1 << 20);
+    let relay_pool = Pool::new(8 << 20);
+    let table = RelayTable::new(cfg.clone(), relay_pool, Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(16);
+    let echo: SiteConnector = Arc::new(|_t, _k| {
+        Box::pin(async {
+            let (a, mut b) = tokio::io::duplex(64 << 10);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match b.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if b.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let relay = tokio::spawn(run_relay(table, accept_rx, echo, None));
+    let connector: Connector = Arc::new(move || {
+        let accept_tx = accept_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(64 << 10);
+            accept_tx
+                .send(Box::new(b))
+                .await
+                .map_err(|_| std::io::Error::other("gone"))?;
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let mut admitted = Vec::new();
+    for _ in 0..N {
+        let s = ClientSession::new(cfg.clone(), &pool, params(), Instant::now()).unwrap();
+        let (app, far) = pipe(&pool, 64 << 10).unwrap();
+        admitted.push((s, app, far));
+    }
+    let mut hog = Vec::new();
+    while let Some(g) = Grant::fixed(&pool, BLOCK) {
+        hog.push(g);
+    }
+    assert_eq!(pool.used_bytes(), pool.capacity_bytes());
+    assert!(
+        ClientSession::new(cfg.clone(), &pool, params(), Instant::now()).is_none(),
+        "admitted a session the spent pool cannot move"
+    );
+    assert!(pipe(&pool, 64 << 10).is_none());
+    let mut apps = Vec::new();
+    for (i, (s, app, far)) in admitted.into_iter().enumerate() {
+        let client = tokio::spawn(run_client(s, far, connector.clone()));
+        apps.push(tokio::spawn(async move {
+            let (mut r, mut w) = tokio::io::split(app);
+            let up = pattern(LEN, i as u8);
+            let want = up.clone();
+            let writer = tokio::spawn(async move { w.write_all(&up).await.map(|_| w) });
+            let mut got = vec![0u8; LEN];
+            r.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, want);
+            let mut w = writer.await.unwrap().unwrap();
+            w.shutdown().await.unwrap();
+            drop((r, w));
+            client
+        }));
+    }
+    for a in apps {
+        let client = tokio::time::timeout(Duration::from_secs(20), a)
+            .await
+            .expect("a session admitted before the pool ran out stalled")
+            .unwrap();
+        client.abort();
+    }
+    drop(hog);
+    assert!(ClientSession::new(cfg, &pool, params(), Instant::now()).is_some());
+    relay.abort();
+}
