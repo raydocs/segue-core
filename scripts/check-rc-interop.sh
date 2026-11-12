@@ -70,7 +70,7 @@ env \
   --nocapture \
   --test-threads=1
 
-cargo build --locked --release -p segue-cli --bin xray-rust
+cargo build --locked --release -p segue-cli --bin segue
 xray_rust_binary="${CARGO_TARGET_DIR:-target}/release/segue"
 
 # The process-level harness runs the same bounded UDP workload through the

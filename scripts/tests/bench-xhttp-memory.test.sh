@@ -113,7 +113,7 @@ common = [
     "--xray-rust-bin", "target/release/segue",
     "--xray-core-dir", "Xray-core",
 ]
-expected = [["build", "--locked", "--release", "-p", "segue-cli", "--bin", "xray-rust"]]
+expected = [["build", "--locked", "--release", "-p", "segue-cli", "--bin", "segue"]]
 for flows in (1, 16, 32):
     expected.append(common + [
         "--xhttp-max-post-bytes", "500000",
@@ -249,7 +249,7 @@ common = [
     "--xray-rust-bin", "target/release/segue",
     "--xray-core-dir", core_dir,
 ]
-expected = [["build", "--locked", "--release", "-p", "segue-cli", "--bin", "xray-rust"]]
+expected = [["build", "--locked", "--release", "-p", "segue-cli", "--bin", "segue"]]
 for flows in (1, 16, 32):
     expected.append(common + [
         "--xhttp-max-post-bytes", "500000",

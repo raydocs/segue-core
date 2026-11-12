@@ -815,7 +815,7 @@ def safe_summary_path(root: pathlib.Path, relative: Any) -> pathlib.Path:
     except FileNotFoundError:
         fail(f"summary file does not exist: {relative}")
     except ValueError as error:
-        if "embedded null byte" in str(error).lower():
+        if "embedded null" in str(error).lower():
             fail(f"invalid summary path: {error}")
         fail("summary path escapes publication root")
     except (OSError, RuntimeError) as error:
@@ -926,7 +926,9 @@ def expected_paths(
     )
     return {
         "raw_root": raw_root,
-        "harness": working_directory / "target" / "release" / "segue-bench",
+        # Historical binary names: published records predate the segue rename
+        # (xray-bench -> segue-bench, xray-rust -> segue) and must not be rewritten.
+        "harness": working_directory / "target" / "release" / "xray-bench",
         "xray-rust": working_directory / "target" / "release" / "xray-rust",
         "xray-core": (
             working_directory
