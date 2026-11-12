@@ -13,12 +13,12 @@ use segue_relay::dial::{Resolver, Route};
 use segue_relay::guard::{is_forbidden, Guard};
 use segue_relay::server::{serve, Relay};
 use segue_relay::system_clock;
-use segue_relay::ticket::{generate_pkcs8, Claims, ExitClass, Signer, TicketAuth};
+use segue_relay::ticket::{generate_pkcs8, grant_of, Claims, ExitClass, Signer, TicketAuth};
 use segue_session::client::{ClientSession, CloseReason, OpenParams};
 use segue_session::codec::{code, Frame, Kind, Open, Resume, Target, VERSION};
 use segue_session::driver::{run_client, BoxCarrier, Connector};
 use segue_session::pool::Pool;
-use segue_session::relay::{Authorizer, RelayTable};
+use segue_session::relay::{Authorizer, RelayEvent, RelayTable};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -47,7 +47,31 @@ fn claims(device: u64, classes: Vec<ExitClass>) -> Claims {
 struct Env {
     relay: Arc<Relay>,
     signer: Signer,
+    /// Private key the policy bundle is signed with (same format and
+    /// verification as the client's `policy.bundle`).
+    policy_key: String,
     _dir: TempDir,
+}
+
+/// Signed policy bundle in the client's format.
+fn bundle(key: &str, version: u64, domains: &[&str], cidrs: &[&str]) -> String {
+    let body = serde_json::json!({
+        "version": version,
+        "expires_at": now() + 3600,
+        "ai_domains": domains,
+        "ai_cidrs": cidrs,
+        "default": {"type": "proxy", "outbound": "overseas"}
+    });
+    segue_policy::sign(key, 1, body.to_string().as_bytes()).unwrap()
+}
+
+/// Revocation file as the sync process writes it.
+fn revocation_text(seq: u64, synced_at: u64, devices: &[u64]) -> String {
+    let mut s = format!("seq {seq}\nsynced_at {synced_at}\n");
+    for d in devices {
+        s += &format!("{d}\n");
+    }
+    s
 }
 
 struct TempDir(std::path::PathBuf);
@@ -91,14 +115,24 @@ fn env(home_server: &str, failover: bool, extra_ai_cidr: &str) -> Env {
     let signer = Signer::from_pkcs8(3, &generate_pkcs8()).unwrap();
     let pk = base64::engine::general_purpose::STANDARD.encode(signer.public_key());
     std::fs::write(dir.0.join("line.cred"), format!("{USER}:{PASS}\n")).unwrap();
-    std::fs::write(dir.0.join("revoked.txt"), "").unwrap();
+    std::fs::write(dir.0.join("revoked.txt"), revocation_text(1, now(), &[])).unwrap();
+    let (policy_key, policy_pub) = segue_policy::generate_key();
+    let cidrs: Vec<&str> = [extra_ai_cidr]
+        .into_iter()
+        .filter(|c| !c.is_empty())
+        .collect();
+    std::fs::write(
+        dir.0.join("policy.bundle"),
+        bundle(&policy_key, 1, &["ai.test"], &cidrs),
+    )
+    .unwrap();
     let json = format!(
         r#"{{
         "listen": "127.0.0.1:7443",
         "node_id": 1,
         "ticket_keys": [{{"key_id": 3, "public_key": "{pk}"}}],
         "revocation_file": "revoked.txt",
-        "ai": {{"domains": ["ai.test"], "cidrs": ["{extra_ai_cidr}"]}},
+        "policy": {{"public_keys": [{{"key_id": 1, "public_key": "{policy_pub}"}}], "bundle": "policy.bundle"}},
         "home_lines": [{{"id": "L1", "server": "{home_server}", "isp": "x", "credentials_file": "line.cred"}}],
         "home_auto_failover": {failover},
         "limits": {{"line_fail_threshold": 1, "connect_timeout_ms": 2000, "first_frame_timeout_ms": 2000}}
@@ -114,6 +148,7 @@ fn env(home_server: &str, failover: bool, extra_ai_cidr: &str) -> Env {
     Env {
         relay,
         signer,
+        policy_key,
         _dir: dir,
     }
 }
@@ -122,7 +157,6 @@ fn auth(e: &Env) -> TicketAuth {
     TicketAuth {
         verifier: e.relay.verifier.clone(),
         revoked: e.relay.revoked.clone(),
-        claims: e.relay.claims.clone(),
         metrics: e.relay.metrics.clone(),
         clock: e.relay.clock.clone(),
     }
@@ -134,7 +168,8 @@ fn ticket_accept_reject_expired_revoked() {
     let a = auth(&e);
     let t = Target::Domain("echo.test".into(), 80);
     let good = e.signer.sign(&claims(42, vec![ExitClass::Overseas]));
-    assert_eq!(a.open(&good, &t, Kind::Tcp), Ok(42));
+    let g = a.open(&good, &t, Kind::Tcp).unwrap();
+    assert_eq!((g.device, g.exit_classes), (42, 1));
     // UDP sessions are never offered by this relay.
     assert_eq!(a.open(&good, &t, Kind::Udp), Err(code::EXIT_DENIED));
     // Garbage, tampered, wrong key.
@@ -168,7 +203,7 @@ fn ticket_accept_reject_expired_revoked() {
     assert_eq!(a.open(&e.signer.sign(&f), &t, Kind::Tcp), Err(code::AUTH));
     // Revoked via the list file.
     let rev = e.relay.cfg.revocation_file.clone().unwrap();
-    std::fs::write(&rev, "42\n").unwrap();
+    std::fs::write(&rev, revocation_text(2, now(), &[42])).unwrap();
     assert_eq!(e.relay.revoked.reload().unwrap(), vec![42]);
     assert_eq!(a.open(&good, &t, Kind::Tcp), Err(code::REVOKED));
     assert_eq!(a.resume(&good), Err(code::REVOKED));
@@ -228,6 +263,16 @@ fn resume_with_other_devices_ticket_is_rejected() {
     while table.take_event().is_some() {}
     table.connect_done(&sid, Ok(()), t);
     while table.poll_transmit(1, t).is_some() {}
+    // An expired-beyond-grace ticket of the owner is refused too.
+    let mut old = claims(10, vec![ExitClass::Overseas]);
+    old.not_before = now() - 9000;
+    old.not_after = now() - 3700;
+    table.add_carrier(9);
+    table.on_frame(9, resume_frame(e.signer.sign(&old), sid, secret, 1), t);
+    match table.poll_transmit(9, t) {
+        Some(Frame::Reject(r)) => assert_eq!(r.code, code::EXPIRED),
+        f => panic!("expected REJECT(expired), got {f:?}"),
+    }
     // Device 11's valid ticket cannot take over device 10's session.
     table.add_carrier(2);
     table.on_frame(
@@ -316,51 +361,62 @@ fn ssrf_guard_table() {
 async fn routing_classifies_independently() {
     let e = env("127.0.0.1:1", false, "93.184.216.0/24");
     let d = &e.relay.dialer;
-    e.relay
-        .claims
-        .put(claims(1, vec![ExitClass::Overseas, ExitClass::Ai]));
-    e.relay.claims.put(claims(2, vec![ExitClass::Overseas]));
+    let g1 = grant_of(&claims(1, vec![ExitClass::Overseas, ExitClass::Ai]));
+    let g2 = grant_of(&claims(2, vec![ExitClass::Overseas]));
     let lo: SocketAddr = "127.0.0.1:80".parse().unwrap();
-    // Overseas target via name; hint ignored.
+    // Overseas target with no hint.
     assert_eq!(
-        d.route(1, &Target::Domain("echo.test".into(), 80), 1).await,
+        d.route(&g1, &Target::Domain("echo.test".into(), 80), 0)
+            .await,
         Ok(Route::Overseas(vec![lo]))
+    );
+    // An EXIT_AI hint the relay's policy cannot confirm is refused, never
+    // downgraded to the data-centre exit (review r4 #1).
+    assert_eq!(
+        d.route(&g1, &Target::Domain("echo.test".into(), 80), 1)
+            .await,
+        Err(code::TARGET_DENIED)
+    );
+    // A hinted AI target the policy confirms goes Home.
+    assert_eq!(
+        d.route(&g1, &Target::Domain("ai.test".into(), 80), 1).await,
+        Ok(Route::Home(lo))
     );
     // AI domain with an overseas hint → Home.
     assert_eq!(
-        d.route(1, &Target::Domain("api.ai.test".into(), 80), 0)
+        d.route(&g1, &Target::Domain("api.ai.test".into(), 80), 0)
             .await,
         Ok(Route::Home(lo))
     );
     // A name that resolves into the AI CIDR is AI too.
     let pubip: SocketAddr = "93.184.216.34:443".parse().unwrap();
     assert_eq!(
-        d.route(1, &Target::Domain("public.test".into(), 443), 0)
+        d.route(&g1, &Target::Domain("public.test".into(), 443), 0)
             .await,
         Ok(Route::Home(pubip))
     );
     assert_eq!(
-        d.route(1, &Target::Ip(pubip), 0).await,
+        d.route(&g1, &Target::Ip(pubip), 0).await,
         Ok(Route::Home(pubip))
     );
     // No AI grant → exit_denied, never direct.
     assert_eq!(
-        d.route(2, &Target::Ip(pubip), 0).await,
+        d.route(&g2, &Target::Ip(pubip), 0).await,
         Err(code::EXIT_DENIED)
     );
     assert_eq!(
-        d.route(2, &Target::Domain("ai.test".into(), 80), 0).await,
+        d.route(&g2, &Target::Domain("ai.test".into(), 80), 0).await,
         Err(code::EXIT_DENIED)
     );
     // SSRF: literal and rebinding names refused.
     assert_eq!(
-        d.route(2, &Target::Ip("10.0.0.1:80".parse().unwrap()), 0)
+        d.route(&g2, &Target::Ip("10.0.0.1:80".parse().unwrap()), 0)
             .await,
         Err(code::TARGET_DENIED)
     );
     assert_eq!(
         d.route(
-            2,
+            &g2,
             &Target::Ip("[::ffff:169.254.169.254]:80".parse().unwrap()),
             0
         )
@@ -368,24 +424,224 @@ async fn routing_classifies_independently() {
         Err(code::TARGET_DENIED)
     );
     assert_eq!(
-        d.route(2, &Target::Domain("rebind.test".into(), 80), 0)
+        d.route(&g2, &Target::Domain("rebind.test".into(), 80), 0)
             .await,
         Err(code::TARGET_DENIED)
     );
     // Rebinding into private space is refused for AI targets too.
     assert_eq!(
-        d.route(1, &Target::Domain("rebind.test".into(), 80), 1)
+        d.route(&g1, &Target::Domain("rebind.test".into(), 80), 1)
             .await,
         Err(code::TARGET_DENIED)
     );
     assert_eq!(
-        d.route(2, &Target::Domain("nx.test".into(), 80), 0).await,
+        d.route(&g2, &Target::Domain("nx.test".into(), 80), 0).await,
         Err(code::DNS_FAILURE)
     );
-    // Unknown device (no ticket seen).
-    assert_eq!(d.route(9, &Target::Ip(pubip), 0).await, Err(code::AUTH));
+    // A grant is per OPEN: device 1's AI grant does not leak into a
+    // session opened with an overseas-only ticket for the same device.
+    let g1_overseas = grant_of(&claims(1, vec![ExitClass::Overseas]));
+    assert_eq!(
+        d.route(&g1_overseas, &Target::Ip(pubip), 0).await,
+        Err(code::EXIT_DENIED)
+    );
+    assert_eq!(
+        d.route(&g1, &Target::Ip(pubip), 0).await,
+        Ok(Route::Home(pubip))
+    );
     let m = e.relay.metrics.render();
     assert!(!m.contains("segue_relay_reclassified 0\n"), "{m}");
+}
+
+/// Review r4 #2: the grant travels with each OPEN's own connect request.
+/// Two sessions of one device opened with different tickets keep their own
+/// exit classes; nothing is looked up per device later.
+#[test]
+fn grant_is_bound_to_each_open() {
+    let e = env("127.0.0.1:1", false, "");
+    let mut table = RelayTable::new(
+        Default::default(),
+        Pool::new(8 << 20),
+        Box::new(auth(&e)),
+        77,
+    );
+    let t = Instant::now();
+    let both = e
+        .signer
+        .sign(&claims(10, vec![ExitClass::Overseas, ExitClass::Ai]));
+    let overseas = e.signer.sign(&claims(10, vec![ExitClass::Overseas]));
+    table.add_carrier(1);
+    table.on_frame(1, open_frame(both, [1; 16], [2; 32]), t);
+    table.add_carrier(2);
+    table.on_frame(2, open_frame(overseas, [3; 16], [4; 32]), t);
+    let mut grants = Vec::new();
+    while let Some(ev) = table.take_event() {
+        if let RelayEvent::Connect {
+            session_id, grant, ..
+        } = ev
+        {
+            grants.push((session_id, grant));
+        }
+    }
+    grants.sort_by_key(|g| g.0);
+    assert_eq!(grants.len(), 2);
+    assert_eq!((grants[0].1.device, grants[0].1.exit_classes), (10, 3));
+    assert_eq!((grants[1].1.device, grants[1].1.exit_classes), (10, 1));
+}
+
+/// Review r4 #1: the AI set comes from the signed policy bundle; it hot
+/// reloads, and forged or rolled-back bundles keep the last good one.
+#[tokio::test]
+async fn policy_bundle_reload_forgery_rollback() {
+    let e = env("127.0.0.1:1", false, "");
+    let d = &e.relay.dialer;
+    let g = grant_of(&claims(1, vec![ExitClass::Overseas, ExitClass::Ai]));
+    let lo: SocketAddr = "127.0.0.1:80".parse().unwrap();
+    let echo_ai = || Target::Domain("echo.test".into(), 80);
+    assert_eq!(e.relay.ai.version(), Some(1));
+    assert_eq!(d.route(&g, &echo_ai(), 1).await, Err(code::TARGET_DENIED));
+    let path = e.relay.cfg.policy_bundle.clone();
+    std::fs::write(
+        &path,
+        bundle(&e.policy_key, 2, &["ai.test", "echo.test"], &[]),
+    )
+    .unwrap();
+    e.relay.reload_policy();
+    assert_eq!(e.relay.ai.version(), Some(2));
+    assert_eq!(d.route(&g, &echo_ai(), 1).await, Ok(Route::Home(lo)));
+    // Forged (other key) and rolled back (lower version): ignored.
+    let (other, _) = segue_policy::generate_key();
+    std::fs::write(&path, bundle(&other, 9, &[], &[])).unwrap();
+    e.relay.reload_policy();
+    std::fs::write(
+        &path,
+        bundle(&e.policy_key, 1, &["ai.test"], &["10.9.9.0/24"]),
+    )
+    .unwrap();
+    e.relay.reload_policy();
+    assert_eq!(e.relay.ai.version(), Some(2));
+    assert_eq!(d.route(&g, &echo_ai(), 1).await, Ok(Route::Home(lo)));
+}
+
+/// Review r4 #1: with no usable bundle the relay cannot confirm anything
+/// and refuses every target (fail closed), AI-hinted or not.
+#[tokio::test]
+async fn no_policy_bundle_fails_closed() {
+    let e = env("127.0.0.1:1", false, "");
+    std::fs::write(e.relay.cfg.policy_bundle.clone(), "garbage").unwrap();
+    let cfg = e.relay.cfg.clone();
+    let guard = Guard {
+        extra_blocked: vec![],
+        exceptions: vec![Cidr::parse("127.0.0.1/32").unwrap()],
+    };
+    let r = Relay::new(cfg, system_clock(), Some(resolver()), Some(guard)).unwrap();
+    assert_eq!(r.ai.version(), None);
+    let g = grant_of(&claims(1, vec![ExitClass::Overseas, ExitClass::Ai]));
+    for hint in [0, 1] {
+        assert_eq!(
+            r.dialer
+                .route(&g, &Target::Domain("ai.test".into(), 80), hint)
+                .await,
+            Err(code::TARGET_DENIED)
+        );
+        assert_eq!(
+            r.dialer
+                .route(&g, &Target::Domain("echo.test".into(), 80), hint)
+                .await,
+            Err(code::TARGET_DENIED)
+        );
+    }
+    assert!(r
+        .metrics
+        .render()
+        .contains("segue_relay_policy_unavailable 4\n"));
+}
+
+/// Review r4 #8: the sync process stops; the file stays readable and the
+/// relay keeps re-reading it, but its own `synced_at` ages past 5 min, so
+/// expired tickets lose the RESUME grace.
+#[test]
+fn stale_revocation_file_ends_resume_grace() {
+    let e = env("127.0.0.1:1", false, "");
+    let skew = Arc::new(AtomicUsize::new(0));
+    let sk = skew.clone();
+    let mut a = auth(&e);
+    a.clock = Arc::new(move || now() + sk.load(Ordering::SeqCst) as u64);
+    let mut c = claims(43, vec![ExitClass::Overseas]);
+    c.not_before = now() - 7200;
+    c.not_after = now() + 10;
+    let exp = e.signer.sign(&c);
+    // Ticket expires 10 s from now; the file was just synced.
+    skew.store(60, Ordering::SeqCst);
+    assert_eq!(a.resume(&exp), Ok(43));
+    // The sync process dies: the file stays readable and is re-read every
+    // poll, but six minutes later its synced_at is stale.
+    skew.store(360, Ordering::SeqCst);
+    for _ in 0..3 {
+        e.relay.revoked.reload().unwrap();
+        assert_eq!(a.resume(&exp), Err(code::EXPIRED));
+    }
+    // Rewriting the same stale content (touching it) does not help, and a
+    // file moving synced_at backwards is refused.
+    let rev = e.relay.cfg.revocation_file.clone().unwrap();
+    let text = std::fs::read_to_string(&rev).unwrap();
+    std::fs::write(&rev, format!("{text}# touched\n")).unwrap();
+    e.relay.revoked.reload().unwrap();
+    assert_eq!(a.resume(&exp), Err(code::EXPIRED));
+    std::fs::write(&rev, revocation_text(9, now() - 1000, &[])).unwrap();
+    assert!(e.relay.revoked.reload().is_err());
+    // A real sync brings the grace back.
+    std::fs::write(&rev, revocation_text(9, now() + 360, &[])).unwrap();
+    e.relay.revoked.reload().unwrap();
+    assert_eq!(a.resume(&exp), Ok(43));
+}
+
+/// Review r4 #13: one byte at a time does not extend the first-frame
+/// deadline; the carrier is closed before its OPEN completes.
+#[tokio::test]
+async fn first_frame_slowloris_is_cut() {
+    let e = env("127.0.0.1:1", false, "");
+    let (addr, stop, _h) = start(&e).await;
+    let mut bytes = Vec::new();
+    open_frame(
+        e.signer.sign(&claims(5, vec![ExitClass::Overseas])),
+        [7; 16],
+        [8; 32],
+    )
+    .encode(&mut bytes);
+    assert!(bytes.len() > 60);
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let t0 = Instant::now();
+    let mut cut = false;
+    for b in &bytes {
+        if s.write_all(&[*b]).await.is_err() {
+            cut = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if t0.elapsed() > Duration::from_secs(5) {
+            break;
+        }
+    }
+    if !cut {
+        let mut buf = [0u8; 64];
+        let r = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await;
+        assert!(
+            matches!(r, Ok(Ok(0)) | Ok(Err(_))),
+            "carrier still open: {r:?}"
+        );
+    }
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "deadline not enforced"
+    );
+    let m = e.relay.metrics.render();
+    assert!(
+        m.contains("segue_relay_carriers_first_frame_timeout 1\n"),
+        "{m}"
+    );
+    assert!(m.contains("segue_relay_carriers_accepted 0\n"), "{m}");
+    let _ = stop.send(true);
 }
 
 /// Echo server; counts accepted connections.
@@ -693,7 +949,11 @@ async fn revocation_resets_live_sessions() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(held.lock().unwrap().len(), 1, "site connected");
-    std::fs::write(e.relay.cfg.revocation_file.clone().unwrap(), "8\n").unwrap();
+    std::fs::write(
+        e.relay.cfg.revocation_file.clone().unwrap(),
+        revocation_text(2, now(), &[8]),
+    )
+    .unwrap();
     let reason = tokio::time::timeout(Duration::from_secs(15), c)
         .await
         .expect("reset in time")

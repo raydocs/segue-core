@@ -568,6 +568,99 @@ mod tests {
         assert_eq!(p.units(if ib == 0 { "a" } else { "b" }), 7);
     }
 
+    /// Review r4 #9: B holds 5 primaries + 2 temporary devices from A. A
+    /// recovers and the two open new connections on A while their old B
+    /// connections live on; a third line then fails. B must still count
+    /// the two lingering devices, so at most 7 devices ever hold live
+    /// connections on B; the seats free only when the last old one ends.
+    #[test]
+    fn switch_back_keeps_seat_until_last_old_connection() {
+        let limits = Limits {
+            line_fail_threshold: 1,
+            ..Limits::default()
+        };
+        let p = HomePool::new(
+            vec![line("a", "x"), line("b", "y"), line("c", "x")],
+            &[],
+            limits,
+            true,
+            Arc::new(Metrics::default()),
+        )
+        .unwrap();
+        let mut leases: Vec<(u64, usize, Lease)> = Vec::new();
+        for d in 0..15 {
+            let (i, _, l) = p.acquire(d).unwrap();
+            leases.push((d, i, l));
+        }
+        let idx = |id: &str| {
+            p.inner
+                .lock()
+                .unwrap()
+                .lines
+                .iter()
+                .position(|l| l.cfg.id == id)
+                .unwrap()
+        };
+        let (a, b, c) = (idx("a"), idx("b"), idx("c"));
+        let on = |line: usize| -> Vec<u64> {
+            let mut v: Vec<u64> = leases.iter().filter(|x| x.1 == line).map(|x| x.0).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let a_devs = on(a);
+        let c_devs = on(c);
+        assert_eq!((a_devs.len(), on(b).len(), c_devs.len()), (5, 5, 5));
+        let live_on_b = |p: &HomePool| p.inner.lock().unwrap().lines[b].live.len();
+
+        // A fails: two of its devices take B's temporary seats (other ISP).
+        p.report(a, false, None);
+        let mut temps = Vec::new();
+        for &d in &a_devs {
+            if let Ok((i, _, l)) = p.acquire(d) {
+                if i == b {
+                    temps.push(d);
+                    leases.push((d, i, l));
+                }
+            }
+        }
+        assert_eq!(temps.len(), 2);
+        assert_eq!((p.units("b"), live_on_b(&p)), (7, 7));
+
+        // A recovers: the temps' new connections go to A; old B ones live.
+        p.report(a, true, None);
+        for &d in &temps {
+            let (i, _, l) = p.acquire(d).unwrap();
+            assert_eq!(i, a);
+            leases.push((d, i, l));
+        }
+        assert_eq!(p.units("b"), 7, "lingering old-line connections hold seats");
+
+        // C fails: its devices may not squeeze onto B.
+        p.report(c, false, None);
+        for &d in &c_devs {
+            if let Ok((i, _, l)) = p.acquire(d) {
+                assert_ne!(i, b, "B is full while old connections live");
+                leases.push((d, i, l));
+            }
+            assert!(live_on_b(&p) <= 7);
+        }
+        assert_eq!((p.units("b"), live_on_b(&p)), (7, 7));
+
+        // One temp's old B connection ends: one seat frees, the other
+        // temp still holds its seat.
+        let first = temps[0];
+        leases.retain(|x| !(x.0 == first && x.1 == b));
+        assert_eq!(p.units("b"), 6);
+        let moved = c_devs
+            .iter()
+            .filter_map(|&d| p.acquire(d).ok().filter(|x| x.0 == b).map(|x| (d, x)))
+            .map(|(d, (i, _, l))| leases.push((d, i, l)))
+            .count();
+        assert!(moved >= 1);
+        assert!(live_on_b(&p) <= 7 && p.units("b") <= 7);
+    }
+
     #[test]
     fn pinned_over_cap_rejected() {
         let pins: Vec<(u64, String)> = (0..6).map(|d| (d, "a".to_string())).collect();
