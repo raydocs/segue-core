@@ -302,3 +302,185 @@ async fn client_does_not_spin_while_a_reconnect_is_slow() {
     );
     client.abort();
 }
+
+/// A relay + client pair whose site connector is `site_conn`; returns the
+/// app end, the relay's control channel and the client task.
+fn revocable_pair(
+    site_conn: segue_session::driver::DeviceSiteConnector,
+) -> (
+    DuplexStream,
+    mpsc::Sender<segue_session::driver::RelayCtrl>,
+    tokio::task::JoinHandle<CloseReason>,
+    tokio::task::JoinHandle<()>,
+) {
+    let cfg = Config::default();
+    let pool = Pool::new(8 << 20);
+    let table = RelayTable::new(cfg.clone(), pool.clone(), Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(4);
+    let (ctrl_tx, ctrl_rx) = mpsc::channel(4);
+    let relay = tokio::spawn(segue_session::driver::run_relay_ctl(
+        table,
+        accept_rx,
+        site_conn,
+        None,
+        Some(ctrl_rx),
+    ));
+    let connector: Connector = Arc::new(move || {
+        let accept_tx = accept_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(256 << 10);
+            accept_tx
+                .send(Box::new(b))
+                .await
+                .map_err(|_| std::io::Error::other("gone"))?;
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+    let (app, far) = tokio::io::duplex(256 << 10);
+    let client = tokio::spawn(run_client(s, far, connector));
+    (app, ctrl_tx, client, relay)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_cancels_a_site_writer_blocked_on_a_site_that_stopped_reading() {
+    use segue_session::codec::code;
+    use segue_session::driver::{DeviceSiteConnector, RelayCtrl, SiteRequest};
+    const SITE_BUF: usize = 1024;
+    let (site_tx, mut site_rx) = mpsc::unbounded_channel::<DuplexStream>();
+    let site_conn: DeviceSiteConnector = Arc::new(move |_r: SiteRequest| {
+        let site_tx = site_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(SITE_BUF);
+            let _ = site_tx.send(b);
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let (mut app, ctrl, client, relay) = revocable_pair(site_conn);
+    let up = pattern(400 << 10, 3);
+    let writer = tokio::spawn(async move {
+        let _ = app.write_all(&up).await;
+        app
+    });
+    // The site never reads: its buffer fills, the relay's site writer
+    // blocks in write_all with more queued behind it.
+    let mut site = tokio::time::timeout(Duration::from_secs(5), site_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ctrl.send(RelayCtrl::ResetDevice {
+        device: 0,
+        close_code: code::REVOKED,
+    })
+    .await
+    .unwrap();
+    let reason = tokio::time::timeout(Duration::from_secs(5), client)
+        .await
+        .expect("client did not end")
+        .unwrap();
+    assert_eq!(reason, CloseReason::Reset(code::REVOKED));
+    // The site now reads: it gets what was already in its socket buffer,
+    // then the connection is gone — nothing queued before the revoke.
+    let mut got = 0usize;
+    let mut buf = vec![0u8; 64 << 10];
+    let end = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match site.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => got += n,
+            }
+        }
+    })
+    .await;
+    assert!(end.is_ok(), "site connection outlived the revoke");
+    assert!(
+        got <= SITE_BUF,
+        "{got} bytes reached the site after the revoke"
+    );
+    writer.abort();
+    relay.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_cancels_a_site_connect_in_flight() {
+    use segue_session::codec::code;
+    use segue_session::driver::{DeviceSiteConnector, RelayCtrl, SiteRequest};
+    struct Guard(Arc<AtomicUsize>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+    let site_conn: DeviceSiteConnector = {
+        let (dropped, started) = (dropped.clone(), started.clone());
+        Arc::new(move |_r: SiteRequest| {
+            let g = Guard(dropped.clone());
+            started.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let _g = g;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Err(std::io::Error::other("never"))
+            })
+        })
+    };
+    let (mut app, ctrl, client, relay) = revocable_pair(site_conn);
+    app.write_all(b"hello").await.unwrap();
+    for _ in 0..100 {
+        if started.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+    ctrl.send(RelayCtrl::ResetDevice {
+        device: 0,
+        close_code: code::REVOKED,
+    })
+    .await
+    .unwrap();
+    let reason = tokio::time::timeout(Duration::from_secs(5), client)
+        .await
+        .expect("client did not end")
+        .unwrap();
+    assert_eq!(reason, CloseReason::Reset(code::REVOKED));
+    for _ in 0..100 {
+        if dropped.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(dropped.load(Ordering::SeqCst), 1, "site connect kept running");
+    relay.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_write_failure_resets_the_session() {
+    // The app's side goes away mid-download: the client must reset, not
+    // keep pulling data nobody will read.
+    let site_conn: SiteConnector = Arc::new(|_t, _k| {
+        Box::pin(async {
+            let (a, mut b) = tokio::io::duplex(64 << 10);
+            tokio::spawn(async move {
+                let chunk = vec![7u8; 16 << 10];
+                while b.write_all(&chunk).await.is_ok() {}
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let site_conn: segue_session::driver::DeviceSiteConnector =
+        Arc::new(move |r: segue_session::driver::SiteRequest| site_conn(r.target, r.kind));
+    let (mut app, _ctrl, client, relay) = revocable_pair(site_conn);
+    app.write_all(b"GET /big").await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    app.read_exact(&mut buf).await.unwrap();
+    drop(app);
+    let reason = tokio::time::timeout(Duration::from_secs(5), client)
+        .await
+        .expect("client kept running after the app went away")
+        .unwrap();
+    assert_ne!(reason, CloseReason::Clean);
+    relay.abort();
+}

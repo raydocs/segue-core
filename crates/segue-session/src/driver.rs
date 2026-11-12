@@ -128,11 +128,19 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
 }
 
 /// Writer task: write each message; an empty message shuts the write side.
-/// Dropping the sender flushes what is queued and shuts down.
-fn spawn_writer<W: AsyncWrite + Unpin + Send + 'static>(
+/// Dropping the sender flushes what is queued and shuts down (the owner
+/// bounds that with [`Tasks::drain`] or aborts the task). A write failure
+/// closes the queue (later sends fail, nothing is silently swallowed) and
+/// runs `on_err`, which reports it to the state machine.
+fn spawn_writer<W, F>(
     mut w: W,
     writable: Arc<Notify>,
-) -> (mpsc::Sender<Vec<u8>>, JoinHandle<()>) {
+    on_err: F,
+) -> (mpsc::Sender<Vec<u8>>, JoinHandle<()>)
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE);
     let h = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
@@ -143,16 +151,67 @@ fn spawn_writer<W: AsyncWrite + Unpin + Send + 'static>(
             };
             writable.notify_one();
             if r.is_err() {
-                // Keep draining so the sender never blocks on a dead peer.
-                while rx.recv().await.is_some() {
-                    writable.notify_one();
-                }
+                drop(rx);
+                on_err.await;
                 return;
             }
         }
         let _ = w.shutdown().await;
     });
     (tx, h)
+}
+
+/// How long a cleanly closed connection may take to flush what is queued.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Tasks a driver still owns after their connection left its tables:
+/// writers flushing a clean close, each with a deadline after which it is
+/// aborted. Everything left is aborted when the driver ends.
+#[derive(Default)]
+struct Tasks {
+    draining: Vec<(tokio::time::Instant, JoinHandle<()>)>,
+}
+
+impl Tasks {
+    fn drain(&mut self, h: JoinHandle<()>) {
+        self.draining.push((tokio::time::Instant::now() + DRAIN, h));
+    }
+
+    /// Forget finished tasks and abort overdue ones.
+    fn prune(&mut self) {
+        let now = tokio::time::Instant::now();
+        self.draining.retain(|(d, h)| {
+            if h.is_finished() {
+                false
+            } else if *d <= now {
+                h.abort();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        self.draining.iter().map(|(d, _)| *d).min()
+    }
+
+    /// Wait for every draining task until its deadline, then abort it.
+    async fn finish(mut self) {
+        for (d, mut h) in std::mem::take(&mut self.draining) {
+            if tokio::time::timeout_at(d, &mut h).await.is_err() {
+                h.abort();
+            }
+        }
+    }
+}
+
+impl Drop for Tasks {
+    fn drop(&mut self) {
+        for (_, h) in &self.draining {
+            h.abort();
+        }
+    }
 }
 
 struct CarrierIo {
@@ -202,11 +261,17 @@ where
     } = ctl;
     let writable = Arc::new(Notify::new());
     let (mut app_r, app_w) = tokio::io::split(app);
-    let (app_tx, app_writer) = spawn_writer(app_w, writable.clone());
+    // The app stopped taking data: the download cannot complete, reset.
+    let (app_err_tx, mut app_err_rx) = tokio::sync::oneshot::channel::<()>();
+    let (app_tx, app_writer) = spawn_writer(app_w, writable.clone(), async move {
+        let _ = app_err_tx.send(());
+    });
+    let mut app_failed = false;
     let (ev_tx, mut ev_rx) = mpsc::channel::<CarrierEv>(64);
     let (conn_tx, mut conn_rx) = mpsc::channel::<(u64, io::Result<BoxCarrier>)>(4);
     let mut carriers: HashMap<u64, CarrierIo> = HashMap::new();
-    let mut finished: Vec<JoinHandle<()>> = Vec::new();
+    let mut tasks = Tasks::default();
+    let mut dial: Option<JoinHandle<()>> = None;
     let mut next_cid = 0u64;
     let mut connecting = false;
     let mut connect_backoff: Option<tokio::time::Instant> = None;
@@ -225,16 +290,17 @@ where
             let cid = next_cid;
             let fut = connect();
             let tx = conn_tx.clone();
-            tokio::spawn(async move {
+            dial = Some(tokio::spawn(async move {
                 let _ = tx.send((cid, fut.await)).await;
-            });
+            }));
         }
         for old in s.take_abandoned() {
             if let Some(io) = carriers.remove(&old) {
                 io.reader.abort();
-                finished.push(io.writer);
+                io.writer.abort();
             }
         }
+        tasks.prune();
         // Carrier output, generated only while the writer has room.
         if let Some(cid) = s.carrier() {
             if let Some(io) = carriers.get(&cid) {
@@ -249,7 +315,7 @@ where
             }
         }
         // Data for the app.
-        while app_tx.capacity() > 0 && !app_shut {
+        while app_tx.capacity() > 0 && !app_shut && !app_tx.is_closed() {
             let n = s.read(&mut rbuf, t);
             if n > 0 {
                 let _ = app_tx.try_send(rbuf[..n].to_vec());
@@ -276,6 +342,7 @@ where
         };
         let deadline = s.poll_timeout().map(tokio::time::Instant::from_std);
         let backoff = connect_backoff.filter(|_| !connecting);
+        let drain = tasks.next_deadline();
         tokio::select! {
             ev = ev_rx.recv() => {
                 let t = now();
@@ -285,7 +352,8 @@ where
                     Some(CarrierEv::Closed(cid)) => {
                         s.on_carrier_closed(cid, t);
                         if let Some(io) = carriers.remove(&cid) {
-                            finished.push(io.writer);
+                            io.reader.abort();
+                            io.writer.abort();
                         }
                     }
                     None => {}
@@ -293,13 +361,17 @@ where
             }
             c = conn_rx.recv() => {
                 connecting = false;
+                dial = None;
                 if let Some((cid, res)) = c {
                     match res {
                         Ok(stream) => {
                             connect_backoff = None;
                             let (r, w) = tokio::io::split(stream);
                             let reader = spawn_reader(cid, r, ev_tx.clone());
-                            let (tx, writer) = spawn_writer(w, writable.clone());
+                            let etx = ev_tx.clone();
+                            let (tx, writer) = spawn_writer(w, writable.clone(), async move {
+                                let _ = etx.send(CarrierEv::Closed(cid)).await;
+                            });
                             carriers.insert(cid, CarrierIo { tx, reader, writer });
                             s.attach(cid, now());
                         }
@@ -325,10 +397,20 @@ where
                     Err(_) => reattach = None,
                 }
             }
+            r = &mut app_err_rx, if !app_failed => {
+                app_failed = true;
+                if r.is_ok() {
+                    s.abort();
+                }
+            }
             _ = writable.notified() => {}
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
             _ = tokio::time::sleep_until(backoff.unwrap_or_else(tokio::time::Instant::now)), if backoff.is_some() => {}
+            _ = tokio::time::sleep_until(drain.unwrap_or_else(tokio::time::Instant::now)), if drain.is_some() => {}
         }
+    }
+    if let Some(h) = dial.take() {
+        h.abort();
     }
     let reason = s
         .close_reason()
@@ -338,19 +420,24 @@ where
     }
     // A clean close can be learnt from a REJECT(closed) (B6) while received
     // data is still buffered: it belongs to the app.
+    // Bounded: an app that stopped reading cannot hold the session open.
+    let until = tokio::time::Instant::now() + DRAIN;
     if reason == CloseReason::Clean && !app_shut {
-        loop {
-            let n = s.read(&mut rbuf, now());
-            if n == 0 {
-                break;
+        let _ = tokio::time::timeout_at(until, async {
+            loop {
+                let n = s.read(&mut rbuf, now());
+                if n == 0 {
+                    break;
+                }
+                if app_tx.send(rbuf[..n].to_vec()).await.is_err() {
+                    break;
+                }
             }
-            if app_tx.send(rbuf[..n].to_vec()).await.is_err() {
-                break;
+            if s.read_eof() {
+                let _ = app_tx.send(Vec::new()).await;
             }
-        }
-        if s.read_eof() {
-            let _ = app_tx.send(Vec::new()).await;
-        }
+        })
+        .await;
     }
     // Flush a final RST / ACK on the current carrier, then close everything.
     if let Some(cid) = s.carrier() {
@@ -362,15 +449,21 @@ where
             }
         }
     }
+    // The final RST / ACK gets a bounded flush; a dead carrier is not
+    // waited for.
     for (_, io) in carriers.drain() {
         io.reader.abort();
-        finished.push(io.writer);
+        tasks.drain(io.writer);
     }
     drop(app_tx);
-    finished.push(app_writer);
-    for h in finished {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), h).await;
+    if reason == CloseReason::Clean {
+        tasks.drain(app_writer);
+    } else {
+        // Not clean: nothing more reaches the app; dropping the stream lets
+        // the caller turn the reason into a reset.
+        app_writer.abort();
     }
+    tasks.finish().await;
     reason
 }
 
@@ -385,6 +478,7 @@ struct SiteIo {
     tx: mpsc::Sender<Vec<u8>>,
     req: mpsc::Sender<usize>,
     reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
     outstanding: bool,
     shut: bool,
     eof: bool,
@@ -430,6 +524,9 @@ pub async fn run_relay_ctl(
     let (site_tx, mut site_rx) = mpsc::channel::<SiteEv>(64);
     let mut carriers: HashMap<u64, CarrierIo> = HashMap::new();
     let mut sites: HashMap<SessionId, SiteIo> = HashMap::new();
+    // Site connects in flight, cancelled when their session ends.
+    let mut dials: HashMap<SessionId, JoinHandle<()>> = HashMap::new();
+    let mut tasks = Tasks::default();
     let mut next_cid = 0u64;
     let mut accepting = true;
     let mut buf = vec![0u8; CHUNK];
@@ -454,9 +551,12 @@ pub async fn run_relay_ctl(
                         exit_class,
                     });
                     let tx = site_tx.clone();
-                    tokio::spawn(async move {
+                    let h = tokio::spawn(async move {
                         let _ = tx.send(SiteEv::Connected(session_id, fut.await)).await;
                     });
+                    if let Some(old) = dials.insert(session_id, h) {
+                        old.abort();
+                    }
                 }
                 RelayEvent::Stall {
                     device,
@@ -475,8 +575,21 @@ pub async fn run_relay_ctl(
                     session_id,
                     close_code,
                 } => {
+                    if let Some(h) = dials.remove(&session_id) {
+                        h.abort();
+                    }
                     if let Some(io) = sites.remove(&session_id) {
                         io.reader.abort();
+                        if close_code == code::CLEAN {
+                            // Everything was delivered to the relay; let the
+                            // writer finish handing it to the site, bounded.
+                            drop(io.tx);
+                            tasks.drain(io.writer);
+                        } else {
+                            // Reset / revoke: queued data must not reach the
+                            // site and its socket must not outlive the session.
+                            io.writer.abort();
+                        }
                     }
                     if let Some(n) = &notices {
                         let _ = n.send(RelayNotice::Closed {
@@ -505,11 +618,15 @@ pub async fn run_relay_ctl(
                     }
                 }
                 io.reader.abort();
+                // Flush the final RST / REJECT, bounded.
+                drop(io.tx);
+                tasks.drain(io.writer);
             }
             table.on_carrier_closed(cid, t);
         }
+        tasks.prune();
         for (sid, io) in sites.iter_mut() {
-            while io.tx.capacity() > 0 && !io.shut {
+            while io.tx.capacity() > 0 && !io.shut && !io.tx.is_closed() {
                 let n = table.read(sid, &mut buf, t);
                 if n > 0 {
                     let _ = io.tx.try_send(buf[..n].to_vec());
@@ -529,9 +646,14 @@ pub async fn run_relay_ctl(
             }
         }
         if !accepting && carriers.is_empty() && table.session_count() == 0 {
+            for (_, h) in dials.drain() {
+                h.abort();
+            }
+            tasks.finish().await;
             return;
         }
         let deadline = table.poll_timeout().map(tokio::time::Instant::from_std);
+        let drain = tasks.next_deadline();
         tokio::select! {
             c = accept.recv(), if accepting => match c {
                 Some(stream) => {
@@ -539,7 +661,10 @@ pub async fn run_relay_ctl(
                     let cid = next_cid;
                     let (r, w) = tokio::io::split(stream);
                     let reader = spawn_reader(cid, r, ev_tx.clone());
-                    let (tx, writer) = spawn_writer(w, writable.clone());
+                    let etx = ev_tx.clone();
+                    let (tx, writer) = spawn_writer(w, writable.clone(), async move {
+                        let _ = etx.send(CarrierEv::Closed(cid)).await;
+                    });
                     carriers.insert(cid, CarrierIo { tx, reader, writer });
                     table.add_carrier(cid);
                 }
@@ -551,7 +676,10 @@ pub async fn run_relay_ctl(
                     Some(CarrierEv::Frame(cid, Ok(f))) => table.on_frame(cid, f, t),
                     Some(CarrierEv::Frame(cid, Err(e))) => table.on_decode_error(cid, e),
                     Some(CarrierEv::Closed(cid)) => {
-                        carriers.remove(&cid);
+                        if let Some(io) = carriers.remove(&cid) {
+                            io.reader.abort();
+                            io.writer.abort();
+                        }
                         table.on_carrier_closed(cid, t);
                     }
                     None => {}
@@ -561,6 +689,7 @@ pub async fn run_relay_ctl(
                 let t = now();
                 match ev {
                     Some(SiteEv::Connected(sid, Ok(stream))) => {
+                        dials.remove(&sid);
                         if table.state(&sid).is_none() {
                             // Session ended while connecting (RST / timeout):
                             // drop the site connection instead of leaking it.
@@ -568,7 +697,10 @@ pub async fn run_relay_ctl(
                             continue;
                         }
                         let (mut r, w) = tokio::io::split(stream);
-                        let (tx, _writer) = spawn_writer(w, writable.clone());
+                        let etx = site_tx.clone();
+                        let (tx, writer) = spawn_writer(w, writable.clone(), async move {
+                            let _ = etx.send(SiteEv::Error(sid)).await;
+                        });
                         let (req, mut req_rx) = mpsc::channel::<usize>(1);
                         let stx = site_tx.clone();
                         let reader = tokio::spawn(async move {
@@ -581,10 +713,13 @@ pub async fn run_relay_ctl(
                                 }
                             }
                         });
-                        sites.insert(sid, SiteIo { tx, req, reader, outstanding: false, shut: false, eof: false });
+                        sites.insert(sid, SiteIo { tx, req, reader, writer, outstanding: false, shut: false, eof: false });
                         table.connect_done(&sid, Ok(()), t);
                     }
-                    Some(SiteEv::Connected(sid, Err(e))) => table.connect_done(&sid, Err(SiteError::code_of(&e)), t),
+                    Some(SiteEv::Connected(sid, Err(e))) => {
+                        dials.remove(&sid);
+                        table.connect_done(&sid, Err(SiteError::code_of(&e)), t);
+                    }
                     Some(SiteEv::Data(sid, d)) => {
                         if let Some(io) = sites.get_mut(&sid) {
                             io.outstanding = false;
@@ -607,6 +742,7 @@ pub async fn run_relay_ctl(
             },
             _ = writable.notified() => {}
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
+            _ = tokio::time::sleep_until(drain.unwrap_or_else(tokio::time::Instant::now)), if drain.is_some() => {}
         }
     }
 }
