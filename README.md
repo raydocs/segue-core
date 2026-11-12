@@ -6,7 +6,7 @@ SDKs for VPN apps on iOS, tvOS, macOS and Android.**
 [![CI](https://github.com/raydocs/segue-core/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/raydocs/segue-core/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/raydocs/segue-core?sort=semver)](https://github.com/raydocs/segue-core/releases/latest)
 [![Maven Central](https://img.shields.io/maven-central/v/io.github.aimalygin/xray-rust-mobile?label=maven%20central)](https://central.sonatype.com/artifact/io.github.aimalygin/xray-rust-mobile)
-[![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue)](LICENSE)
+[![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue)](licenses/LICENSE)
 ![Platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20tvOS%20%7C%20macOS%20%7C%20Android-lightgrey)
 ![Rust](https://img.shields.io/badge/rust-1.96-orange)
 
@@ -451,7 +451,7 @@ website/                   project website source
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
-- [Third-party notices](THIRD_PARTY_NOTICES.md)
+- [Third-party notices](licenses/THIRD_PARTY_NOTICES.md)
 
 ## Contributing and testing
 
@@ -482,6 +482,6 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 ## License
 
 The project source is licensed under the
-[Mozilla Public License 2.0](LICENSE). Downloaded geodata and other third-party
+[Mozilla Public License 2.0](licenses/LICENSE). Downloaded geodata and other third-party
 components remain under their respective licenses; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md).

@@ -4578,7 +4578,7 @@ files whose source and license you have verified.
 
 For the Apple sample, `scripts/fetch-geodata.sh` downloads pinned assets,
 verifies their hard-coded SHA-256 digests, and installs them into the sample
-resource directory. Review [third-party notices](../THIRD_PARTY_NOTICES.md)
+resource directory. Review [third-party notices](../licenses/THIRD_PARTY_NOTICES.md)
 before redistributing those files.
 
 For the CLI, lookup starts with the config directory, then the current working

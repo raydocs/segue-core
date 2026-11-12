@@ -131,7 +131,7 @@ THE SOFTWARE.
 - Complete notices: [LICENSE](vendor/gotatun/LICENSE) and
   [LICENSE-CLOUDFLARE](vendor/gotatun/LICENSE-CLOUDFLARE).
 - Modified source and reproducible patch:
-  [provenance](vendor/gotatun/XRAY-PATCH.md).
+  [provenance](../vendor/gotatun/XRAY-PATCH.md).
 
 The vendored engine adds bounded resource ownership for the WireGuard client.
 It is built with the `ring` and `device` features. The complete covered source,

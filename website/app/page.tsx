@@ -241,7 +241,7 @@ export default function Home() {
       <footer className="site-footer shell">
         <a className="brand" href="#top"><span className="brand-mark" aria-hidden="true">xr</span><span>xray-rust</span></a>
         <p>Independent open-source software, licensed under MPL-2.0. Not affiliated with or endorsed by XTLS or Xray-core.</p>
-        <div><a href={coreUrl}>Core</a><a href={mobileUrl}>Mobile</a><a href={`${coreUrl}/blob/main/LICENSE`}>License</a></div>
+        <div><a href={coreUrl}>Core</a><a href={mobileUrl}>Mobile</a><a href={`${coreUrl}/blob/main/licenses/LICENSE`}>License</a></div>
       </footer>
     </main>
   );

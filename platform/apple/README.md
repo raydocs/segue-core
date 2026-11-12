@@ -460,7 +460,7 @@ try XrayConfigValidator.validate(
 modify the Packet Tunnel provider configuration; inject a custom tunnel
 controller that writes the two App Group keys above when using a shared
 generation. Review
-[third-party notices](../../THIRD_PARTY_NOTICES.md) before redistribution.
+[third-party notices](../../licenses/THIRD_PARTY_NOTICES.md) before redistribution.
 
 Profiles without `geosite:` or non-private `geoip:` references do not need
 these files. Xray-core reads `geoip:private` from `geoip.dat` everywhere; here

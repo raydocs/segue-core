@@ -5,7 +5,7 @@ WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 DEFAULT_OUTPUT_DIR="$WORKSPACE_ROOT/platform/apple/XrayClient/dat"
 
 # Keep these URLs immutable. Updating either tag also requires updating the
-# corresponding SHA-256 digest and THIRD_PARTY_NOTICES.md.
+# corresponding SHA-256 digest and licenses/THIRD_PARTY_NOTICES.md.
 GEOIP_VERSION="202607171233"
 GEOIP_SHA256="b71d1999439dde2de2d2b6844a2befa50c50211ff739785c005ca7c230a17d6a"
 GEOIP_URL="https://github.com/v2fly/geoip/releases/download/$GEOIP_VERSION/geoip.dat"
