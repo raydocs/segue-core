@@ -980,3 +980,128 @@
 +        }
 +    }
  }
+diff --git a/src/socket/tcp.rs b/src/socket/tcp.rs
+index 54ef3f1a..4a9ddee2 100644
+--- a/src/socket/tcp.rs
++++ b/src/socket/tcp.rs
+@@ -1295,6 +1295,30 @@ impl<'a> Socket<'a> {
+         !self.tx_buffer.is_full()
+     }
+ 
++    /// XRAY-PATCH: resize an owned receive buffer in place.
++    ///
++    /// Growing always succeeds for owned storage. Shrinking requires an empty
++    /// reassembly assembler and `capacity >= recv_queue()`. Window scaling is
++    /// fixed when the socket is created or reset, so callers that grow beyond
++    /// 64 KiB must create the socket with the largest buffer first. Segments
++    /// are only accepted into the physical buffer, so a window advertised
++    /// before a shrink cannot overrun storage; the excess is dropped and
++    /// retransmitted by the peer.
++    #[cfg(feature = "alloc")]
++    pub fn resize_recv_buffer(&mut self, capacity: usize) -> bool {
++        if capacity < self.rx_buffer.capacity() && !self.assembler.is_empty() {
++            return false;
++        }
++        self.rx_buffer.resize(capacity)
++    }
++
++    /// XRAY-PATCH: resize an owned transmit buffer in place. Requires
++    /// `capacity >= send_queue()`; unacknowledged octets are preserved.
++    #[cfg(feature = "alloc")]
++    pub fn resize_send_buffer(&mut self, capacity: usize) -> bool {
++        self.tx_buffer.resize(capacity)
++    }
++
+     /// Return the maximum number of bytes inside the recv buffer.
+     #[inline]
+     pub fn recv_capacity(&self) -> usize {
+@@ -1798,6 +1822,14 @@ impl<'a> Socket<'a> {
+         } else {
+             window_start
+         };
++        // XRAY-PATCH: never accept octets beyond the physical receive buffer.
++        // A buffer resized after the last advertisement must not overrun.
++        let physical_end = window_start + self.rx_buffer.window();
++        let window_end = if window_end > physical_end {
++            physical_end
++        } else {
++            window_end
++        };
+         let segment_start = repr.seq_number;
+         let segment_end = repr.seq_number + repr.payload.len();
+ 
+diff --git a/src/storage/ring_buffer.rs b/src/storage/ring_buffer.rs
+index 7d461b68..dbe5583a 100644
+--- a/src/storage/ring_buffer.rs
++++ b/src/storage/ring_buffer.rs
+@@ -93,6 +93,39 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
+         self.window() == 0
+     }
+ 
++    /// XRAY-PATCH: change the capacity of an owned buffer in place.
++    ///
++    /// The ring is linearized starting at the read position. Allocated
++    /// octets and as much of the unallocated area as fits are preserved, so
++    /// out-of-order data written with `write_unallocated` survives growth.
++    /// Returns `false` (and changes nothing) for borrowed storage or when
++    /// `capacity` is smaller than the allocated length.
++    #[cfg(feature = "alloc")]
++    pub fn resize(&mut self, capacity: usize) -> bool
++    where
++        T: Copy + Default,
++    {
++        if capacity < self.length {
++            return false;
++        }
++        let read_at = self.read_at;
++        let ManagedSlice::Owned(old) = &mut self.storage else {
++            return false;
++        };
++        let cap = old.len();
++        if cap == capacity {
++            return true;
++        }
++        let mut next = alloc::vec::Vec::with_capacity(capacity);
++        for i in 0..cap.min(capacity) {
++            next.push(old[(read_at + i) % cap]);
++        }
++        next.resize(capacity, T::default());
++        *old = next;
++        self.read_at = 0;
++        true
++    }
++
+     /// Shorthand for `(self.read + idx) % self.capacity()` with an
+     /// additional check to ensure that the capacity is not zero.
+     fn get_idx(&self, idx: usize) -> usize {
+@@ -770,6 +803,30 @@ mod test {
+         assert_eq!(&data[..], b"mno\x00\x00\x00");
+     }
+ 
++    #[test]
++    #[cfg(feature = "alloc")]
++    fn test_resize_preserves_wrapped_contents() {
++        let mut ring = RingBuffer::new(vec![0u8; 4]);
++        assert_eq!(ring.enqueue_slice(b"abcd"), 4);
++        let mut out = [0u8; 2];
++        assert_eq!(ring.dequeue_slice(&mut out), 2);
++        assert_eq!(ring.enqueue_slice(b"ef"), 2); // wrapped: "cdef"
++        assert!(ring.resize(8));
++        assert_eq!((ring.capacity(), ring.len()), (8, 4));
++        assert_eq!(ring.enqueue_slice(b"gh"), 2);
++        let mut all = [0u8; 6];
++        assert_eq!(ring.dequeue_slice(&mut all), 6);
++        assert_eq!(&all, b"cdefgh");
++        assert!(ring.resize(0), "empty ring shrinks to nothing");
++        assert_eq!(ring.capacity(), 0);
++        assert!(ring.resize(4));
++        assert_eq!(ring.enqueue_slice(b"ij"), 2);
++        assert!(!ring.resize(1), "cannot drop queued octets");
++        let mut borrowed = [0u8; 4];
++        let mut ring = RingBuffer::new(&mut borrowed[..]);
++        assert!(!ring.resize(8), "borrowed storage is fixed");
++    }
++
+     #[test]
+     fn test_buffer_with_no_capacity() {
+         let mut no_capacity: RingBuffer<u8> = RingBuffer::new(vec![]);

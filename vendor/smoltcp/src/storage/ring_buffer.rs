@@ -804,6 +804,30 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "alloc")]
+    fn test_resize_preserves_wrapped_contents() {
+        let mut ring = RingBuffer::new(vec![0u8; 4]);
+        assert_eq!(ring.enqueue_slice(b"abcd"), 4);
+        let mut out = [0u8; 2];
+        assert_eq!(ring.dequeue_slice(&mut out), 2);
+        assert_eq!(ring.enqueue_slice(b"ef"), 2); // wrapped: "cdef"
+        assert!(ring.resize(8));
+        assert_eq!((ring.capacity(), ring.len()), (8, 4));
+        assert_eq!(ring.enqueue_slice(b"gh"), 2);
+        let mut all = [0u8; 6];
+        assert_eq!(ring.dequeue_slice(&mut all), 6);
+        assert_eq!(&all, b"cdefgh");
+        assert!(ring.resize(0), "empty ring shrinks to nothing");
+        assert_eq!(ring.capacity(), 0);
+        assert!(ring.resize(4));
+        assert_eq!(ring.enqueue_slice(b"ij"), 2);
+        assert!(!ring.resize(1), "cannot drop queued octets");
+        let mut borrowed = [0u8; 4];
+        let mut ring = RingBuffer::new(&mut borrowed[..]);
+        assert!(!ring.resize(8), "borrowed storage is fixed");
+    }
+
+    #[test]
     fn test_buffer_with_no_capacity() {
         let mut no_capacity: RingBuffer<u8> = RingBuffer::new(vec![]);
 
