@@ -40,6 +40,7 @@ pub type DeviceSiteConnector =
 /// One site connect request (relay side).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SiteRequest {
+    pub session_id: SessionId,
     pub device: u64,
     pub target: Target,
     pub kind: Kind,
@@ -398,7 +399,7 @@ pub async fn run_relay_ctl(
                     kind,
                     exit_class,
                 } => {
-                    let fut = site(SiteRequest { device, target, kind, exit_class });
+                    let fut = site(SiteRequest { session_id, device, target, kind, exit_class });
                     let tx = site_tx.clone();
                     tokio::spawn(async move {
                         let _ = tx.send(SiteEv::Connected(session_id, fut.await)).await;

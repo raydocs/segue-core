@@ -2227,6 +2227,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "segue-relay"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "rand 0.8.6",
+ "ring",
+ "segue-session",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "segue-routing"
 version = "0.9.0"
 dependencies = [

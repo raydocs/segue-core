@@ -15,6 +15,7 @@ members = [
     "crates/segue-bench",
     "crates/segue-kernel",
     "crates/segue-session",
+    "crates/segue-relay",
     "fuzz",
 ]
 resolver = "2"
