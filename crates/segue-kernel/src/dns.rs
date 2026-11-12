@@ -493,15 +493,32 @@ fn respond(q: &Question<'_>, rcode: u8, ips: &[IpAddr], ttl: u32) -> Vec<u8> {
     out
 }
 
-/// Serve DNS over UDP on `sock` until it errors.
+/// Most queries answered at once (UDP datagrams in flight plus TCP
+/// connections). Each one may hold a 64 KiB receive buffer per domestic
+/// resolver, so this caps the listener's memory; a datagram over the limit
+/// is dropped (the client retries) and a TCP connection waits.
+const MAX_IN_FLIGHT: usize = 256;
+
+/// Serve DNS over UDP on `sock`. Per-datagram errors (e.g. an ICMP
+/// port-unreachable from a client that went away, which some platforms
+/// report on the next receive) do not stop the listener.
 pub async fn serve_udp(sock: UdpSocket, dns: Arc<SmartDns>) -> std::io::Result<()> {
     let sock = Arc::new(sock);
+    let limit = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let mut buf = vec![0u8; 4096];
     loop {
-        let (n, peer) = sock.recv_from(&mut buf).await?;
+        let (n, peer) = match sock.recv_from(&mut buf).await {
+            Ok(r) => r,
+            Err(e) if transient(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        let Ok(permit) = limit.clone().try_acquire_owned() else {
+            continue;
+        };
         let msg = buf[..n].to_vec();
         let (sock, dns) = (sock.clone(), dns.clone());
         tokio::spawn(async move {
+            let _permit = permit;
             if let Some(reply) = dns.handle(&msg).await {
                 let _ = sock.send_to(&reply, peer).await;
             }
@@ -509,12 +526,34 @@ pub async fn serve_udp(sock: UdpSocket, dns: Arc<SmartDns>) -> std::io::Result<(
     }
 }
 
+fn transient(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        ConnectionReset | ConnectionRefused | ConnectionAborted | Interrupted | WouldBlock
+    )
+}
+
 /// Serve DNS over TCP (2-byte length framing, several queries per connection).
 pub async fn serve_tcp(listener: TcpListener, dns: Arc<SmartDns>) -> std::io::Result<()> {
+    let limit = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     loop {
-        let (conn, _) = listener.accept().await?;
+        let permit = limit
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore never closed");
+        let conn = match listener.accept().await {
+            Ok((conn, _)) => conn,
+            // Out of descriptors or an aborted handshake: keep serving.
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let dns = dns.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let _ = tcp_conn(conn, &dns).await;
         });
     }
