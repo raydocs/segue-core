@@ -599,3 +599,78 @@ async fn aborting_the_client_driver_releases_its_carrier_and_dial() {
     }
     assert_eq!(pool.used_blocks(), 0, "pool not returned");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_cut_short_is_never_reported_clean() {
+    // r5 N8: both sides FIN while the app is not reading; the drain bound
+    // passes with the tail still queued. The app must get either every byte
+    // or a non-clean reason, never a prefix and a clean EOF.
+    const BODY: usize = 256 << 10;
+    let body = pattern(BODY, 5);
+    let site_conn: SiteConnector = {
+        let body = body.clone();
+        Arc::new(move |_t, _k| {
+            let body = body.clone();
+            Box::pin(async move {
+                let (a, b) = tokio::io::duplex(64 << 10);
+                tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(b);
+                    let mut req = Vec::new();
+                    let _ = r.read_to_end(&mut req).await;
+                    let _ = w.write_all(&body).await;
+                    let _ = w.shutdown().await;
+                });
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    let cfg = Config::default();
+    let pool = Pool::new(8 << 20);
+    let table = RelayTable::new(cfg.clone(), pool.clone(), Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(4);
+    let relay = tokio::spawn(run_relay(table, accept_rx, site_conn, None));
+    let connector: Connector = Arc::new(move || {
+        let accept_tx = accept_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(256 << 10);
+            accept_tx
+                .send(Box::new(b))
+                .await
+                .map_err(|_| std::io::Error::other("gone"))?;
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+    // A small app pipe: the tail has to wait in the driver.
+    let (mut app, far) = tokio::io::duplex(4 << 10);
+    let (closed_tx, mut closed_rx) = oneshot::channel();
+    let ctl = segue_session::driver::ClientCtl {
+        closed: Some(closed_tx),
+        ..Default::default()
+    };
+    let client = tokio::spawn(segue_session::driver::run_client_ctl(s, far, connector, ctl));
+    app.write_all(b"GET /big HTTP/1.1\r\n\r\n").await.unwrap();
+    app.shutdown().await.unwrap();
+    // Paused well past the drain bound.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), app.read_to_end(&mut got))
+        .await
+        .expect("app stream never ended");
+    let reason = tokio::time::timeout(Duration::from_secs(5), &mut closed_rx)
+        .await
+        .expect("no close reason")
+        .ok();
+    if got.len() < BODY {
+        assert_ne!(
+            reason,
+            Some(CloseReason::Clean),
+            "{} of {BODY} bytes delivered, yet reported clean",
+            got.len()
+        );
+    } else {
+        assert_eq!(got, body);
+    }
+    let _ = client.await;
+    relay.abort();
+}

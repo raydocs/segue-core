@@ -409,9 +409,12 @@ pub struct ClientCtl {
     /// `STALL` hints for this session from the control stream: the
     /// relay's `attach_gen` that it saw stall (B1).
     pub stall: Option<mpsc::UnboundedReceiver<u32>>,
-    /// Receives how the session ended as soon as it is known, before the
-    /// app stream is shut down, so the caller can tell a clean EOF from a
-    /// reset (the app stream itself can only show EOF).
+    /// Receives how the session ended, before the app stream is cut, so
+    /// the caller can tell a clean EOF from a reset (the app stream itself
+    /// can only show EOF). A reset is sent as soon as it is known; `Clean`
+    /// only once every received byte reached the app, which may be after
+    /// the app saw EOF. Data the app did not take within the drain bound
+    /// turns a clean close into a reset.
     pub closed: Option<tokio::sync::oneshot::Sender<CloseReason>>,
     /// Fires once, when the relay first answers OPENED, so the caller can
     /// report success to the app only after the relay accepted the flow.
@@ -431,7 +434,7 @@ where
     let ClientCtl {
         mut reattach,
         mut stall,
-        closed,
+        mut closed,
         mut opened,
     } = ctl;
     let writable = Arc::new(Notify::new());
@@ -628,34 +631,64 @@ where
     if let Some(h) = dial.take() {
         h.abort();
     }
-    let reason = s
+    let mut reason = s
         .close_reason()
         .unwrap_or(CloseReason::Reset(code::INTERNAL));
-    if let Some(tx) = closed {
-        let _ = tx.send(reason);
+    // Not clean: nothing more reaches the app. The reason goes out before
+    // the app stream ends, so the caller turns that end into a reset.
+    if reason != CloseReason::Clean {
+        if let Some(tx) = closed.take() {
+            let _ = tx.send(reason);
+        }
+        app_writer.abort();
     }
     // A clean close can be learnt from a REJECT(closed) (B6) while received
     // data is still buffered: it belongs to the app.
     // Bounded: an app that stopped reading cannot hold the session open.
+    // Clean is only reported once every byte reached the app (r5 N8): a
+    // drain cut short by the deadline is a reset, never a short clean EOF.
     let until = tokio::time::Instant::now() + DRAIN;
-    if reason == CloseReason::Clean && !app_shut {
-        let _ = tokio::time::timeout_at(until, async {
-            loop {
-                let mut v = vec![0u8; s.recv_half().buffered().min(CHUNK)];
-                let n = s.read(&mut v, now());
-                if n == 0 {
-                    break;
+    if reason == CloseReason::Clean {
+        let mut delivered = app_shut;
+        if !app_shut {
+            delivered = tokio::time::timeout_at(until, async {
+                loop {
+                    let mut v = vec![0u8; s.recv_half().buffered().min(CHUNK)];
+                    let n = s.read(&mut v, now());
+                    if n == 0 {
+                        break;
+                    }
+                    v.truncate(n);
+                    if app_tx.send(v.into()).await.is_err() {
+                        return false;
+                    }
                 }
-                v.truncate(n);
-                if app_tx.send(v.into()).await.is_err() {
-                    break;
+                if s.read_eof() {
+                    let _ = app_tx.send(Vec::new().into()).await;
                 }
-            }
-            if s.read_eof() {
-                let _ = app_tx.send(Vec::new().into()).await;
-            }
-        })
-        .await;
+                true
+            })
+            .await
+            .unwrap_or(false);
+        }
+        // The writer ends once its queue is flushed (channel closed).
+        drop(app_tx);
+        let mut app_writer = app_writer;
+        let flushed = delivered
+            && tokio::time::timeout_at(until, &mut app_writer.0)
+                .await
+                .is_ok_and(|r| r.is_ok())
+            && app_err_rx.try_recv().is_err();
+        if !flushed {
+            reason = CloseReason::Reset(code::INTERNAL);
+        }
+        if let Some(tx) = closed.take() {
+            let _ = tx.send(reason);
+        }
+        // Aborted only after the reason is out (no-op when finished).
+        app_writer.abort();
+    } else {
+        drop(app_tx);
     }
     // Flush a final RST / ACK on the current carrier, then close everything.
     if let Some(cid) = s.carrier() {
@@ -672,14 +705,6 @@ where
     for (_, io) in carriers.drain() {
         io.reader.abort();
         tasks.drain(io.writer);
-    }
-    drop(app_tx);
-    if reason == CloseReason::Clean {
-        tasks.drain(app_writer);
-    } else {
-        // Not clean: nothing more reaches the app; dropping the stream lets
-        // the caller turn the reason into a reset.
-        app_writer.abort();
     }
     tasks.finish().await;
     reason
