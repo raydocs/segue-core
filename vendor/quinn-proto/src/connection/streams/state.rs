@@ -349,13 +349,16 @@ impl StreamsState {
         }
         self.on_stream_frame(!stopped, id);
 
-        // Update connection-level flow control
-        Ok(if bytes_read != final_offset.into_inner() {
-            // bytes_read is always <= end, so this won't underflow.
+        // Update connection-level flow control. `Recv::stop` already returned
+        // the credit for `bytes_read..end` of a stopped stream, so only the
+        // bytes the reset declares past `end` are new credit for it.
+        let credited_to = if stopped { end } else { bytes_read };
+        Ok(if credited_to != final_offset.into_inner() {
+            // bytes_read <= end <= final_offset, so this won't underflow.
             self.data_recvd = self
                 .data_recvd
                 .saturating_add(u64::from(final_offset) - end);
-            self.add_read_credits(u64::from(final_offset) - bytes_read)
+            self.add_read_credits(u64::from(final_offset) - credited_to)
         } else {
             ShouldTransmit(false)
         })
@@ -1338,6 +1341,50 @@ mod tests {
         );
         assert_eq!(client.local_max_data - initial_max, 48);
         assert!(!client.recv.contains_key(&id));
+    }
+
+    /// A stopped stream's unread bytes are credited once, by `stop`; the
+    /// peer's RESET_STREAM may add only the bytes it declares past them.
+    #[test]
+    fn stopped_reset_credits_unread_bytes_once() {
+        let mut client = make(Side::Client);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let initial_max = client.local_max_data;
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 4096]),
+                },
+                4096,
+            )
+            .unwrap();
+        let mut pending = Retransmits::default();
+        RecvStream {
+            id,
+            state: &mut client,
+            pending: &mut pending,
+        }
+        .stop(0u32.into())
+        .unwrap();
+        assert_eq!(client.local_max_data - initial_max, 4096);
+
+        // The reset declares 1024 bytes the peer sent past what arrived.
+        let _ = client
+            .received_reset(frame::ResetStream {
+                id,
+                error_code: 0u32.into(),
+                final_offset: 5120u32.into(),
+            })
+            .unwrap();
+        assert_eq!(client.data_recvd, 5120);
+        assert_eq!(
+            client.local_max_data - initial_max,
+            5120,
+            "unread bytes credited twice"
+        );
     }
 
     #[test]

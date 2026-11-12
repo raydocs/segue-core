@@ -215,3 +215,23 @@ confirmed did it: a certificate the client refuses, or a dial given up after
 the Finished. `chrome_parrot_close_before_the_handshake_is_confirmed_is_sent_once`
 fails with sixteen datagrams, where it stops counting, when the condition is
 removed. The complete 312-test library suite passes in the reconstruction.
+
+## A stopped stream's reset credits its unread bytes once
+
+`Recv::stop` returns connection flow-control credit for every byte a stream
+had received but the application had not read (`bytes_read..end`), since
+those bytes will never be read. Upstream's `StreamsState::received_reset`
+then credited `final_offset - bytes_read` again when the peer answered the
+STOP_SENDING with RESET_STREAM, so the unread bytes of a stopped stream were
+credited twice. Each such stream raised the connection's receive window by
+its unread bytes beyond what had been consumed, and the peer could keep that
+much more data in flight: a Hysteria2 client whose slow downloads are
+cancelled, rate-limited streams killed after 10 s, 30 per round, saw buffered
+connection data grow 14, 32, 66 MB and RSS 38, 62, 105 MB over three rounds.
+For a stopped stream the reset now credits only `final_offset - end`, the
+bytes it declares past those received; a stream that was not stopped is
+credited `final_offset - bytes_read` as before. With the correction the same
+load stays flat at about 23 MB of heap and 38 MB RSS over five rounds.
+`stopped_reset_credits_unread_bytes_once` receives 4,096 bytes, stops the
+stream and resets it at offset 5,120, and checks that the connection window
+grew by exactly 5,120; it fails with 9,216 when the correction is reverted.
