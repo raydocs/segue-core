@@ -76,6 +76,33 @@ impl Guard {
         if any_contains(&self.exceptions, ip) {
             return true;
         }
-        !is_forbidden(ip)
+        !is_forbidden(ip) && !is_local_addr(ip)
+    }
+}
+
+/// The address belongs to this host (§5.5 item 2: the node's own
+/// addresses). A public address bound on an interface would otherwise let a
+/// target loop back into the node's own inbounds or local services. Binding
+/// an ephemeral UDP port succeeds only for local addresses. Addresses the
+/// host does not own (1:1 NAT public IPs) still need `blocked_cidrs`.
+pub fn is_local_addr(ip: IpAddr) -> bool {
+    std::net::UdpSocket::bind(std::net::SocketAddr::new(ip, 0)).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_interface_addresses_are_detected() {
+        assert!(is_local_addr("127.0.0.1".parse().unwrap()));
+        assert!(!is_local_addr("1.1.1.1".parse().unwrap()));
+        // The address of the default route's interface (no packet is sent).
+        let s = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        if s.connect("1.1.1.1:53").is_ok() {
+            let me = s.local_addr().unwrap().ip();
+            assert!(is_local_addr(me));
+            assert!(!Guard::default().allows(me));
+        }
     }
 }

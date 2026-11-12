@@ -61,11 +61,17 @@ pub struct HomePool {
 pub enum HomeError {
     /// No lines configured, or every line full.
     NoCapacity,
-    /// Assigned line is DOWN (and failover is off or found no seat).
+    /// Assigned line is DOWN (and failover is off or found no seat), or
+    /// the gateway failed.
     LineDown,
+    /// The gateway works but the target refused / was unreachable (SOCKS
+    /// reply code): not a Home outage.
+    TargetRefused,
 }
 
 const MAX_DEVICES: usize = 1 << 20;
+/// Lines probed at once.
+const PROBE_CONCURRENCY: usize = 16;
 
 impl HomePool {
     pub fn new(
@@ -262,6 +268,14 @@ impl HomePool {
         line: &LineConfig,
         timeout: Duration,
     ) -> Result<(TcpStream, SocketAddr), SocksError> {
+        Self::open_with(line, self.last_addr(i), timeout).await
+    }
+
+    async fn open_with(
+        line: &LineConfig,
+        last_addr: Option<SocketAddr>,
+        timeout: Duration,
+    ) -> Result<(TcpStream, SocketAddr), SocksError> {
         let addrs: Vec<SocketAddr> = match tokio::time::timeout(
             timeout,
             tokio::net::lookup_host(line.server.as_str()),
@@ -272,7 +286,7 @@ impl HomePool {
             _ => Vec::new(),
         };
         let addrs = if addrs.is_empty() {
-            self.last_addr(i).into_iter().collect()
+            last_addr.into_iter().collect()
         } else {
             addrs
         };
@@ -328,7 +342,11 @@ impl HomePool {
                     "line" = line.id,
                     "error" = e.to_string()
                 );
-                Err(HomeError::LineDown)
+                Err(if e.is_line_fault() {
+                    HomeError::LineDown
+                } else {
+                    HomeError::TargetRefused
+                })
             }
         }
     }
@@ -336,18 +354,36 @@ impl HomePool {
     /// Active probe of every line: gateway + auth (§5.7). Exit-IP echo needs
     /// a known echo target and is left to deployment config.
     pub async fn probe_all(&self, timeout: Duration) {
-        let lines: Vec<LineConfig> = self
+        let lines: Vec<(LineConfig, Option<SocketAddr>)> = self
             .inner
             .lock()
             .unwrap()
             .lines
             .iter()
-            .map(|l| l.cfg.clone())
+            .map(|l| (l.cfg.clone(), l.last_addr))
             .collect();
-        for (i, l) in lines.iter().enumerate() {
-            match self.open(i, l, timeout).await {
-                Ok((_, a)) => self.report(i, true, Some(a)),
-                Err(_) => self.report(i, false, None),
+        // Concurrently (bounded): one hung gateway must not stretch the
+        // probe cycle to `lines × timeout`.
+        let mut set = tokio::task::JoinSet::new();
+        let mut it = lines.into_iter().enumerate();
+        loop {
+            while set.len() < PROBE_CONCURRENCY {
+                let Some((i, (l, last))) = it.next() else {
+                    break;
+                };
+                set.spawn(async move {
+                    let r = Self::open_with(&l, last, timeout).await;
+                    (i, r.map(|(_, a)| a))
+                });
+            }
+            let Some(r) = set.join_next().await else {
+                break;
+            };
+            if let Ok((i, r)) = r {
+                match r {
+                    Ok(a) => self.report(i, true, Some(a)),
+                    Err(_) => self.report(i, false, None),
+                }
             }
         }
     }

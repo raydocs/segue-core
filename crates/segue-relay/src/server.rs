@@ -197,17 +197,32 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
         let relay = relay.clone();
         let ctrl = ctrl_tx.clone();
         tokio::spawn(async move {
-            let mut rev = tokio::time::interval(REVOCATION_POLL);
-            let mut probe = tokio::time::interval(relay.cfg.limits.probe_interval);
-            loop {
-                tokio::select! {
-                    _ = rev.tick() => relay.reload_revocations(&ctrl).await,
-                    _ = probe.tick() => {
+            // Probes run in their own task: a slow or hung gateway must
+            // never delay revocation (≤ 60 s to RST, §6.4).
+            let prober = {
+                let relay = relay.clone();
+                tokio::spawn(async move {
+                    let mut probe = tokio::time::interval(relay.cfg.limits.probe_interval);
+                    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        probe.tick().await;
                         if relay.home.line_count() > 0 {
                             relay.home.probe_all(relay.cfg.limits.connect_timeout).await;
                         }
                     }
+                })
+            };
+            struct AbortOnDrop(tokio::task::JoinHandle<()>);
+            impl Drop for AbortOnDrop {
+                fn drop(&mut self) {
+                    self.0.abort();
                 }
+            }
+            let _prober = AbortOnDrop(prober);
+            let mut rev = tokio::time::interval(REVOCATION_POLL);
+            loop {
+                rev.tick().await;
+                relay.reload_revocations(&ctrl).await;
             }
         })
     };

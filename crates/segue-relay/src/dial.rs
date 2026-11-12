@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::guard::Guard;
-use crate::home::HomePool;
+use crate::home::{HomeError, HomePool};
 use crate::metrics::Metrics;
 use crate::policy::{normalize_domain, AiSet};
 use crate::ticket::{ClaimsCache, ExitClass};
@@ -125,6 +125,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Site<S> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
+
+/// Addresses tried per overseas connect.
+const MAX_CONNECT_ADDRS: usize = 4;
 
 pub struct Dialer {
     pub node_id: u64,
@@ -268,7 +271,9 @@ impl Dialer {
         match route {
             Route::Overseas(addrs) => {
                 let mut last = code::CONNECT_REFUSED;
-                for a in addrs {
+                // Bound the total connect time: a name with many dead
+                // addresses must not hold the slot for `n × timeout`.
+                for a in addrs.into_iter().take(MAX_CONNECT_ADDRS) {
                     match tokio::time::timeout(self.connect_timeout, TcpStream::connect(a)).await {
                         Ok(Ok(s)) => {
                             let _ = s.set_nodelay(true);
@@ -296,6 +301,10 @@ impl Dialer {
                         home: Some((self.metrics.clone(), line)),
                         bytes: AtomicU64::new(0),
                     }))
+                }
+                Err(HomeError::TargetRefused) => {
+                    Metrics::inc(&self.metrics.connect_failures);
+                    Err(self.deny(code::CONNECT_REFUSED))
                 }
                 Err(e) => {
                     Metrics::inc(&self.metrics.home_unavailable);

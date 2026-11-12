@@ -310,8 +310,15 @@ impl Config {
         if limits.max_carriers == 0 || limits.max_sessions_per_device == 0 {
             return Err("limits: max_carriers and max_sessions_per_device must be > 0".into());
         }
-        if limits.line_units == 0 || limits.line_units_failover < limits.line_units {
-            return Err("limits: 0 < line_units <= line_units_failover".into());
+        // D2: 5 per line is a hard cap, 7 only while failed over.
+        if limits.line_units == 0
+            || limits.line_units > 5
+            || limits.line_units_failover < limits.line_units
+            || limits.line_units_failover > 7
+        {
+            return Err(
+                "limits: 0 < line_units <= 5, line_units <= line_units_failover <= 7".into(),
+            );
         }
         if limits.first_frame_timeout.is_zero()
             || limits.connect_timeout.is_zero()
