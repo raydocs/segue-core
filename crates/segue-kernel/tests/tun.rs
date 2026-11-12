@@ -847,6 +847,25 @@ async fn application_half_close_reaches_the_site() {
 }
 
 #[tokio::test]
+async fn upload_lost_after_site_closed_resets_the_application() {
+    let dialer = Arc::new(FakeDialer::default());
+    let mut h = Harness::start(rules_proxy_default(), dialer.clone(), None);
+    h.send(tcp(CLIENT4, SITE4, SYN, 100, 0, b"")).await;
+    let sseq = h.next_meaningful().await.seq + 1;
+    h.send(tcp(CLIENT4, SITE4, ACK, 101, sseq, b"")).await;
+    // The site goes away entirely: its FIN reaches the application...
+    drop(dialer.site().await);
+    let fin = h.next_meaningful().await;
+    assert!(fin.fin && !fin.rst);
+    // ...but bytes the application still sends can no longer be delivered,
+    // so the flow must be reset, not left looking cleanly closed.
+    h.send(tcp(CLIENT4, SITE4, ACK, 101, sseq + 1, b"more"))
+        .await;
+    let rst = h.next_meaningful().await;
+    assert!(rst.rst, "expected RST, got {rst:?}");
+}
+
+#[tokio::test]
 async fn rejected_route_gets_rst_and_never_dials() {
     let dialer = Arc::new(FakeDialer::default());
     let mut h = Harness::start(rules_proxy_default(), dialer.clone(), None);

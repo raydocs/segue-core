@@ -1308,9 +1308,14 @@ fn pump(stack: &mut Netstack, id: FlowId, pipe: &mut Pipe, buf: &mut [u8]) -> bo
     // Application → upstream.
     while let Some(tx) = &pipe.down {
         if tx.is_closed() {
-            // Relay task is gone before the stack closed: reset.
+            // The relay stopped taking upload bytes before the application
+            // finished sending (dial failed or the site write failed): the
+            // upload is truncated, so reset rather than let it look clean,
+            // even if the site's FIN was already passed on.
             pipe.down = None;
-            break;
+            let _ = stack.tcp_abort(id);
+            pipe.closed = true;
+            return true;
         }
         match stack.tcp_recv_queue(id) {
             Ok(0) => {
