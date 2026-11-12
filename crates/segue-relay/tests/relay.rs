@@ -111,6 +111,22 @@ fn resolver() -> Resolver {
 }
 
 fn env(home_server: &str, failover: bool, extra_ai_cidr: &str) -> Env {
+    env_with(
+        home_server,
+        failover,
+        extra_ai_cidr,
+        resolver(),
+        system_clock(),
+    )
+}
+
+fn env_with(
+    home_server: &str,
+    failover: bool,
+    extra_ai_cidr: &str,
+    resolver: Resolver,
+    clock: segue_relay::Clock,
+) -> Env {
     let dir = tempdir("cfg");
     let signer = Signer::from_pkcs8(3, &generate_pkcs8()).unwrap();
     let pk = base64::engine::general_purpose::STANDARD.encode(signer.public_key());
@@ -144,7 +160,7 @@ fn env(home_server: &str, failover: bool, extra_ai_cidr: &str) -> Env {
         extra_blocked: vec![],
         exceptions: vec![Cidr::parse("127.0.0.1/32").unwrap()],
     };
-    let relay = Arc::new(Relay::new(cfg, system_clock(), Some(resolver()), Some(guard)).unwrap());
+    let relay = Arc::new(Relay::new(cfg, clock, Some(resolver), Some(guard)).unwrap());
     Env {
         relay,
         signer,
@@ -523,12 +539,107 @@ async fn policy_bundle_reload_forgery_rollback() {
     assert_eq!(d.route(&g, &echo_ai(), 1).await, Ok(Route::Home(lo)));
 }
 
+/// Review r5 N1: the policy is read after the DNS wait. A resolver held
+/// open while v2 (which makes the name AI) is installed: the connect goes
+/// Home on v2, not Overseas on the v1 snapshot. A bundle expiring during the
+/// wait refuses the connect.
+#[tokio::test]
+async fn policy_change_during_dns_wait_applies() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (en, ga) = (entered.clone(), gate.clone());
+    let skew = Arc::new(AtomicUsize::new(0));
+    let sk = skew.clone();
+    let res: Resolver = Arc::new(move |h: String| {
+        let (en, ga) = (en.clone(), ga.clone());
+        Box::pin(async move {
+            if h == "slow.test" {
+                en.notify_one();
+                ga.notified().await;
+            }
+            Ok(vec!["93.184.216.34".parse().unwrap()])
+        })
+    });
+    let clock: segue_relay::Clock = Arc::new(move || now() + sk.load(Ordering::SeqCst) as u64);
+    let e = env_with("127.0.0.1:1", false, "", res, clock);
+    let g = grant_of(&claims(1, vec![ExitClass::Overseas, ExitClass::Ai]));
+    let ip: SocketAddr = "93.184.216.34:443".parse().unwrap();
+    let slow = || Target::Domain("slow.test".into(), 443);
+    let spawn = |relay: Arc<Relay>, g: segue_session::relay::Grant| {
+        tokio::spawn(async move { relay.dialer.route(&g, &slow(), 0).await })
+    };
+
+    // v1: slow.test is plain overseas.
+    let t = spawn(e.relay.clone(), g.clone());
+    entered.notified().await;
+    std::fs::write(
+        &e.relay.cfg.policy_bundle,
+        bundle(&e.policy_key, 2, &["ai.test", "slow.test"], &[]),
+    )
+    .unwrap();
+    e.relay.reload_policy();
+    assert_eq!(e.relay.ai.version(), Some(2));
+    gate.notify_one();
+    assert_eq!(
+        t.await.unwrap(),
+        Ok(Route::Home(ip)),
+        "stale v1 snapshot used"
+    );
+
+    // The last bundle expires while the name resolves.
+    let t = spawn(e.relay.clone(), g.clone());
+    entered.notified().await;
+    skew.store(7200, Ordering::SeqCst);
+    gate.notify_one();
+    assert_eq!(t.await.unwrap(), Err(code::TARGET_DENIED));
+}
+
+/// Review r5 N2: the rollback floor survives a restart. v2 accepted, the
+/// file replaced by a valid v1 while the relay is down: the new relay
+/// keeps v2's AI set.
+#[tokio::test]
+async fn policy_rollback_refused_after_restart() {
+    let e = env("127.0.0.1:1", false, "");
+    let path = e.relay.cfg.policy_bundle.clone();
+    std::fs::write(
+        &path,
+        bundle(&e.policy_key, 2, &["ai.test", "echo.test"], &[]),
+    )
+    .unwrap();
+    e.relay.reload_policy();
+    assert_eq!(e.relay.ai.version(), Some(2));
+    std::fs::write(&path, bundle(&e.policy_key, 1, &["ai.test"], &[])).unwrap();
+    let guard = Guard {
+        extra_blocked: vec![],
+        exceptions: vec![Cidr::parse("127.0.0.1/32").unwrap()],
+    };
+    let r = Relay::new(
+        e.relay.cfg.clone(),
+        system_clock(),
+        Some(resolver()),
+        Some(guard),
+    )
+    .unwrap();
+    assert_eq!(r.ai.version(), Some(2), "restart accepted rollback to v1");
+    let g = grant_of(&claims(1, vec![ExitClass::Overseas, ExitClass::Ai]));
+    let lo: SocketAddr = "127.0.0.1:80".parse().unwrap();
+    assert_eq!(
+        r.dialer
+            .route(&g, &Target::Domain("echo.test".into(), 80), 0)
+            .await,
+        Ok(Route::Home(lo))
+    );
+}
+
 /// Review r4 #1: with no usable bundle the relay cannot confirm anything
 /// and refuses every target (fail closed), AI-hinted or not.
 #[tokio::test]
 async fn no_policy_bundle_fails_closed() {
     let e = env("127.0.0.1:1", false, "");
     std::fs::write(e.relay.cfg.policy_bundle.clone(), "garbage").unwrap();
+    // A first start: no accepted state from an earlier run either (with
+    // one, its unexpired bundle stays in force, review r5 N2).
+    std::fs::remove_file(&e.relay.cfg.policy_state).unwrap();
     let cfg = e.relay.cfg.clone();
     let guard = Guard {
         extra_blocked: vec![],

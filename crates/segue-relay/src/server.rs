@@ -121,15 +121,31 @@ impl Relay {
         if cfg.revocation_file.is_some() {
             revoked.reload()?;
         }
-        let ai = Arc::new(AiPolicy::new(
+        let ai = Arc::new(AiPolicy::with_state(
             cfg.policy_keys.clone(),
             Some(cfg.policy_bundle.clone()),
+            Some(cfg.policy_state.clone()),
         ));
+        // The rollback floor of earlier runs first (review r5 N2): a bundle
+        // file replaced by an older one while the relay was down is refused.
+        if let Err(e) = ai.restore() {
+            crate::log!(
+                "error",
+                "policy state unreadable; refusing all bundles until repaired",
+                "error" = e
+            );
+        }
         // A missing or bad bundle is not fatal: the relay refuses every
         // target until a good one arrives (fail closed).
-        match ai.reload(clock()) {
-            Ok(v) => crate::log!("info", "policy bundle loaded", "version" = format!("{v:?}")),
-            Err(e) => crate::log!(
+        match (ai.reload(clock()), ai.version()) {
+            (Ok(_), v) => crate::log!("info", "policy bundle loaded", "version" = v),
+            (Err(e), Some(v)) => crate::log!(
+                "error",
+                "policy bundle file rejected; keeping the accepted bundle",
+                "version" = v,
+                "error" = e
+            ),
+            (Err(e), None) => crate::log!(
                 "error",
                 "policy bundle not loaded; refusing all targets",
                 "error" = e

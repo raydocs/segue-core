@@ -187,19 +187,28 @@ impl Dialer {
     /// out of the data centre as overseas.
     pub async fn route(&self, grant: &Grant, target: &Target, hint: u8) -> Result<Route, u8> {
         let device = grant.device;
+        if self.ai.check((self.clock)()).is_none() {
+            // No unexpired signed bundle: nothing can be classified (and
+            // nothing is resolved).
+            Metrics::inc(&self.metrics.policy_unavailable);
+            return Err(code::TARGET_DENIED);
+        }
+        let (name, ips, port) = match target {
+            Target::Ip(a) => (None, vec![a.ip()], a.port()),
+            Target::Domain(name, port) => {
+                let n = normalize_domain(name).ok_or(code::TARGET_DENIED)?;
+                let ips = self.resolve(&n).await?;
+                (Some(n), ips, *port)
+            }
+        };
+        // Classify with the policy in force after the DNS wait (review r5
+        // N1): a bundle installed meanwhile applies to this connect, and one
+        // that expired meanwhile refuses it.
         let Some(ai) = self.ai.check((self.clock)()) else {
-            // No unexpired signed bundle: nothing can be classified.
             Metrics::inc(&self.metrics.policy_unavailable);
             return Err(code::TARGET_DENIED);
         };
-        let (ai_name, ips, port) = match target {
-            Target::Ip(a) => (false, vec![a.ip()], a.port()),
-            Target::Domain(name, port) => {
-                let n = normalize_domain(name).ok_or(code::TARGET_DENIED)?;
-                let ai = ai.is_ai_domain(&n);
-                (ai, self.resolve(&n).await?, *port)
-            }
-        };
+        let ai_name = name.as_deref().is_some_and(|n| ai.is_ai_domain(n));
         if port == 0 {
             return Err(code::TARGET_DENIED);
         }

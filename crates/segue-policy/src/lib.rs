@@ -12,10 +12,15 @@
 //! expiry and the AI set (`ai_domains` suffixes, `ai_cidrs`).
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
 use base64::Engine as _;
 use ring::signature::{self, KeyPair as _};
 use serde::{Deserialize, Serialize};
+
+pub mod cidr;
+use cidr::any_contains;
+pub use cidr::Cidr;
 
 /// Domain separation for policy signatures.
 pub const SIG_CONTEXT: &[u8] = b"segue-policy-v1\0";
@@ -146,9 +151,26 @@ impl AiView {
     }
 }
 
-/// Lowercased, trailing dot removed: the form both sides match on.
+/// Lowercased, trailing dot removed: the form names are matched in.
 pub fn normalize_domain(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The canonical form of a DNS name, or `None` if it is not one: lowercase,
+/// one optional trailing dot removed, 1..=253 bytes, labels of 1..=63 bytes
+/// from `[a-z0-9_-]`. A leading dot, an empty label or whitespace is
+/// rejected, not repaired: a signed list means the same to every consumer.
+pub fn canonical_domain(name: &str) -> Option<String> {
+    let n = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+    let ok = !n.is_empty()
+        && n.len() <= 253
+        && n.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+    ok.then_some(n)
 }
 
 /// `name` equals `suffix` or ends with `.suffix` (both normalized).
@@ -157,6 +179,54 @@ pub fn suffix_match(name: &str, suffix: &str) -> bool {
         || (name.len() > suffix.len()
             && name.ends_with(suffix)
             && name.as_bytes()[name.len() - suffix.len() - 1] == b'.')
+}
+
+/// The AI set of one bundle: the single classification both the client
+/// kernel and the relay use (KERNEL_SPEC §5.5 item 7), so the same signed
+/// bytes are accepted or refused, and match, identically on both ends.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AiSet {
+    suffixes: Vec<String>,
+    cidrs: Vec<Cidr>,
+}
+
+impl AiSet {
+    /// Every entry must already be canonical ([`canonical_domain`],
+    /// [`Cidr::parse`]); one bad entry refuses the whole bundle.
+    pub fn parse(domains: &[String], cidrs: &[String]) -> Result<Self, String> {
+        let suffixes = domains
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                canonical_domain(d).ok_or_else(|| format!("ai_domains[{i}]: bad domain {d:?}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let cidrs = cidrs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Cidr::parse(c).map_err(|e| format!("ai_cidrs[{i}]: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { suffixes, cidrs })
+    }
+
+    pub fn from_view(v: &AiView) -> Result<Self, String> {
+        Self::parse(&v.ai_domains, &v.ai_cidrs)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.suffixes.is_empty() && self.cidrs.is_empty()
+    }
+
+    /// `name` (any case, trailing dot allowed) is an AI domain.
+    pub fn is_ai_domain(&self, name: &str) -> bool {
+        let n = normalize_domain(name);
+        self.suffixes.iter().any(|s| suffix_match(&n, s))
+    }
+
+    /// `ip` (IPv4-mapped IPv6 as IPv4) is in an AI range.
+    pub fn is_ai_ip(&self, ip: IpAddr) -> bool {
+        any_contains(&self.cidrs, ip)
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +253,46 @@ mod tests {
         );
         assert!(suffix_match("api.openai.com", "openai.com"));
         assert!(!suffix_match("notopenai.com", "openai.com"));
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Review r5 N3: non-canonical entries are refused, never repaired
+    /// differently by each consumer.
+    #[test]
+    fn ai_set_is_strict() {
+        for bad in [
+            ".openai.com",
+            " openai.com",
+            "openai.com ",
+            "a..b",
+            "",
+            ".",
+            "a/b",
+            "x.com..",
+        ] {
+            assert!(
+                AiSet::parse(&strs(&[bad]), &[]).is_err(),
+                "{bad:?} accepted"
+            );
+        }
+        for bad in [" 1.2.3.0/24", "1.2.3.0/33", "1.2.3.0/"] {
+            assert!(
+                AiSet::parse(&[], &strs(&[bad])).is_err(),
+                "{bad:?} accepted"
+            );
+        }
+        let s = AiSet::parse(
+            &strs(&["OpenAI.com.", "ai.test"]),
+            &strs(&["203.0.113.0/24"]),
+        )
+        .unwrap();
+        assert!(s.is_ai_domain("api.openai.com") && s.is_ai_domain("API.OpenAI.Com."));
+        assert!(!s.is_ai_domain("notopenai.com") && !s.is_ai_domain("openai.com.evil"));
+        assert!(s.is_ai_ip("203.0.113.9".parse().unwrap()));
+        assert!(s.is_ai_ip("::ffff:203.0.113.9".parse().unwrap()));
+        assert!(!s.is_ai_ip("203.0.114.9".parse().unwrap()));
     }
 }

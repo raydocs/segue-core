@@ -59,6 +59,10 @@ struct RawPolicy {
     public_keys: Vec<RawKey>,
     /// Bundle file, kept current by the sync process; re-read on change.
     bundle: PathBuf,
+    /// Where the relay keeps the bundles it accepted (rollback floor across
+    /// restarts). Default: `<bundle>.accepted`. Must be writable.
+    #[serde(default)]
+    state_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,6 +184,8 @@ pub struct Config {
     /// Policy bundle verification keys (key id → raw Ed25519 key).
     pub policy_keys: BTreeMap<u32, Vec<u8>>,
     pub policy_bundle: PathBuf,
+    /// Accepted-bundle state (review r5 N2).
+    pub policy_state: PathBuf,
     pub home_lines: Vec<LineConfig>,
     pub home_auto_failover: bool,
     pub home_assignments: Vec<(u64, String)>,
@@ -301,12 +307,12 @@ impl Config {
         let blocked_cidrs = raw
             .blocked_cidrs
             .iter()
-            .map(|c| Cidr::parse(c))
+            .map(|c| Cidr::parse(c.trim()))
             .collect::<Result<Vec<_>, _>>()?;
         let dev_allow_cidrs = raw
             .dev_allow_cidrs
             .iter()
-            .map(|c| Cidr::parse(c))
+            .map(|c| Cidr::parse(c.trim()))
             .collect::<Result<Vec<_>, _>>()?;
         let r = &raw.limits;
         let limits = Limits {
@@ -357,6 +363,14 @@ impl Config {
             revocation_file: raw.revocation_file.map(|p| base.join(p)),
             policy_keys,
             policy_bundle: base.join(&raw.policy.bundle),
+            policy_state: match &raw.policy.state_file {
+                Some(p) => base.join(p),
+                None => {
+                    let mut p = base.join(&raw.policy.bundle).into_os_string();
+                    p.push(".accepted");
+                    PathBuf::from(p)
+                }
+            },
             home_lines,
             home_auto_failover: raw.home_auto_failover,
             home_assignments,
