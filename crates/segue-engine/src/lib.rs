@@ -68,7 +68,8 @@ pub use outbound::{
     OutboundHealthFailure, OutboundHealthSnapshot, OutboundHealthState,
     OutboundHealthStatusSnapshot, OutboundNode, OutboundNodeId, OutboundNodeKind,
     OutboundProxyGraphError, OutboundRouter, OutboundSelectionOverlay, OutboundSelectionSnapshot,
-    OutboundSelectorGroup, OutboundSelectorGroupSnapshot, RoutingPolicySnapshot, TcpOutbound,
+    OutboundSelectorGroup, OutboundSelectorGroupSnapshot, OutboundUdpSession, RoutingPolicySnapshot,
+    TcpOutbound,
     UdpOutbound, VlessTcpOutbound, VlessUdpFraming,
 };
 pub use runtime_log::{RuntimeLogConfig, RuntimeLogger};

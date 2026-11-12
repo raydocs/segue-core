@@ -279,3 +279,48 @@ where
     }
     Ok(())
 }
+
+/// One outbound UDP session, for embedders outside this crate (the Segue
+/// kernel). A thin wrapper over the same session the engine's own SOCKS and
+/// TUN inbounds relay through; framing stays here.
+pub struct OutboundUdpSession(Session);
+
+impl OutboundUdpSession {
+    /// Opens a session through `outbound` for datagrams to `target`. Names
+    /// are resolved with `resolver` (destination and server bootstrap
+    /// alike). `global_id` keys XUDP/connection reuse where the protocol has
+    /// one; distinct flows should pass distinct ids. A Freedom (direct)
+    /// outbound is refused: direct UDP is the embedder's own socket. Plain
+    /// VLESS UDP without Mux is not offered here (it needs inbound-side
+    /// framing).
+    pub async fn open(
+        outbound: &UdpOutbound,
+        target: &Target,
+        resolver: &dyn DnsResolver,
+        dialer: &TransportDialer,
+        global_id: [u8; 8],
+    ) -> Result<Self, CoreError> {
+        if let UdpOutbound::Vless(vless) = outbound {
+            if !vless.udp_uses_mux(target) {
+                return Err(CoreError::UnsupportedOutboundNetwork);
+            }
+        }
+        open(outbound, target, resolver, resolver, dialer, global_id)
+            .await
+            .map(Self)
+    }
+
+    /// The largest payload this session carries to `target`.
+    pub fn max_payload(&self, target: &Target) -> usize {
+        self.0.max_payload(target)
+    }
+
+    pub async fn send(&self, target: &Target, payload: &[u8]) -> Result<(), CoreError> {
+        self.0.send(target, payload).await
+    }
+
+    /// The next datagram and the source it came from.
+    pub async fn recv(&self) -> Result<(Target, Vec<u8>), CoreError> {
+        self.0.recv().await.map(|d| (d.source, d.payload))
+    }
+}
