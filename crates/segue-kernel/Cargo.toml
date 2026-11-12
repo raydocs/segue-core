@@ -1,0 +1,27 @@
+[package]
+name = "segue-kernel"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+# Segue's own code: not MPL. Kept in new files only; see licenses/.
+license = "LicenseRef-Segue-Proprietary"
+repository.workspace = true
+publish = false
+description = "Segue client kernel: rule-based routing in front of the outer transport engine"
+
+[[bin]]
+name = "segue-kernel"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+segue-config = { path = "../segue-config" }
+segue-engine = { path = "../segue-engine" }
+segue-routing = { path = "../segue-routing" }
+segue-transport = { path = "../segue-transport" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
