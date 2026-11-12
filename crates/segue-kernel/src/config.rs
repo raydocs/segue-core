@@ -13,8 +13,7 @@
 //!     "chnroute": ["1.0.1.0/24"], "chnroute_file": "chnroute.txt",
 //!     "foreign": {"type": "proxy", "outbound": "proxy"},
 //!     "fake_ip_range": "198.18.0.0/15", "fake_ip_ttl_secs": 60, "fake_ip_grace_secs": 600,
-//!     "fake_ip_quarantine_secs": 21600, "fake_ip_max_entries": 16384,
-//!     "fake_ip_state": "fakeip.state",
+//!     "fake_ip_max_entries": 16384, "fake_ip_state": "fakeip.state",
 //!     "query_timeout_ms": 2000, "cache_size": 4096
 //!   }
 //! }
@@ -219,11 +218,12 @@ struct RawDns {
     /// `default` and setting it here is an error.
     #[serde(default)]
     foreign: Option<Action>,
-    /// Where the fake-IP key and mapping are kept across restarts.
-    #[serde(default)]
+    /// Where the fake-IP key and bindings are kept across restarts
+    /// (relative to the config file). Default `fakeip.state`; `null` keeps
+    /// them in memory only, so a restart may hand a cached address to
+    /// another name.
+    #[serde(default = "default_fake_state")]
     fake_ip_state: Option<PathBuf>,
-    #[serde(default = "default_fake_quarantine")]
-    fake_ip_quarantine_secs: u64,
     #[serde(default = "default_fake_max")]
     fake_ip_max_entries: usize,
     #[serde(default = "default_fake_range")]
@@ -247,8 +247,8 @@ fn default_fake_ttl() -> u64 {
 fn default_fake_grace() -> u64 {
     600
 }
-fn default_fake_quarantine() -> u64 {
-    crate::fakeip::DEFAULT_QUARANTINE.as_secs()
+fn default_fake_state() -> Option<PathBuf> {
+    Some(PathBuf::from("fakeip.state"))
 }
 fn default_fake_max() -> usize {
     crate::fakeip::DEFAULT_MAX_ENTRIES
@@ -268,7 +268,6 @@ pub struct DnsConfig {
     pub fake_ip_prefix: u8,
     pub fake_ip_ttl: Duration,
     pub fake_ip_grace: Duration,
-    pub fake_ip_quarantine: Duration,
     pub fake_ip_max_entries: usize,
     /// Absolute path of the fake-IP state file.
     pub fake_ip_state: Option<PathBuf>,
@@ -662,7 +661,6 @@ fn dns_config(
         fake_ip_prefix,
         fake_ip_ttl: Duration::from_secs(d.fake_ip_ttl_secs),
         fake_ip_grace: Duration::from_secs(d.fake_ip_grace_secs),
-        fake_ip_quarantine: Duration::from_secs(d.fake_ip_quarantine_secs),
         fake_ip_max_entries: d.fake_ip_max_entries,
         fake_ip_state: d
             .fake_ip_state
