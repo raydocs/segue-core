@@ -2245,6 +2245,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "segue-session"
+version = "0.1.0"
+dependencies = [
+ "rand 0.8.6",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "segue-transport"
 version = "0.9.0"
 dependencies = [

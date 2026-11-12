@@ -1,0 +1,18 @@
+[package]
+name = "segue-session"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+# Segue's own code: not MPL. Kept in new files only; see licenses/.
+license = "LicenseRef-Segue-Proprietary"
+repository.workspace = true
+publish = false
+description = "Segue L5 session layer (SESSION_PROTOCOL v0.4): frame codec, resumable sessions, flow control"
+
+[dependencies]
+rand.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
