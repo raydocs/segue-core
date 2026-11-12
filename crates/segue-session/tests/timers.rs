@@ -260,3 +260,70 @@ fn detached_session_past_max_lifetime_rejects_resume_with_max_lifetime() {
         Some(CloseReason::Reset(code::MAX_LIFETIME))
     );
 }
+
+#[test]
+fn control_stream_answers_ping_and_carries_stall_and_revoked() {
+    use segue_session::codec::{ty, CtrlHello, CtrlHelloReply, VERSION};
+    let t0 = Instant::now();
+    let mut c = client(t0);
+    c.attach(1, t0);
+    let mut r = RelayTable::new(
+        Config::default(),
+        Pool::new(1 << 20),
+        Box::new(AllowAll),
+        INSTANCE,
+    );
+    r.add_carrier(1);
+    r.on_frame(1, c.poll_transmit(1, t0).unwrap(), t0);
+    let _ = r.take_event();
+    r.connect_done(&SID, Ok(()), t0);
+    while let Some(f) = r.poll_transmit(1, t0) {
+        c.on_frame(1, f, t0).unwrap();
+    }
+    // Control stream.
+    r.add_carrier(9);
+    let hello = CtrlHello {
+        version: VERSION,
+        ticket: b"ticket".to_vec(),
+        held_anchors: vec![5],
+    };
+    r.on_frame(9, hello.to_frame(), t0);
+    match r.poll_transmit(9, t0) {
+        Some(Frame::Control { ty: t, payload }) if t == ty::CTRL_HELLO => {
+            assert_eq!(
+                CtrlHelloReply::parse(&payload).unwrap().instance_id,
+                INSTANCE
+            );
+        }
+        f => panic!("expected CTRL_HELLO reply, got {f:?}"),
+    }
+    r.on_frame(9, Frame::Ping { nonce: 42 }, t0);
+    assert_eq!(
+        r.poll_transmit(9, t0),
+        Some(Frame::Pong {
+            nonce: 42,
+            extra: vec![]
+        })
+    );
+    // Downstream data that is never acknowledged: after T_live, STALL on
+    // the control stream (B1), and the client acts on it.
+    r.site_data(&SID, &[7u8; 1000]);
+    while r.poll_transmit(1, t0).is_some() {}
+    let t = t0 + Config::default().timing.t_live;
+    r.handle_timeout(t);
+    let stall = r.poll_transmit(9, t).expect("STALL");
+    let Frame::Stall(entries) = stall else {
+        panic!("expected STALL, got {stall:?}")
+    };
+    assert_eq!(entries, vec![(SID, c.gen())]);
+    c.on_stall(entries[0].1, t);
+    assert!(c.wants_attach(t));
+    // Device reset: REVOKED on the control stream, which then closes.
+    r.reset_device(0, code::REVOKED);
+    let mut got_revoked = false;
+    while let Some(f) = r.poll_transmit(9, t) {
+        got_revoked |= matches!(f, Frame::Control { ty: t, .. } if t == ty::REVOKED);
+    }
+    assert!(got_revoked);
+    assert!(r.take_closed_carriers().contains(&9));
+}

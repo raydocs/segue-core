@@ -36,31 +36,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
-use ring::signature::{self, KeyPair as _};
 use serde::{Deserialize, Serialize};
 
 use crate::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet, RuleSpec};
 
-/// Domain separation for policy signatures.
-pub const SIG_CONTEXT: &[u8] = b"segue-policy-v1\0";
-/// Largest envelope accepted (the AI / chnroute lists are a few thousand
-/// entries; this leaves room without letting a bad file eat memory).
-pub const MAX_BUNDLE_BYTES: usize = 8 << 20;
-
-fn b64() -> base64::engine::GeneralPurpose {
-    base64::engine::general_purpose::STANDARD
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Envelope {
-    pub key_id: u32,
-    /// Base64 of the body JSON.
-    pub body: String,
-    /// Base64 Ed25519 signature over `SIG_CONTEXT || body bytes`.
-    pub sig: String,
-}
+// Envelope format and signature check are shared with the relay, which
+// reads its AI set from the same signed bundle (KERNEL_SPEC §5.5 item 7).
+pub use segue_policy::{generate_key, parse_public_key, Envelope, MAX_BUNDLE_BYTES, SIG_CONTEXT};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +52,9 @@ pub struct Body {
     pub expires_at: u64,
     #[serde(default)]
     pub ai_domains: Vec<String>,
+    /// AI IP ranges (the relay's AI set reads the same list).
+    #[serde(default)]
+    pub ai_cidrs: Vec<String>,
     #[serde(default)]
     pub rules: Vec<RuleSpec>,
     pub default: Action,
@@ -82,6 +67,11 @@ pub struct Body {
 pub struct Policy {
     pub rules: RuleSet,
     pub chnroute: CidrTable,
+    /// Route for a name with no domain rule whose domestic DNS answer falls
+    /// outside chnroute (smart DNS "foreign"). From a signed bundle this is
+    /// always the bundle's `default`, so a name reaches the same decision by
+    /// DNS + fake-IP as by a direct domain CONNECT.
+    pub foreign: Action,
     /// 0 for an inline (dev) policy and for the fail-closed policy.
     pub version: u64,
     /// None: does not expire (inline dev rules).
@@ -96,6 +86,7 @@ impl Policy {
         Self {
             rules: RuleSet::new(Vec::new(), Action::Reject),
             chnroute: CidrTable::default(),
+            foreign: Action::Reject,
             version: 0,
             expires_at: None,
             refuse_all: true,
@@ -105,11 +96,31 @@ impl Policy {
     /// Rules given in the kernel config (lab / tests only).
     pub fn inline(rules: RuleSet, chnroute: CidrTable) -> Self {
         Self {
+            foreign: rules.default_action().clone(),
             rules,
             chnroute,
             version: 0,
             expires_at: None,
             refuse_all: false,
+        }
+    }
+
+    /// Lab only: a `dns.foreign` route different from the default.
+    pub fn with_foreign(mut self, foreign: Action) -> Self {
+        self.foreign = foreign;
+        self
+    }
+
+    /// Decision for a fake-IP flow to `domain` (re-authorized per flow): an
+    /// explicit domain rule, else the foreign route (fake-IPs for unmatched
+    /// names are only handed out to names judged foreign).
+    pub fn decide_fake(&self, domain: &str) -> &Action {
+        match self
+            .rules
+            .lookup(&segue_routing::TargetAddr::Domain(domain.to_owned()))
+        {
+            Some((_, a)) => a,
+            None => &self.foreign,
         }
     }
 }
@@ -202,30 +213,11 @@ impl Verifier {
     /// Signature + body checks that do not depend on what is installed.
     /// Returns the body (version / expiry still to be judged).
     pub fn open(&self, bytes: &[u8]) -> Result<(Body, Policy), PolicyError> {
-        if bytes.len() > MAX_BUNDLE_BYTES {
-            return Err(PolicyError::Malformed(format!(
-                "{} bytes > {MAX_BUNDLE_BYTES}",
-                bytes.len()
-            )));
-        }
-        let env: Envelope =
-            serde_json::from_slice(bytes).map_err(|e| PolicyError::Malformed(e.to_string()))?;
-        let key = self
-            .keys
-            .get(&env.key_id)
-            .ok_or(PolicyError::UnknownKey(env.key_id))?;
-        let body = b64()
-            .decode(env.body.trim())
-            .map_err(|_| PolicyError::Malformed("body: bad base64".into()))?;
-        let sig = b64()
-            .decode(env.sig.trim())
-            .map_err(|_| PolicyError::Malformed("sig: bad base64".into()))?;
-        let mut msg = Vec::with_capacity(SIG_CONTEXT.len() + body.len());
-        msg.extend_from_slice(SIG_CONTEXT);
-        msg.extend_from_slice(&body);
-        signature::UnparsedPublicKey::new(&signature::ED25519, key)
-            .verify(&msg, &sig)
-            .map_err(|_| PolicyError::BadSignature)?;
+        let body = segue_policy::open(&self.keys, bytes).map_err(|e| match e {
+            segue_policy::EnvelopeError::Malformed(m) => PolicyError::Malformed(m),
+            segue_policy::EnvelopeError::UnknownKey(k) => PolicyError::UnknownKey(k),
+            segue_policy::EnvelopeError::BadSignature => PolicyError::BadSignature,
+        })?;
         // Only signed bytes are parsed past this point.
         let parsed: Body = serde_json::from_slice(&body)
             .map_err(|e| PolicyError::Malformed(format!("body: {e}")))?;
@@ -235,7 +227,7 @@ impl Verifier {
 
     fn compile(&self, b: &Body) -> Result<Policy, PolicyError> {
         let bad = PolicyError::Incompatible;
-        let mut rules = Vec::with_capacity(b.ai_domains.len() + b.rules.len());
+        let mut rules = Vec::with_capacity(b.ai_domains.len() + b.ai_cidrs.len() + b.rules.len());
         for (i, d) in b.ai_domains.iter().enumerate() {
             let d = crate::rules::normalize(d);
             if d.is_empty() || d.contains('/') {
@@ -243,6 +235,14 @@ impl Verifier {
             }
             rules.push(Rule {
                 matcher: Matcher::DomainSuffix(d),
+                action: Action::Proxy(self.ai_route.clone()),
+            });
+        }
+        for (i, c) in b.ai_cidrs.iter().enumerate() {
+            rules.push(Rule {
+                matcher: Matcher::Cidr(
+                    Cidr::parse(c).map_err(|e| bad(format!("ai_cidrs[{i}]: {e}")))?,
+                ),
                 action: Action::Proxy(self.ai_route.clone()),
             });
         }
@@ -274,6 +274,7 @@ impl Verifier {
             cidrs.push(Cidr::parse(c).map_err(|e| bad(format!("chnroute[{i}]: {e}")))?);
         }
         Ok(Policy {
+            foreign: b.default.clone(),
             rules: set,
             chnroute: CidrTable::new(&cidrs),
             version: b.version,
@@ -499,48 +500,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Parse a base64 Ed25519 public key.
-pub fn parse_public_key(text: &str) -> Result<Vec<u8>, String> {
-    let k = b64()
-        .decode(text.trim())
-        .map_err(|_| "public key: bad base64".to_string())?;
-    if k.len() != 32 {
-        return Err("public key: must be 32 bytes".into());
-    }
-    Ok(k)
-}
-
-/// A fresh Ed25519 key as base64 PKCS#8 (dev signing tool).
-pub fn generate_key() -> (String, String) {
-    let rng = ring::rand::SystemRandom::new();
-    let der = signature::Ed25519KeyPair::generate_pkcs8(&rng).expect("ed25519 keygen");
-    let pair = signature::Ed25519KeyPair::from_pkcs8(der.as_ref()).expect("fresh key");
-    (
-        b64().encode(der.as_ref()),
-        b64().encode(pair.public_key().as_ref()),
-    )
-}
-
 /// Sign `body` (the body JSON) into an envelope (dev signing tool; the
 /// control plane does this in production).
 pub fn sign(key_b64: &str, key_id: u32, body: &[u8]) -> Result<String, String> {
-    let der = b64()
-        .decode(key_b64.trim())
-        .map_err(|_| "key: bad base64".to_string())?;
-    let pair = signature::Ed25519KeyPair::from_pkcs8(&der).map_err(|_| "key: bad PKCS#8")?;
     let parsed: Body =
         serde_json::from_slice(body).map_err(|e| format!("body does not parse: {e}"))?;
     let _ = parsed;
-    let mut msg = Vec::with_capacity(SIG_CONTEXT.len() + body.len());
-    msg.extend_from_slice(SIG_CONTEXT);
-    msg.extend_from_slice(body);
-    let sig = pair.sign(&msg);
-    let env = Envelope {
-        key_id,
-        body: b64().encode(body),
-        sig: b64().encode(sig.as_ref()),
-    };
-    Ok(serde_json::to_string(&env).expect("envelope"))
+    segue_policy::sign(key_b64, key_id, body)
 }
 
 /// Read a private key file, refusing one readable by group / others.
@@ -575,6 +541,12 @@ pub fn write_private_key(path: &Path, text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use ring::signature;
+
+    fn b64() -> base64::engine::GeneralPurpose {
+        base64::engine::general_purpose::STANDARD
+    }
     use segue_routing::TargetAddr;
 
     const NOW: u64 = 1_800_000_000;

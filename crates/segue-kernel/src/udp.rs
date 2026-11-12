@@ -23,9 +23,15 @@
 //! (`max_associations`). Datagrams over the path's payload limit,
 //! over a full queue, or with FRAG ≠ 0 are dropped and counted.
 //!
-//! Not here yet: QUIC Initial SNI sniffing for bare-IP UDP (§5.2a.2); such
-//! flows are routed by IP rules only, so an AI CIDR still maps to a refused
-//! outbound.
+//! A bare-IP destination (not fake) is classified by its first datagrams
+//! (§5.2a.2): a QUIC client Initial is decrypted for its SNI and the name
+//! routed like a TCP sniff (the stricter of the IP and the name rule, so an
+//! AI name is refused); QUIC whose name cannot be confirmed (ClientHello
+//! not complete within [`crate::quic::MAX_DATAGRAMS`] datagrams, unknown
+//! version, no SNI), and anything to UDP/443 that is not a readable QUIC
+//! Initial, is refused so the app falls back to TCP. Other UDP goes by the
+//! IP rules. Datagrams are held (counted in the association budget) while
+//! the ClientHello is incomplete and released to the flow once routed.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -41,6 +47,7 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::dial::{Dialer, UdpSession};
+use crate::quic::{InitialSniffer, Quic};
 use crate::rules::Action;
 use crate::socks::{Kernel, REP_GENERAL, REP_OK};
 
@@ -114,6 +121,33 @@ impl Udp {
 
 type Key = (TargetAddr, u16);
 
+/// A destination of one association.
+enum Slot {
+    Live(mpsc::Sender<Vec<u8>>),
+    /// Waiting for the rest of a QUIC ClientHello.
+    Held {
+        sniffer: InitialSniffer,
+        datagrams: Vec<Vec<u8>>,
+        since: Instant,
+    },
+}
+
+impl Slot {
+    fn stale(&self, idle: Duration) -> bool {
+        match self {
+            Slot::Live(tx) => tx.is_closed(),
+            Slot::Held { since, .. } => since.elapsed() >= idle,
+        }
+    }
+}
+
+fn release(queued: &AtomicUsize, slot: &Slot) {
+    if let Slot::Held { datagrams, .. } = slot {
+        let n: usize = datagrams.iter().map(Vec::len).sum();
+        queued.fetch_sub(n, Ordering::Relaxed);
+    }
+}
+
 /// Serve one UDP ASSOCIATE request. `client_port` is the port the client
 /// said it would send from (0: not known yet).
 pub(crate) async fn associate(
@@ -132,7 +166,7 @@ pub(crate) async fn associate(
     reply_bound(&mut conn, REP_OK, Some(socket.local_addr()?)).await?;
 
     let mut client = (client_port != 0).then(|| SocketAddr::new(peer.ip(), client_port));
-    let mut flows: HashMap<Key, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut flows: HashMap<Key, Slot> = HashMap::new();
     let queued = Arc::new(AtomicUsize::new(0));
     let mut buf = vec![0u8; 65_535];
     let mut ctl = [0u8; 64];
@@ -159,7 +193,13 @@ pub(crate) async fn associate(
                 uplink(kernel, udp, &mut flows, &queued, &socket, from, &buf[..n]);
             }
             _ = tokio::time::sleep_until(last + idle) => {
-                flows.retain(|_, tx| !tx.is_closed());
+                flows.retain(|_, f| {
+                    let stale = f.stale(idle);
+                    if stale {
+                        release(&queued, f);
+                    }
+                    !stale
+                });
                 if flows.is_empty() {
                     break;
                 }
@@ -174,7 +214,7 @@ pub(crate) async fn associate(
 fn uplink(
     kernel: &Kernel,
     udp: &Udp,
-    flows: &mut HashMap<Key, mpsc::Sender<Vec<u8>>>,
+    flows: &mut HashMap<Key, Slot>,
     queued: &Arc<AtomicUsize>,
     socket: &Arc<UdpSocket>,
     client: SocketAddr,
@@ -193,37 +233,112 @@ fn uplink(
         })
         .is_ok()
     };
-    if let Some(tx) = flows.get(&key) {
-        if !reserve(queued) {
-            return udp.drop_one();
-        }
-        match tx.try_send(payload.to_vec()) {
-            Ok(()) => return,
-            Err(TrySendError::Full(_)) => {
-                queued.fetch_sub(payload.len(), Ordering::Relaxed);
+    let mut held = None;
+    match flows.get_mut(&key) {
+        Some(Slot::Live(tx)) => {
+            if !reserve(queued) {
                 return udp.drop_one();
             }
-            // Went idle (or broke): route afresh below.
-            Err(TrySendError::Closed(_)) => {
-                queued.fetch_sub(payload.len(), Ordering::Relaxed);
-                flows.remove(&key);
+            match tx.try_send(payload.to_vec()) {
+                Ok(()) => return,
+                Err(TrySendError::Full(_)) => {
+                    queued.fetch_sub(payload.len(), Ordering::Relaxed);
+                    return udp.drop_one();
+                }
+                // Went idle (or broke): route afresh below.
+                Err(TrySendError::Closed(_)) => {
+                    queued.fetch_sub(payload.len(), Ordering::Relaxed);
+                    flows.remove(&key);
+                }
             }
         }
+        Some(Slot::Held { .. }) => held = flows.remove(&key),
+        None => {}
     }
-    if flows.len() >= udp.settings.max_flows {
-        flows.retain(|_, tx| !tx.is_closed());
+    if held.is_none() && flows.len() >= udp.settings.max_flows {
+        flows.retain(|_, f| {
+            let stale = f.stale(udp.settings.idle_timeout);
+            if stale {
+                release(queued, f);
+            }
+            !stale
+        });
         if flows.len() >= udp.settings.max_flows {
             return udp.drop_one();
         }
     }
-    let Some((tag, target)) = route(kernel, &udp.settings, &key.0, port) else {
-        return udp.drop_one();
-    };
     if !reserve(queued) {
+        if let Some(h) = &held {
+            release(queued, h);
+        }
         return udp.drop_one();
     }
-    let (tx, rx) = mpsc::channel(udp.settings.queue.max(1));
-    let _ = tx.try_send(payload.to_vec());
+    let decided = match (held, &key.0) {
+        (
+            Some(Slot::Held {
+                mut sniffer,
+                mut datagrams,
+                since,
+            }),
+            TargetAddr::Ip(ip),
+        ) => {
+            datagrams.push(payload.to_vec());
+            match sniffer.push(payload) {
+                Quic::NeedMore => {
+                    flows.insert(
+                        key,
+                        Slot::Held {
+                            sniffer,
+                            datagrams,
+                            since,
+                        },
+                    );
+                    return;
+                }
+                q => (
+                    route_sniffed(kernel, &udp.settings, *ip, port, &q),
+                    datagrams,
+                ),
+            }
+        }
+        (_, TargetAddr::Ip(ip)) if sniffs(kernel, *ip) => {
+            let mut sniffer = InitialSniffer::default();
+            match sniffer.push(payload) {
+                Quic::NeedMore => {
+                    flows.insert(
+                        key,
+                        Slot::Held {
+                            sniffer,
+                            datagrams: vec![payload.to_vec()],
+                            since: Instant::now(),
+                        },
+                    );
+                    return;
+                }
+                q => (
+                    route_sniffed(kernel, &udp.settings, *ip, port, &q),
+                    vec![payload.to_vec()],
+                ),
+            }
+        }
+        _ => (
+            route(kernel, &udp.settings, &key.0, port),
+            vec![payload.to_vec()],
+        ),
+    };
+    let (route, datagrams) = decided;
+    let Some((tag, target)) = route else {
+        let n: usize = datagrams.iter().map(Vec::len).sum();
+        queued.fetch_sub(n, Ordering::Relaxed);
+        for _ in &datagrams {
+            udp.drop_one();
+        }
+        return;
+    };
+    let (tx, rx) = mpsc::channel(udp.settings.queue.max(datagrams.len()));
+    for d in datagrams {
+        let _ = tx.try_send(d);
+    }
     tokio::spawn(flow(
         Flow {
             dialer: kernel.dialer.clone(),
@@ -240,8 +355,61 @@ fn uplink(
         },
         rx,
     ));
-    flows.insert(key, tx);
+    flows.insert(key, Slot::Live(tx));
 }
+
+/// Whether a new flow to this bare IP is classified by its datagrams first
+/// (not a fake address, and not already refused by an IP rule).
+pub(crate) fn sniffs(kernel: &Kernel, ip: IpAddr) -> bool {
+    if kernel.fake_ip.as_ref().is_some_and(|p| p.contains(ip)) {
+        return false;
+    }
+    let policy = kernel.policy.current();
+    !policy.refuse_all
+        && !matches!(
+            policy.rules.lookup(&TargetAddr::Ip(ip)),
+            Some((_, Action::Reject))
+        )
+}
+
+/// Route a bare-IP flow once its first datagrams are classified (§5.2a.2).
+/// The policy current now applies.
+pub(crate) fn route_sniffed(
+    kernel: &Kernel,
+    s: &UdpSettings,
+    ip: IpAddr,
+    port: u16,
+    quic: &Quic,
+) -> Option<(Option<String>, TargetAddr)> {
+    let policy = kernel.policy.current();
+    if policy.refuse_all {
+        return None;
+    }
+    match quic {
+        // UDP/443 is QUIC's port: anything there that is not a readable
+        // client Initial (a short-header packet of a connection we never saw
+        // start, a QUIC version we cannot read) cannot be confirmed non-AI.
+        Quic::NotQuic if port != QUIC_PORT => route(kernel, s, &TargetAddr::Ip(ip), port),
+        Quic::Domain(d) => {
+            let rules = &policy.rules;
+            let by_ip = rules.lookup(&TargetAddr::Ip(ip));
+            let by_domain = rules.lookup(&TargetAddr::Domain(d.clone()));
+            let action = crate::socks::stricter(by_ip, by_domain)
+                .unwrap_or_else(|| rules.default_action())
+                .clone();
+            let target = match action {
+                // Direct goes to the address the app asked for (resolving
+                // the sniffed name locally would leak it).
+                Action::Direct => TargetAddr::Ip(ip),
+                _ => TargetAddr::Domain(d.clone()),
+            };
+            finish(s, action, target, port)
+        }
+        _ => None,
+    }
+}
+
+const QUIC_PORT: u16 = 443;
 
 /// The outbound (None: direct) and the address to dial, or None: refused.
 pub(crate) fn route(
@@ -257,16 +425,30 @@ pub(crate) fn route(
     let (action, target) = match addr {
         TargetAddr::Ip(ip) if kernel.fake_ip.as_ref().is_some_and(|p| p.contains(*ip)) => {
             // A fake address is never dialled as an IP.
+            // Authorized against the policy in force now; the pool only
+            // remembers the name.
             let entry = kernel.fake_ip.as_ref()?.lookup(*ip)?;
-            (entry.action, TargetAddr::Domain(entry.domain))
+            (
+                policy.decide_fake(&entry.domain).clone(),
+                TargetAddr::Domain(entry.domain),
+            )
         }
         _ => (policy.rules.decide(addr).clone(), addr.clone()),
     };
+    finish(s, action, target, port)
+}
+
+fn finish(
+    s: &UdpSettings,
+    action: Action,
+    target: TargetAddr,
+    port: u16,
+) -> Option<(Option<String>, TargetAddr)> {
     match action {
         Action::Reject => None,
         Action::Direct => Some((None, target)),
         Action::Proxy(tag) if s.refuse.contains(&tag) => None,
-        Action::Proxy(tag) if port == 443 && s.refuse_quic.contains(&tag) => None,
+        Action::Proxy(tag) if port == QUIC_PORT && s.refuse_quic.contains(&tag) => None,
         Action::Proxy(tag) => Some((Some(tag), target)),
     }
 }

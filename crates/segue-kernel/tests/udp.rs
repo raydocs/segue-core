@@ -10,6 +10,9 @@ use async_trait::async_trait;
 use segue_kernel::dial::{Datagrams, DialError, Dialer, Stream, UdpSession};
 use segue_kernel::fakeip::FakeIpPool;
 use segue_kernel::policy::{Policy, PolicyStore};
+use segue_kernel::quic::{
+    hex, QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2, RFC9001_CLIENT_INITIAL,
+};
 use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
 use segue_kernel::socks::{serve, Kernel, REP_CMD_UNSUPPORTED, REP_OK};
 use segue_kernel::udp::{Udp, UdpSettings};
@@ -120,6 +123,7 @@ fn rules() -> RuleSet {
     RuleSet::new(
         vec![
             rule(Matcher::DomainSuffix("openai.com".into()), proxy("home")),
+            rule(Matcher::DomainSuffix("chatgpt.com".into()), proxy("home")),
             rule(
                 Matcher::Cidr(Cidr::parse("1.2.3.0/24").unwrap()),
                 proxy("home"),
@@ -335,8 +339,8 @@ async fn fake_ip_destinations_are_dialled_by_name_and_stale_ones_dropped() {
         )
         .unwrap(),
     );
-    let fake = pool.assign("video.example", proxy("proxy")).unwrap();
-    let ai = pool.assign("chat.openai.com", proxy("home")).unwrap();
+    let fake = pool.assign("video.example", 0).unwrap();
+    let ai = pool.assign("chat.openai.com", 0).unwrap();
     let env = start(Some(settings()), Some(pool)).await;
     let (_, _ctl, relay) = associate(env.socks).await;
     let c = client(relay).await;
@@ -449,4 +453,70 @@ async fn queued_bytes_are_bounded_per_association() {
         got += 1;
     }
     assert_eq!((got, udp.dropped()), (4, 6));
+}
+
+/// §5.2a.2: a bare-IP QUIC flow is routed by its Initial's SNI.
+#[tokio::test]
+async fn quic_initial_sni_routes_bare_ip_udp_by_name() {
+    let env = start(Some(settings()), None).await;
+    let (_, _ctl, relay) = associate(env.socks).await;
+    let c = client(relay).await;
+    let initial = hex(RFC9001_CLIENT_INITIAL);
+    c.send(&packet(&ip("8.8.8.8"), 443, &initial))
+        .await
+        .unwrap();
+    // (The fake session's 1000-byte payload limit drops the 1200-byte
+    // Initial itself; the dial is what is checked.)
+    for _ in 0..100 {
+        if !env.fake.calls().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        env.fake.calls(),
+        vec![(Some("proxy".into()), "example.com:443".into())]
+    );
+}
+
+/// An AI name in a ClientHello split over two datagrams (real quic-go
+/// capture) is refused: nothing dialled, both datagrams dropped.
+#[tokio::test]
+async fn quic_ai_sni_split_over_two_datagrams_is_refused() {
+    let env = start(Some(settings()), None).await;
+    let (_, _ctl, relay) = associate(env.socks).await;
+    let c = client(relay).await;
+    for d in [QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2] {
+        c.send(&packet(&ip("8.8.8.8"), 443, &hex(d))).await.unwrap();
+    }
+    assert_eq!(recv(&c, QUIET).await, None);
+    assert!(env.fake.calls().is_empty(), "{:?}", env.fake.calls());
+    assert_eq!(env.udp.as_ref().unwrap().dropped(), 2);
+}
+
+/// Until classified, QUIC that cannot be confirmed non-AI is refused (the
+/// app falls back to TCP): an incomplete ClientHello, anything on UDP/443
+/// that is not a readable Initial. Other UDP still goes by IP rules.
+#[tokio::test]
+async fn unconfirmed_quic_is_refused() {
+    let env = start(Some(settings()), None).await;
+    let (_, _ctl, relay) = associate(env.socks).await;
+    let c = client(relay).await;
+    let first = hex(QUIC_GO_CHATGPT_INITIAL);
+    for _ in 0..segue_kernel::quic::MAX_DATAGRAMS {
+        c.send(&packet(&ip("8.8.4.4"), 443, &first)).await.unwrap();
+    }
+    c.send(&packet(&ip("8.8.8.8"), 443, b"\x40short-header"))
+        .await
+        .unwrap();
+    assert_eq!(recv(&c, QUIET).await, None);
+    assert!(env.fake.calls().is_empty(), "{:?}", env.fake.calls());
+    c.send(&packet(&ip("8.8.8.8"), 3478, b"stun"))
+        .await
+        .unwrap();
+    assert!(recv(&c, WAIT).await.is_some());
+    assert_eq!(
+        env.fake.calls(),
+        vec![(Some("proxy".into()), "8.8.8.8:3478".into())]
+    );
 }

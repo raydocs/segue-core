@@ -102,6 +102,8 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 
 use crate::dial::{Dialer, UdpSession};
 use crate::dns::SmartDns;
+use crate::policy::Policy;
+use crate::quic::{InitialSniffer, Quic};
 use crate::rules::{Action, RuleSet};
 use crate::sniff::{sniff, Sniff};
 use crate::socks::{Kernel, SniffSettings};
@@ -1121,6 +1123,17 @@ impl Netstack {
     /// Feed one packet read from the TUN. `policy` is asked once per new flow
     /// (TCP SYN or first UDP datagram) after the built-in checks.
     pub fn input(&mut self, pkt: &[u8], now: Instant, policy: &mut dyn FnMut(&FlowKey) -> Verdict) {
+        self.input_with(pkt, now, &mut |k: &FlowKey, _: &[u8]| policy(k))
+    }
+
+    /// [`Self::input`], with the policy also seeing the first UDP datagram's
+    /// payload (empty for TCP).
+    pub fn input_with(
+        &mut self,
+        pkt: &[u8],
+        now: Instant,
+        policy: &mut dyn FnMut(&FlowKey, &[u8]) -> Verdict,
+    ) {
         self.stats.packets_in += 1;
         self.now = now;
         let oversize = pkt.len() > self.cfg.mtu;
@@ -1148,7 +1161,9 @@ impl Netstack {
             return;
         }
         match parsed.l4 {
-            L4::Tcp(meta) => self.input_tcp(pkt, &parsed.key, meta, now, policy),
+            L4::Tcp(meta) => self.input_tcp(pkt, &parsed.key, meta, now, &mut |k: &FlowKey| {
+                policy(k, &[])
+            }),
             L4::Udp(payload) => {
                 let payload = Bytes::copy_from_slice(payload);
                 self.input_udp(pkt, &parsed, payload, now, policy)
@@ -1272,7 +1287,7 @@ impl Netstack {
         parsed: &Parsed<'_>,
         payload: Bytes,
         now: Instant,
-        policy: &mut dyn FnMut(&FlowKey) -> Verdict,
+        policy: &mut dyn FnMut(&FlowKey, &[u8]) -> Verdict,
     ) {
         let key = parsed.key;
         let tag = if let Some(entry) = self.udp.get_mut(&key) {
@@ -1298,7 +1313,7 @@ impl Netstack {
                     return;
                 }
                 Some(ReservedDst::Refuse) => {
-                    let v = (key.dst.port() == DNS_PORT).then(|| policy(&key));
+                    let v = (key.dst.port() == DNS_PORT).then(|| policy(&key, &payload));
                     if v != Some(Verdict::Local) {
                         self.stats.udp_refused_reserved += 1;
                         self.emit_icmp(pkt, parsed, now, IcmpError::Prohibited);
@@ -1319,7 +1334,7 @@ impl Netstack {
                         self.emit_icmp(pkt, parsed, now, IcmpError::Prohibited);
                         return;
                     }
-                    policy(&key)
+                    policy(&key, &payload)
                 }
             };
             match verdict {
@@ -1716,6 +1731,17 @@ impl Netstack {
 
     /// The relay of a UDP flow failed (refused, never retried direct): its
     /// datagrams are answered with ICMP until the flow expires.
+    /// Refuse a flow the router accepted for classification: this and later
+    /// datagrams get the ICMP refusal.
+    pub fn udp_refuse_policy(&mut self, key: &FlowKey) {
+        if let Some(e) = self.udp.get_mut(key) {
+            if !e.refused {
+                e.refused = true;
+                self.stats.udp_refused_policy += 1;
+            }
+        }
+    }
+
     pub fn udp_refuse(&mut self, key: &FlowKey) {
         if let Some(e) = self.udp.get_mut(key) {
             if !e.refused {
@@ -1806,6 +1832,9 @@ pub enum TcpRoute {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UdpRoute {
     Dial(Dial),
+    /// Classify the flow's first datagrams (QUIC Initial SNI, §5.2a.2),
+    /// then ask [`TunRouter::udp_sniffed`]. Datagrams are held meanwhile.
+    Sniff,
     /// Answered by the stack's [`SmartDns`].
     Dns,
     Refuse,
@@ -1822,6 +1851,10 @@ pub trait TunRouter: Send + Sync {
     /// Default: refuse.
     fn route_udp(&self, _key: &FlowKey) -> UdpRoute {
         UdpRoute::Refuse
+    }
+    /// After [`UdpRoute::Sniff`]: what the datagrams were. `None` refuses.
+    fn udp_sniffed(&self, _key: &FlowKey, _quic: &Quic) -> Option<Dial> {
+        None
     }
 }
 
@@ -1859,13 +1892,15 @@ pub struct TunKernel {
 }
 
 impl TunKernel {
-    fn fake(&self, key: &FlowKey) -> Option<Option<Dial>> {
+    /// Fake-IP destination: the recorded name, authorized against the
+    /// policy in force now (the pool stores no decision).
+    fn fake(&self, policy: &Policy, key: &FlowKey) -> Option<Option<Dial>> {
         let ip = key.dst.ip();
         let pool = self.kernel.fake_ip.as_ref().filter(|p| p.contains(ip))?;
-        Some(
-            pool.lookup(ip)
-                .and_then(|e| Dial::from_action(&e.action, TargetAddr::Domain(e.domain))),
-        )
+        Some(pool.lookup(ip).and_then(|e| {
+            let action = policy.decide_fake(&e.domain).clone();
+            Dial::from_action(&action, TargetAddr::Domain(e.domain))
+        }))
     }
 }
 
@@ -1879,7 +1914,7 @@ impl TunRouter for TunKernel {
             // No valid policy bundle: fail closed, fake-IP included (§5.4).
             return TcpRoute::Refuse;
         }
-        if let Some(fake) = self.fake(key) {
+        if let Some(fake) = self.fake(&policy, key) {
             return fake.map_or(TcpRoute::Refuse, TcpRoute::Dial);
         }
         let rules = &policy.rules;
@@ -1923,11 +1958,27 @@ impl TunRouter for TunKernel {
         let Some(udp) = self.kernel.udp.as_ref() else {
             return UdpRoute::Refuse;
         };
-        let addr = TargetAddr::Ip(key.dst.ip());
+        let ip = key.dst.ip();
+        if crate::udp::sniffs(&self.kernel, ip) {
+            return UdpRoute::Sniff;
+        }
+        let addr = TargetAddr::Ip(ip);
         match crate::udp::route(&self.kernel, &udp.settings, &addr, key.dst.port()) {
             Some((tag, target)) => UdpRoute::Dial(Dial { tag, target }),
             None => UdpRoute::Refuse,
         }
+    }
+
+    fn udp_sniffed(&self, key: &FlowKey, quic: &Quic) -> Option<Dial> {
+        let udp = self.kernel.udp.as_ref()?;
+        crate::udp::route_sniffed(
+            &self.kernel,
+            &udp.settings,
+            key.dst.ip(),
+            key.dst.port(),
+            quic,
+        )
+        .map(|(tag, target)| Dial { tag, target })
     }
 }
 
@@ -1952,6 +2003,17 @@ enum TcpPlan {
     Dial(Dial),
     Sniff(SniffSettings),
     Dns,
+}
+
+enum UdpPlan {
+    Dial(Dial),
+    /// Datagrams held while the QUIC ClientHello is incomplete. `skip`:
+    /// datagrams already fed to the sniffer (the first one, at admission).
+    Sniff {
+        sniffer: InitialSniffer,
+        held: Vec<Bytes>,
+        skip: usize,
+    },
 }
 
 enum UdpMsg {
@@ -2072,7 +2134,7 @@ impl TunStack {
         });
         let mut pipes: HashMap<FlowId, Pipe> = HashMap::new();
         let mut tcp_plans: HashMap<FlowKey, TcpPlan> = HashMap::new();
-        let mut udp_plans: HashMap<FlowKey, Dial> = HashMap::new();
+        let mut udp_plans: HashMap<FlowKey, UdpPlan> = HashMap::new();
         let mut udp_flows: HashMap<FlowKey, mpsc::Sender<Bytes>> = HashMap::new();
         let (msg_tx, mut msg_rx) = mpsc::channel::<UdpMsg>(self.config.udp_queue.max(1));
         let dns_slots = Arc::new(Semaphore::new(self.max_dns_in_flight));
@@ -2145,13 +2207,47 @@ impl TunStack {
                     });
                     continue;
                 }
-                let tx = match udp_flows.entry(d.key) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                let (tx, held) = match udp_flows.entry(d.key) {
+                    std::collections::hash_map::Entry::Occupied(e) => (e.into_mut(), Vec::new()),
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        let Some(dial) = udp_plans.remove(&d.key) else {
-                            continue;
+                        let (dial, held) = match udp_plans.remove(&d.key) {
+                            None => continue,
+                            Some(UdpPlan::Dial(dial)) => (dial, Vec::new()),
+                            Some(UdpPlan::Sniff {
+                                mut sniffer,
+                                mut held,
+                                skip,
+                            }) => {
+                                let q = if skip > 0 {
+                                    Quic::NeedMore
+                                } else {
+                                    sniffer.push(&d.payload)
+                                };
+                                if q == Quic::NeedMore {
+                                    held.push(d.payload);
+                                    let skip = skip.saturating_sub(1);
+                                    udp_plans.insert(
+                                        d.key,
+                                        UdpPlan::Sniff {
+                                            sniffer,
+                                            held,
+                                            skip,
+                                        },
+                                    );
+                                    continue;
+                                }
+                                match router.udp_sniffed(&d.key, &q) {
+                                    Some(dial) => (dial, held),
+                                    None => {
+                                        // Unconfirmed QUIC or a refused name:
+                                        // later datagrams get the ICMP refusal.
+                                        stack.udp_refuse_policy(&d.key);
+                                        continue;
+                                    }
+                                }
+                            }
                         };
-                        let (tx, rx) = mpsc::channel(self.udp_flow_queue.max(1));
+                        let (tx, rx) = mpsc::channel(self.udp_flow_queue.max(held.len() + 1));
                         tokio::spawn(udp_flow(
                             ctx.clone(),
                             d.key,
@@ -2160,9 +2256,14 @@ impl TunStack {
                             msg_tx.clone(),
                             stack.max_udp_reply(&d.key),
                         ));
-                        e.insert(tx)
+                        (e.insert(tx), held)
                     }
                 };
+                for p in held {
+                    if tx.try_send(p).is_err() {
+                        stack.stats.dropped_udp_queue_full += 1;
+                    }
+                }
                 if tx.try_send(d.payload).is_err() {
                     stack.stats.dropped_udp_queue_full += 1;
                 }
@@ -2178,9 +2279,9 @@ impl TunStack {
                 pkt = io.recv() => {
                     let pkt = pkt?;
                     let mut asked = None;
-                    stack.input(&pkt, Instant::now(), &mut |key: &FlowKey| {
+                    stack.input_with(&pkt, Instant::now(), &mut |key: &FlowKey, first: &[u8]| {
                         asked = Some(*key);
-                        policy(&*router, has_dns, &mut tcp_plans, &mut udp_plans, key)
+                        policy(&*router, has_dns, &mut tcp_plans, &mut udp_plans, key, first)
                     });
                     // Admission can still fail after the router said yes.
                     if let Some(key) = asked.filter(|k| !stack.has_flow(k)) {
@@ -2221,8 +2322,9 @@ fn policy(
     router: &dyn TunRouter,
     has_dns: bool,
     tcp_plans: &mut HashMap<FlowKey, TcpPlan>,
-    udp_plans: &mut HashMap<FlowKey, Dial>,
+    udp_plans: &mut HashMap<FlowKey, UdpPlan>,
     key: &FlowKey,
+    first: &[u8],
 ) -> Verdict {
     match key.proto {
         Proto::Tcp => {
@@ -2246,9 +2348,34 @@ fn policy(
             UdpRoute::Refuse => Verdict::Refuse,
             UdpRoute::Dns if !has_dns => Verdict::Refuse,
             UdpRoute::Dns => Verdict::Local,
+            UdpRoute::Sniff => {
+                // Classified here when the first datagram is enough, so a
+                // refusal gets its ICMP at once.
+                let mut sniffer = InitialSniffer::default();
+                let q = sniffer.push(first);
+                if q == Quic::NeedMore {
+                    udp_plans.insert(
+                        *key,
+                        UdpPlan::Sniff {
+                            sniffer,
+                            held: Vec::new(),
+                            skip: 1,
+                        },
+                    );
+                    return Verdict::Accept(None);
+                }
+                match router.udp_sniffed(key, &q) {
+                    Some(d) => {
+                        let tag = d.tag.clone();
+                        udp_plans.insert(*key, UdpPlan::Dial(d));
+                        Verdict::Accept(tag)
+                    }
+                    None => Verdict::Refuse,
+                }
+            }
             UdpRoute::Dial(d) => {
                 let tag = d.tag.clone();
-                udp_plans.insert(*key, d);
+                udp_plans.insert(*key, UdpPlan::Dial(d));
                 Verdict::Accept(tag)
             }
         },

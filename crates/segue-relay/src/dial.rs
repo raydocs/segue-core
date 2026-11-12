@@ -17,10 +17,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::guard::Guard;
-use crate::home::{HomeError, HomePool};
+use crate::home::{HomeError, HomePool, Lease};
 use crate::metrics::Metrics;
-use crate::policy::{normalize_domain, AiSet};
-use crate::ticket::{ClaimsCache, ExitClass};
+use crate::policy::{normalize_domain, AiPolicy};
+use crate::ticket::{grant_allows, ExitClass};
+use crate::Clock;
+use segue_session::relay::Grant;
 
 /// Resolves a host name to addresses (injectable for tests).
 pub type Resolver = Arc<dyn Fn(String) -> BoxFuture<io::Result<Vec<IpAddr>>> + Send + Sync>;
@@ -81,6 +83,8 @@ struct Site<S> {
     inner: S,
     _slot: DeviceSlot,
     home: Option<(Arc<Metrics>, String)>,
+    /// Home seat held for as long as this connection lives.
+    _lease: Option<Lease>,
     bytes: AtomicU64,
 }
 
@@ -132,9 +136,9 @@ const MAX_CONNECT_ADDRS: usize = 4;
 pub struct Dialer {
     pub node_id: u64,
     pub guard: Guard,
-    pub ai: AiSet,
+    pub ai: Arc<AiPolicy>,
     pub home: Arc<HomePool>,
-    pub claims: Arc<ClaimsCache>,
+    pub clock: Clock,
     pub metrics: Arc<Metrics>,
     pub resolver: Resolver,
     pub devices: Arc<DeviceCounts>,
@@ -173,22 +177,35 @@ impl Dialer {
         }
     }
 
-    /// Classify and check a target for `device`. Pure policy; no connect.
-    pub async fn route(&self, device: u64, target: &Target, hint: u8) -> Result<Route, u8> {
-        let claims = self.claims.get(device).ok_or(code::AUTH)?;
+    /// Classify and check a target for the session whose OPEN produced
+    /// `grant`. Pure policy; no connect.
+    ///
+    /// The relay classifies on its own (R2-1) with the AI set of the signed
+    /// bundle. The client's hint can only make the decision stricter: an
+    /// `overseas` hint on an AI target is upgraded to AI, but an `ai` hint
+    /// the relay cannot confirm is refused (`target_denied`), never sent
+    /// out of the data centre as overseas.
+    pub async fn route(&self, grant: &Grant, target: &Target, hint: u8) -> Result<Route, u8> {
+        let device = grant.device;
+        let Some(ai) = self.ai.check((self.clock)()) else {
+            // No unexpired signed bundle: nothing can be classified.
+            Metrics::inc(&self.metrics.policy_unavailable);
+            return Err(code::TARGET_DENIED);
+        };
         let (ai_name, ips, port) = match target {
             Target::Ip(a) => (false, vec![a.ip()], a.port()),
             Target::Domain(name, port) => {
                 let n = normalize_domain(name).ok_or(code::TARGET_DENIED)?;
-                let ai = self.ai.is_ai_domain(&n);
+                let ai = ai.is_ai_domain(&n);
                 (ai, self.resolve(&n).await?, *port)
             }
         };
         if port == 0 {
             return Err(code::TARGET_DENIED);
         }
-        let is_ai = ai_name || ips.iter().any(|&ip| self.ai.is_ai_ip(ip));
-        if is_ai != (hint == crate::hint::AI) {
+        let is_ai = ai_name || ips.iter().any(|&ip| ai.is_ai_ip(ip));
+        let hint_ai = hint == crate::hint::AI;
+        if is_ai != hint_ai {
             let n = self.metrics.reclass(device);
             if n == 1 || n.is_power_of_two() {
                 crate::log!(
@@ -197,8 +214,14 @@ impl Dialer {
                     "device" = device,
                     "hint" = hint,
                     "ai" = is_ai,
+                    "policy_version" = ai.version(),
                     "count" = n
                 );
+            }
+            if hint_ai {
+                // Never downgrade AI to the data-centre exit.
+                Metrics::inc(&self.metrics.target_denied);
+                return Err(code::TARGET_DENIED);
             }
         }
         let allowed: Vec<IpAddr> = ips
@@ -213,11 +236,11 @@ impl Dialer {
             return Err(code::TARGET_DENIED);
         }
         if is_ai {
-            if !claims.allows(ExitClass::Ai) {
+            if !grant_allows(grant, ExitClass::Ai) {
                 Metrics::inc(&self.metrics.exit_denied);
                 return Err(code::EXIT_DENIED);
             }
-            if claims.ai_anchor_node_id != 0 && claims.ai_anchor_node_id != self.node_id {
+            if grant.ai_anchor_node_id != 0 && grant.ai_anchor_node_id != self.node_id {
                 // Cross-node AI anchoring is M9+.
                 Metrics::inc(&self.metrics.exit_denied);
                 return Err(code::EXIT_DENIED);
@@ -227,7 +250,7 @@ impl Dialer {
             let pick = allowed
                 .iter()
                 .copied()
-                .find(|ip| crate::cidr::canon(*ip).is_ipv4() && (ai_name || self.ai.is_ai_ip(*ip)));
+                .find(|ip| crate::cidr::canon(*ip).is_ipv4() && (ai_name || ai.is_ai_ip(*ip)));
             return match pick {
                 Some(ip) => Ok(Route::Home(SocketAddr::new(crate::cidr::canon(ip), port))),
                 None => {
@@ -236,7 +259,7 @@ impl Dialer {
                 }
             };
         }
-        if !claims.allows(ExitClass::Overseas) {
+        if !grant_allows(grant, ExitClass::Overseas) {
             Metrics::inc(&self.metrics.exit_denied);
             return Err(code::EXIT_DENIED);
         }
@@ -259,13 +282,13 @@ impl Dialer {
         }
         let Some(slot) = self
             .devices
-            .try_acquire(r.device, self.max_sessions_per_device)
+            .try_acquire(r.grant.device, self.max_sessions_per_device)
         else {
             Metrics::inc(&self.metrics.session_limit);
             return Err(self.deny(code::CAPACITY));
         };
         let route = self
-            .route(r.device, &r.target, r.exit_class)
+            .route(&r.grant, &r.target, r.exit_class)
             .await
             .map_err(|c| self.deny(c))?;
         match route {
@@ -282,6 +305,7 @@ impl Dialer {
                                 inner: s,
                                 _slot: slot,
                                 home: None,
+                                _lease: None,
                                 bytes: AtomicU64::new(0),
                             }));
                         }
@@ -292,13 +316,18 @@ impl Dialer {
                 Metrics::inc(&self.metrics.connect_failures);
                 Err(self.deny(last))
             }
-            Route::Home(a) => match self.home.dial(r.device, a, self.connect_timeout).await {
-                Ok((s, line)) => {
+            Route::Home(a) => match self
+                .home
+                .dial(r.grant.device, a, self.connect_timeout)
+                .await
+            {
+                Ok((s, line, lease)) => {
                     Metrics::inc(&self.metrics.connects_home);
                     Ok(Box::new(Site {
                         inner: s,
                         _slot: slot,
                         home: Some((self.metrics.clone(), line)),
+                        _lease: Some(lease),
                         bytes: AtomicU64::new(0),
                     }))
                 }
@@ -311,7 +340,7 @@ impl Dialer {
                     crate::log!(
                         "warn",
                         "home unavailable",
-                        "device" = r.device,
+                        "device" = r.grant.device,
                         "reason" = format!("{e:?}")
                     );
                     Err(self.deny(code::HOME_UNAVAILABLE))

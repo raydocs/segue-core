@@ -141,14 +141,17 @@ async fn handle(mut conn: TcpStream, kernel: &Kernel) -> Result<(), Fail> {
     if let TargetAddr::Ip(ip) = addr {
         if let Some(pool) = kernel.fake_ip.as_ref().filter(|p| p.contains(ip)) {
             // A fake address is never dialled as an IP.
+            // The pool only remembers the name; the flow is authorized
+            // against the policy in force now.
             let Some(entry) = pool.lookup(ip) else {
                 reply(&mut conn, REP_NOT_ALLOWED).await?;
                 return Ok(());
             };
+            let action = policy.decide_fake(&entry.domain).clone();
             return connect_then_reply(
                 conn,
                 kernel,
-                &entry.action,
+                &action,
                 TargetAddr::Domain(entry.domain),
                 port,
             )

@@ -10,6 +10,9 @@ use segue_kernel::dial::{Datagrams, DialError, Dialer, Stream, UdpSession};
 use segue_kernel::dns::{answers_for_test, query_for_test, DnsSettings, SmartDns, TYPE_A};
 use segue_kernel::fakeip::FakeIpPool;
 use segue_kernel::policy::{Policy, PolicyStore};
+use segue_kernel::quic::{
+    hex, QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2, RFC9001_CLIENT_INITIAL,
+};
 use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
 use segue_kernel::sniff::client_hello_for_test;
 use segue_kernel::socks::{Kernel, SniffSettings};
@@ -1293,6 +1296,10 @@ fn kernel_rules() -> RuleSet {
                 action: Action::Proxy("ai".into()),
             },
             Rule {
+                matcher: Matcher::DomainSuffix("chatgpt.com".into()),
+                action: Action::Proxy("ai".into()),
+            },
+            Rule {
                 matcher: Matcher::DomainSuffix("blocked.test".into()),
                 action: Action::Reject,
             },
@@ -1357,7 +1364,6 @@ fn kernel_env(policy: Policy, sniff: bool, udp: bool, fail: bool, dns: bool) -> 
             DnsSettings {
                 // Never reached: every name asked here has a rule.
                 domestic: vec!["127.0.0.1:9".parse().unwrap()],
-                foreign: Action::Proxy("p1".into()),
                 query_timeout: Duration::from_millis(200),
                 cache_size: 64,
             },
@@ -1444,10 +1450,7 @@ async fn ip_reject_refuses_the_syn_even_with_sniffing() {
 #[tokio::test]
 async fn fake_ip_destination_is_dialled_by_name_and_stale_fake_is_refused() {
     let mut e = kernel_env(inline(), false, false, false, false);
-    let ip = e
-        .pool
-        .assign("api.openai.com", Action::Proxy("ai".into()))
-        .unwrap();
+    let ip = e.pool.assign("api.openai.com", 0).unwrap();
     let dst = SocketAddr::new(IpAddr::V4(ip), 443);
     connect(&mut e.h, dst).await;
     let _site = e.dialer.site().await;
@@ -1577,4 +1580,98 @@ async fn udp_without_kernel_udp_is_refused() {
     e.h.send(udp(CLIENT4, "8.8.8.8:3478".parse().unwrap(), b"x"))
         .await;
     assert_eq!(out(&e.h.next().await).proto, IpProtocol::Icmp);
+}
+
+/// Wait for the kernel's UDP dials (the fake echo session caps payloads at
+/// 1000 bytes, so a 1200-byte Initial gets no echo here).
+async fn udp_dials(e: &Env) -> Vec<(Option<String>, TargetAddr, u16)> {
+    for _ in 0..100 {
+        let d = e.dialer.udp_dials.lock().unwrap().clone();
+        if !d.is_empty() {
+            return d;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Vec::new()
+}
+
+/// §5.2a.2 over TUN: a QUIC Initial's SNI routes the bare-IP flow by name.
+#[tokio::test]
+async fn tun_quic_sni_dials_by_name() {
+    let e = kernel_env(inline(), false, true, false, false);
+    let dst: SocketAddr = "8.8.8.8:443".parse().unwrap();
+    e.h.send(udp(CLIENT4, dst, &hex(RFC9001_CLIENT_INITIAL)))
+        .await;
+    assert_eq!(
+        udp_dials(&e).await,
+        vec![(
+            Some("p1".to_string()),
+            TargetAddr::Domain("example.com".into()),
+            443
+        )]
+    );
+}
+
+/// The AI name of a two-datagram ClientHello (real quic-go capture) is
+/// refused: nothing dialled, the flow's next datagram gets ICMP.
+#[tokio::test]
+async fn tun_quic_ai_sni_split_hello_is_refused() {
+    let mut e = kernel_env(inline(), false, true, false, false);
+    let dst: SocketAddr = "8.8.8.8:443".parse().unwrap();
+    let (a, b) = (hex(QUIC_GO_CHATGPT_INITIAL), hex(QUIC_GO_CHATGPT_INITIAL_2));
+    e.h.send(udp(CLIENT4, dst, &a)).await;
+    e.h.send(udp(CLIENT4, dst, &b)).await;
+    let mut icmp = None;
+    for _ in 0..50 {
+        e.h.send(udp(CLIENT4, dst, &a)).await;
+        if let Ok(Some(p)) =
+            tokio::time::timeout(Duration::from_millis(100), e.h.from_stack.recv()).await
+        {
+            icmp = Some(p);
+            break;
+        }
+    }
+    let (t, code, _) = icmpv4(&icmp.expect("ICMP after refusal"));
+    assert_eq!((t, code), (3, 13));
+    assert!(e.dialer.udp_dials.lock().unwrap().is_empty());
+}
+
+/// A split ClientHello with a non-AI policy: held until the name is known,
+/// then dialled once, by that name.
+#[tokio::test]
+async fn tun_quic_split_hello_held_then_dialled_by_name() {
+    let rules = RuleSet::new(Vec::new(), Action::Proxy("p1".into()));
+    let e = kernel_env(
+        Policy::inline(rules, CidrTable::default()),
+        false,
+        true,
+        false,
+        false,
+    );
+    let dst: SocketAddr = "8.8.8.8:443".parse().unwrap();
+    e.h.send(udp(CLIENT4, dst, &hex(QUIC_GO_CHATGPT_INITIAL)))
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(e.dialer.udp_dials.lock().unwrap().is_empty(), "held");
+    e.h.send(udp(CLIENT4, dst, &hex(QUIC_GO_CHATGPT_INITIAL_2)))
+        .await;
+    assert_eq!(
+        udp_dials(&e).await,
+        vec![(
+            Some("p1".to_string()),
+            TargetAddr::Domain("chatgpt.com".into()),
+            443
+        )]
+    );
+}
+
+/// Unreadable QUIC on UDP/443 is refused at once with ICMP.
+#[tokio::test]
+async fn tun_unconfirmed_quic_is_refused() {
+    let mut e = kernel_env(inline(), false, true, false, false);
+    e.h.send(udp(CLIENT4, "8.8.8.8:443".parse().unwrap(), b"\x40short"))
+        .await;
+    let (t, code, _) = icmpv4(&e.h.next().await);
+    assert_eq!((t, code), (3, 13));
+    assert!(e.dialer.udp_dials.lock().unwrap().is_empty());
 }

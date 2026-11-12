@@ -6,14 +6,13 @@
 //! holds only public keys and verifies offline. A ticket is a bearer secret:
 //! it is never logged, and [`Claims`] carries nothing that grants access.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ring::signature::{self, KeyPair as _};
 use segue_session::codec::{code, Kind, Target};
-use segue_session::relay::Authorizer;
+use segue_session::relay::{Authorizer, Grant};
 use serde::{Deserialize, Serialize};
 
 use crate::metrics::Metrics;
@@ -170,46 +169,32 @@ impl Verifier {
     }
 }
 
-/// Latest claims per device, for the site connector (which only learns the
-/// device id from the session table). Bounded.
-#[derive(Default)]
-pub struct ClaimsCache {
-    map: Mutex<HashMap<u64, Claims>>,
+/// Bit for each [`ExitClass`] in [`Grant::exit_classes`].
+pub fn class_bit(c: ExitClass) -> u32 {
+    match c {
+        ExitClass::Overseas => 1,
+        ExitClass::Ai => 2,
+    }
 }
 
-const MAX_CLAIMS: usize = 65_536;
-
-impl ClaimsCache {
-    pub fn put(&self, c: Claims) {
-        let mut m = self.map.lock().unwrap();
-        if m.len() >= MAX_CLAIMS && !m.contains_key(&c.device_id) {
-            // Drop expired entries first; if none, an arbitrary one. A
-            // device whose entry is gone is refused (`auth`) at dial time.
-            let now_min = c.not_before;
-            m.retain(|_, x| x.not_after > now_min);
-            if m.len() >= MAX_CLAIMS {
-                if let Some(&k) = m.keys().next() {
-                    m.remove(&k);
-                }
-            }
-        }
-        m.insert(c.device_id, c);
+/// What this OPEN's ticket authorized; carried with the session's own
+/// connect request, never looked up per device.
+pub fn grant_of(c: &Claims) -> Grant {
+    Grant {
+        device: c.device_id,
+        exit_classes: c.exit_classes.iter().fold(0, |m, &x| m | class_bit(x)),
+        ai_anchor_node_id: c.ai_anchor_node_id,
     }
+}
 
-    pub fn get(&self, device: u64) -> Option<Claims> {
-        self.map.lock().unwrap().get(&device).cloned()
-    }
-
-    pub fn remove(&self, device: u64) {
-        self.map.lock().unwrap().remove(&device);
-    }
+pub fn grant_allows(g: &Grant, c: ExitClass) -> bool {
+    g.exit_classes & class_bit(c) != 0
 }
 
 /// [`Authorizer`] over tickets and the revocation list.
 pub struct TicketAuth {
     pub verifier: Arc<Verifier>,
     pub revoked: Arc<Revocations>,
-    pub claims: Arc<ClaimsCache>,
     pub metrics: Arc<Metrics>,
     pub clock: Clock,
 }
@@ -223,7 +208,7 @@ impl TicketAuth {
                 let c = self.verifier.decode(ticket).map_err(|_| code::AUTH)?;
                 let grace = resume
                     && now < c.not_after.saturating_add(RESUME_GRACE_SECS)
-                    && self.revoked.is_fresh();
+                    && self.revoked.is_fresh_at(now);
                 if !grace {
                     Metrics::inc(&self.metrics.tickets_expired);
                     return Err(code::EXPIRED);
@@ -245,23 +230,19 @@ impl TicketAuth {
 }
 
 impl Authorizer for TicketAuth {
-    fn open(&self, ticket: &[u8], _target: &Target, kind: Kind) -> Result<u64, u8> {
+    fn open(&self, ticket: &[u8], _target: &Target, kind: Kind) -> Result<Grant, u8> {
         let c = self.check(ticket, false)?;
         // This relay carries TCP only; Home UDP is never offered (§5.5.5).
         if kind == Kind::Udp || c.exit_classes.is_empty() {
             Metrics::inc(&self.metrics.exit_denied);
             return Err(code::EXIT_DENIED);
         }
-        let d = c.device_id;
-        self.claims.put(c);
-        Ok(d)
+        Ok(grant_of(&c))
     }
 
+    /// No side effects: RESUME never changes what any session may dial.
     fn resume(&self, ticket: &[u8]) -> Result<u64, u8> {
-        let c = self.check(ticket, true)?;
-        let d = c.device_id;
-        self.claims.put(c);
-        Ok(d)
+        Ok(self.check(ticket, true)?.device_id)
     }
 }
 

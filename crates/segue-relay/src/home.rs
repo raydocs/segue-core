@@ -34,6 +34,9 @@ struct Line {
     fails: u32,
     /// Last gateway address that worked (Decodo DNS outage, §5.7).
     last_addr: Option<SocketAddr>,
+    /// Live connections per device on this line. A device holds a seat
+    /// here while it has any, even after it moved back to its primary.
+    live: HashMap<u64, usize>,
 }
 
 #[derive(Debug, Default)]
@@ -50,7 +53,7 @@ struct Inner {
 }
 
 pub struct HomePool {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
     limits: Limits,
     auto_failover: bool,
     metrics: Arc<Metrics>,
@@ -88,6 +91,7 @@ impl HomePool {
                 state: LineState::Active,
                 fails: 0,
                 last_addr: None,
+                live: HashMap::new(),
             })
             .collect();
         let mut devices = HashMap::new();
@@ -105,7 +109,7 @@ impl HomePool {
             );
         }
         let p = Self {
-            inner: Mutex::new(Inner { lines, devices }),
+            inner: Arc::new(Mutex::new(Inner { lines, devices })),
             limits,
             auto_failover,
             metrics,
@@ -144,6 +148,25 @@ impl HomePool {
     /// none). Returns (index, config).
     pub fn line_for(&self, device: u64) -> Result<(usize, LineConfig), HomeError> {
         let mut g = self.inner.lock().unwrap();
+        let i = self.pick(&mut g, device)?;
+        Ok((i, g.lines[i].cfg.clone()))
+    }
+
+    /// [`Self::line_for`] plus a seat lease for one connection: the device
+    /// keeps its seat on that line until the lease (the connection) ends.
+    pub fn acquire(&self, device: u64) -> Result<(usize, LineConfig, Lease), HomeError> {
+        let mut g = self.inner.lock().unwrap();
+        let i = self.pick(&mut g, device)?;
+        *g.lines[i].live.entry(device).or_default() += 1;
+        let lease = Lease {
+            inner: self.inner.clone(),
+            line: i,
+            device,
+        };
+        Ok((i, g.lines[i].cfg.clone(), lease))
+    }
+
+    fn pick(&self, g: &mut Inner, device: u64) -> Result<usize, HomeError> {
         if g.lines.is_empty() {
             return Err(HomeError::NoCapacity);
         }
@@ -153,7 +176,7 @@ impl HomePool {
                 if g.devices.len() >= MAX_DEVICES {
                     return Err(HomeError::NoCapacity);
                 }
-                let i = pick_new(&g, self.limits.line_units).ok_or(HomeError::NoCapacity)?;
+                let i = pick_new(g, self.limits.line_units).ok_or(HomeError::NoCapacity)?;
                 g.devices.insert(
                     device,
                     Assign {
@@ -171,20 +194,20 @@ impl HomePool {
             }
         };
         if g.lines[primary].state == LineState::Active {
-            // Primary healthy again: drop any temporary seat (switch-back
-            // is an ops action in phase 1; with failover on, return at the
-            // next new connection).
+            // Primary healthy again: new connections return to it. The
+            // temporary seat stays held while old connections on that
+            // line live (their leases), so it cannot be handed out twice.
             if let Some(a) = g.devices.get_mut(&device) {
                 a.current = None;
             }
-            return Ok((primary, g.lines[primary].cfg.clone()));
+            return Ok(primary);
         }
         if !self.auto_failover {
             return Err(HomeError::LineDown);
         }
         if let Some(c) = g.devices.get(&device).and_then(|a| a.current) {
             if g.lines[c].state == LineState::Active {
-                return Ok((c, g.lines[c].cfg.clone()));
+                return Ok(c);
             }
         }
         let cap = self.limits.line_units_failover;
@@ -192,9 +215,11 @@ impl HomePool {
         // Prefer another ISP, then fewest seats.
         let best = (0..g.lines.len())
             .filter(|&i| {
-                i != primary && g.lines[i].state == LineState::Active && seats(&g, i) < cap
+                i != primary
+                    && g.lines[i].state == LineState::Active
+                    && (seats(g, i) < cap || g.lines[i].live.contains_key(&device))
             })
-            .min_by_key(|&i| (g.lines[i].cfg.isp == pisp, seats(&g, i)));
+            .min_by_key(|&i| (g.lines[i].cfg.isp == pisp, seats(g, i)));
         let Some(t) = best else {
             return Err(HomeError::LineDown);
         };
@@ -206,7 +231,7 @@ impl HomePool {
             "from" = g.lines[primary].cfg.id,
             "to" = g.lines[t].cfg.id
         );
-        Ok((t, g.lines[t].cfg.clone()))
+        Ok(t)
     }
 
     /// Gateway outcome for line `i` (sessions and probes).
@@ -314,8 +339,8 @@ impl HomePool {
         device: u64,
         target: SocketAddr,
         timeout: Duration,
-    ) -> Result<(TcpStream, String), HomeError> {
-        let (i, line) = self.line_for(device)?;
+    ) -> Result<(TcpStream, String, Lease), HomeError> {
+        let (i, line, lease) = self.acquire(device)?;
         let r = async {
             let (mut s, a) = self.open(i, &line, timeout).await?;
             tokio::time::timeout(timeout, socks5::connect(&mut s, target))
@@ -327,7 +352,7 @@ impl HomePool {
         match r {
             Ok((s, a)) => {
                 self.report(i, true, Some(a));
-                Ok((s, line.id))
+                Ok((s, line.id, lease))
             }
             Err(e) => {
                 if e.is_line_fault() {
@@ -393,13 +418,49 @@ fn primaries(g: &Inner, i: usize) -> usize {
     g.devices.values().filter(|a| a.primary == i).count()
 }
 
-/// Seats used on line `i`: primaries (reserved even while failed over) plus
-/// temporary occupants.
+/// Seats used on line `i`: primaries (reserved even while failed over),
+/// temporary occupants, and devices with live connections left here.
 fn seats(g: &Inner, i: usize) -> usize {
-    g.devices
+    let assigned = g
+        .devices
         .values()
         .filter(|a| a.primary == i || a.current == Some(i))
-        .count()
+        .count();
+    // Plus devices that moved away but still have connections here.
+    let lingering = g.lines[i]
+        .live
+        .keys()
+        .filter(|d| {
+            g.devices
+                .get(d)
+                .is_none_or(|a| a.primary != i && a.current != Some(i))
+        })
+        .count();
+    assigned + lingering
+}
+
+/// One Home connection's hold on its line's seat (D2). Dropped when the
+/// connection ends; the last one on a line releases the device's seat
+/// there (unless the line is its primary or current line).
+#[derive(Debug)]
+pub struct Lease {
+    inner: Arc<Mutex<Inner>>,
+    line: usize,
+    device: u64,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(l) = g.lines.get_mut(self.line) {
+            if let Some(n) = l.live.get_mut(&self.device) {
+                *n -= 1;
+                if *n == 0 {
+                    l.live.remove(&self.device);
+                }
+            }
+        }
+    }
 }
 
 /// New unit: ISP with the lowest share of units → its line with fewest
@@ -505,6 +566,99 @@ mod tests {
         assert_eq!(refused, 3);
         let ib = 1 - ia;
         assert_eq!(p.units(if ib == 0 { "a" } else { "b" }), 7);
+    }
+
+    /// Review r4 #9: B holds 5 primaries + 2 temporary devices from A. A
+    /// recovers and the two open new connections on A while their old B
+    /// connections live on; a third line then fails. B must still count
+    /// the two lingering devices, so at most 7 devices ever hold live
+    /// connections on B; the seats free only when the last old one ends.
+    #[test]
+    fn switch_back_keeps_seat_until_last_old_connection() {
+        let limits = Limits {
+            line_fail_threshold: 1,
+            ..Limits::default()
+        };
+        let p = HomePool::new(
+            vec![line("a", "x"), line("b", "y"), line("c", "x")],
+            &[],
+            limits,
+            true,
+            Arc::new(Metrics::default()),
+        )
+        .unwrap();
+        let mut leases: Vec<(u64, usize, Lease)> = Vec::new();
+        for d in 0..15 {
+            let (i, _, l) = p.acquire(d).unwrap();
+            leases.push((d, i, l));
+        }
+        let idx = |id: &str| {
+            p.inner
+                .lock()
+                .unwrap()
+                .lines
+                .iter()
+                .position(|l| l.cfg.id == id)
+                .unwrap()
+        };
+        let (a, b, c) = (idx("a"), idx("b"), idx("c"));
+        let on = |line: usize| -> Vec<u64> {
+            let mut v: Vec<u64> = leases.iter().filter(|x| x.1 == line).map(|x| x.0).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let a_devs = on(a);
+        let c_devs = on(c);
+        assert_eq!((a_devs.len(), on(b).len(), c_devs.len()), (5, 5, 5));
+        let live_on_b = |p: &HomePool| p.inner.lock().unwrap().lines[b].live.len();
+
+        // A fails: two of its devices take B's temporary seats (other ISP).
+        p.report(a, false, None);
+        let mut temps = Vec::new();
+        for &d in &a_devs {
+            if let Ok((i, _, l)) = p.acquire(d) {
+                if i == b {
+                    temps.push(d);
+                    leases.push((d, i, l));
+                }
+            }
+        }
+        assert_eq!(temps.len(), 2);
+        assert_eq!((p.units("b"), live_on_b(&p)), (7, 7));
+
+        // A recovers: the temps' new connections go to A; old B ones live.
+        p.report(a, true, None);
+        for &d in &temps {
+            let (i, _, l) = p.acquire(d).unwrap();
+            assert_eq!(i, a);
+            leases.push((d, i, l));
+        }
+        assert_eq!(p.units("b"), 7, "lingering old-line connections hold seats");
+
+        // C fails: its devices may not squeeze onto B.
+        p.report(c, false, None);
+        for &d in &c_devs {
+            if let Ok((i, _, l)) = p.acquire(d) {
+                assert_ne!(i, b, "B is full while old connections live");
+                leases.push((d, i, l));
+            }
+            assert!(live_on_b(&p) <= 7);
+        }
+        assert_eq!((p.units("b"), live_on_b(&p)), (7, 7));
+
+        // One temp's old B connection ends: one seat frees, the other
+        // temp still holds its seat.
+        let first = temps[0];
+        leases.retain(|x| !(x.0 == first && x.1 == b));
+        assert_eq!(p.units("b"), 6);
+        let moved = c_devs
+            .iter()
+            .filter_map(|&d| p.acquire(d).ok().filter(|x| x.0 == b).map(|x| (d, x)))
+            .map(|(d, (i, _, l))| leases.push((d, i, l)))
+            .count();
+        assert!(moved >= 1);
+        assert!(live_on_b(&p) <= 7 && p.units("b") <= 7);
     }
 
     #[test]
