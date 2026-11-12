@@ -67,6 +67,11 @@ pub struct Body {
 pub struct Policy {
     pub rules: RuleSet,
     pub chnroute: CidrTable,
+    /// Route for a name with no domain rule whose domestic DNS answer falls
+    /// outside chnroute (smart DNS "foreign"). From a signed bundle this is
+    /// always the bundle's `default`, so a name reaches the same decision by
+    /// DNS + fake-IP as by a direct domain CONNECT.
+    pub foreign: Action,
     /// 0 for an inline (dev) policy and for the fail-closed policy.
     pub version: u64,
     /// None: does not expire (inline dev rules).
@@ -81,6 +86,7 @@ impl Policy {
         Self {
             rules: RuleSet::new(Vec::new(), Action::Reject),
             chnroute: CidrTable::default(),
+            foreign: Action::Reject,
             version: 0,
             expires_at: None,
             refuse_all: true,
@@ -90,11 +96,31 @@ impl Policy {
     /// Rules given in the kernel config (lab / tests only).
     pub fn inline(rules: RuleSet, chnroute: CidrTable) -> Self {
         Self {
+            foreign: rules.default_action().clone(),
             rules,
             chnroute,
             version: 0,
             expires_at: None,
             refuse_all: false,
+        }
+    }
+
+    /// Lab only: a `dns.foreign` route different from the default.
+    pub fn with_foreign(mut self, foreign: Action) -> Self {
+        self.foreign = foreign;
+        self
+    }
+
+    /// Decision for a fake-IP flow to `domain` (re-authorized per flow): an
+    /// explicit domain rule, else the foreign route (fake-IPs for unmatched
+    /// names are only handed out to names judged foreign).
+    pub fn decide_fake(&self, domain: &str) -> &Action {
+        match self
+            .rules
+            .lookup(&segue_routing::TargetAddr::Domain(domain.to_owned()))
+        {
+            Some((_, a)) => a,
+            None => &self.foreign,
         }
     }
 }
@@ -248,6 +274,7 @@ impl Verifier {
             cidrs.push(Cidr::parse(c).map_err(|e| bad(format!("chnroute[{i}]: {e}")))?);
         }
         Ok(Policy {
+            foreign: b.default.clone(),
             rules: set,
             chnroute: CidrTable::new(&cidrs),
             version: b.version,

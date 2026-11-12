@@ -1,4 +1,5 @@
 //! Domain sniffing on the first bytes of a TCP flow (KERNEL_SPEC §5.2a.1).
+//! QUIC Initial SNI for UDP lives in [`crate::quic`].
 //!
 //! Pure parsers over a byte prefix. They never consume anything from the
 //! socket: the caller keeps the bytes and replays them to the upstream.
@@ -67,6 +68,15 @@ pub fn tls_sni(buf: &[u8]) -> Sniff {
             return parse_client_hello(&hs);
         }
     }
+}
+
+/// Server name from raw (possibly truncated) TLS handshake bytes, as carried
+/// in QUIC CRYPTO frames (no record layer).
+pub fn client_hello_sni(hs: &[u8]) -> Sniff {
+    if hs.is_empty() {
+        return Sniff::NeedMore;
+    }
+    parse_client_hello(hs)
 }
 
 fn hs_complete(hs: &[u8]) -> bool {
