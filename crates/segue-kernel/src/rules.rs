@@ -69,12 +69,8 @@ impl RuleSet {
         };
         self.rules.iter().enumerate().find_map(|(i, rule)| {
             let hit = match (&rule.matcher, target, domain) {
-                (Matcher::DomainSuffix(s), _, Some(d)) => {
-                    d == s
-                        || (d.len() > s.len()
-                            && d.ends_with(s.as_str())
-                            && d.as_bytes()[d.len() - s.len() - 1] == b'.')
-                }
+                // Same suffix rule as the relay's AI set (segue-policy).
+                (Matcher::DomainSuffix(s), _, Some(d)) => segue_policy::suffix_match(d, s),
                 (Matcher::DomainExact(s), _, Some(d)) => d == s,
                 (Matcher::DomainKeyword(s), _, Some(d)) => d.contains(s.as_str()),
                 (Matcher::Cidr(c), TargetAddr::Ip(ip), _) => c.contains(*ip),
@@ -102,7 +98,7 @@ impl RuleSet {
 }
 
 pub(crate) fn normalize(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
+    segue_policy::normalize_domain(name)
 }
 
 /// IPv4 or IPv6 prefix.

@@ -228,11 +228,12 @@ impl Verifier {
     fn compile(&self, b: &Body) -> Result<Policy, PolicyError> {
         let bad = PolicyError::Incompatible;
         let mut rules = Vec::with_capacity(b.ai_domains.len() + b.ai_cidrs.len() + b.rules.len());
-        for (i, d) in b.ai_domains.iter().enumerate() {
-            let d = crate::rules::normalize(d);
-            if d.is_empty() || d.contains('/') {
-                return Err(bad(format!("ai_domains[{i}]: bad domain")));
-            }
+        // The AI set is accepted or refused by the same function the relay
+        // uses (review r5 N3), so one signed bundle means the same on both
+        // ends; the entries are then already canonical.
+        segue_policy::AiSet::parse(&b.ai_domains, &b.ai_cidrs).map_err(bad)?;
+        for d in &b.ai_domains {
+            let d = segue_policy::canonical_domain(d).expect("checked by AiSet::parse");
             rules.push(Rule {
                 matcher: Matcher::DomainSuffix(d),
                 action: Action::Proxy(self.ai_route.clone()),
@@ -587,6 +588,57 @@ mod tests {
 
     fn dom(d: &str) -> TargetAddr {
         TargetAddr::Domain(d.into())
+    }
+
+    /// Review r5 N3: the kernel and the relay read the same signed bytes
+    /// the same way: both refuse a non-canonical AI entry, and for accepted
+    /// bundles every name is AI to both or to neither.
+    #[test]
+    fn ai_classification_matches_relay() {
+        let k = keys();
+        let v = verifier(&k);
+        let names = [
+            "openai.com",
+            "api.openai.com",
+            "API.OpenAI.com.",
+            "notopenai.com",
+            "openai.com.evil",
+            "x.ai.test",
+            "test",
+        ];
+        for domains in [
+            r#"[".openai.com"]"#,
+            r#"[" openai.com"]"#,
+            r#"["openai.com "]"#,
+            r#"["a..b"]"#,
+            r#"["OpenAI.com.", "ai.test"]"#,
+            r#"["openai.com"]"#,
+        ] {
+            let body = format!(
+                r#"{{"version":1,"expires_at":{},"ai_domains":{domains},"ai_cidrs":["203.0.113.0/24"],
+                    "default":{{"type":"proxy","outbound":"overseas"}}}}"#,
+                NOW + 100
+            );
+            let bytes = sign(&k.key, 1, body.as_bytes()).unwrap().into_bytes();
+            let kernel = v.open(&bytes);
+            let relay = segue_policy::open(&v.keys, &bytes)
+                .map_err(|e| e.to_string())
+                .and_then(|b| segue_policy::AiView::parse(&b).map_err(|e| e.to_string()))
+                .and_then(|view| segue_policy::AiSet::from_view(&view));
+            assert_eq!(kernel.is_ok(), relay.is_ok(), "{domains}: accept differs");
+            let (Ok((_, pol)), Ok(set)) = (kernel, relay) else {
+                continue;
+            };
+            for n in names {
+                let k_ai = pol.rules.decide(&dom(n)) == &Action::Proxy("ai".into());
+                assert_eq!(k_ai, set.is_ai_domain(n), "{domains}: {n} differs");
+            }
+            let ip = "203.0.113.7".parse().unwrap();
+            assert_eq!(
+                pol.rules.decide(&TargetAddr::Ip(ip)) == &Action::Proxy("ai".into()),
+                set.is_ai_ip(ip)
+            );
+        }
     }
 
     #[test]
