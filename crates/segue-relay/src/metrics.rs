@@ -41,6 +41,8 @@ counters!(
     tickets_wrong_device,
     exit_denied,
     target_denied,
+    policy_unavailable,
+    policy_reloads,
     ssrf_blocked,
     session_limit,
     reclassified,

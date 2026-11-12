@@ -11,7 +11,6 @@ use base64::Engine as _;
 use serde::Deserialize;
 
 use crate::cidr::Cidr;
-use crate::policy::AiSet;
 use crate::socks5::Credentials;
 
 #[derive(Debug, Deserialize)]
@@ -24,8 +23,9 @@ struct Raw {
     ticket_keys: Vec<RawKey>,
     #[serde(default)]
     revocation_file: Option<PathBuf>,
-    #[serde(default)]
-    ai: RawAi,
+    /// The signed policy bundle the AI whitelist is read from (the same
+    /// bundle format and keys as the client, KERNEL_SPEC §5.5 item 7).
+    policy: RawPolicy,
     #[serde(default)]
     home_lines: Vec<RawLine>,
     #[serde(default)]
@@ -53,13 +53,12 @@ struct RawKey {
     public_key: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawAi {
-    #[serde(default)]
-    domains: Vec<String>,
-    #[serde(default)]
-    cidrs: Vec<String>,
+struct RawPolicy {
+    public_keys: Vec<RawKey>,
+    /// Bundle file, kept current by the sync process; re-read on change.
+    bundle: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,7 +126,8 @@ pub struct Limits {
     pub max_carriers: usize,
     /// Live sessions per device; more → `REJECT(capacity)`.
     pub max_sessions_per_device: usize,
-    /// A carrier must send its first byte within this.
+    /// A carrier must deliver its complete first frame (OPEN / RESUME,
+    /// authenticated on arrival) within this.
     pub first_frame_timeout: Duration,
     pub connect_timeout: Duration,
     pub dns_timeout: Duration,
@@ -177,7 +177,9 @@ pub struct Config {
     pub metrics_listen: Option<SocketAddr>,
     pub ticket_keys: Vec<(u32, [u8; 32])>,
     pub revocation_file: Option<PathBuf>,
-    pub ai: AiSet,
+    /// Policy bundle verification keys (key id → raw Ed25519 key).
+    pub policy_keys: BTreeMap<u32, Vec<u8>>,
+    pub policy_bundle: PathBuf,
     pub home_lines: Vec<LineConfig>,
     pub home_auto_failover: bool,
     pub home_assignments: Vec<(u64, String)>,
@@ -250,7 +252,17 @@ impl Config {
             }
             ticket_keys.push((k.key_id, b));
         }
-        let ai = AiSet::new(&raw.ai.domains, &raw.ai.cidrs)?;
+        if raw.policy.public_keys.is_empty() {
+            return Err("policy.public_keys must not be empty".into());
+        }
+        let mut policy_keys = BTreeMap::new();
+        for k in &raw.policy.public_keys {
+            let b = segue_policy::parse_public_key(&k.public_key)
+                .map_err(|e| format!("policy key {}: {e}", k.key_id))?;
+            if policy_keys.insert(k.key_id, b).is_some() {
+                return Err(format!("duplicate policy key_id {}", k.key_id));
+            }
+        }
         let mut home_lines: Vec<LineConfig> = Vec::new();
         for l in &raw.home_lines {
             if l.id.is_empty() || home_lines.iter().any(|x| x.id == l.id) {
@@ -343,7 +355,8 @@ impl Config {
             metrics_listen: raw.metrics_listen,
             ticket_keys,
             revocation_file: raw.revocation_file.map(|p| base.join(p)),
-            ai,
+            policy_keys,
+            policy_bundle: base.join(&raw.policy.bundle),
             home_lines,
             home_auto_failover: raw.home_auto_failover,
             home_assignments,

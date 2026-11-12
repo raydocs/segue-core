@@ -20,6 +20,7 @@ bytes.workspace = true
 rand.workspace = true
 ring = "0.17.14"
 segue-config = { path = "../segue-config" }
+segue-policy = { path = "../segue-policy" }
 segue-engine = { path = "../segue-engine" }
 segue-routing = { path = "../segue-routing" }
 segue-session = { path = "../segue-session" }

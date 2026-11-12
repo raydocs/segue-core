@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::client::{ClientSession, CloseReason, State};
 use crate::codec::{code, Frame, FrameDecoder, Kind, SessionId, Target};
-use crate::relay::{RelayEvent, RelayTable};
+use crate::relay::{Grant, RelayEvent, RelayTable};
 use crate::ProtoError;
 
 pub trait Carrier: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
@@ -41,7 +41,8 @@ pub type DeviceSiteConnector =
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SiteRequest {
     pub session_id: SessionId,
-    pub device: u64,
+    /// What this session's own OPEN ticket authorized.
+    pub grant: Grant,
     pub target: Target,
     pub kind: Kind,
     pub exit_class: u8,
@@ -441,14 +442,14 @@ pub async fn run_relay_ctl(
             match ev {
                 RelayEvent::Connect {
                     session_id,
-                    device,
+                    grant,
                     target,
                     kind,
                     exit_class,
                 } => {
                     let fut = site(SiteRequest {
                         session_id,
-                        device,
+                        grant,
                         target,
                         kind,
                         exit_class,

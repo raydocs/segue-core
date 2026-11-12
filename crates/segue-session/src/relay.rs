@@ -20,9 +20,36 @@ use crate::{ct_eq, Config, ProtoError};
 
 pub type CarrierId = u64;
 
-/// Ticket / revocation check. Returns the device id, or a REJECT code.
+/// What one OPEN's ticket authorized. It travels with that session's
+/// connect request ([`RelayEvent::Connect`]), so a site connect is decided
+/// by the ticket of its own OPEN, never by per-device state another OPEN or
+/// RESUME may have changed in the meantime.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Grant {
+    pub device: u64,
+    /// Exit classes, as bits defined by the [`Authorizer`].
+    pub exit_classes: u32,
+    /// Node the device's AI traffic must anchor on (0: any).
+    pub ai_anchor_node_id: u64,
+}
+
+impl Grant {
+    /// Every class allowed (tests, [`AllowAll`]).
+    pub fn all(device: u64) -> Self {
+        Self {
+            device,
+            exit_classes: u32::MAX,
+            ai_anchor_node_id: 0,
+        }
+    }
+}
+
+/// Ticket / revocation check, or a REJECT code. Both calls must be free of
+/// side effects: a RESUME that is rejected later (secret, device,
+/// generation) must not have changed anything.
 pub trait Authorizer: Send + Sync {
-    fn open(&self, ticket: &[u8], target: &Target, kind: Kind) -> Result<u64, u8>;
+    fn open(&self, ticket: &[u8], target: &Target, kind: Kind) -> Result<Grant, u8>;
+    /// Returns the device id.
     fn resume(&self, ticket: &[u8]) -> Result<u64, u8>;
 }
 
@@ -30,8 +57,8 @@ pub trait Authorizer: Send + Sync {
 pub struct AllowAll;
 
 impl Authorizer for AllowAll {
-    fn open(&self, _: &[u8], _: &Target, _: Kind) -> Result<u64, u8> {
-        Ok(0)
+    fn open(&self, _: &[u8], _: &Target, _: Kind) -> Result<Grant, u8> {
+        Ok(Grant::all(0))
     }
     fn resume(&self, _: &[u8]) -> Result<u64, u8> {
         Ok(0)
@@ -43,8 +70,8 @@ pub enum RelayEvent {
     /// Connect to the site; answer with [`RelayTable::connect_done`].
     Connect {
         session_id: SessionId,
-        /// Device the ticket authorized (for per-device exit policy).
-        device: u64,
+        /// What this OPEN's ticket authorized (device, exit classes).
+        grant: Grant,
         target: Target,
         kind: Kind,
         /// The client's hint (R2-1: the relay classifies on its own; the
@@ -331,8 +358,8 @@ impl RelayTable {
                     // connected in a process that has since restarted.
                     return self.reject(cid, code::UNKNOWN_SESSION, o.attach_gen, None);
                 }
-                let device = match self.auth.open(&o.ticket, &o.target, o.kind) {
-                    Ok(d) => d,
+                let grant = match self.auth.open(&o.ticket, &o.target, o.kind) {
+                    Ok(g) => g,
                     Err(c) => return self.reject(cid, c, o.attach_gen, None),
                 };
                 let Some(mut recv) =
@@ -344,7 +371,7 @@ impl RelayTable {
                     return self.reject(cid, code::PROTOCOL, o.attach_gen, None);
                 }
                 let s = Session {
-                    device,
+                    device: grant.device,
                     secret: o.resume_secret,
                     cur_gen: o.attach_gen,
                     carrier: Some(cid),
@@ -361,7 +388,7 @@ impl RelayTable {
                 self.carriers.get_mut(&cid).unwrap().session = Some(sid);
                 self.events.push_back(RelayEvent::Connect {
                     session_id: sid,
-                    device,
+                    grant,
                     target: o.target,
                     kind: o.kind,
                     exit_class: o.exit_class,

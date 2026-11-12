@@ -20,17 +20,21 @@ use crate::dial::{system_resolver, DeviceCounts, Dialer, Resolver};
 use crate::guard::Guard;
 use crate::home::HomePool;
 use crate::metrics::Metrics;
+use crate::policy::AiPolicy;
 use crate::revoke::Revocations;
-use crate::ticket::{ClaimsCache, TicketAuth, Verifier};
+use crate::ticket::{TicketAuth, Verifier};
 use crate::Clock;
 
 /// How often the revocation file is polled (spec pull interval: 30 s).
 pub const REVOCATION_POLL: Duration = Duration::from_secs(5);
 
-/// Carrier that holds a slot of the global carrier limit.
+/// Carrier that holds a slot of the global carrier limit. `pre` holds the
+/// bytes read while waiting for the first frame; they are read again first.
 struct Counted {
     inner: TcpStream,
     _permit: OwnedSemaphorePermit,
+    pre: Vec<u8>,
+    pos: usize,
 }
 
 impl AsyncRead for Counted {
@@ -39,7 +43,41 @@ impl AsyncRead for Counted {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if self.pos < self.pre.len() {
+            let n = buf.remaining().min(self.pre.len() - self.pos);
+            let p = self.pos;
+            buf.put_slice(&self.pre[p..p + n]);
+            self.pos += n;
+            if self.pos == self.pre.len() {
+                self.pre = Vec::new();
+                self.pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
         Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+/// Read until one complete frame has been decoded (or the bytes cannot be
+/// a frame: the table answers that, e.g. `REJECT(version)`). Returns the
+/// bytes read; `None` on EOF / error before a full frame.
+async fn read_first_frame(s: &mut TcpStream) -> Option<Vec<u8>> {
+    use segue_session::codec::FrameDecoder;
+    use tokio::io::AsyncReadExt as _;
+    let mut dec = FrameDecoder::new();
+    let mut pre = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let n = s.read(&mut buf).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        pre.extend_from_slice(&buf[..n]);
+        dec.push(&buf[..n]);
+        match dec.next_frame() {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => return Some(pre),
+        }
     }
 }
 
@@ -64,7 +102,7 @@ pub struct Relay {
     pub cfg: Config,
     pub metrics: Arc<Metrics>,
     pub revoked: Arc<Revocations>,
-    pub claims: Arc<ClaimsCache>,
+    pub ai: Arc<AiPolicy>,
     pub home: Arc<HomePool>,
     pub dialer: Arc<Dialer>,
     pub verifier: Arc<Verifier>,
@@ -83,7 +121,20 @@ impl Relay {
         if cfg.revocation_file.is_some() {
             revoked.reload()?;
         }
-        let claims = Arc::new(ClaimsCache::default());
+        let ai = Arc::new(AiPolicy::new(
+            cfg.policy_keys.clone(),
+            Some(cfg.policy_bundle.clone()),
+        ));
+        // A missing or bad bundle is not fatal: the relay refuses every
+        // target until a good one arrives (fail closed).
+        match ai.reload(clock()) {
+            Ok(v) => crate::log!("info", "policy bundle loaded", "version" = format!("{v:?}")),
+            Err(e) => crate::log!(
+                "error",
+                "policy bundle not loaded; refusing all targets",
+                "error" = e
+            ),
+        }
         let home = Arc::new(HomePool::new(
             cfg.home_lines.clone(),
             &cfg.home_assignments,
@@ -97,9 +148,9 @@ impl Relay {
                 extra_blocked: cfg.blocked_cidrs.clone(),
                 exceptions: cfg.dev_allow_cidrs.clone(),
             }),
-            ai: cfg.ai.clone(),
+            ai: ai.clone(),
             home: home.clone(),
-            claims: claims.clone(),
+            clock: clock.clone(),
             metrics: metrics.clone(),
             resolver: resolver.unwrap_or_else(system_resolver),
             devices: Arc::new(DeviceCounts::default()),
@@ -112,7 +163,7 @@ impl Relay {
             cfg,
             metrics,
             revoked,
-            claims,
+            ai,
             home,
             dialer,
             verifier,
@@ -127,7 +178,6 @@ impl Relay {
         let auth = TicketAuth {
             verifier: self.verifier.clone(),
             revoked: self.revoked.clone(),
-            claims: self.claims.clone(),
             metrics: self.metrics.clone(),
             clock: self.clock.clone(),
         };
@@ -153,7 +203,6 @@ impl Relay {
                     );
                 }
                 for d in added {
-                    self.claims.remove(d);
                     Metrics::inc(&self.metrics.devices_reset);
                     let _ = ctrl
                         .send(RelayCtrl::ResetDevice {
@@ -166,6 +215,25 @@ impl Relay {
             Err(e) => crate::log!(
                 "error",
                 "revocation reload failed; keeping last list",
+                "error" = e
+            ),
+        }
+    }
+}
+
+impl Relay {
+    /// Re-read the policy bundle if it changed; the last good one stays on
+    /// error.
+    pub fn reload_policy(&self) {
+        match self.ai.reload((self.clock)()) {
+            Ok(Some(v)) => {
+                Metrics::inc(&self.metrics.policy_reloads);
+                crate::log!("info", "policy bundle installed", "version" = v);
+            }
+            Ok(None) => {}
+            Err(e) => crate::log!(
+                "error",
+                "policy bundle rejected; keeping last good",
                 "error" = e
             ),
         }
@@ -226,6 +294,7 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
             loop {
                 rev.tick().await;
                 relay.reload_revocations(&ctrl).await;
+                relay.reload_policy();
             }
         })
     };
@@ -261,16 +330,22 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
                 let tx = accept_tx.clone();
                 let m = relay.metrics.clone();
                 tokio::spawn(async move {
-                    // A carrier must start talking quickly; idle sockets
-                    // would otherwise pin a slot.
-                    let mut b = [0u8; 1];
-                    match tokio::time::timeout(first, s.peek(&mut b)).await {
-                        Ok(Ok(n)) if n > 0 => {
+                    // The whole first frame must arrive and parse within
+                    // the deadline; a byte at a time does not extend it.
+                    // The table then authenticates that frame at once, and
+                    // a failed check closes the carrier with REJECT.
+                    let mut s = s;
+                    match tokio::time::timeout(first, read_first_frame(&mut s)).await {
+                        Ok(Some(pre)) => {
                             Metrics::inc(&m.carriers_accepted);
-                            let _ = tx.send(Box::new(Counted { inner: s, _permit: permit })).await;
+                            let c = Counted { inner: s, _permit: permit, pre, pos: 0 };
+                            let _ = tx.send(Box::new(c)).await;
                         }
-                        Ok(_) => {}
-                        Err(_) => Metrics::inc(&m.carriers_first_frame_timeout),
+                        Ok(None) => {}
+                        Err(_) => {
+                            Metrics::inc(&m.carriers_first_frame_timeout);
+                            let _ = s.set_zero_linger();
+                        }
                     }
                 });
             }

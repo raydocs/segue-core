@@ -19,7 +19,7 @@ use crate::dial::UdpSession;
 struct Deny(u8);
 
 impl Authorizer for Deny {
-    fn open(&self, _: &[u8], _: &Target, _: Kind) -> Result<u64, u8> {
+    fn open(&self, _: &[u8], _: &Target, _: Kind) -> Result<segue_session::relay::Grant, u8> {
         Err(self.0)
     }
     fn resume(&self, _: &[u8]) -> Result<u64, u8> {

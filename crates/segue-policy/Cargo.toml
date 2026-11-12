@@ -1,0 +1,16 @@
+[package]
+name = "segue-policy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+# Segue's own code: not MPL. Kept in new files only; see licenses/.
+license = "LicenseRef-Segue-Proprietary"
+repository.workspace = true
+publish = false
+description = "Signed policy bundle envelope shared by the Segue client kernel and the relay"
+
+[dependencies]
+base64.workspace = true
+ring = "0.17.14"
+serde = { workspace = true }
+serde_json = { workspace = true }
