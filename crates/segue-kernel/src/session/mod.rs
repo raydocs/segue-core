@@ -1,0 +1,458 @@
+//! Session-layer routes (SESSION_PROTOCOL v0.4) behind the [`Dialer`] seam.
+//!
+//! A rule whose outbound tag names a `segue` route does not dial the target
+//! through the engine. Instead it opens a resumable session to a node's
+//! relay: every carrier is an engine stream (Reality / Hy2) to the relay's
+//! loopback address on the node. A dropped carrier is replaced with RESUME,
+//! so the app connection survives the outer tunnel dying.
+//!
+//! Which node: the configured exits (e.g. `la`, `ny`) each name a carrier
+//! outbound and a relay. The exit choice is `Auto` (first exit in config
+//! order whose carrier is up or not recently failed) or one named exit; a
+//! session stays on the exit it was opened on (its state lives in that
+//! relay), so a change applies to new sessions.
+//!
+//! The app gets success only after the relay answered OPENED, which it does
+//! only once the site connect worked: a refused session (exit_denied,
+//! home_unavailable, target_denied, ...) is a dial error, so SOCKS answers
+//! with an error and nothing is ever retried direct.
+//!
+//! Kill switch (KILLSWITCH.md L1): carrier outcomes drive one [`KillSwitch`]
+//! per exit. While a carrier cannot be established (`Reconnecting` /
+//! `Error`), new flows on strict (AI) routes are refused at once; overseas
+//! flows are tried (the session retries OPEN for a bounded time) and refused
+//! if that fails. A user disconnect (L5) refuses every proxied flow and ends
+//! the live sessions.
+//!
+//! UDP is never carried to a `home` role route or outbound, whatever the
+//! UDP settings say (KERNEL_SPEC §5.4): [`KernelDialer::dial_udp`] is the
+//! one place every UDP flow passes.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use segue_routing::TargetAddr;
+use segue_session::client::{ClientSession, CloseReason, OpenParams};
+use segue_session::codec::{Kind, Target};
+use segue_session::driver::{run_client_ctl, BoxCarrier, ClientCtl, Connector};
+use segue_session::pool::Pool;
+use tokio::sync::watch;
+
+use crate::dial::{Datagrams, DialError, Dialer};
+use crate::killswitch::{Event, KillSwitch, Posture};
+
+/// `exit_class` hints in OPEN (the relay classifies by itself).
+pub const EXIT_OVERSEAS: u8 = 0;
+pub const EXIT_AI: u8 = 1;
+
+/// Session memory for all client sessions of this process.
+pub const POOL_BYTES: usize = 32 << 20;
+/// Longest wait for OPENED (covers the session's own OPEN retries).
+const OPEN_WAIT: Duration = Duration::from_secs(20);
+/// After this long since the last failed carrier connect, a strict route
+/// may try again (the next carrier attempt decides the posture), and Auto
+/// may pick that exit again.
+pub const STRICT_RETRY_AFTER: Duration = Duration::from_secs(3);
+const CARRIER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One node the sessions can anchor at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Exit {
+    /// `la`, `ny`, ... (what the UI shows and `set_exit` takes).
+    pub name: String,
+    /// Engine outbound that carries the session.
+    pub carrier: String,
+    /// Relay address as the carrier's server sees it.
+    pub relay: SocketAddr,
+    /// Node id sent as `anchor_node_id`.
+    pub node_id: u64,
+}
+
+#[derive(Clone)]
+pub struct SegueRoute {
+    pub ticket: Vec<u8>,
+    pub exit_class: u8,
+}
+
+impl std::fmt::Debug for SegueRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegueRoute")
+            .field("ticket", &"<redacted>")
+            .field("exit_class", &self.exit_class)
+            .finish()
+    }
+}
+
+/// The user's exit selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExitChoice {
+    Auto,
+    Named(String),
+}
+
+impl ExitChoice {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Auto => "auto",
+            Self::Named(n) => n,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Health {
+    ks: KillSwitch,
+    last_fail: Option<Instant>,
+}
+
+impl Health {
+    fn recently_failed(&self) -> bool {
+        self.last_fail
+            .is_some_and(|t| t.elapsed() < STRICT_RETRY_AFTER)
+    }
+}
+
+struct State {
+    user_off: bool,
+    /// None: Auto; Some(i): exits[i].
+    choice: Option<usize>,
+    health: Vec<Health>,
+}
+
+impl State {
+    fn pick(&self) -> usize {
+        if let Some(i) = self.choice {
+            return i;
+        }
+        if let Some(i) = self
+            .health
+            .iter()
+            .position(|h| h.ks.posture() == Posture::Connected)
+        {
+            return i;
+        }
+        if let Some(i) = self.health.iter().position(|h| !h.recently_failed()) {
+            return i;
+        }
+        // All failed recently: the one that failed longest ago.
+        (0..self.health.len())
+            .min_by_key(|&i| self.health[i].last_fail)
+            .unwrap_or(0)
+    }
+
+    fn posture(&self) -> Posture {
+        if self.user_off {
+            return Posture::Disconnected;
+        }
+        match self.health.get(self.pick()) {
+            Some(h) => h.ks.posture(),
+            None => Posture::Connecting,
+        }
+    }
+}
+
+/// Snapshot for the control API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Status {
+    pub posture: Posture,
+    pub choice: ExitChoice,
+    /// The exit new sessions use now (None: no exits configured).
+    pub current_exit: Option<String>,
+    pub exits: Vec<String>,
+}
+
+/// Engine outbounds plus session routes.
+pub struct KernelDialer {
+    engine: Arc<dyn Dialer>,
+    exits: Vec<Exit>,
+    routes: BTreeMap<String, SegueRoute>,
+    /// Tags with the `home` role: never carry UDP.
+    home: BTreeSet<String>,
+    pool: Arc<Pool>,
+    state: Arc<Mutex<State>>,
+    /// true while the user has Segue off; live sessions watch it.
+    off: watch::Sender<bool>,
+}
+
+impl KernelDialer {
+    pub fn new(
+        engine: Arc<dyn Dialer>,
+        exits: Vec<Exit>,
+        routes: BTreeMap<String, SegueRoute>,
+        home: BTreeSet<String>,
+    ) -> Self {
+        let health = vec![
+            Health {
+                ks: KillSwitch::new(),
+                last_fail: None,
+            };
+            exits.len()
+        ];
+        Self {
+            engine,
+            exits,
+            routes,
+            home,
+            pool: Pool::new(POOL_BYTES),
+            state: Arc::new(Mutex::new(State {
+                user_off: false,
+                choice: None,
+                health,
+            })),
+            off: watch::channel(false).0,
+        }
+    }
+
+    pub fn posture(&self) -> Posture {
+        self.state.lock().unwrap().posture()
+    }
+
+    pub fn status(&self) -> Status {
+        let st = self.state.lock().unwrap();
+        let choice = match st.choice {
+            None => ExitChoice::Auto,
+            Some(i) => ExitChoice::Named(self.exits[i].name.clone()),
+        };
+        Status {
+            posture: st.posture(),
+            choice,
+            current_exit: (!self.exits.is_empty()).then(|| self.exits[st.pick()].name.clone()),
+            exits: self.exits.iter().map(|e| e.name.clone()).collect(),
+        }
+    }
+
+    /// Select the exit for new sessions (`auto` or a configured name).
+    pub fn set_exit(&self, name: &str) -> Result<(), DialError> {
+        let choice = if name == "auto" {
+            None
+        } else {
+            Some(
+                self.exits
+                    .iter()
+                    .position(|e| e.name == name)
+                    .ok_or_else(|| DialError(format!("unknown exit {name:?}")))?,
+            )
+        };
+        self.state.lock().unwrap().choice = choice;
+        Ok(())
+    }
+
+    /// User turned Segue on (L5).
+    pub fn connect(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.user_off = false;
+        for h in &mut st.health {
+            h.ks.on_event(Event::UserConnect);
+            h.last_fail = None;
+        }
+        self.off.send_replace(false);
+    }
+
+    /// User turned Segue off (L5): new proxied flows are refused and live
+    /// sessions end.
+    pub fn disconnect(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.user_off = true;
+        for h in &mut st.health {
+            h.ks.on_event(Event::UserDisconnect);
+        }
+        self.off.send_replace(true);
+    }
+
+    /// Try a carrier to the current exit now, so the posture reflects
+    /// reality before any flow arrives (after connect / set_exit). Under
+    /// Auto, a failed exit moves the pick on, so each exit is tried once.
+    pub async fn probe(&self) -> Result<(), DialError> {
+        let mut last = DialError("no exits configured".into());
+        for _ in 0..self.exits.len() {
+            let (i, auto) = {
+                let st = self.state.lock().unwrap();
+                if st.user_off {
+                    return Err(DialError("disconnected".into()));
+                }
+                (st.pick(), st.choice.is_none())
+            };
+            match (self.connector(i))().await {
+                Ok(_) => return Ok(()),
+                Err(e) => last = DialError(format!("probe {}: {e}", self.exits[i].name)),
+            }
+            if !auto {
+                break;
+            }
+        }
+        if self.exits.is_empty() {
+            return Ok(());
+        }
+        Err(last)
+    }
+
+    fn connector(&self, i: usize) -> Connector {
+        let engine = self.engine.clone();
+        let state = self.state.clone();
+        let carrier = self.exits[i].carrier.clone();
+        let relay = self.exits[i].relay;
+        Arc::new(move || {
+            let engine = engine.clone();
+            let state = state.clone();
+            let carrier = carrier.clone();
+            Box::pin(async move {
+                let res = tokio::time::timeout(
+                    CARRIER_TIMEOUT,
+                    engine.dial(Some(&carrier), &TargetAddr::Ip(relay.ip()), relay.port()),
+                )
+                .await;
+                let mut st = state.lock().unwrap();
+                let h = &mut st.health[i];
+                match res {
+                    Ok(Ok(s)) => {
+                        h.ks.on_event(Event::ChannelUp);
+                        h.last_fail = None;
+                        Ok(Box::new(s) as BoxCarrier)
+                    }
+                    Ok(Err(e)) => {
+                        mark_failed(h);
+                        Err(std::io::Error::other(e.0))
+                    }
+                    Err(_) => {
+                        mark_failed(h);
+                        Err(std::io::ErrorKind::TimedOut.into())
+                    }
+                }
+            })
+        })
+    }
+
+    async fn open(
+        &self,
+        r: &SegueRoute,
+        addr: &TargetAddr,
+        port: u16,
+    ) -> Result<crate::dial::Stream, DialError> {
+        let i = {
+            let st = self.state.lock().unwrap();
+            if st.user_off {
+                return Err(DialError("refused: disconnected".into()));
+            }
+            if self.exits.is_empty() {
+                return Err(DialError("refused: no exits configured".into()));
+            }
+            let i = st.pick();
+            let h = &st.health[i];
+            let down = matches!(h.ks.posture(), Posture::Reconnecting | Posture::Error)
+                && h.recently_failed();
+            if r.exit_class == EXIT_AI && down {
+                return Err(DialError(
+                    "refused: tunnel reconnecting (strict route)".into(),
+                ));
+            }
+            i
+        };
+        let target = match addr {
+            TargetAddr::Ip(ip) => Target::Ip(SocketAddr::new(*ip, port)),
+            TargetAddr::Domain(d) => Target::Domain(d.clone(), port),
+        };
+        let params = OpenParams {
+            ticket: r.ticket.clone(),
+            kind: Kind::Tcp,
+            target,
+            exit_class: r.exit_class,
+            anchor_node_id: self.exits[i].node_id,
+            instance_hint: 0,
+        };
+        let s = ClientSession::new(Default::default(), &self.pool, params, Instant::now())
+            .ok_or_else(|| DialError("refused: session memory exhausted".into()))?;
+        let (app, far) = tokio::io::duplex(64 << 10);
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel();
+        let ctl = ClientCtl {
+            reattach: None,
+            closed: Some(closed_tx),
+            opened: Some(open_tx),
+        };
+        let run = run_client_ctl(s, far, self.connector(i), ctl);
+        let mut off = self.off.subscribe();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = run => {}
+                // Dropping the session drops its carriers and the app pipe.
+                _ = off.wait_for(|off| *off) => {}
+            }
+        });
+        tokio::select! {
+            o = open_rx => match o {
+                Ok(()) => Ok(Box::new(app)),
+                Err(_) => Err(DialError(closed_text((&mut closed_rx).await.ok()))),
+            },
+            c = &mut closed_rx => Err(DialError(closed_text(c.ok()))),
+            _ = tokio::time::sleep(OPEN_WAIT) => Err(DialError("session open timed out".into())),
+        }
+    }
+}
+
+fn mark_failed(h: &mut Health) {
+    match h.ks.posture() {
+        Posture::Connected => {
+            h.ks.on_event(Event::ChannelLost);
+        }
+        // Never had a carrier on this exit: no channel can be established.
+        Posture::Connecting => {
+            h.ks.on_event(Event::Failed);
+        }
+        _ => {}
+    }
+    h.last_fail = Some(Instant::now());
+}
+
+fn closed_text(r: Option<CloseReason>) -> String {
+    match r {
+        Some(CloseReason::Refused(c)) => format!("session refused (code {c})"),
+        Some(CloseReason::Reset(c)) => format!("session reset (code {c})"),
+        Some(CloseReason::Clean) => "session closed before open".into(),
+        None => "session ended".into(),
+    }
+}
+
+#[async_trait]
+impl Dialer for KernelDialer {
+    async fn dial(
+        &self,
+        tag: Option<&str>,
+        addr: &TargetAddr,
+        port: u16,
+    ) -> Result<crate::dial::Stream, DialError> {
+        if let Some(r) = tag.and_then(|t| self.routes.get(t)) {
+            return self.open(r, addr, port).await;
+        }
+        if tag.is_some() && *self.off.borrow() {
+            return Err(DialError("refused: disconnected".into()));
+        }
+        self.engine.dial(tag, addr, port).await
+    }
+
+    async fn dial_udp(
+        &self,
+        tag: Option<&str>,
+        addr: &TargetAddr,
+        port: u16,
+    ) -> Result<Datagrams, DialError> {
+        if let Some(t) = tag {
+            if self.home.contains(t) {
+                // Fixed property of the Home exit (§5.4), not a setting.
+                return Err(DialError("udp refused: home exit never carries UDP".into()));
+            }
+            if self.routes.contains_key(t) {
+                return Err(DialError("udp refused on session routes".into()));
+            }
+            if *self.off.borrow() {
+                return Err(DialError("refused: disconnected".into()));
+            }
+        }
+        self.engine.dial_udp(tag, addr, port).await
+    }
+}
+
+#[cfg(test)]
+mod tests;

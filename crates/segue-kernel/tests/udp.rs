@@ -9,7 +9,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use segue_kernel::dial::{Datagrams, DialError, Dialer, Stream, UdpSession};
 use segue_kernel::fakeip::FakeIpPool;
-use segue_kernel::rules::{Action, Cidr, Matcher, Rule, RuleSet};
+use segue_kernel::policy::{Policy, PolicyStore};
+use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
 use segue_kernel::socks::{serve, Kernel, REP_CMD_UNSUPPORTED, REP_OK};
 use segue_kernel::udp::{Udp, UdpSettings};
 use segue_routing::TargetAddr;
@@ -166,7 +167,7 @@ async fn start(udp: Option<UdpSettings>, pool: Option<Arc<FakeIpPool>>) -> Env {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let socks = l.local_addr().unwrap();
     let kernel = Kernel {
-        rules: rules(),
+        policy: PolicyStore::inline(Policy::inline(rules(), CidrTable::default())),
         dialer: fake.clone(),
         fake_ip: pool,
         sniff: None,

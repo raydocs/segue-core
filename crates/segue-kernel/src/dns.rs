@@ -31,7 +31,8 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
 use crate::fakeip::FakeIpPool;
-use crate::rules::{normalize, Action, CidrTable, RuleSet};
+use crate::policy::PolicyStore;
+use crate::rules::{normalize, Action};
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_AAAA: u16 = 28;
@@ -50,7 +51,6 @@ const TCP_IDLE: Duration = Duration::from_secs(10);
 
 pub struct DnsSettings {
     pub domestic: Vec<SocketAddr>,
-    pub chnroute: CidrTable,
     /// Route for names with no domain rule whose domestic answer falls
     /// outside chnroute. Never `Direct`.
     pub foreign: Action,
@@ -72,7 +72,8 @@ struct CacheEntry {
 }
 
 pub struct SmartDns {
-    rules: RuleSet,
+    /// Rules and chnroute come from the policy in force (signed bundle).
+    policy: Arc<PolicyStore>,
     pool: Arc<FakeIpPool>,
     s: DnsSettings,
     cache: Mutex<HashMap<(String, u16), CacheEntry>>,
@@ -99,9 +100,9 @@ enum Class {
 }
 
 impl SmartDns {
-    pub fn new(rules: RuleSet, pool: Arc<FakeIpPool>, s: DnsSettings) -> Self {
+    pub fn new(policy: Arc<PolicyStore>, pool: Arc<FakeIpPool>, s: DnsSettings) -> Self {
         Self {
-            rules,
+            policy,
             pool,
             s,
             cache: Mutex::new(HashMap::new()),
@@ -121,7 +122,8 @@ impl SmartDns {
         if q.name == "use-application-dns.net" {
             return Some(respond(&q, RCODE_NXDOMAIN, &[], 0));
         }
-        let class = match self.rules.lookup(&TargetAddr::Domain(q.name.clone())) {
+        let policy = self.policy.current();
+        let class = match policy.rules.lookup(&TargetAddr::Domain(q.name.clone())) {
             Some((_, Action::Direct)) => Class::Domestic,
             Some((_, a)) => Class::Fake(a.clone()),
             None => Class::Unmatched,
@@ -248,7 +250,12 @@ impl SmartDns {
             return None;
         }
         let ttl = if ips.is_empty() { NEGATIVE_TTL } else { ttl };
-        if unmatched && !ips.is_empty() && !ips.iter().all(|ip| self.s.chnroute.contains(*ip)) {
+        if unmatched
+            && !ips.is_empty()
+            && !ips
+                .iter()
+                .all(|ip| self.policy.current().chnroute.contains(*ip))
+        {
             return Some((Cached::Foreign, ttl));
         }
         Some((Cached::Real { rcode, ips }, ttl))

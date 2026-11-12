@@ -25,7 +25,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::dial::{Dialer, Stream};
 use crate::fakeip::FakeIpPool;
-use crate::rules::{Action, RuleSet};
+use crate::policy::{Policy, PolicyStore};
+use crate::rules::{Action, CidrTable, RuleSet};
 use crate::sniff::{sniff, Sniff};
 use crate::udp::{associate, Udp};
 
@@ -43,7 +44,9 @@ const CMD_CONNECT: u8 = 1;
 const CMD_UDP_ASSOCIATE: u8 = 3;
 
 pub struct Kernel {
-    pub rules: RuleSet,
+    /// Rules in force (signed bundle, or inline in the lab). Each flow reads
+    /// the current policy once.
+    pub policy: Arc<PolicyStore>,
     pub dialer: Arc<dyn Dialer>,
     /// Present when the smart DNS is on; CONNECTs into its range are
     /// resolved through it.
@@ -58,7 +61,7 @@ impl Kernel {
     /// Rules + dialer only: no fake-IP, no sniffing.
     pub fn new(rules: RuleSet, dialer: Arc<dyn Dialer>) -> Self {
         Self {
-            rules,
+            policy: PolicyStore::inline(Policy::inline(rules, CidrTable::default())),
             dialer,
             fake_ip: None,
             sniff: None,
@@ -119,6 +122,12 @@ async fn handle(mut conn: TcpStream, kernel: &Kernel) -> Result<(), Fail> {
         }
         Err(e) => return Err(e),
     };
+    let policy = kernel.policy.current();
+    if policy.refuse_all {
+        // No valid policy: fail closed (KERNEL_SPEC §5.4).
+        reply(&mut conn, REP_NOT_ALLOWED).await?;
+        return Ok(());
+    }
     if cmd == CMD_UDP_ASSOCIATE {
         let Some(udp) = kernel.udp.as_ref() else {
             reply(&mut conn, REP_CMD_UNSUPPORTED).await?;
@@ -146,10 +155,11 @@ async fn handle(mut conn: TcpStream, kernel: &Kernel) -> Result<(), Fail> {
             .await;
         }
         if let Some(settings) = kernel.sniff {
-            return sniffed(conn, kernel, ip, port, settings).await;
+            return sniffed(conn, kernel, &policy.rules, ip, port, settings).await;
         }
     }
-    let action = kernel.rules.decide(&addr).clone();
+    let action = policy.rules.decide(&addr).clone();
+    drop(policy);
     connect_then_reply(conn, kernel, &action, addr, port).await
 }
 
@@ -193,11 +203,12 @@ async fn dial(kernel: &Kernel, tag: Option<&str>, addr: &TargetAddr, port: u16) 
 async fn sniffed(
     mut conn: TcpStream,
     kernel: &Kernel,
+    rules: &RuleSet,
     ip: IpAddr,
     port: u16,
     s: SniffSettings,
 ) -> Result<(), Fail> {
-    let by_ip = kernel.rules.lookup(&TargetAddr::Ip(ip));
+    let by_ip = rules.lookup(&TargetAddr::Ip(ip));
     if let Some((_, Action::Reject)) = by_ip {
         // Nothing a sniffed name could do changes this; refuse before the
         // early success so the client gets a proper SOCKS error.
@@ -208,9 +219,9 @@ async fn sniffed(
     let (first, domain) = peek_host(&mut conn, s).await?;
     let by_domain = domain
         .as_ref()
-        .and_then(|d| kernel.rules.lookup(&TargetAddr::Domain(d.clone())));
+        .and_then(|d| rules.lookup(&TargetAddr::Domain(d.clone())));
     let action = stricter(by_ip, by_domain)
-        .unwrap_or_else(|| kernel.rules.default_action())
+        .unwrap_or_else(|| rules.default_action())
         .clone();
     let (tag, target) = match &action {
         Action::Reject => return reset(conn),

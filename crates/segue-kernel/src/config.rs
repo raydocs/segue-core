@@ -26,18 +26,41 @@
 //!
 //! `sniff` absent: bare-IP CONNECTs are routed by IP rules only. `dns`
 //! absent: no DNS listener and no fake-IP range.
+//!
+//! Roles: an outbound object may carry `"role": "home"` (the AI / Home
+//! exit; stripped before the engine sees the object). A `segue` route with
+//! `exit_class: "ai"` is home-role. Home-role tags never carry UDP: they
+//! are always in the UDP refuse set, and listing one in `udp.refuse_quic`
+//! (which would allow non-443 UDP) is a config error.
+//!
+//! Rules: in the product they come only from a signed bundle (`policy`
+//! section, see [`crate::policy`]); then `rules`, `default`,
+//! `dns.chnroute` and `dns.chnroute_file` must be absent. Inline rules
+//! are for the lab and tests.
+//!
+//! ```json
+//! "policy": {"public_keys": [{"key_id": 1, "public_key": "<b64>"}],
+//!            "bundle": "policy.bundle", "installed": "policy.installed",
+//!            "ai_route": "ai"},
+//! "exits": [{"name": "la", "carrier": "reality-la", "relay": "10.0.0.1:7443", "node_id": 1},
+//!           {"name": "ny", "carrier": "hy2-ny", "relay": "10.0.0.2:7443", "node_id": 2}],
+//! "segue": {"ai": {"ticket_file": "device.ticket", "exit_class": "ai"}},
+//! "control": {"listen": "127.0.0.1:0", "token_file": "control.json"}
+//! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::dns::DnsSettings;
+use crate::policy::{Policy, PolicyStore, Verifier};
 use crate::rules::{Action, Cidr, CidrTable, RuleSet, RuleSpec};
-use crate::session::SegueRoute;
+use crate::session::{Exit, SegueRoute};
 use crate::socks::SniffSettings;
 use crate::udp::UdpSettings;
 
@@ -48,8 +71,15 @@ struct RawConfig {
     #[serde(default)]
     outbounds: BTreeMap<String, Value>,
     #[serde(default)]
-    rules: Vec<RuleSpec>,
-    default: Action,
+    rules: Option<Vec<RuleSpec>>,
+    #[serde(default)]
+    default: Option<Action>,
+    #[serde(default)]
+    policy: Option<RawPolicy>,
+    #[serde(default)]
+    exits: Vec<RawExit>,
+    #[serde(default)]
+    control: Option<RawControl>,
     #[serde(default)]
     sniff: Option<RawSniff>,
     #[serde(default)]
@@ -64,16 +94,65 @@ struct RawConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSegue {
-    /// Engine outbound that carries the session (Reality / Hy2).
-    carrier: String,
-    /// The relay address as the carrier's server sees it.
-    relay: SocketAddr,
     /// File holding the device ticket (until the control plane).
     ticket_file: PathBuf,
     /// `overseas` or `ai` (a hint; the relay classifies by itself).
     exit_class: String,
+    /// Optional; must agree with `exit_class` (`ai` ⇔ `home`).
     #[serde(default)]
-    anchor_node_id: u64,
+    role: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExit {
+    name: String,
+    /// Engine outbound that carries sessions to this node (Reality / Hy2).
+    carrier: String,
+    /// The relay address as the carrier's server sees it.
+    relay: SocketAddr,
+    #[serde(default)]
+    node_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicy {
+    public_keys: Vec<RawKey>,
+    /// A freshly delivered bundle, tried at startup.
+    #[serde(default)]
+    bundle: Option<PathBuf>,
+    /// Where the last good bundle is kept.
+    #[serde(default)]
+    installed: Option<PathBuf>,
+    #[serde(default = "default_ai_route")]
+    ai_route: String,
+}
+
+fn default_ai_route() -> String {
+    "ai".into()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawKey {
+    key_id: u32,
+    public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawControl {
+    listen: SocketAddr,
+    /// Written at start (mode 0600): `{"addr": ..., "token": ...}`.
+    token_file: PathBuf,
+}
+
+/// Validated `control` section.
+#[derive(Debug, Clone)]
+pub struct ControlConfig {
+    pub listen: SocketAddr,
+    pub token_file: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,14 +253,39 @@ pub struct DnsConfig {
 
 pub struct KernelConfig {
     pub listen: SocketAddr,
+    /// Engine outbound objects (`role` stripped).
     pub outbounds: BTreeMap<String, Value>,
-    pub rules: RuleSet,
+    /// Rules in force: a signed bundle store, or inline (lab) rules.
+    pub policy: Arc<PolicyStore>,
+    /// Startup policy messages (what was restored / rejected).
+    pub policy_log: Vec<String>,
     pub sniff: Option<SniffSettings>,
     pub dns: Option<DnsConfig>,
     /// None: UDP ASSOCIATE is refused as unsupported.
     pub udp: Option<UdpSettings>,
     /// Session-layer routes (`segue` section), by tag.
     pub segue: BTreeMap<String, SegueRoute>,
+    /// Session exits in preference order (Auto picks the first healthy).
+    pub exits: Vec<Exit>,
+    /// Home-role tags (outbounds and session routes): never carry UDP.
+    pub home: BTreeSet<String>,
+    pub control: Option<ControlConfig>,
+}
+
+/// Remove and check the `role` key of an outbound object. True: home.
+fn take_role(tag: &str, spec: &mut Value) -> Result<bool, String> {
+    let role = match spec {
+        Value::Object(map) => map.remove("role"),
+        _ => None,
+    };
+    match role {
+        None => Ok(false),
+        Some(Value::String(r)) if r == "home" => Ok(true),
+        Some(Value::String(r)) if r == "proxy" => Ok(false),
+        Some(other) => Err(format!(
+            "outbounds.{tag}.role must be \"home\" or \"proxy\", got {other}"
+        )),
+    }
 }
 
 impl KernelConfig {
@@ -202,29 +306,73 @@ impl KernelConfig {
                 raw.listen
             ));
         }
-        let rules = raw
-            .rules
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| r.into_rule().map_err(|e| format!("rules[{i}]: {e}")))
-            .collect::<Result<Vec<_>, _>>()?;
-        let rules = RuleSet::new(rules, raw.default);
+        let mut outbounds = raw.outbounds;
+        let mut home = BTreeSet::new();
+        for (tag, spec) in outbounds.iter_mut() {
+            if take_role(tag, spec)? {
+                home.insert(tag.clone());
+            }
+        }
+        let mut exits = Vec::new();
+        for (i, e) in raw.exits.iter().enumerate() {
+            let ok_name = !e.name.is_empty()
+                && e.name.len() <= 32
+                && e.name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            if !ok_name || e.name == "auto" {
+                return Err(format!(
+                    "exits[{i}].name must be [a-z0-9-]{{1,32}} and not \"auto\""
+                ));
+            }
+            if exits.iter().any(|x: &Exit| x.name == e.name) {
+                return Err(format!("exits[{i}]: duplicate name {:?}", e.name));
+            }
+            if !outbounds.contains_key(&e.carrier) {
+                return Err(format!(
+                    "exits[{i}]: unknown carrier outbound {:?}",
+                    e.carrier
+                ));
+            }
+            if home.contains(&e.carrier) {
+                return Err(format!(
+                    "exits[{i}]: carrier must not be a home-role outbound"
+                ));
+            }
+            exits.push(Exit {
+                name: e.name.clone(),
+                carrier: e.carrier.clone(),
+                relay: e.relay,
+                node_id: e.node_id,
+            });
+        }
+        if !raw.segue.is_empty() && exits.is_empty() {
+            return Err("segue routes need at least one entry in exits".into());
+        }
         let mut segue = BTreeMap::new();
         for (tag, r) in &raw.segue {
-            if raw.outbounds.contains_key(tag) {
+            if outbounds.contains_key(tag) {
                 return Err(format!("segue.{tag}: tag also used by an outbound"));
-            }
-            if !raw.outbounds.contains_key(&r.carrier) {
-                return Err(format!(
-                    "segue.{tag}: unknown carrier outbound {:?}",
-                    r.carrier
-                ));
             }
             let exit_class = match r.exit_class.as_str() {
                 "overseas" => crate::session::EXIT_OVERSEAS,
                 "ai" => crate::session::EXIT_AI,
                 _ => return Err(format!("segue.{tag}: exit_class must be overseas or ai")),
             };
+            let is_home = exit_class == crate::session::EXIT_AI;
+            match r.role.as_deref() {
+                None => {}
+                Some("home") if is_home => {}
+                Some("proxy") if !is_home => {}
+                Some(_) => {
+                    return Err(format!(
+                        "segue.{tag}: role must match exit_class (ai is home, overseas is proxy)"
+                    ))
+                }
+            }
+            if is_home {
+                home.insert(tag.clone());
+            }
             let path = if r.ticket_file.is_absolute() {
                 r.ticket_file.clone()
             } else {
@@ -237,26 +385,12 @@ impl KernelConfig {
             if ticket.is_empty() {
                 return Err(format!("segue.{tag}: ticket_file is empty"));
             }
-            segue.insert(
-                tag.clone(),
-                SegueRoute {
-                    carrier: r.carrier.clone(),
-                    relay: r.relay,
-                    ticket,
-                    exit_class,
-                    anchor_node_id: r.anchor_node_id,
-                },
-            );
+            segue.insert(tag.clone(), SegueRoute { ticket, exit_class });
         }
         // Tags a rule may name: engine outbounds and session routes.
-        let mut known = raw.outbounds.clone();
+        let mut known = outbounds.clone();
         for tag in segue.keys() {
             known.insert(tag.clone(), Value::Null);
-        }
-        for tag in rules.proxy_tags() {
-            if !known.contains_key(tag) {
-                return Err(format!("rule refers to unknown outbound {tag:?}"));
-            }
         }
         let sniff = match raw.sniff {
             None => None,
@@ -273,26 +407,119 @@ impl KernelConfig {
                 })
             }
         };
-        let dns = raw.dns.map(|d| dns_config(d, &known, base)).transpose()?;
-        let udp = raw.udp.map(|u| udp_config(u, &known)).transpose()?;
+        let signed = raw.policy.is_some();
+        let (dns, chnroute) = match raw.dns {
+            Some(d) => {
+                if signed && (!d.chnroute.is_empty() || d.chnroute_file.is_some()) {
+                    return Err(
+                        "dns.chnroute / chnroute_file come from the policy bundle; remove them"
+                            .into(),
+                    );
+                }
+                let (c, cidrs) = dns_config(d, &known, base)?;
+                (Some(c), cidrs)
+            }
+            None => (None, Vec::new()),
+        };
+        let udp = raw.udp.map(|u| udp_config(u, &known, &home)).transpose()?;
+        let resolve = |p: PathBuf| if p.is_absolute() { p } else { base.join(p) };
+        let (policy, policy_log) = match raw.policy {
+            Some(p) => {
+                if raw.rules.is_some() || raw.default.is_some() {
+                    // Zero-config product: rules only come signed.
+                    return Err("rules / default come from the policy bundle; remove them".into());
+                }
+                let mut keys = BTreeMap::new();
+                for k in &p.public_keys {
+                    let key = crate::policy::parse_public_key(&k.public_key)
+                        .map_err(|e| format!("policy.public_keys[{}]: {e}", k.key_id))?;
+                    if keys.insert(k.key_id, key).is_some() {
+                        return Err(format!("policy: duplicate key_id {}", k.key_id));
+                    }
+                }
+                let verifier = Verifier::new(
+                    keys,
+                    p.ai_route.clone(),
+                    known.keys().cloned().collect(),
+                    home.clone(),
+                )?;
+                let store = PolicyStore::signed(verifier, p.installed.map(resolve));
+                let log = store.load_startup(p.bundle.map(resolve).as_deref());
+                (Arc::new(store), log)
+            }
+            None => {
+                let rules = raw
+                    .rules
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| r.into_rule().map_err(|e| format!("rules[{i}]: {e}")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let default = raw
+                    .default
+                    .ok_or("default is required without a policy section")?;
+                let rules = RuleSet::new(rules, default);
+                for tag in rules.proxy_tags() {
+                    if !known.contains_key(tag) {
+                        return Err(format!("rule refers to unknown outbound {tag:?}"));
+                    }
+                }
+                let policy = Policy::inline(rules, CidrTable::new(&chnroute));
+                (PolicyStore::inline(policy), Vec::new())
+            }
+        };
+        let control = match raw.control {
+            None => None,
+            Some(c) => {
+                if !c.listen.ip().is_loopback() {
+                    return Err(format!(
+                        "control.listen must be a loopback address, got {}",
+                        c.listen
+                    ));
+                }
+                Some(ControlConfig {
+                    listen: c.listen,
+                    token_file: resolve(c.token_file),
+                })
+            }
+        };
         Ok(Self {
             listen: raw.listen,
-            outbounds: raw.outbounds,
-            rules,
+            outbounds,
+            policy,
+            policy_log,
             sniff,
             dns,
             udp,
             segue,
+            exits,
+            home,
+            control,
         })
     }
 }
 
-fn udp_config(u: RawUdp, outbounds: &BTreeMap<String, Value>) -> Result<UdpSettings, String> {
+fn udp_config(
+    u: RawUdp,
+    outbounds: &BTreeMap<String, Value>,
+    home: &BTreeSet<String>,
+) -> Result<UdpSettings, String> {
     for tag in u.refuse.iter().chain(&u.refuse_quic) {
         if !outbounds.contains_key(tag) {
             return Err(format!("udp refers to unknown outbound {tag:?}"));
         }
     }
+    for tag in &u.refuse_quic {
+        if home.contains(tag) {
+            // refuse_quic means "UDP allowed except 443": not for Home.
+            return Err(format!(
+                "udp.refuse_quic: {tag:?} is a home-role outbound; UDP to Home is always refused"
+            ));
+        }
+    }
+    // Home-role tags are refused whatever `refuse` lists.
+    let mut refuse: BTreeSet<String> = u.refuse.into_iter().collect();
+    refuse.extend(home.iter().cloned());
     if u.idle_timeout_secs == 0
         || !(1..=4096).contains(&u.max_flows)
         || !(1..=1024).contains(&u.queue)
@@ -304,7 +531,7 @@ fn udp_config(u: RawUdp, outbounds: &BTreeMap<String, Value>) -> Result<UdpSetti
         );
     }
     Ok(UdpSettings {
-        refuse: u.refuse.into_iter().collect(),
+        refuse,
         refuse_quic: u.refuse_quic.into_iter().collect(),
         idle_timeout: Duration::from_secs(u.idle_timeout_secs),
         max_flows: u.max_flows,
@@ -318,7 +545,7 @@ fn dns_config(
     d: RawDns,
     outbounds: &BTreeMap<String, Value>,
     base: &Path,
-) -> Result<DnsConfig, String> {
+) -> Result<(DnsConfig, Vec<Cidr>), String> {
     if !d.listen.ip().is_loopback() {
         // An open resolver on the LAN would answer anyone and hand out
         // fake-IPs that route through this device.
@@ -384,11 +611,10 @@ fn dns_config(
     if d.query_timeout_ms == 0 || d.cache_size == 0 || d.fake_ip_ttl_secs == 0 {
         return Err("dns: query_timeout_ms, cache_size and fake_ip_ttl_secs must be > 0".into());
     }
-    Ok(DnsConfig {
+    let cfg = DnsConfig {
         listen: d.listen,
         settings: DnsSettings {
             domestic: d.domestic,
-            chnroute: CidrTable::new(&cidrs),
             foreign: d.foreign,
             query_timeout: Duration::from_millis(d.query_timeout_ms),
             cache_size: d.cache_size,
@@ -397,7 +623,8 @@ fn dns_config(
         fake_ip_prefix,
         fake_ip_ttl: Duration::from_secs(d.fake_ip_ttl_secs),
         fake_ip_grace: Duration::from_secs(d.fake_ip_grace_secs),
-    })
+    };
+    Ok((cfg, cidrs))
 }
 
 #[cfg(test)]
@@ -460,7 +687,11 @@ mod tests {
             (d.fake_ip_base, d.fake_ip_prefix),
             ("198.18.0.0".parse().unwrap(), 15)
         );
-        assert!(d.settings.chnroute.contains("1.0.1.9".parse().unwrap()));
+        assert!(c
+            .policy
+            .current()
+            .chnroute
+            .contains("1.0.1.9".parse().unwrap()));
         assert_eq!(d.settings.foreign, Action::Proxy("p".into()));
     }
 
@@ -518,9 +749,155 @@ mod tests {
             &dir,
         )
         .unwrap();
-        let t = &c.dns.unwrap().settings.chnroute;
+        let p = c.policy.current();
+        let t = &p.chnroute;
         assert!(t.contains("36.1.2.3".parse().unwrap()));
         assert!(t.contains("240e::1".parse().unwrap()));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const OUT: &str = r#""outbounds":{"home":{"role":"home","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                        "p":{"protocol":"freedom"}}"#;
+
+    fn doc(rest: &str) -> String {
+        format!(r#"{{"listen":"127.0.0.1:1080",{OUT},{rest}}}"#)
+    }
+
+    #[test]
+    fn home_role_always_refuses_udp() {
+        // Not in udp.refuse, still refused; role stripped for the engine.
+        let c = KernelConfig::parse(&doc(r#""default":{"type":"direct"},"udp":{"refuse":[]}"#))
+            .unwrap();
+        let u = c.udp.unwrap();
+        assert!(u.refuse.contains("home"));
+        assert!(!u.refuse.contains("p"));
+        assert!(c.home.contains("home"));
+        assert!(c.outbounds["home"].get("role").is_none());
+        assert_eq!(c.outbounds["home"]["protocol"], "socks");
+    }
+
+    #[test]
+    fn config_cannot_allow_udp_to_home() {
+        let err = KernelConfig::parse(&doc(
+            r#""default":{"type":"direct"},"udp":{"refuse_quic":["home"]}"#,
+        ))
+        .err()
+        .unwrap();
+        assert!(err.contains("always refused"), "{err}");
+        let err = KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","outbounds":{"h":{"role":"exit"}},"default":{"type":"direct"}}"#,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("role"), "{err}");
+        let err = KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","outbounds":{"h":{"role":true}},"default":{"type":"direct"}}"#,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("role"), "{err}");
+    }
+
+    fn segue_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("segue-cfg-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t"), "dGlja2V0").unwrap();
+        dir
+    }
+
+    #[test]
+    fn segue_ai_route_is_home_and_role_must_match() {
+        let dir = segue_dir("role");
+        let ok = doc(
+            r#""exits":[{"name":"la","carrier":"p","relay":"127.0.0.1:7443","node_id":1}],
+               "segue":{"ai":{"ticket_file":"t","exit_class":"ai"},
+                        "ov":{"ticket_file":"t","exit_class":"overseas","role":"proxy"}},
+               "default":{"type":"direct"},"udp":{}"#,
+        );
+        let c = KernelConfig::parse_in(&ok, &dir).unwrap();
+        assert!(c.home.contains("ai") && !c.home.contains("ov"));
+        assert!(c.udp.unwrap().refuse.contains("ai"));
+        assert_eq!(c.exits[0].name, "la");
+        let bad = ok.replace(
+            r#""exit_class":"ai"}"#,
+            r#""exit_class":"ai","role":"proxy"}"#,
+        );
+        let err = KernelConfig::parse_in(&bad, &dir).err().unwrap();
+        assert!(err.contains("role must match"), "{err}");
+        // A home outbound cannot carry sessions.
+        let bad = ok.replace(r#""carrier":"p""#, r#""carrier":"home""#);
+        let err = KernelConfig::parse_in(&bad, &dir).err().unwrap();
+        assert!(err.contains("home-role"), "{err}");
+        for bad_name in ["auto", "LA", ""] {
+            let bad = ok.replace(r#""name":"la""#, &format!(r#""name":"{bad_name}""#));
+            assert!(KernelConfig::parse_in(&bad, &dir).is_err(), "{bad_name}");
+        }
+        let no_exits = ok.replace(
+            r#""exits":[{"name":"la","carrier":"p","relay":"127.0.0.1:7443","node_id":1}],"#,
+            "",
+        );
+        assert!(KernelConfig::parse_in(&no_exits, &dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn policy_section_forbids_inline_rules_and_fails_closed() {
+        let dir = segue_dir("pol");
+        let (key, public) = crate::policy::generate_key();
+        let pol = format!(
+            r#""policy":{{"public_keys":[{{"key_id":1,"public_key":"{public}"}}],"bundle":"b","installed":"i"}},
+               "exits":[{{"name":"la","carrier":"p","relay":"127.0.0.1:7443"}}],
+               "segue":{{"ai":{{"ticket_file":"t","exit_class":"ai"}}}}"#
+        );
+        // No bundle yet: valid config, fail-closed policy.
+        let c = KernelConfig::parse_in(&doc(&pol), &dir).unwrap();
+        assert!(!c.policy.status().valid);
+        assert!(c.policy.current().refuse_all);
+        // Inline rules next to a policy are rejected (zero-config product).
+        let err = KernelConfig::parse_in(
+            &doc(&format!(r#"{pol},"default":{{"type":"direct"}}"#)),
+            &dir,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("policy bundle"), "{err}");
+        let err = KernelConfig::parse_in(
+            &doc(&format!(
+                r#"{pol},"dns":{{"listen":"127.0.0.1:5353","domestic":["223.5.5.5:53"],"chnroute":["1.0.0.0/8"],"foreign":{{"type":"reject"}}}}"#
+            )),
+            &dir,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("policy bundle"), "{err}");
+        // A signed bundle in place installs at startup and is persisted.
+        let body = br#"{"version":2,"expires_at":4000000000,"ai_domains":["openai.com"],"default":{"type":"direct"}}"#;
+        std::fs::write(dir.join("b"), crate::policy::sign(&key, 1, body).unwrap()).unwrap();
+        let c = KernelConfig::parse_in(&doc(&pol), &dir).unwrap();
+        assert_eq!(c.policy.status().version, Some(2), "{:?}", c.policy_log);
+        assert!(dir.join("i").exists());
+        assert_eq!(
+            c.policy
+                .current()
+                .rules
+                .decide(&segue_routing::TargetAddr::Domain("x.openai.com".into())),
+            &Action::Proxy("ai".into())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn control_must_be_loopback() {
+        let c = KernelConfig::parse(&doc(
+            r#""default":{"type":"direct"},"control":{"listen":"127.0.0.1:0","token_file":"/tmp/x"}"#,
+        ))
+        .unwrap();
+        assert!(c.control.is_some());
+        let err = KernelConfig::parse(&doc(
+            r#""default":{"type":"direct"},"control":{"listen":"0.0.0.0:9","token_file":"x"}"#,
+        ))
+        .err()
+        .unwrap();
+        assert!(err.contains("loopback"), "{err}");
     }
 }
