@@ -247,6 +247,7 @@ fn udp_config(u: RawUdp, outbounds: &BTreeMap<String, Value>) -> Result<UdpSetti
         max_flows: u.max_flows,
         queue: u.queue,
         max_associations: u.max_associations,
+        queue_bytes: crate::udp::ASSOCIATION_QUEUE_BYTES,
     })
 }
 

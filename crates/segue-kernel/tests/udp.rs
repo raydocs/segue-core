@@ -72,6 +72,9 @@ impl Dialer for Fake {
             .lock()
             .unwrap()
             .push((tag.map(str::to_owned), shown));
+        if tag == Some("slow") {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
         if tag == Some("broken") {
             return Err(DialError("outer link down".into()));
         }
@@ -122,6 +125,7 @@ fn rules() -> RuleSet {
             ),
             rule(Matcher::DomainSuffix("broken.test".into()), proxy("broken")),
             rule(Matcher::DomainSuffix("ads.test".into()), Action::Reject),
+            rule(Matcher::DomainSuffix("slow.test".into()), proxy("slow")),
             rule(
                 Matcher::Cidr(Cidr::parse("10.0.0.0/8").unwrap()),
                 Action::Direct,
@@ -143,6 +147,7 @@ fn settings() -> UdpSettings {
         max_flows: 4,
         queue: 8,
         max_associations: 2,
+        queue_bytes: 1 << 20,
     }
 }
 
@@ -406,4 +411,41 @@ async fn udp_off_answers_command_unsupported() {
     let env = start(None, None).await;
     let (rep, _, _) = associate(env.socks).await;
     assert_eq!(rep, REP_CMD_UNSUPPORTED);
+}
+
+#[tokio::test]
+async fn queued_bytes_are_bounded_per_association() {
+    let mut s = settings();
+    s.queue_bytes = 4 * 900;
+    s.idle_timeout = Duration::from_secs(5);
+    let env = start(Some(s), None).await;
+    let (_, _ctl, relay) = associate(env.socks).await;
+    let c = client(relay).await;
+    let udp = env.udp.as_ref().unwrap();
+    // Two flows, both still dialling: 4 datagrams of 900 bytes fit in the
+    // budget (each flow's queue of 8 would hold more), the other 6 drop.
+    for i in 0..10u8 {
+        let to = if i % 2 == 0 {
+            "a.slow.test"
+        } else {
+            "b.slow.test"
+        };
+        c.send(&packet(&dom(to), 53, &[i; 900])).await.unwrap();
+    }
+    let mut got = 0;
+    while recv(&c, Duration::from_secs(1)).await.is_some() {
+        got += 1;
+    }
+    assert_eq!((got, udp.dropped()), (4, 6));
+    // The budget came back once the queues drained.
+    for i in 0..4u8 {
+        c.send(&packet(&dom("a.slow.test"), 53, &[i; 900]))
+            .await
+            .unwrap();
+    }
+    let mut got = 0;
+    while recv(&c, Duration::from_secs(1)).await.is_some() {
+        got += 1;
+    }
+    assert_eq!((got, udp.dropped()), (4, 6));
 }

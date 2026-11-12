@@ -18,8 +18,9 @@
 //! signal a per-datagram error, and the app falls back to TCP (where the
 //! same rules answer with a proper refusal).
 //!
-//! Memory is bounded per association (`max_flows` × `queue` datagrams) and
-//! globally (`max_associations`). Datagrams over the path's payload limit,
+//! Memory is bounded per association (`max_flows` × `queue` datagrams, and
+//! at most `queue_bytes` of queued payload) and globally
+//! (`max_associations`). Datagrams over the path's payload limit,
 //! over a full queue, or with FRAG ≠ 0 are dropped and counted.
 //!
 //! Not here yet: QUIC Initial SNI sniffing for bare-IP UDP (§5.2a.2); such
@@ -28,7 +29,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +45,8 @@ use crate::rules::Action;
 use crate::socks::{Kernel, REP_GENERAL, REP_OK};
 
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default for `UdpSettings::queue_bytes`.
+pub const ASSOCIATION_QUEUE_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Debug)]
 pub struct UdpSettings {
@@ -62,6 +65,10 @@ pub struct UdpSettings {
     pub queue: usize,
     /// Concurrent associations.
     pub max_associations: usize,
+    /// Payload bytes queued across all flows of one association. A datagram
+    /// can be ~64 KiB, so the datagram-count `queue` alone would let one
+    /// association hold `max_flows × queue × 64 KiB` (hundreds of MiB).
+    pub queue_bytes: usize,
 }
 
 impl Default for UdpSettings {
@@ -73,6 +80,7 @@ impl Default for UdpSettings {
             max_flows: 128,
             queue: 32,
             max_associations: 64,
+            queue_bytes: ASSOCIATION_QUEUE_BYTES,
         }
     }
 }
@@ -125,6 +133,7 @@ pub(crate) async fn associate(
 
     let mut client = (client_port != 0).then(|| SocketAddr::new(peer.ip(), client_port));
     let mut flows: HashMap<Key, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let queued = Arc::new(AtomicUsize::new(0));
     let mut buf = vec![0u8; 65_535];
     let mut ctl = [0u8; 64];
     let idle = udp.settings.idle_timeout;
@@ -147,7 +156,7 @@ pub(crate) async fn associate(
                     Some(_) => {}
                 }
                 last = Instant::now();
-                uplink(kernel, udp, &mut flows, &socket, from, &buf[..n]);
+                uplink(kernel, udp, &mut flows, &queued, &socket, from, &buf[..n]);
             }
             _ = tokio::time::sleep_until(last + idle) => {
                 flows.retain(|_, tx| !tx.is_closed());
@@ -166,6 +175,7 @@ fn uplink(
     kernel: &Kernel,
     udp: &Udp,
     flows: &mut HashMap<Key, mpsc::Sender<Vec<u8>>>,
+    queued: &Arc<AtomicUsize>,
     socket: &Arc<UdpSocket>,
     client: SocketAddr,
     pkt: &[u8],
@@ -174,12 +184,28 @@ fn uplink(
         return udp.drop_one();
     };
     let key = (addr, port);
+    // Reserve the payload's bytes in the association budget; whoever takes
+    // the datagram off the queue (or drops it) gives them back.
+    let budget = udp.settings.queue_bytes;
+    let reserve = |q: &AtomicUsize| {
+        q.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            (used + payload.len() <= budget).then_some(used + payload.len())
+        })
+        .is_ok()
+    };
     if let Some(tx) = flows.get(&key) {
+        if !reserve(queued) {
+            return udp.drop_one();
+        }
         match tx.try_send(payload.to_vec()) {
             Ok(()) => return,
-            Err(TrySendError::Full(_)) => return udp.drop_one(),
+            Err(TrySendError::Full(_)) => {
+                queued.fetch_sub(payload.len(), Ordering::Relaxed);
+                return udp.drop_one();
+            }
             // Went idle (or broke): route afresh below.
             Err(TrySendError::Closed(_)) => {
+                queued.fetch_sub(payload.len(), Ordering::Relaxed);
                 flows.remove(&key);
             }
         }
@@ -193,6 +219,9 @@ fn uplink(
     let Some((tag, target)) = route(kernel, &udp.settings, &key.0, port) else {
         return udp.drop_one();
     };
+    if !reserve(queued) {
+        return udp.drop_one();
+    }
     let (tx, rx) = mpsc::channel(udp.settings.queue.max(1));
     let _ = tx.try_send(payload.to_vec());
     tokio::spawn(flow(
@@ -207,6 +236,7 @@ fn uplink(
             client,
             idle: udp.settings.idle_timeout,
             dropped: udp.dropped.clone(),
+            queued: queued.clone(),
         },
         rx,
     ));
@@ -247,16 +277,37 @@ struct Flow {
     client: SocketAddr,
     idle: Duration,
     dropped: Arc<AtomicU64>,
+    queued: Arc<AtomicUsize>,
 }
 
 async fn flow(f: Flow, mut rx: mpsc::Receiver<Vec<u8>>) {
+    run_flow(&f, &mut rx).await;
+    // Give back the budget of whatever is still queued.
+    rx.close();
+    while let Ok(p) = rx.try_recv() {
+        f.queued.fetch_sub(p.len(), Ordering::Relaxed);
+    }
+}
+
+/// Takes the next datagram off the queue and returns its budget.
+async fn next(f: &Flow, rx: &mut mpsc::Receiver<Vec<u8>>) -> Result<Option<Vec<u8>>, ()> {
+    let p = tokio::time::timeout(f.idle, rx.recv())
+        .await
+        .map_err(drop)?;
+    if let Some(p) = &p {
+        f.queued.fetch_sub(p.len(), Ordering::Relaxed);
+    }
+    Ok(p)
+}
+
+async fn run_flow(f: &Flow, rx: &mut mpsc::Receiver<Vec<u8>>) {
     let dial = f.dialer.dial_udp(f.tag.as_deref(), &f.target, f.port);
     let session: Arc<dyn UdpSession> = match tokio::time::timeout(DIAL_TIMEOUT, dial).await {
         Ok(Ok(s)) => Arc::from(s),
         _ => {
             // Refused, never retried direct. Swallow until idle so a chatty
             // app does not trigger a dial per datagram.
-            while let Ok(Some(_)) = tokio::time::timeout(f.idle, rx.recv()).await {
+            while let Ok(Some(_)) = next(f, rx).await {
                 f.dropped.fetch_add(1, Ordering::Relaxed);
             }
             return;
@@ -290,7 +341,7 @@ async fn flow(f: Flow, mut rx: mpsc::Receiver<Vec<u8>>) {
         }
     });
     loop {
-        match tokio::time::timeout(f.idle, rx.recv()).await {
+        match next(f, rx).await {
             Ok(Some(p)) => {
                 if p.len() > max {
                     f.dropped.fetch_add(1, Ordering::Relaxed);
@@ -303,7 +354,9 @@ async fn flow(f: Flow, mut rx: mpsc::Receiver<Vec<u8>>) {
             // Association gone.
             Ok(None) => break,
             Err(_) => {
-                let quiet = start.elapsed().as_millis() as u64 - last_down.load(Ordering::Relaxed);
+                // The downlink may have stored a later instant than ours.
+                let quiet = (start.elapsed().as_millis() as u64)
+                    .saturating_sub(last_down.load(Ordering::Relaxed));
                 if down.is_finished() || quiet >= f.idle.as_millis() as u64 {
                     break;
                 }
