@@ -665,6 +665,29 @@ class EvidenceAllowlists(unittest.TestCase):
         }), {("unreviewed.json", "generic-api-key"),
              ("unreviewed.py", "generic-api-key")})
 
+    def test_vendored_rustls_fixture_exceptions_are_narrow(self):
+        # Synthetic PEM assembled at runtime to avoid embedding a key literal.
+        body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7" * 2
+        key = "-----BEGIN " + "PRIVATE KEY-----\n" + body + "\n-----END " + "PRIVATE KEY-----\n"
+        vectors = "vendor/shaped-rustls/rustls-provider-test/tests/rfc-9180-test-vectors.json"
+        lock = "vendor/shaped-rustls/Cargo.lock"
+        reviewed = {
+            "vendor/shaped-rustls/test-ca/rsa-2048/end.key": key,
+            "vendor/shaped-rustls/bogo/keys/key.pem": key,
+            vectors: json.dumps({"api_key": DIGEST}),
+            lock: '[[package]]\ndependencies = [\n "libcrux-secrets",\n "libcrux-sha3",\n]\n',
+        }
+        self.assertEqual(self.scan(reviewed), set())
+        self.assertEqual(self.scan({
+            "vendor/shaped-rustls/rustls/src/end.key": key,
+            "vendor/shaped-rustls/test-ca/rsa-2048/end.pem": key,
+            vectors: key,
+            lock: json.dumps({"api_key": DIGEST}),
+        }), {("vendor/shaped-rustls/rustls/src/end.key", "private-key"),
+             ("vendor/shaped-rustls/test-ca/rsa-2048/end.pem", "private-key"),
+             (vectors, "private-key"),
+             (lock, "generic-api-key")})
+
     def test_other_rules_still_scan_reviewed_paths(self):
         # Synthetic scanner control, assembled to avoid embedding a token literal.
         token = "ghp_" + "aB7cD9eF2gH4iJ6kL8mN0oP1qR3sT5uV7wX9"

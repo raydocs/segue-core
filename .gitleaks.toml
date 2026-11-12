@@ -999,3 +999,28 @@ paths = [
   '''^docs/benchmarks/results/2026-10-30-xhttp-h3-send-budget/scripts/stream_ab\.py$''',
   '''^docs/benchmarks/results/2026-10-30-v26\.10\.21-three-engine/commands\.sh$''',
 ]
+
+# vendor/shaped-rustls is a vendored copy of the shaped-rustls fork of rustls
+# (upstream xray-rust consumed it as a git dependency). Its public test
+# fixtures carry throwaway test keys and RFC 9180 HPKE test vectors; none are
+# credentials. Each exception keeps its rule and exact path.
+[[allowlists]]
+description = "Public rustls test CA and BoGo keys in vendored shaped-rustls"
+targetRules = ["private-key"]
+paths = [
+  '''^vendor/shaped-rustls/test-ca/(ecdsa-p256|ecdsa-p384|ecdsa-p521|eddsa|rsa-2048|rsa-3072|rsa-4096)/(ca|inter|end|client)\.key$''',
+  '''^vendor/shaped-rustls/bogo/keys/(key|ecdsa_p256_key|ecdsa_p384_key|rsa_1024_key|rsa_chain_key)\.pem$''',
+]
+
+[[allowlists]]
+description = "RFC 9180 HPKE test vectors in vendored shaped-rustls"
+targetRules = ["generic-api-key"]
+paths = ['''^vendor/shaped-rustls/rustls-provider-test/tests/rfc-9180-test-vectors\.json$''']
+
+[[allowlists]]
+description = "libcrux-secrets/libcrux-sha3 dependency names in vendored shaped-rustls Cargo.lock"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "match"
+regexes = ['''^libcrux-secrets",\s*"libcrux-sha3"$''']
+paths = ['''^vendor/shaped-rustls/Cargo\.lock$''']
