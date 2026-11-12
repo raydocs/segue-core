@@ -181,6 +181,9 @@ pub struct Config {
     pub metrics_listen: Option<SocketAddr>,
     pub ticket_keys: Vec<(u32, [u8; 32])>,
     pub revocation_file: Option<PathBuf>,
+    /// Last accepted revocation snapshot, `<revocation_file>.accepted`
+    /// (review r5 N4: restored first on start).
+    pub revocation_state: Option<PathBuf>,
     /// Policy bundle verification keys (key id → raw Ed25519 key).
     pub policy_keys: BTreeMap<u32, Vec<u8>>,
     pub policy_bundle: PathBuf,
@@ -360,6 +363,11 @@ impl Config {
             node_id: raw.node_id,
             metrics_listen: raw.metrics_listen,
             ticket_keys,
+            revocation_state: raw.revocation_file.as_ref().map(|p| {
+                let mut s = base.join(p).into_os_string();
+                s.push(".accepted");
+                PathBuf::from(s)
+            }),
             revocation_file: raw.revocation_file.map(|p| base.join(p)),
             policy_keys,
             policy_bundle: base.join(&raw.policy.bundle),

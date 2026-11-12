@@ -50,7 +50,7 @@ J
 # Relay: key, ticket (overseas+ai), config
 "$BIN/segue-relay" keygen "$OUT/ticket.key" > "$OUT/ticket.pub"
 "$BIN/segue-relay" issue-ticket --key "$OUT/ticket.key" --key-id 1 --device 42 --classes overseas,ai > "$OUT/device.ticket"
-echo "lineuser:linepass" > "$OUT/line.cred"; printf 'seq 1\nsynced_at %s\n' "$(date +%s)" > "$OUT/revoked.txt"
+echo "lineuser:linepass" > "$OUT/line.cred"; printf 'seq 1\nsynced_at %s\nend 0\n' "$(date +%s)" > "$OUT/revoked.txt"
 cat > "$OUT/relay.json" <<J
 {"listen":"127.0.0.1:$RP","node_id":1,"metrics_listen":"127.0.0.1:7444",
  "ticket_keys":[{"key_id":1,"public_key":"$(cat "$OUT/ticket.pub")"}],

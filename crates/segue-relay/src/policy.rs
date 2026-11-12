@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
@@ -170,7 +170,7 @@ impl AiPolicy {
             current: env(&st.current),
             previous: env(&st.previous),
         };
-        write_atomic(sp, serde_json::to_string(&p).expect("state").as_bytes())
+        crate::write_atomic(sp, serde_json::to_string(&p).expect("state").as_bytes())
             .map_err(|e| format!("policy state {}: {e}", sp.display()))
     }
 
@@ -245,21 +245,6 @@ impl AiPolicy {
             .as_ref()
             .map(|c| c.version)
     }
-}
-
-/// Write via a temporary file and rename, so a crash leaves the old or the
-/// new content, never a torn file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]

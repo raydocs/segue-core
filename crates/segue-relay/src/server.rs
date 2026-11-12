@@ -117,9 +117,27 @@ impl Relay {
         guard: Option<Guard>,
     ) -> Result<Self, String> {
         let metrics = Arc::new(Metrics::default());
-        let revoked = Arc::new(Revocations::new(cfg.revocation_file.clone()));
+        let revoked = Arc::new(Revocations::with_state(
+            cfg.revocation_file.clone(),
+            cfg.revocation_state.clone(),
+        ));
+        if let Err(e) = revoked.restore() {
+            crate::log!("error", "revocation state not restored", "error" = e);
+        }
         if cfg.revocation_file.is_some() {
-            revoked.reload()?;
+            // Without an earlier snapshot a bad file is fatal; with one,
+            // the file (e.g. an older list replayed) is refused and the
+            // restored snapshot stays.
+            match (revoked.reload(), revoked.seq()) {
+                (Ok(_), _) => {}
+                (Err(e), Some(seq)) => crate::log!(
+                    "error",
+                    "revocation file refused; keeping restored list",
+                    "seq" = seq,
+                    "error" = e
+                ),
+                (Err(e), None) => return Err(e),
+            }
         }
         let ai = Arc::new(AiPolicy::with_state(
             cfg.policy_keys.clone(),

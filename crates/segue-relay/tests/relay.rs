@@ -71,7 +71,7 @@ fn revocation_text(seq: u64, synced_at: u64, devices: &[u64]) -> String {
     for d in devices {
         s += &format!("{d}\n");
     }
-    s
+    s + &format!("end {}\n", devices.len())
 }
 
 struct TempDir(std::path::PathBuf);

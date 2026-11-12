@@ -53,3 +53,18 @@ pub fn system_clock() -> Clock {
             .map_or(0, |d| d.as_secs())
     })
 }
+
+/// Write via a temporary file and rename, so a crash leaves the old or the
+/// new content, never a torn file.
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
