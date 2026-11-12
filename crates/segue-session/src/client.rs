@@ -629,9 +629,15 @@ impl ClientSession {
 
     /// App reset the connection.
     pub fn abort(&mut self) {
+        self.reset(code::SITE_RESET);
+    }
+
+    /// Reset the session locally with `code` (RST to the relay), e.g. when
+    /// the control stream reports the device revoked.
+    pub fn reset(&mut self, code: u8) {
         if !self.is_closed() {
-            self.rst = Some(code::SITE_RESET);
-            self.close(CloseReason::Reset(code::SITE_RESET));
+            self.rst = Some(code);
+            self.close(CloseReason::Reset(code));
         }
     }
 

@@ -419,6 +419,10 @@ pub struct ClientCtl {
     /// Fires once, when the relay first answers OPENED, so the caller can
     /// report success to the app only after the relay accepted the flow.
     pub opened: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Becomes `Some(code)` to reset the session locally with that code
+    /// (the control stream said REVOKED, r5 N10): the reason reaches
+    /// `closed` before the app stream ends, so the app sees a reset.
+    pub cancel: Option<tokio::sync::watch::Receiver<Option<u8>>>,
 }
 
 /// [`run_client`] with hooks.
@@ -436,6 +440,7 @@ where
         mut stall,
         mut closed,
         mut opened,
+        mut cancel,
     } = ctl;
     let writable = Arc::new(Notify::new());
     let (mut app_r, app_w) = tokio::io::split(app);
@@ -604,6 +609,14 @@ where
                 match r {
                     Ok(()) => s.reattach(now()),
                     Err(_) => reattach = None,
+                }
+            }
+            c = async {
+                cancel.as_mut().expect("guarded").wait_for(Option::is_some).await.map(|c| c.unwrap_or(code::REVOKED))
+            }, if cancel.is_some() => {
+                match c {
+                    Ok(c) => s.reset(c),
+                    Err(_) => cancel = None,
                 }
             }
             g = async { stall.as_mut().expect("guarded").recv().await }, if stall.is_some() => {

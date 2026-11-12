@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use segue_session::codec::{Kind, Target};
-use segue_session::driver::{run_relay, SiteConnector};
+use segue_session::driver::{run_relay_ctl, RelayCtrl, SiteConnector, SiteRequest};
 use segue_session::relay::{AllowAll, Authorizer, RelayTable};
 use segue_session::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,6 +38,8 @@ struct Node {
     holes: Holes,
     /// Site connects at this relay.
     sites: Arc<AtomicUsize>,
+    /// Relay commands (revocation).
+    ctrl: mpsc::Sender<RelayCtrl>,
 }
 
 /// Engine stand-in: `dial(Some(carrier), relay)` → a pipe into that
@@ -252,8 +254,12 @@ fn node(auth: Box<dyn Authorizer>, site: Option<SiteConnector>) -> Node {
         }
         None => echo_site(sites.clone()),
     };
-    tokio::spawn(run_relay(table, rx, site, None));
+    let site: segue_session::driver::DeviceSiteConnector =
+        Arc::new(move |r: SiteRequest| site(r.target, r.kind));
+    let (ctrl, ctrl_rx) = mpsc::channel(4);
+    tokio::spawn(run_relay_ctl(table, rx, site, None, Some(ctrl_rx)));
     Node {
+        ctrl,
         accept: tx,
         up: Arc::new(AtomicBool::new(true)),
         carriers: Arc::default(),
@@ -271,6 +277,7 @@ struct Lab {
     ny_carriers: Arc<AtomicUsize>,
     la_sites: Arc<AtomicUsize>,
     la_holes: Holes,
+    la_ctrl: mpsc::Sender<RelayCtrl>,
     engine: Arc<Engine>,
 }
 
@@ -297,6 +304,7 @@ fn lab_parts(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>) -> La
     let (la_carriers, ny_carriers) = (la.carriers.clone(), ny.carriers.clone());
     let la_sites = la.sites.clone();
     let la_holes = la.holes.clone();
+    let la_ctrl = la.ctrl.clone();
     let engine = Arc::new(Engine {
         nodes: [("reality-la".to_string(), la), ("hy2-ny".to_string(), ny)].into(),
         ..Default::default()
@@ -334,6 +342,7 @@ fn lab_parts(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>) -> La
         ny_carriers,
         la_sites,
         la_holes,
+        la_ctrl,
         engine,
     }
 }
@@ -783,5 +792,43 @@ async fn download_survives_a_blackhole_on_the_session_carrier_via_stall() {
         l.la_holes.lock().unwrap().len() - l.la_carriers.load(Ordering::SeqCst),
         controls,
         "the control stream was not replaced: recovery came from STALL"
+    );
+}
+
+#[tokio::test]
+async fn revoked_on_the_control_stream_resets_sessions_whose_carriers_are_dead() {
+    // r5 N10: the data carrier is blackholed, the control stream works.
+    // The relay's RST cannot arrive, its REVOKED can: the kernel must reset
+    // the session locally, report it and refuse new sessions.
+    let (l, mut s, _at) = download_lab().await;
+    l.blackhole_la(false);
+    l.la_ctrl
+        .send(RelayCtrl::ResetDevice {
+            device: 0,
+            close_code: code::REVOKED,
+        })
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 16 << 10];
+    let end = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match s.read(&mut buf).await {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    })
+    .await
+    .expect("session not reset after REVOKED");
+    let e = end.expect_err("revoked session ended with a clean EOF");
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+    let st = l.d.status();
+    assert_eq!(st.revoked, Some(code::REVOKED));
+    assert_eq!(st.posture, Posture::Error);
+    let refused = l.d.dial(Some("overseas"), &site(), 443).await;
+    assert!(
+        refused.is_err_and(|e| e.0.contains("revoked")),
+        "new session not refused after REVOKED"
     );
 }
