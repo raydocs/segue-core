@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::net::UdpSocket;
 use segue_routing::{
     DnsHostTarget, DomainHostIndex, DomainMatcher, Network, RegexMatcher, Target, TargetAddr,
 };
@@ -13,6 +12,7 @@ use segue_transport::{
     CachingDnsResolver, ConfiguredDnsResolver, DnsResolver, NameServer, SystemDnsResolver,
     TcpConnector, TransportConnector, TransportError,
 };
+use tokio::net::UdpSocket;
 
 fn hosts<const N: usize>(
     rules: [(DomainMatcher, DnsHostTarget); N],

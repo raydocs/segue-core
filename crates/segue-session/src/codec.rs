@@ -885,14 +885,27 @@ impl FrameDecoder {
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
-        if self.pos > 0 && self.pos == self.buf.len() {
-            self.buf.clear();
-            self.pos = 0;
-        } else if self.pos > MAX_PAYLOAD {
+        // Drop consumed frames first and grow exactly: the buffer then holds
+        // at most one partial frame plus one read, never a doubled copy.
+        if self.pos > 0 {
             self.buf.drain(..self.pos);
             self.pos = 0;
         }
+        self.buf.reserve_exact(bytes.len());
         self.buf.extend_from_slice(bytes);
+    }
+
+    /// Memory held (the buffer keeps its capacity between frames).
+    pub fn held_bytes(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    /// Free the buffer when no partial frame is held (an idle stream).
+    pub fn release_idle(&mut self) {
+        if self.buffered() == 0 {
+            self.buf = Vec::new();
+            self.pos = 0;
+        }
     }
 
     /// Bytes held but not yet returned as frames.

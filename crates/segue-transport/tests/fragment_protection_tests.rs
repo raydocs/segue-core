@@ -1,3 +1,8 @@
+use segue_routing::{Network, Target, TargetAddr};
+use segue_transport::{
+    ConnectorConfig, RealityClientConfig, SocketHandle, SocketProtector, TcpFragmentConfig,
+    TlsClientConfig, TransportDialer, TransportError,
+};
 use std::{
     io,
     net::Ipv4Addr,
@@ -10,11 +15,6 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-};
-use segue_routing::{Network, Target, TargetAddr};
-use segue_transport::{
-    ConnectorConfig, RealityClientConfig, SocketHandle, SocketProtector, TcpFragmentConfig,
-    TlsClientConfig, TransportDialer, TransportError,
 };
 
 struct Protector {

@@ -1,8 +1,8 @@
 use super::*;
-use socket2::{Domain, Protocol, Socket, Type};
-use std::{io, mem, os::fd::AsRawFd};
 use segue_config::TproxySettings;
 use segue_routing::Network;
+use socket2::{Domain, Protocol, Socket, Type};
+use std::{io, mem, os::fd::AsRawFd};
 
 const MAX_TCP_CONNECTIONS: usize = 1024;
 // Four full-sized packets cap pending payload memory at 256 KiB per flow.

@@ -7,10 +7,10 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 
+use segue_routing::Target;
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
 };
-use segue_routing::Target;
 use zeroize::Zeroizing;
 
 use super::http::{parse_authority_target, HttpParseError};

@@ -1263,8 +1263,239 @@ fn exhausted_pool_refuses_new_flows_with_rst() {
     assert_eq!(stack.stats().tcp_refused_memory, 1);
 }
 
+// Counting allocator: allocations made on a thread that set `TRACKED` are
+// counted (wherever they are freed), so tests on other threads do not
+// disturb a measurement.
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    thread_local! {
+        pub static TRACKED: Cell<bool> = const { Cell::new(false) };
+    }
+    pub static LIVE: AtomicIsize = AtomicIsize::new(0);
+    pub static PEAK: AtomicIsize = AtomicIsize::new(0);
+    const HDR: usize = 16;
+
+    fn padded(l: Layout) -> (Layout, usize) {
+        let pad = HDR.max(l.align());
+        (
+            Layout::from_size_align(l.size() + pad, l.align().max(HDR)).unwrap(),
+            pad,
+        )
+    }
+
+    pub struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let (pl, pad) = padded(l);
+            let base = System.alloc(pl);
+            if base.is_null() {
+                return base;
+            }
+            let tracked = TRACKED.try_with(|c| c.get()).unwrap_or(false);
+            let p = base.add(pad);
+            (p.sub(8) as *mut u64).write(tracked as u64);
+            if tracked {
+                let n = l.size() as isize;
+                let now = LIVE.fetch_add(n, Ordering::Relaxed) + n;
+                PEAK.fetch_max(now, Ordering::Relaxed);
+            }
+            p
+        }
+
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            let (pl, pad) = padded(l);
+            if (p.sub(8) as *const u64).read() == 1 {
+                LIVE.fetch_sub(l.size() as isize, Ordering::Relaxed);
+            }
+            System.dealloc(p.sub(pad), pl);
+        }
+    }
+
+    pub fn live() -> isize {
+        LIVE.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_peak() {
+        PEAK.store(live(), Ordering::Relaxed);
+    }
+
+    pub fn peak() -> isize {
+        PEAK.load(Ordering::Relaxed)
+    }
+}
+
+#[global_allocator]
+static ALLOC: counting::Counting = counting::Counting;
+
+/// Real allocations of the TCP side of the stack (KERNEL_SPEC §6.3), its
+/// blocks charged to the process pool that sessions also use: many flows
+/// upload while the app does not read and get a download queued (peak),
+/// then everything is drained and the flows go idle (retained).
+#[test]
+fn tcp_memory_follows_the_shared_pool_and_is_released_when_idle() {
+    const FLOWS: u16 = 50;
+    const MIB: f64 = (1 << 20) as f64;
+    // The process pool: sessions already hold 1 MiB of its 3 MiB.
+    let shared = segue_session::pool::Pool::new(3 << 20);
+    let sessions = segue_session::pool::Grant::fixed(&shared, 1 << 20).unwrap();
+    let for_tun = (shared.blocks() - shared.used_blocks()) * BLOCK;
+    let cfg = NetstackConfig {
+        shared_pool: Some(shared.clone()),
+        ..Default::default()
+    };
+    counting::TRACKED.with(|t| t.set(true));
+    let now = Instant::now();
+    let mut stack = Netstack::new(cfg, now);
+    let base = counting::live();
+    counting::reset_peak();
+    let mut flows = Vec::new();
+    for i in 0..FLOWS {
+        let src = SocketAddr::new(CLIENT4.ip(), 1000 + i);
+        stack.input(&tcp(src, SITE4, SYN, 1000, 0, b""), now, &mut accept_all);
+        let id = match stack.pop_event() {
+            Some(Event::TcpAccepted { id, .. }) => id,
+            e => panic!("flow {i}: expected TcpAccepted, got {e:?}"),
+        };
+        let synack = seg(&one(&mut stack));
+        let sseq = synack.seq.wrapping_add(1);
+        stack.input(&tcp(src, SITE4, ACK, 1001, sseq, b""), now, &mut accept_all);
+        flows.push((src, id, 1001u32, sseq));
+    }
+    // Upload without the app reading, and a 64 KiB download queued on each.
+    let payload = vec![b'u'; 1400];
+    // Highest download byte sent on each flow (not acked until the drain).
+    let mut sent_hi: Vec<u32> = flows.iter().map(|f| f.3).collect();
+    for round in 0..40 {
+        for (k, f) in flows.iter_mut().enumerate() {
+            let (src, id, seq, sseq) = *f;
+            stack.input(
+                &tcp(src, SITE4, ACK, seq, sseq, &payload),
+                now,
+                &mut accept_all,
+            );
+            stack.poll(now);
+            let mut acked = seq;
+            for p in drain(&mut stack) {
+                let s = seg(&p);
+                if s.dst_port == src.port() && s.ack {
+                    acked = s.ack_no;
+                }
+                if s.dst_port == src.port() && !s.payload.is_empty() {
+                    let end = s.seq.wrapping_add(s.payload.len() as u32);
+                    if end.wrapping_sub(sent_hi[k]) as i32 > 0 {
+                        sent_hi[k] = end;
+                    }
+                }
+            }
+            f.2 = acked;
+            if round == 0 {
+                let mut put = 0;
+                while put < 64 * 1024 {
+                    match stack.tcp_write(id, &[b'd'; 16 * 1024]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => put += n,
+                    }
+                }
+            }
+        }
+    }
+    let busy = counting::live() - base;
+    let peak = counting::peak() - base;
+    let tun_used = stack.pool().used_bytes();
+    println!(
+        "{FLOWS} TCP flows: pool {:.2} MiB of {:.2} MiB for TUN, heap {:.2} MiB, peak {:.2} MiB",
+        tun_used as f64 / MIB,
+        for_tun as f64 / MIB,
+        busy as f64 / MIB,
+        peak as f64 / MIB
+    );
+    // The traffic wanted ~6 MiB of rings; the shared pool held it back.
+    assert!(tun_used > for_tun / 2, "pool barely used: {tun_used}");
+    assert!(shared.used_bytes() <= shared.blocks() * BLOCK);
+    assert_eq!(
+        shared.used_bytes(),
+        tun_used + (1 << 20),
+        "TUN blocks are charged to the process pool"
+    );
+    // Heap ≈ charged rings plus a fixed cost per flow (smoltcp socket,
+    // flow entry; `TCP_FLOW_OVERHEAD` in the budget) and the packet queues.
+    const FIXED: isize = 8 * 1024;
+    let bound = for_tun as isize + FLOWS as isize * FIXED + (256 << 10);
+    assert!(
+        peak <= bound,
+        "peak {:.2} MiB over {:.2} MiB",
+        peak as f64 / MIB,
+        bound as f64 / MIB
+    );
+    // A new flow while the process pool is spent is refused, not admitted
+    // past the budget.
+    let hog = segue_session::pool::Grant::fixed(
+        &shared,
+        (shared.blocks() - shared.used_blocks()) * BLOCK,
+    );
+    let src = SocketAddr::new(CLIENT4.ip(), 9);
+    stack.input(&tcp(src, SITE4, SYN, 1, 0, b""), now, &mut accept_all);
+    assert!(seg(&one(&mut stack)).rst);
+    assert_eq!(stack.stats().tcp_refused_memory, 1);
+    drop(hog);
+    // Drain both directions, then let the flows go idle.
+    let mut buf = vec![0u8; 64 * 1024];
+    for _ in 0..40 {
+        for f in &flows {
+            while stack.tcp_read(f.1, &mut buf).unwrap_or(0) > 0 {}
+        }
+        stack.poll(now);
+        for p in drain(&mut stack) {
+            let s = seg(&p);
+            let end = s.seq.wrapping_add(s.payload.len() as u32);
+            if let Some(k) = flows.iter().position(|f| f.0.port() == s.dst_port) {
+                if end.wrapping_sub(sent_hi[k]) as i32 > 0 {
+                    sent_hi[k] = end;
+                }
+            }
+        }
+        for (k, f) in flows.iter().enumerate() {
+            stack.input(
+                &tcp(f.0, SITE4, ACK, f.2, sent_hi[k], b""),
+                now,
+                &mut accept_all,
+            );
+        }
+    }
+    drop(buf);
+    let later = now + Duration::from_secs(11);
+    stack.poll(later);
+    drain(&mut stack);
+    let retained = counting::live() - base;
+    println!(
+        "idle: heap {:.0} KiB = {:.1} KiB/flow, pool {} KiB",
+        retained as f64 / 1024.0,
+        retained as f64 / 1024.0 / FLOWS as f64,
+        stack.pool().used_bytes() / 1024
+    );
+    assert_eq!(
+        stack.pool().used_bytes(),
+        FLOWS as usize * 2 * BLOCK,
+        "only admission blocks kept"
+    );
+    assert_eq!(shared.used_bytes(), FLOWS as usize * 2 * BLOCK + (1 << 20));
+    assert!(
+        retained <= FLOWS as isize * FIXED,
+        "idle flows keep {:.1} KiB each",
+        retained as f64 / 1024.0 / FLOWS as f64
+    );
+    counting::TRACKED.with(|t| t.set(false));
+    drop(sessions);
+}
+
 #[test]
 fn default_memory_budget_is_well_under_20_mib() {
+    // The configured worst case (the measured behaviour is checked by
+    // `tcp_memory_follows_the_shared_pool_and_is_released_when_idle`).
     let stack = TunStack::new(Arc::new(RefuseAllRules), Arc::new(FakeDialer::default()));
     let b = stack.memory_budget();
     println!("default TUN memory budget: {b:?}");

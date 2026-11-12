@@ -1,7 +1,9 @@
 //! XDRIVE outbound transports: `xdriveSettings` turned into the storage its
 //! sessions live in.
+use segue_config::{
+    StreamSecurity, StreamSettings, StreamTransport, XdriveService, XdriveSettings,
+};
 use std::time::Duration;
-use segue_config::{StreamSecurity, StreamSettings, StreamTransport, XdriveService, XdriveSettings};
 
 use segue_transport::stream::{H3QuicConfig, XhttpXmuxPolicy};
 use segue_transport::xdrive::{

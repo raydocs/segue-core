@@ -8,14 +8,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::time::{timeout, Instant};
 use segue_engine::Core;
 use segue_proxy::mux::{self, Status};
 use segue_proxy::reverse::{encode_control, ControlState};
 use segue_routing::{Network, Target, TargetAddr};
+use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::time::{timeout, Instant};
 
 const ID: &str = "27848739-7e62-4138-9fd3-098a63964b6b";
 const TAG: &str = "r-in";

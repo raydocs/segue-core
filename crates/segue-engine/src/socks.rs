@@ -9,10 +9,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
-use tokio::task::{AbortHandle, Id as TaskId, JoinSet};
 use segue_config::{
     CoreConfig, DomainStrategy, InboundSniffingConfig, RouteContext, SocksInboundSettings,
 };
@@ -26,6 +22,10 @@ use segue_proxy::inbound::{
 use segue_proxy::vless::{encode_xudp_keep_packet, encode_xudp_new_packet, UdpResponseReader};
 use segue_routing::{Target, TargetAddr};
 use segue_transport::{protect_udp_socket, TransportDialer};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{AbortHandle, Id as TaskId, JoinSet};
 
 use crate::outbound::{
     absorb_udp_datagrams, absorb_udp_datagrams_until, final_rules,
@@ -2349,11 +2349,11 @@ mod tests {
     use std::task::{Context, Poll};
 
     use bytes::Bytes;
+    use segue_config::{InboundSniffingConfig, SniffingDestination};
+    use segue_routing::{Network, Target, TargetAddr};
     use tokio::io::AsyncWrite;
     use tokio::sync::{mpsc, Semaphore};
     use tokio::task::JoinSet;
-    use segue_config::{InboundSniffingConfig, SniffingDestination};
-    use segue_routing::{Network, Target, TargetAddr};
 
     use super::{
         admit_socks_udp_flow, apply_fake_ip_sniffed_dial_precedence, evict_oldest_socks_udp_flow,

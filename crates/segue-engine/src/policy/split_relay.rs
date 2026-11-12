@@ -127,7 +127,10 @@ async fn run_parallel_uplink(
 pub(crate) async fn copy_split_with_idle_timeout<R, W>(
     budget: std::sync::Arc<tokio::sync::Semaphore>,
     inbound: (R, W),
-    outbound: (segue_transport::ParallelRead, segue_transport::ParallelWrite),
+    outbound: (
+        segue_transport::ParallelRead,
+        segue_transport::ParallelWrite,
+    ),
     timeouts: RelayTimeouts,
     buffer_size: usize,
     traffic: std::sync::Arc<ConnectionTraffic>,
@@ -347,7 +350,10 @@ mod tests {
     fn pending_halves(
         dropped: &Arc<AtomicUsize>,
         fail: bool,
-    ) -> (segue_transport::ParallelRead, segue_transport::ParallelWrite) {
+    ) -> (
+        segue_transport::ParallelRead,
+        segue_transport::ParallelWrite,
+    ) {
         (
             Box::new(PendingIo {
                 dropped: dropped.clone(),

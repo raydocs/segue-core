@@ -1,8 +1,3 @@
-use std::io::{self, Cursor};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use segue_proxy::inbound::{
     decode_http_basic_credentials, encode_socks5_udp_datagram, negotiate_socks5,
     negotiate_socks5_no_auth, parse_http_connect, parse_http_connect_request, parse_socks4_connect,
@@ -13,6 +8,11 @@ use segue_proxy::inbound::{
     SocksCommand, SocksInboundAuth, SocksParseError, MAX_SOCKS_CREDENTIAL_LENGTH,
 };
 use segue_routing::{Network, Target, TargetAddr};
+use std::io::{self, Cursor};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 #[derive(Debug)]
 struct CountingIo {

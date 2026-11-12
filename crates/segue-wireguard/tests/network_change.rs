@@ -1,6 +1,9 @@
 mod support;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use segue_proxy::wireguard::KeyMaterial;
+use segue_transport::{SocketHandle, SocketProtector};
+use segue_wireguard::{Client, Config, PeerConfig};
 use std::{
     io,
     net::{IpAddr, SocketAddr},
@@ -16,9 +19,6 @@ use tokio::{
     time::timeout,
 };
 use x25519_dalek::{PublicKey, StaticSecret};
-use segue_proxy::wireguard::KeyMaterial;
-use segue_transport::{SocketHandle, SocketProtector};
-use segue_wireguard::{Client, Config, PeerConfig};
 
 #[derive(Default)]
 struct Protector {

@@ -1,11 +1,11 @@
 //! Destination DNS stays inside the WireGuard device, including TCP fallback.
 use super::*;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use segue_routing::DomainHostIndex;
 use segue_transport::{
     dns_response_matches_query, CachingDnsResolver, ConfiguredDnsResolver, DnsQueryMetadata,
     DnsQueryTransport, DnsQueryTransportKind, NameServer,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct NoLocalFallback;
 

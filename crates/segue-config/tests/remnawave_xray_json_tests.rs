@@ -4,8 +4,8 @@
 //! server. Xray-core v26.10.31 ignores the labels and the Shadowsocks pair, and
 //! reads `enableSessionResumption` as a boolean that its uTLS path never uses.
 
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, DiagnosticSeverity};
+use serde_json::{json, Value};
 
 fn vless_tls(tls: Value) -> Value {
     json!({

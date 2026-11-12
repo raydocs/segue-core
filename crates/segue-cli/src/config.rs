@@ -15,8 +15,7 @@ use segue_config::{
 
 use crate::{geodata_dirs_for_config, CliError};
 
-const HELP: &str =
-    "usage: segue config check -config <file|-> [--json] [--geodata-dir <dir>]...
+const HELP: &str = "usage: segue config check -config <file|-> [--json] [--geodata-dir <dir>]...
        segue config contract
        segue config example <name>
 

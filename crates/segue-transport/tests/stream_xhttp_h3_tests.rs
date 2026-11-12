@@ -13,11 +13,11 @@ use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rand::rngs::mock::StepRng;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use segue_routing::{Network, Target, TargetAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
-use segue_routing::{Network, Target, TargetAddr};
 
 use segue_transport::stream::xhttp_composer_test_only::{
     NormalizedRange, XhttpConfig, XhttpConfigInput, XhttpEndpoint, XhttpModeSelection, XhttpRange,

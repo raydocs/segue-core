@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, InboundProtocol, TproxySettings};
+use serde_json::{json, Value};
 fn profile() -> Value {
     json!({"inbounds":[{"protocol":"dokodemo-door","listen":"0.0.0.0","port":12345,
     "settings":{"network":"tcp,udp","followRedirect":true},"streamSettings":{"sockopt":{"tproxy":"tproxy","mark":255}}}],"outbounds":[{"protocol":"freedom"}]})

@@ -1,8 +1,8 @@
 //! One XUDP association over an owned Mux command stream.
 use super::*;
+use segue_proxy::mux::{self, Frame, Status};
 use tokio::io::{AsyncReadExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex as AsyncMutex;
-use segue_proxy::mux::{self, Frame, Status};
 
 pub(crate) struct Session {
     target: Target,

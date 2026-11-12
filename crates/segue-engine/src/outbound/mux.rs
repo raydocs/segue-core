@@ -6,6 +6,7 @@
 //! therefore delays its siblings' downlink frames (head-of-line blocking).
 use super::*;
 use bytes::Bytes;
+use segue_proxy::mux::{self as wire, Frame, Status};
 use std::{
     collections::{BTreeMap, VecDeque},
     task::Waker,
@@ -15,7 +16,6 @@ use tokio::{
     sync::{Mutex as AsyncMutex, Notify},
     task::JoinHandle,
 };
-use segue_proxy::mux::{self as wire, Frame, Status};
 
 /// Parents that can still open children.
 const MAX_PARENTS: usize = 4;

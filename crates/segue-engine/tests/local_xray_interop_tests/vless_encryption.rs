@@ -1,7 +1,7 @@
 use super::*;
-use std::io::{BufRead, BufReader};
 use segue_engine::{open_vless_tcp_stream_with_resolver_and_dialer, OutboundRouter, TcpOutbound};
 use segue_routing::{Network, Target, TargetAddr};
+use std::io::{BufRead, BufReader};
 
 struct Origin(Child);
 impl Drop for Origin {

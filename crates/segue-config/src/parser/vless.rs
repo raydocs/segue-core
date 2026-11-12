@@ -1,9 +1,9 @@
 use super::{normalize_xray_address_text, Parser};
 use crate::surface;
 use crate::{TargetAddr, VlessOutboundSettings, VlessReverseSettings, VlessUser};
+use segue_proxy::vless::DEFAULT_VISION_SEED;
 use serde_json::Value;
 use std::net::IpAddr;
-use segue_proxy::vless::DEFAULT_VISION_SEED;
 
 /// Where the server and its users are: Xray-core's simplified form, with
 /// both in `settings`, or its one `vnext` entry.

@@ -9,12 +9,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use thiserror::Error;
 use segue_config::{parse_xray_json_with_geodata_dirs, CoreConfig, Diagnostic};
 use segue_engine::{
     Core, CoreError, TunFdClosePolicy, TunFdConfig, TunFdPacketFormat, TunFdRuntime,
     TunRuntimeOptions, TunRuntimeProfile,
 };
+use thiserror::Error;
 
 const USAGE: &str = "usage: segue run -config <config.json>\n       segue config <check|contract|example> (see config --help)";
 

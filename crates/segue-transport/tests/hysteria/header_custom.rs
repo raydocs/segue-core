@@ -1,17 +1,17 @@
 //! Hysteria with a `header-custom` UDP mask against Xray-core's server,
 //! which applies the same `finalmask.udp` list.
 use super::support::{ReferenceServer, Task, DEADLINE, SALAMANDER_PASSWORD};
+use segue_routing::{Network, Target, TargetAddr};
+use segue_transport::{
+    header_custom::{CustomArg, CustomExpr, CustomItem, HeaderCustomUdpConfig},
+    hysteria::{HeaderCustomCarrier, HysteriaClient},
+};
 use serde_json::{json, Value};
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
     time::timeout,
-};
-use segue_routing::{Network, Target, TargetAddr};
-use segue_transport::{
-    header_custom::{CustomArg, CustomExpr, CustomItem, HeaderCustomUdpConfig},
-    hysteria::{HeaderCustomCarrier, HysteriaClient},
 };
 
 fn item(packet: &[u8]) -> CustomItem {

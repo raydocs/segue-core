@@ -1,6 +1,6 @@
 use super::*;
-use std::net::IpAddr;
 use segue_engine::{TunAdmissionPolicy, TunFlow, TunFlowAdmission};
+use std::net::IpAddr;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

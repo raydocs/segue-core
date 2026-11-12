@@ -1,9 +1,9 @@
 mod stream_httpupgrade_tests {
     use base64::Engine as _;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
     use segue_transport::stream::{connect_httpupgrade, HttpUpgradeConfig};
     use segue_transport::TransportError;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     async fn loopback() -> (TcpListener, std::net::SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0")

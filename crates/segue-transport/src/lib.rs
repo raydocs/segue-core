@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use segue_routing::{Target, TargetAddr};
 use std::net::{SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -6,7 +7,6 @@ use std::{fmt, io, sync::Arc};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
-use segue_routing::{Target, TargetAddr};
 use zeroize::Zeroize;
 
 #[cfg(unix)]

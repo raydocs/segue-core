@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use segue_config::{
     CoreConfig, InboundConfig, InboundProtocol, Network, ObservatoryConfig, OutboundConfig,
     OutboundSettings, RoutingConfig, StreamSecurity, StreamSettings, StreamTransport,
 };
 use segue_engine::{Core, CoreState, OutboundHealthState};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 fn freedom_outbound(tag: &str) -> OutboundConfig {
     OutboundConfig {

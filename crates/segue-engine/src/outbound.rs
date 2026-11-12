@@ -62,7 +62,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rand::Rng;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use segue_config::{
     CoreConfig, DnsOutboundSettings, DomainStrategy, FreedomFinalRule, FreedomOutboundSettings,
     FreedomRedirect, Network, OutboundConfig, OutboundSettings, ProxyProtocolVersion,
@@ -87,6 +86,7 @@ use segue_transport::{
     ResolvedTcpConnector, SystemDnsResolver, TlsClientConfig, TransportDialer, TransportError,
     TransportStream,
 };
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use zeroize::Zeroizing;
 
 use crate::policy::effective_policy_for_level;
@@ -5369,10 +5369,6 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-    use tokio::sync::Notify;
-    use uuid::Uuid;
     use segue_config::{
         compile_domain_matchers, DnsConfig, DnsServerConfig, DomainMatcher, GrpcSettings,
         HappyEyeballsSettings, HttpUpgradeSettings, IpCidr, IpMatcherSet, OutboundProxySettings,
@@ -5384,6 +5380,10 @@ mod tests {
     use segue_transport::{
         CachingDnsResolver, DnsLookup, RealityTlsEngine, ResolvedTcpConnector, TransportError,
     };
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Notify;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -10204,7 +10204,9 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(CoreError::Transport(segue_transport::TransportError::Tcp(_)))
+            Err(CoreError::Transport(segue_transport::TransportError::Tcp(
+                _
+            )))
         ));
     }
 
@@ -11410,12 +11412,13 @@ mod socket_option_tests {
         let chained = TransportDialer::system()
             .unwrap()
             .with_resolved_tcp_connector(Arc::new(NoTcp));
-        let upload = chained
-            .clone()
-            .with_socket_options(Arc::new(segue_transport::SocketOptions {
-                mark: 1,
-                ..Default::default()
-            }));
+        let upload =
+            chained
+                .clone()
+                .with_socket_options(Arc::new(segue_transport::SocketOptions {
+                    mark: 1,
+                    ..Default::default()
+                }));
         let compiled = |upload_sockopt: serde_json::Value, download_sockopt: serde_json::Value| {
             let value = json!({
                 "protocol": "vless",
@@ -11454,10 +11457,10 @@ mod socket_option_tests {
 #[cfg(test)]
 mod address_port_tests {
     use super::*;
+    use segue_transport::{RecordResolver, SrvRecord};
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
     use tokio::net::{TcpListener, UdpSocket};
-    use segue_transport::{RecordResolver, SrvRecord};
 
     fn outbound(value: serde_json::Value) -> OutboundConfig {
         let parsed = segue_config::parse_xray_json(&json!({ "outbounds": [value] }).to_string())

@@ -1,7 +1,7 @@
 //! TCP integration gaps from #79: authenticated TLS, real proxy hops and probes.
 use super::*;
-use std::sync::Mutex;
 use segue_engine::{OutboundHealthFailure, OutboundProbeOutcome, StartupProbeOptions};
+use std::sync::Mutex;
 
 #[path = "../http_runtime/support.rs"]
 mod http_support;

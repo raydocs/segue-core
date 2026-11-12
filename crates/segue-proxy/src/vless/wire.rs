@@ -1,9 +1,9 @@
 use std::fmt;
 
 use prost::Message;
+use segue_routing::{Target, TargetAddr};
 use thiserror::Error;
 use uuid::Uuid;
-use segue_routing::{Target, TargetAddr};
 
 const VLESS_VERSION: u8 = 0;
 const ADDR_IPV4: u8 = 1;

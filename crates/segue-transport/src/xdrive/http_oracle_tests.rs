@@ -9,9 +9,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http::Method;
+use segue_proxy::go_url;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use segue_proxy::go_url;
 use zeroize::Zeroizing;
 
 use super::client::{Prepared, Progress, ServiceRequest, ServiceResponse, ServiceUrl};

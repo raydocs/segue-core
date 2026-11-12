@@ -1,9 +1,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use std::time::{Duration, Instant};
 use segue_proxy::hysteria::*;
 use segue_proxy::wireguard::*;
+use std::time::{Duration, Instant};
 
 fuzz_target!(|data: &[u8]| {
     let _ = decode_tcp_request(data);

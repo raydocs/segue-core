@@ -26,10 +26,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinSet;
 use segue_config::{CoreConfig, OutboundSettings, VlessReverseSettings};
 use segue_transport::TransportDialer;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 
 use crate::dns::RuntimeDnsResolvers;
 use crate::outbound::{open_vless_reverse_tunnel, OutboundNodeId};

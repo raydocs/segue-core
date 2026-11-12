@@ -1,17 +1,17 @@
 #[path = "hysteria_runtime/support.rs"]
 mod support;
+use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
+use segue_routing::{Network, Target, TargetAddr};
 use std::sync::atomic::Ordering;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
-use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
-use segue_routing::{Network, Target, TargetAddr};
 
 async fn run_parsed_salamander_hop_profile(noise_before: Option<bool>) {
-    use std::{sync::Arc, time::Duration};
     use segue_engine::Core;
     use segue_transport::TransportDialer;
+    use std::{sync::Arc, time::Duration};
     timeout(Duration::from_secs(20), async {
         let server = ReferenceServer::start_with_carrier(true, true).await;
         let noise_packets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -237,9 +237,9 @@ async fn hysteria_runtime_socks_http_udp_share_session_account_and_stop() {
 #[tokio::test]
 #[ignore = "requires pinned reference; use check-hysteria-interop.sh or check-native-hysteria-interop.sh"]
 async fn hysteria_runtime_concurrent_open_isolated_trust_and_socket_policy() {
-    use std::sync::Arc;
     use segue_engine::{open_tcp_stream_with_resolver_and_dialer, CoreError, OutboundRouter};
     use segue_transport::{hysteria::HysteriaError, TransportDialer};
+    use std::sync::Arc;
     timeout(DEADLINE, async {
         let server = ReferenceServer::start().await;
         let (address, _echo) = tcp_echo().await;

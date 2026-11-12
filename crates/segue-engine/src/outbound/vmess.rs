@@ -1,7 +1,7 @@
 use super::*;
+use segue_proxy::vmess::{Account, Cipher, ClientStream};
 use tokio::io::{AsyncReadExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex as AsyncMutex;
-use segue_proxy::vmess::{Account, Cipher, ClientStream};
 #[derive(Debug, Clone)]
 pub struct VmessOutbound(Arc<Payload>);
 #[derive(Debug)]
@@ -311,7 +311,10 @@ impl TransportStream for ParallelStream {
     }
     fn take_parallel_halves(
         &mut self,
-    ) -> Option<(segue_transport::ParallelRead, segue_transport::ParallelWrite)> {
+    ) -> Option<(
+        segue_transport::ParallelRead,
+        segue_transport::ParallelWrite,
+    )> {
         let (read, write) = self
             .0
             .take()?

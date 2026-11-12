@@ -1,14 +1,14 @@
 //! The dialer runs the `header-custom` handshake on every TCP carrier as soon
 //! as it connects: before the fragment mask, TLS and REALITY.
-use std::{net::Ipv4Addr, sync::Arc, time::Duration};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-};
 use segue_routing::{Network, Target, TargetAddr};
 use segue_transport::{
     header_custom::{CustomArg, CustomExpr, CustomItem, HeaderCustomTcpConfig},
     ConnectorConfig, RealityClientConfig, TcpFragmentConfig, TlsClientConfig, TransportDialer,
+};
+use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
 };
 
 fn packet(bytes: &[u8]) -> CustomItem {

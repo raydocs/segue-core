@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use segue_transport::stream::{
     xhttp_h1_test_only::{
         send_fixed_request, start_chunked_request, start_fixed_request, H1Error, H1Request,
@@ -13,6 +12,7 @@ use segue_transport::stream::{
     },
     HeaderMap,
 };
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
 #[tokio::test]
 async fn fixed_request_error_reports_exact_partial_wire_progress() {

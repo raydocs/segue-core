@@ -1,9 +1,9 @@
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json, OutboundProtocol, OutboundSettings, SocksOutboundSettings, StreamSecurity,
     StreamTransport, TargetAddr,
 };
 use segue_proxy::inbound::SocksAccount;
+use serde_json::{json, Value};
 
 const USER: &str = "synthetic-socks-user";
 const PASS: &str = "synthetic-socks-pass";

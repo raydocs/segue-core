@@ -5,14 +5,14 @@ use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
 use quinn::{RecvStream, SendStream, VarInt};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
-use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
-use tokio::time::timeout;
 use segue_proxy::hysteria::{
     decode_tcp_response, encode_tcp_request, TcpRequest, WireError, MAX_MESSAGE_LENGTH,
     MAX_PADDING_LENGTH,
 };
 use segue_routing::{Network, Target};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
+use tokio::time::timeout;
 
 use super::client::{random_padding, Shared};
 use super::{HysteriaClient, HysteriaError};

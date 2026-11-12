@@ -5,9 +5,9 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, watch};
 use segue_config::InboundSniffingConfig;
 use segue_routing::Target;
+use tokio::sync::{mpsc, watch};
 
 use crate::sniffing::{Sniffed, UdpSniffProgress, UdpSniffer, QUIC_MAX_CRYPTO_STREAM_SIZE};
 

@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, StreamTransport, TargetAddr};
+use serde_json::{json, Value};
 
 #[test]
 fn pinned_download_configuration_contract_and_fail_closed_boundaries() {

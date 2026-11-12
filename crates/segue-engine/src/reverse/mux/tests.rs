@@ -1,6 +1,6 @@
 use super::*;
-use tokio::io::{duplex, DuplexStream};
 use segue_proxy::reverse::{encode_control, ControlState};
+use tokio::io::{duplex, DuplexStream};
 
 /// A portal's frame, as Xray-core's Mux client writes it.
 struct PortalFrame<'a> {

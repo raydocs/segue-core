@@ -1,6 +1,5 @@
 use std::{collections::BTreeSet, env, fmt::Write as _, fs, path::Path, process::Command};
 
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use segue_transport::{
     reality::{
         prepare_reality_handshake, validate_reality_client_hello_metadata, RealityHandshakeInput,
@@ -9,6 +8,7 @@ use segue_transport::{
     reality_connector::{RealityClientHelloRequest, RealityTlsSessionProvider},
     RustlsRealityTlsSessionProvider,
 };
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 
 #[path = "support/client_hello_draws.rs"]
 mod client_hello_draws;

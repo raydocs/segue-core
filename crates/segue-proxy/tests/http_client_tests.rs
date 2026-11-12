@@ -1,13 +1,13 @@
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use segue_proxy::outbound::{
     encode_connect_request, encode_http2_connect_request, http_connect, HttpAccount,
     HttpClientError, MAX_HTTP_CONNECT_RESPONSE_HEAD, MAX_HTTP_CREDENTIAL_LENGTH,
 };
 use segue_routing::{Network, Target, TargetAddr};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const USER: &str = "synthetic-user";
 const PASS: &str = "synthetic-pass";

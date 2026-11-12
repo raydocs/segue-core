@@ -1,5 +1,5 @@
-use serde_json::Value;
 use segue_config::profile_import::{import_profile, ImportError, ProfileFormat};
+use serde_json::Value;
 
 #[test]
 fn trojan_uri_preserves_encoded_credentials_plus_ipv6_and_name() {

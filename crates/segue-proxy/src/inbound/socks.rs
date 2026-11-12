@@ -2,9 +2,9 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use bytes::Bytes;
+use segue_routing::{Network, Target, TargetAddr};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use segue_routing::{Network, Target, TargetAddr};
 use zeroize::Zeroizing;
 
 /// RFC 1929 caps both the username and the password at 255 bytes.

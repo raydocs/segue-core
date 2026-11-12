@@ -2,11 +2,11 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use serde_json::{json, Value};
 use segue_config::{
     go_lowercase, parse_xray_json, ContentAttributes, DiagnosticSeverity, Network, RouteContext,
     RoutingPortRange, RoutingRule, RoutingRuleTarget,
 };
+use serde_json::{json, Value};
 
 fn config(rules: Value) -> String {
     json!({

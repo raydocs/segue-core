@@ -6,10 +6,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use serde_json::{json, Value};
 use segue_config::tooling::{
     configuration_contract, configuration_examples, validate_xray_json_with_exclusive_geodata_dirs,
 };
+use serde_json::{json, Value};
 
 #[path = "../../../tests/support/config_tooling.rs"]
 mod fixtures;

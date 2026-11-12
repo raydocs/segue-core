@@ -1,8 +1,8 @@
 use bytes::Bytes;
-use thiserror::Error;
 use segue_config::{
     DnsOutboundRule, DnsOutboundRuleAction, DnsOutboundSettings, DnsQTypeRange, DomainMatcherSet,
 };
+use thiserror::Error;
 
 const DNS_HEADER_LEN: usize = 12;
 const DNS_TYPE_A: u16 = 1;

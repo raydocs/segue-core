@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
-use tokio::time::{sleep, Duration};
 use segue_tun::{
     TunEndpoint, TunStats, TunTcpFlowSummaryEvent, TunTcpOpenErrorEvent,
     TunTcpRemoteWriteSlowEvent, TunTcpSlowFlowEvent, TunTcpSlowFlowKind, TunUdpQuicBlockedEvent,
     TunUdpResponseGapEvent, TunUdpSlowFlowEvent,
 };
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::{sleep, Duration};
 
 use crate::RuntimeLogger;
 
@@ -298,9 +298,9 @@ fn average_duration_ms(total: u64, events: u64) -> u64 {
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::watch;
     use segue_tun::TunConfig;
     use segue_tun::{TunStats, TunTcpFlowSummaryEvent, TunTcpOpenErrorEvent};
+    use tokio::sync::watch;
 
     use super::{
         format_tcp_flow_summary_event, format_tcp_open_error_event, format_tun_stats_debug_lines,

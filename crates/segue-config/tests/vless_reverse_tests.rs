@@ -1,10 +1,10 @@
 //! The bridge side of the VLESS reverse proxy, read as Xray-core v26.10.31
 //! reads it, and its legacy reverse proxy refused as there.
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json, DiagnosticSeverity, OutboundSettings, SniffingDestination,
     VlessOutboundSettings, VlessReverseSettings,
 };
+use serde_json::{json, Value};
 
 const ID: &str = "27848739-7e62-4138-9fd3-098a63964b6b";
 

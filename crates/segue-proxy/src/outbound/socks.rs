@@ -20,9 +20,9 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
+use segue_routing::{Target, TargetAddr};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use segue_routing::{Target, TargetAddr};
 use zeroize::Zeroizing;
 
 use crate::inbound::{

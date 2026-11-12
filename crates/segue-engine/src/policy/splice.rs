@@ -30,11 +30,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{ready, Context, Poll};
 
+use segue_transport::{BoxedTransportStream, RawRead};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Interest, ReadBuf};
 use tokio::net::tcp::WriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use segue_transport::{BoxedTransportStream, RawRead};
 
 use super::relay_buffer::{RelayBuffer, PROCESS_POOL};
 use super::{
@@ -434,9 +434,9 @@ mod tests {
     use std::time::Duration;
 
     use bytes::BytesMut;
+    use segue_proxy::vless::{VisionCommand, VisionPadding};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use segue_proxy::vless::{VisionCommand, VisionPadding};
 
     use super::*;
 

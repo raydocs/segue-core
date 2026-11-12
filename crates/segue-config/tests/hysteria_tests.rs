@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, Network, OutboundSettings, StreamSecurity, StreamTransport};
+use serde_json::{json, Value};
 
 fn example() -> Value {
     serde_json::from_str(include_str!(

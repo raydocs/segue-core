@@ -597,7 +597,9 @@ pub(super) fn udp_noise_config(
     let segment = |segment: &segue_config::NoiseSegment| match segment {
         segue_config::NoiseSegment::Bytes(bytes) => NoiseSegment::Bytes(bytes.clone()),
         segue_config::NoiseSegment::Random(size) => NoiseSegment::Random(range(*size)),
-        segue_config::NoiseSegment::RandomLetters(size) => NoiseSegment::RandomLetters(range(*size)),
+        segue_config::NoiseSegment::RandomLetters(size) => {
+            NoiseSegment::RandomLetters(range(*size))
+        }
         segue_config::NoiseSegment::RandomDigits(size) => NoiseSegment::RandomDigits(range(*size)),
         segue_config::NoiseSegment::Timestamp => NoiseSegment::Timestamp,
         segue_config::NoiseSegment::Counter => NoiseSegment::Counter,

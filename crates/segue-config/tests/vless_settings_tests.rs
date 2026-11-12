@@ -1,7 +1,7 @@
 //! VLESS and VMess outbound settings, read as Xray-core v26.10.31 reads them.
+use segue_config::{parse_xray_json, OutboundSettings, TargetAddr, VlessOutboundSettings};
 use serde_json::{json, Value};
 use uuid::Uuid;
-use segue_config::{parse_xray_json, OutboundSettings, TargetAddr, VlessOutboundSettings};
 
 const ID: &str = "27848739-7e62-4138-9fd3-098a63964b6b";
 

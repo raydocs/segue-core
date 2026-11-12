@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
 use segue_proxy::hysteria::*;
 use segue_proxy::wireguard::*;
+use serde_json::Value;
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!(

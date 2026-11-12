@@ -9,14 +9,14 @@ pub use udp::UdpSession;
 
 use crate::shadowsocks::address::encode as encode_address;
 use base64::{engine::general_purpose::STANDARD, Engine};
+#[cfg(test)]
+use segue_routing::TargetAddr;
+use segue_routing::{Network, Target};
 use sha2::{Digest, Sha256};
 use std::{
     fmt, io,
     time::{SystemTime, UNIX_EPOCH},
 };
-#[cfg(test)]
-use segue_routing::TargetAddr;
-use segue_routing::{Network, Target};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_KEYS: usize = 8;

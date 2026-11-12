@@ -2,8 +2,6 @@ mod reality_tests {
     use hmac::{Hmac, KeyInit, Mac};
     use ml_dsa::{EncodedVerifyingKey, Keypair, MlDsa65, Seed, Signer, SigningKey};
     use rcgen::generate_simple_self_signed;
-    use serde::Deserialize;
-    use sha2::Sha512;
     use segue_transport::reality::{
         build_reality_session_id, derive_reality_auth_key, prepare_reality_handshake,
         seal_reality_client_hello, verify_reality_certificate_binding,
@@ -12,6 +10,8 @@ mod reality_tests {
         RealityError, RealityHandshakeInput, RealityMldsa65CertificateInput,
         RealityPreparedClientHello, RealityPreparedHandshake, RealitySessionIdInput,
     };
+    use serde::Deserialize;
+    use sha2::Sha512;
 
     const SESSION_ID_VECTORS_JSON: &str =
         include_str!("../../../tests/fixtures/reality/session_id_vectors.json");

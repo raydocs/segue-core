@@ -1,7 +1,7 @@
 //! Xray's `localOS` routing condition and the `direct` freedom alias.
 
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, DiagnosticSeverity, OutboundProtocol, RoutingRule, LOCAL_OS};
+use serde_json::{json, Value};
 
 fn rule(local_os: Value) -> Result<RoutingRule, Vec<(Option<String>, String)>> {
     let raw = json!({

@@ -8,8 +8,8 @@ use std::{
 };
 
 use prost::Message;
-use thiserror::Error;
 use segue_routing::IpMatcherSetBuilder;
+use thiserror::Error;
 
 use crate::{ConfigModelError, DomainMatcher, IpCidr, RegexMatcher};
 

@@ -119,7 +119,11 @@ fn charged(data: Vec<u8>, mut g: Option<PoolGrant>) -> Out {
 /// `Some(Some(_))` charged, `Some(None)` uncharged because the pool is short
 /// but the queue is empty (one message in flight keeps the session moving
 /// and cannot deadlock on its own grants), `None` wait for blocks.
-fn queue_charge(pool: &Arc<Pool>, tx: &mpsc::Sender<Out>, bytes: usize) -> Option<Option<PoolGrant>> {
+fn queue_charge(
+    pool: &Arc<Pool>,
+    tx: &mpsc::Sender<Out>,
+    bytes: usize,
+) -> Option<Option<PoolGrant>> {
     match PoolGrant::fixed(pool, bytes) {
         Some(g) => Some(Some(g)),
         None if tx.capacity() == tx.max_capacity() => Some(None),
@@ -145,13 +149,42 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut dec = FrameDecoder::new();
+        let mut dec_charge = pool.as_ref().map(|p| PoolGrant::new(p, false));
         let mut buf = ReadBuffer::new(pool);
         loop {
-            match r.read(buf.get()).await {
+            // A large buffer goes back once the stream has been quiet for
+            // READ_IDLE (cancelling a pending read loses nothing).
+            let idle = buf
+                .idle_at()
+                .or_else(|| (dec.held_bytes() > 0).then_some(buf.last + READ_IDLE));
+            let read = match idle {
+                Some(at) => match tokio::time::timeout_at(at, r.read(buf.get())).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        buf.shrink();
+                        dec.release_idle();
+                        if let Some(g) = &mut dec_charge {
+                            g.try_resize(dec.held_bytes());
+                        }
+                        if dec.held_bytes() > 0 {
+                            // A partial frame: wait for the rest.
+                            buf.last = tokio::time::Instant::now();
+                        }
+                        continue;
+                    }
+                },
+                None => r.read(buf.get()).await,
+            };
+            match read {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     dec.push(&buf.get()[..n]);
                     buf.adapt(n);
+                    if let Some(g) = &mut dec_charge {
+                        // Best effort: a partial frame must be kept anyway.
+                        g.try_resize(0);
+                        g.grow_towards(dec.held_bytes());
+                    }
                 }
             }
             loop {
@@ -182,9 +215,12 @@ struct ReadBuffer {
     buf: Vec<u8>,
     pool: Option<Arc<Pool>>,
     charge: Option<PoolGrant>,
+    last: tokio::time::Instant,
 }
 
 const SMALL_READ: usize = 512;
+/// Quiet time after which a large read buffer is released.
+const READ_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl ReadBuffer {
     fn new(pool: Option<Arc<Pool>>) -> Self {
@@ -192,7 +228,18 @@ impl ReadBuffer {
             buf: vec![0; SMALL_READ],
             pool,
             charge: None,
+            last: tokio::time::Instant::now(),
         }
+    }
+
+    /// When a large buffer should be released if nothing is read.
+    fn idle_at(&self) -> Option<tokio::time::Instant> {
+        (self.buf.len() > SMALL_READ).then_some(self.last + READ_IDLE)
+    }
+
+    fn shrink(&mut self) {
+        self.buf = vec![0; SMALL_READ];
+        self.charge = None;
     }
 
     fn get(&mut self) -> &mut [u8] {
@@ -205,6 +252,7 @@ impl ReadBuffer {
 
     /// After a read of `n` bytes.
     fn adapt(&mut self, n: usize) {
+        self.last = tokio::time::Instant::now();
         if n == self.buf.len() && self.buf.len() < CHUNK {
             let charge = match &self.pool {
                 Some(p) => match PoolGrant::fixed(p, CHUNK) {
@@ -216,8 +264,7 @@ impl ReadBuffer {
             self.charge = charge;
             self.buf = vec![0; CHUNK];
         } else if self.buf.len() > SMALL_READ && n < SMALL_READ {
-            self.buf = vec![0; SMALL_READ];
-            self.charge = None;
+            self.shrink();
         }
     }
 }
@@ -433,6 +480,12 @@ where
                     pool_blocked = true;
                     break;
                 };
+                // Uncharged (pool short): one block at a time.
+                let avail = if g.is_some() {
+                    avail
+                } else {
+                    avail.min(crate::pool::BLOCK)
+                };
                 let mut v = vec![0u8; avail];
                 let n = s.read(&mut v, t);
                 if n == 0 {
@@ -464,6 +517,7 @@ where
         };
         let deadline = s.poll_timeout().map(tokio::time::Instant::from_std);
         let backoff = connect_backoff.filter(|_| !connecting);
+        let abuf_idle = abuf.idle_at();
         let drain = tasks.next_deadline();
         tokio::select! {
             ev = ev_rx.recv() => {
@@ -537,6 +591,9 @@ where
             }
             _ = writable.notified() => {}
             _ = pool.freed(), if pool_blocked => {}
+            _ = tokio::time::sleep_until(abuf_idle.unwrap_or_else(tokio::time::Instant::now)), if abuf_idle.is_some() => {
+                abuf.shrink();
+            }
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
             _ = tokio::time::sleep_until(backoff.unwrap_or_else(tokio::time::Instant::now)), if backoff.is_some() => {}
             _ = tokio::time::sleep_until(drain.unwrap_or_else(tokio::time::Instant::now)), if drain.is_some() => {}

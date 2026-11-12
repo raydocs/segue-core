@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::watch;
-use tokio::task::JoinSet;
 use segue_config::{ObservatoryConfig, OBSERVATORY_PROBE_TIMEOUT};
 use segue_transport::{DnsResolver, TransportDialer};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use crate::outbound::{OutboundNodeId, OutboundRouter, OutboundSelectionOverlay};
 use crate::startup_probe::{

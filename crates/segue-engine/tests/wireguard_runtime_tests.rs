@@ -3,13 +3,13 @@
 mod hysteria_support;
 #[path = "wireguard_runtime/support.rs"]
 mod support;
+use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
+use segue_routing::{Network, Target, TargetAddr};
 use std::sync::atomic::Ordering;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
-use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
-use segue_routing::{Network, Target, TargetAddr};
 
 #[tokio::test]
 #[ignore = "requires pinned reference; use check-wireguard-runtime.sh or check-native-wireguard-interop.sh"]
@@ -177,9 +177,9 @@ async fn sharing_accounting_and_stop(psk: Option<[u8; 32]>) {
 #[tokio::test]
 #[ignore = "requires pinned reference; use check-wireguard-runtime.sh or check-native-wireguard-interop.sh"]
 async fn wireguard_runtime_concurrent_open_isolated_socket_policy() {
-    use std::sync::Arc;
     use segue_engine::{open_tcp_stream_with_resolver_and_dialer, CoreError, OutboundRouter};
     use segue_wireguard::Error;
+    use std::sync::Arc;
     timeout(DEADLINE, async {
         let server = ReferenceServer::start().await;
         let (address, _echo) = tcp_echo().await;

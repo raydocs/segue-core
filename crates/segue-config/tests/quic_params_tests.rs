@@ -1,8 +1,8 @@
 //! `finalmask.quicParams` as Xray-core v26.10.31's Hysteria and XHTTP H3
 //! dialers read it.
 
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, DiagnosticSeverity, QuicBbrProfile, QuicCongestion};
+use serde_json::{json, Value};
 
 fn hysteria(quic: Value) -> String {
     let mut raw: Value = serde_json::from_str(include_str!(

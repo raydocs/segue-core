@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, OutboundSettings};
+use serde_json::{json, Value};
 
 fn profile(settings: Value) -> Value {
     json!({"outbounds":[{"protocol":"trojan","settings":settings,"streamSettings":{"security":"tls","tlsSettings":{"serverName":"example.test"}}}]})

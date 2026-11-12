@@ -691,16 +691,16 @@ mod stream_grpc_h2_tests {
     use h2::server::{self, SendResponse};
     use h2::{RecvStream, SendStream};
     use http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
-    use tokio::io::{
-        duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
-    };
-    use tokio::sync::{mpsc, oneshot};
-    use tokio::time::Instant;
     use segue_transport::stream::grpc_test_only::{
         encode_hunk, open_grpc_h2_stream, GrpcStream, MAX_HUNK_PAYLOAD_LEN,
     };
     use segue_transport::stream::GrpcConfig;
     use segue_transport::BoxedTransportStream;
+    use tokio::io::{
+        duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
+    };
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::Instant;
 
     /// `grpcSettings.authority` when it is set; the tests never exercise the
     /// fallbacks (`Xray-core/transport/internet/grpc/dial.go:159-167`), which
@@ -2825,8 +2825,6 @@ mod stream_grpc_request_headers_tests {
 
     use h2::server;
     use http::Method;
-    use tokio::io::{duplex, DuplexStream};
-    use tokio::sync::oneshot;
     use segue_transport::stream::grpc_test_only::{
         grpc_request_path, open_grpc_h2_stream, HunkMode,
     };
@@ -2834,6 +2832,8 @@ mod stream_grpc_request_headers_tests {
         apply_masquerade, resolve_user_agent, Authority, GrpcConfig, HeaderMap, HeaderValue,
     };
     use segue_transport::BoxedTransportStream;
+    use tokio::io::{duplex, DuplexStream};
+    use tokio::sync::oneshot;
 
     const DEADLINE: Duration = Duration::from_secs(10);
     /// A literal, so `resolve_user_agent` hands it back untouched and the case
@@ -3236,13 +3236,13 @@ mod stream_grpc_oracle_tests {
     use std::time::Duration;
 
     use h2::server;
-    use tokio::io::{duplex, AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
-    use tokio::sync::oneshot;
     use segue_transport::stream::grpc_test_only::{
         encode_hunk, grpc_request_path, open_grpc_h2_stream, HunkDecoder, HunkMode,
     };
     use segue_transport::stream::{GrpcConfig, HeaderValue};
     use segue_transport::BoxedTransportStream;
+    use tokio::io::{duplex, AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+    use tokio::sync::oneshot;
 
     const CONNECTION_PREAMBLE_JSON: &str =
         include_str!("../../../tests/fixtures/grpc/connection_preamble.json");
@@ -4395,14 +4395,14 @@ mod stream_grpc_pool_tests {
     use h2::server::{self, SendResponse};
     use h2::{Reason, RecvStream, SendStream};
     use http::{HeaderMap, HeaderValue, Response};
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
-    use tokio::net::{TcpListener, TcpStream};
     use segue_routing::{Network, Target, TargetAddr};
     use segue_transport::stream::grpc_test_only::{open_grpc_h2_stream, resolve_keepalive};
     use segue_transport::stream::{GrpcConfig, GrpcTransport, TransportLayer};
     use segue_transport::{
         BoxedTransportStream, ConnectorConfig, TlsClientConfig, TransportDialer, TransportError,
     };
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::net::{TcpListener, TcpStream};
 
     /// Every test here can stall rather than fail, so each is fenced by a
     /// deadline the way `stream_grpc_h2_tests` is.
@@ -5538,13 +5538,13 @@ mod stream_grpc_flow_control_tests {
     use h2::server::{self, SendResponse};
     use h2::SendStream;
     use http::{HeaderValue, Response};
-    use tokio::io::AsyncReadExt;
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::oneshot;
     use segue_routing::{Network, Target, TargetAddr};
     use segue_transport::stream::grpc_test_only::encode_hunk;
     use segue_transport::stream::{GrpcConfig, GrpcTransport, TransportLayer};
     use segue_transport::{BoxedTransportStream, ConnectorConfig, TransportDialer};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
 
     /// A starved flow stalls rather than fails, so the deadline is what turns
     /// the bug into a test failure — the same fence the sibling blocks use.

@@ -1,9 +1,9 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use segue_config::{OutboundSettings, ProxyProtocolVersion};
 use segue_transport::DnsLookup;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 

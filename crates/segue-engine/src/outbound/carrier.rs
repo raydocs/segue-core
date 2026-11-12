@@ -1,7 +1,7 @@
 //! Shared endpoint, authenticated connector and stream transport compilation.
 use super::*;
-use std::borrow::Cow;
 use segue_transport::stream::XhttpConnectTarget;
+use std::borrow::Cow;
 
 #[derive(Clone, Copy)]
 pub(super) struct ServerConfigPaths {
@@ -924,7 +924,9 @@ pub(super) fn fragment_config(
         .as_ref()
         .map(|settings| {
             let packets = match settings.packets {
-                segue_config::FragmentPackets::TlsHello => segue_transport::FragmentPackets::TlsHello,
+                segue_config::FragmentPackets::TlsHello => {
+                    segue_transport::FragmentPackets::TlsHello
+                }
                 segue_config::FragmentPackets::AllWrites => {
                     segue_transport::FragmentPackets::AllWrites
                 }

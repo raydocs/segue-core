@@ -2,15 +2,15 @@
 //! controller Xray's dialer installs after authentication runs, and data
 //! crosses it both ways intact.
 use super::support::{ReferenceServer, Task, DEADLINE};
+use segue_routing::{Network, Target, TargetAddr};
+use segue_transport::hysteria::HysteriaClient;
+use segue_transport::stream::{H3BbrProfile, H3Congestion};
 use std::{net::Ipv4Addr, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     time::timeout,
 };
-use segue_routing::{Network, Target, TargetAddr};
-use segue_transport::hysteria::HysteriaClient;
-use segue_transport::stream::{H3BbrProfile, H3Congestion};
 
 const PAYLOAD: usize = 2 * 1024 * 1024;
 

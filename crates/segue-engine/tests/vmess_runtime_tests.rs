@@ -2,6 +2,8 @@
 mod hysteria_support;
 #[path = "trojan_runtime/support.rs"]
 mod support;
+use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
+use segue_routing::{Network, Target, TargetAddr};
 use std::sync::atomic::Ordering;
 use support::*;
 use tokio::{
@@ -9,8 +11,6 @@ use tokio::{
     net::{TcpStream, UdpSocket},
     time::timeout,
 };
-use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
-use segue_routing::{Network, Target, TargetAddr};
 
 async fn bulk_echo(stream: &mut TcpStream) {
     let payload = (0..256 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
@@ -140,9 +140,9 @@ async fn vmess_runtime_carriers_socks_http_udp_accounting_and_close() {
 #[tokio::test]
 #[ignore = "requires pinned Xray; run scripts/check-vmess-interop.sh"]
 async fn vmess_runtime_rejects_wrong_uuid_and_untrusted_peer() {
-    use std::sync::Arc;
     use segue_engine::{open_tcp_stream_with_resolver_and_dialer, OutboundRouter};
     use segue_transport::TransportDialer;
+    use std::sync::Arc;
     let server = ReferenceServer::start_vmess("ws", "aes-128-gcm", "").await;
     timeout(DEADLINE, async {
         let (address, _echo) = tcp_echo().await;

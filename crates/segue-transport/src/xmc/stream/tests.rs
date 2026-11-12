@@ -168,8 +168,8 @@ async fn the_dialer_logs_in_outside_the_header_custom_handshake() {
         XmcConfig,
     };
     use crate::{ConnectorConfig, TransportDialer};
-    use std::sync::Arc;
     use segue_routing::{Network, Target, TargetAddr};
+    use std::sync::Arc;
     let packet = |bytes: &[u8]| CustomItem {
         delay: (0, 0),
         rand: 0,

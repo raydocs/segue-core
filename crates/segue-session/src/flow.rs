@@ -405,7 +405,10 @@ impl RecvHalf {
         };
         if !active {
             // Idle and drained: the buffer's memory goes back now; it is
-            // re-reserved (within the grant) when data arrives.
+            // re-reserved (within the grant) when data arrives. The grant
+            // itself cannot fall below the window already advertised
+            // (`max_offset` never moves back, rule 8), so the pool keeps
+            // that promise charged.
             self.buf.shrink_to_fit();
         }
         let pool = self.grant.pool();
@@ -483,7 +486,9 @@ impl RecvHalf {
         // shrink), so there is nothing to time out until it is read.
         if self.fin.is_some()
             || !self.buf.is_empty()
-            || self.grant.bytes() <= self.min_credit.max((self.adv_max - self.consumed) as usize)
+            || (self.buf.capacity() == 0
+                && self.grant.bytes()
+                    <= self.min_credit.max((self.adv_max - self.consumed) as usize))
         {
             return None;
         }
@@ -685,7 +690,16 @@ mod tests {
         r.update_credit(later);
         // (The grant still covers credit already advertised, which cannot
         // be withdrawn; the memory behind it is released until used.)
-        assert!(r.held_bytes() <= r.grant_bytes(), "{} > {}", r.held_bytes(), r.grant_bytes());
-        assert_eq!(r.held_bytes(), 0, "idle drained receive buffer keeps {peak} bytes");
+        assert!(
+            r.held_bytes() <= r.grant_bytes(),
+            "{} > {}",
+            r.held_bytes(),
+            r.grant_bytes()
+        );
+        assert_eq!(
+            r.held_bytes(),
+            0,
+            "idle drained receive buffer keeps {peak} bytes"
+        );
     }
 }

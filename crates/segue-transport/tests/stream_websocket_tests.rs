@@ -202,12 +202,12 @@ mod stream_websocket_tests {
 mod stream_websocket_handshake_tests {
     use std::time::Duration;
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
     use segue_transport::stream::{
         accept_key_for, connect_websocket, encode_early_data, WebSocketConfig,
     };
     use segue_transport::TransportError;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     async fn loopback() -> (TcpListener, std::net::SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use segue_config::profile_import::{import_profile, import_request, ImportError, ProfileFormat};
+use serde_json::{json, Value};
 
 fn config(text: &str) -> Value {
     let profile = import_profile(ProfileFormat::Http, text, None, &[]).unwrap();

@@ -1,9 +1,9 @@
 use base64::Engine as _;
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json, BlackholeOutboundSettings, BlackholeResponse, DiagnosticSeverity,
     OutboundProtocol, OutboundSettings, RoutingRuleTarget,
 };
+use serde_json::{json, Value};
 
 /// The shape managed Android subscriptions ship: a proxy, `direct` and a
 /// `block` blackhole that deny rules (ads, QUIC) route to.

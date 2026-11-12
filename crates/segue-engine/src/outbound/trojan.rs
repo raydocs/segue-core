@@ -1,8 +1,8 @@
 //! Trojan client lifecycle over the shared protected stream carrier.
 use super::*;
+use segue_proxy::trojan::{self as wire, TrojanAuth, UdpPacket, WireError};
 use tokio::io::{AsyncReadExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex as AsyncMutex;
-use segue_proxy::trojan::{self as wire, TrojanAuth, UdpPacket, WireError};
 
 #[derive(Debug, Clone)]
 pub struct TrojanOutbound(Arc<Payload>);

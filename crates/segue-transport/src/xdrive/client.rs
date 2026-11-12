@@ -23,13 +23,13 @@ use std::time::Duration;
 use async_compression::tokio::bufread::GzipDecoder;
 use bytes::{Buf, Bytes};
 use http::Method;
+use segue_proxy::go_url;
+use segue_routing::{Network, Target, TargetAddr};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf,
 };
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
-use segue_proxy::go_url;
-use segue_routing::{Network, Target, TargetAddr};
 
 use super::h2::H2Connection;
 use crate::stream::http_headers::{serialize_request_with_framing, H1BodyFraming, HeaderMap};
