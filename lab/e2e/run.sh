@@ -32,15 +32,27 @@ python3 -I "$HERE/http_log.py" $HP "$OUT/www" "$OUT/http.log" & PIDS+=($!)
 python3 -I "$HERE/fake_decodo.py" $DP "$OUT/decodo.log" lineuser linepass & PIDS+=($!)
 python3 -I "$HERE/udp_echo.py" $UP "$OUT/udp.log" & PIDS+=($!)
 
+# Routing policy: a signed bundle (dev key). `localhost` is an AI domain →
+# the Home-role `ai` route; 127.0.0.1 → overseas; default reject. The user
+# never edits rules. The relay verifies the same bundle with the same key
+# and takes its AI set from it (it never downgrades an AI hint).
+"$BIN/segue-kernel" policy-keygen "$OUT/policy.key" > "$OUT/policy.pub"
+cat > "$OUT/policy-body.json" <<J
+{"version":1,"expires_at":$(( $(date +%s) + 3600 )),"ai_domains":["localhost"],
+ "rules":[{"ip_cidr":"127.0.0.1/32","action":{"type":"proxy","outbound":"overseas"}}],
+ "default":{"type":"reject"}}
+J
+"$BIN/segue-kernel" sign-bundle --key "$OUT/policy.key" --key-id 1 "$OUT/policy-body.json" > "$OUT/policy.bundle"
+
 # Relay: key, ticket (overseas+ai), config
 "$BIN/segue-relay" keygen "$OUT/ticket.key" > "$OUT/ticket.pub"
 "$BIN/segue-relay" issue-ticket --key "$OUT/ticket.key" --key-id 1 --device 42 --classes overseas,ai > "$OUT/device.ticket"
-echo "lineuser:linepass" > "$OUT/line.cred"; : > "$OUT/revoked.txt"
+echo "lineuser:linepass" > "$OUT/line.cred"; printf 'seq 1\nsynced_at %s\n' "$(date +%s)" > "$OUT/revoked.txt"
 cat > "$OUT/relay.json" <<J
 {"listen":"127.0.0.1:$RP","node_id":1,"metrics_listen":"127.0.0.1:7444",
  "ticket_keys":[{"key_id":1,"public_key":"$(cat "$OUT/ticket.pub")"}],
  "revocation_file":"revoked.txt",
- "ai":{"domains":["localhost"],"cidrs":[]},
+ "policy":{"public_keys":[{"key_id":1,"public_key":"$(cat "$OUT/policy.pub")"}],"bundle":"policy.bundle"},
  "home_lines":[{"id":"L1","server":"127.0.0.1:$DP","isp":"fake","credentials_file":"line.cred"}],
  "dev_allow_cidrs":["127.0.0.1/32","::1/128"]}
 J
@@ -73,17 +85,6 @@ J
 else
   echo "SINGBOX not set or not executable: Hy2 cases skipped" | tee -a "$OUT/result.txt"; NY=""
 fi
-
-# Routing policy: a signed bundle (dev key). `localhost` (AI-whitelisted at
-# the relay) is an AI domain → the Home-role `ai` route; 127.0.0.1 → overseas;
-# default reject. The user never edits rules.
-"$BIN/segue-kernel" policy-keygen "$OUT/policy.key" > "$OUT/policy.pub"
-cat > "$OUT/policy-body.json" <<J
-{"version":1,"expires_at":$(( $(date +%s) + 3600 )),"ai_domains":["localhost"],
- "rules":[{"ip_cidr":"127.0.0.1/32","action":{"type":"proxy","outbound":"overseas"}}],
- "default":{"type":"reject"}}
-J
-"$BIN/segue-kernel" sign-bundle --key "$OUT/policy.key" --key-id 1 "$OUT/policy-body.json" > "$OUT/policy.bundle"
 
 # Client kernel: two exits (la = Reality, ny = Hy2), Auto by default.
 cat > "$OUT/kernel.json" <<J
