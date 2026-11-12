@@ -378,3 +378,30 @@ async fn no_exits_refuses_session_routes() {
     assert!(d.dial(Some("overseas"), &site(), 443).await.is_err());
     assert_eq!(d.status().current_exit, None);
 }
+
+#[tokio::test]
+async fn unknown_session_reject_opens_a_fresh_session_bounded() {
+    // UNKNOWN_SESSION (an OPEN retry the relay never saw): a fresh session
+    // is tried, at most FRESH_OPENS times, then the dial fails.
+    let l = lab_with(Box::new(Deny(segue_session::codec::code::UNKNOWN_SESSION)));
+    assert!(l.d.dial(Some("overseas"), &site(), 443).await.is_err());
+    assert_eq!(
+        l.la_carriers.load(Ordering::SeqCst),
+        1 + FRESH_OPENS as usize
+    );
+    // Any other refusal is final at once.
+    let l = lab_with(Box::new(Deny(7)));
+    assert!(l.d.dial(Some("overseas"), &site(), 443).await.is_err());
+    assert_eq!(l.la_carriers.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn connect_while_on_keeps_kill_switch_state() {
+    let l = lab();
+    l.d.set_exit("la").unwrap();
+    l.la_up.store(false, Ordering::SeqCst);
+    let _ = l.d.probe().await;
+    l.d.connect(); // already on: must not reset to Connecting / clear the failure
+    assert_eq!(l.d.posture(), Posture::Error);
+    assert!(l.d.dial(Some("ai"), &site(), 443).await.is_err());
+}
