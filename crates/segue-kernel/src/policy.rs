@@ -130,7 +130,10 @@ impl Policy {
     /// explicit domain rule, else the foreign route (fake-IPs for unmatched
     /// names are only handed out to names judged foreign).
     pub fn decide_fake(&self, domain: &str) -> &Action {
-        match self.rules.lookup(&segue_routing::TargetAddr::Domain(domain.to_owned())) {
+        match self
+            .rules
+            .lookup(&segue_routing::TargetAddr::Domain(domain.to_owned()))
+        {
             Some((_, a)) => a,
             None => &self.foreign,
         }

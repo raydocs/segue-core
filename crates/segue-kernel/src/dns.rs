@@ -303,9 +303,7 @@ impl SmartDns {
         let mut packet = query.to_vec();
         packet[..2].copy_from_slice(&id.to_be_bytes());
         match self.race(packet).await {
-            Some(_) if self.policy.current().refuse_all => {
-                Some(respond(q, RCODE_REFUSED, &[], 0))
-            }
+            Some(_) if self.policy.current().refuse_all => Some(respond(q, RCODE_REFUSED, &[], 0)),
             Some(mut reply) => {
                 reply[..2].copy_from_slice(&q.id.to_be_bytes());
                 Some(reply)

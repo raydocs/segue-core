@@ -457,7 +457,11 @@ mod tests {
         let a = pool(15, 60_000);
         let b = pool(15, 60_000);
         let ip = a.assign("api.openai.com", 1).unwrap();
-        assert_eq!(b.assign("api.openai.com", 1), Some(ip), "same key, same address");
+        assert_eq!(
+            b.assign("api.openai.com", 1),
+            Some(ip),
+            "same key, same address"
+        );
         assert_eq!(a.assign("api.openai.com", 2), Some(ip), "stable on re-ask");
         assert!(a.contains(ip.into()));
         let e = a.lookup(ip.into()).unwrap();

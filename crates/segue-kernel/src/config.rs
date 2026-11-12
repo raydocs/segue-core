@@ -664,7 +664,9 @@ fn dns_config(
         fake_ip_grace: Duration::from_secs(d.fake_ip_grace_secs),
         fake_ip_quarantine: Duration::from_secs(d.fake_ip_quarantine_secs),
         fake_ip_max_entries: d.fake_ip_max_entries,
-        fake_ip_state: d.fake_ip_state.map(|f| if f.is_absolute() { f } else { base.join(f) }),
+        fake_ip_state: d
+            .fake_ip_state
+            .map(|f| if f.is_absolute() { f } else { base.join(f) }),
         foreign: d.foreign,
     };
     Ok((cfg, cidrs))
@@ -927,7 +929,10 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(err.contains("dns.foreign comes from the policy bundle"), "{err}");
+        assert!(
+            err.contains("dns.foreign comes from the policy bundle"),
+            "{err}"
+        );
         // A signed bundle in place installs at startup and is persisted.
         let body = br#"{"version":2,"expires_at":4000000000,"ai_domains":["openai.com"],"default":{"type":"direct"}}"#;
         std::fs::write(dir.join("b"), crate::policy::sign(&key, 1, body).unwrap()).unwrap();

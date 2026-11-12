@@ -1413,10 +1413,7 @@ async fn ip_reject_refuses_the_syn_even_with_sniffing() {
 #[tokio::test]
 async fn fake_ip_destination_is_dialled_by_name_and_stale_fake_is_refused() {
     let mut e = kernel_env(inline(), false, false, false, false);
-    let ip = e
-        .pool
-        .assign("api.openai.com", 0)
-        .unwrap();
+    let ip = e.pool.assign("api.openai.com", 0).unwrap();
     let dst = SocketAddr::new(IpAddr::V4(ip), 443);
     connect(&mut e.h, dst).await;
     let _site = e.dialer.site().await;

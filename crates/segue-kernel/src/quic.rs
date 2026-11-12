@@ -69,11 +69,7 @@ impl InitialSniffer {
         let first = self.seen == 1;
         let quic_shaped = dgram.first().is_some_and(|b| b & 0xc0 == 0xc0) && dgram.len() >= 7;
         if !quic_shaped {
-            return if first {
-                Quic::NotQuic
-            } else {
-                self.verdict()
-            };
+            return if first { Quic::NotQuic } else { self.verdict() };
         }
         let mut rest = dgram;
         // Coalesced packets (RFC 9000 §12.2): walk every long-header packet.
@@ -178,7 +174,11 @@ fn decrypt_initial(
     let mut body = pkt.get(pn_off + pn_len..)?.to_vec();
     let key = LessSafeKey::new(UnboundKey::new(&aead::AES_128_GCM, &key).ok()?);
     let plain = key
-        .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(&hdr), &mut body)
+        .open_in_place(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::from(&hdr),
+            &mut body,
+        )
         .ok()?;
     frames(plain, crypto)
 }
@@ -314,10 +314,12 @@ impl<'a> Cur<'a> {
 
 /// RFC 9001 Appendix A.2: the client Initial (QUIC v1, SNI example.com).
 #[doc(hidden)]
-pub const RFC9001_CLIENT_INITIAL: &str = include_str!("../testdata/quic/rfc9001-client-initial.hex");
+pub const RFC9001_CLIENT_INITIAL: &str =
+    include_str!("../testdata/quic/rfc9001-client-initial.hex");
 /// RFC 9369 Appendix A.2: the same Initial for QUIC v2.
 #[doc(hidden)]
-pub const RFC9369_CLIENT_INITIAL: &str = include_str!("../testdata/quic/rfc9369-client-initial.hex");
+pub const RFC9369_CLIENT_INITIAL: &str =
+    include_str!("../testdata/quic/rfc9369-client-initial.hex");
 
 /// The first datagram captured from quic-go (sing-box hysteria2 client,
 /// SNI chatgpt.com): a 1975-byte ClientHello with shuffled CRYPTO frames,
@@ -374,7 +376,10 @@ mod tests {
         assert_eq!(s.push(&second), Quic::Domain("chatgpt.com".into()));
         let mut s = InitialSniffer::default();
         let r = s.push(&second);
-        assert!(r == Quic::NeedMore || r == Quic::Domain("chatgpt.com".into()), "{r:?}");
+        assert!(
+            r == Quic::NeedMore || r == Quic::Domain("chatgpt.com".into()),
+            "{r:?}"
+        );
         if r == Quic::NeedMore {
             assert_eq!(s.push(&pkt), Quic::Domain("chatgpt.com".into()));
         }
