@@ -488,3 +488,114 @@ async fn app_write_failure_resets_the_session() {
     assert_ne!(reason, CloseReason::Clean);
     relay.abort();
 }
+
+/// Sets its flag when dropped.
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A carrier that flags when the last owner lets go of it.
+struct Tracked {
+    io: DuplexStream,
+    _flag: DropFlag,
+}
+
+impl AsyncRead for Tracked {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Tracked {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+async fn wait_flag(f: &std::sync::atomic::AtomicBool, what: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !f.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what} outlived the aborted driver"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_the_client_driver_releases_its_carrier_and_dial() {
+    // r5 N9: dropping the driver future (user disconnect) must take its
+    // reader / writer / dial tasks with it.
+    use std::sync::atomic::AtomicBool;
+    let carrier_gone = Arc::new(AtomicBool::new(false));
+    let dial_gone = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let peers = Arc::new(Mutex::new(Vec::new()));
+    let connector: Connector = {
+        let (carrier_gone, dial_gone, calls, peers) =
+            (carrier_gone.clone(), dial_gone.clone(), calls.clone(), peers.clone());
+        Arc::new(move || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let (carrier_gone, dial_gone, peers) =
+                (carrier_gone.clone(), dial_gone.clone(), peers.clone());
+            Box::pin(async move {
+                if n > 0 {
+                    // A reconnect that never completes.
+                    let _f = DropFlag(dial_gone);
+                    std::future::pending::<()>().await;
+                }
+                // A silent relay: never answers, never closes.
+                let (a, b) = tokio::io::duplex(64 << 10);
+                peers.lock().unwrap().push(b);
+                Ok(Box::new(Tracked {
+                    io: a,
+                    _flag: DropFlag(carrier_gone),
+                }) as BoxCarrier)
+            })
+        })
+    };
+    let pool = Pool::new(8 << 20);
+    let s = ClientSession::new(Config::default(), &pool, params(), Instant::now()).unwrap();
+    let (mut app, far) = tokio::io::duplex(64 << 10);
+    app.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    let client = tokio::spawn(run_client(s, far, connector));
+    // T_attach passes on the silent carrier and a second dial starts.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .ok();
+    client.abort();
+    let _ = client.await;
+    wait_flag(&carrier_gone, "the carrier").await;
+    if calls.load(Ordering::SeqCst) >= 2 {
+        wait_flag(&dial_gone, "the dial").await;
+    }
+    assert_eq!(pool.used_blocks(), 0, "pool not returned");
+}

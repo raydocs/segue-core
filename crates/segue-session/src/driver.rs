@@ -24,6 +24,32 @@ use crate::pool::{Grant as PoolGrant, Pool};
 use crate::relay::{Grant, RelayEvent, RelayTable};
 use crate::ProtoError;
 
+/// A spawned task owned by a driver: dropping it aborts the task, so a driver
+/// future that is dropped or aborted (user disconnect, relay shutdown) takes
+/// its dials, readers, writers and site sockets with it instead of leaving
+/// them running detached (r5 N9).
+struct Task(JoinHandle<()>);
+
+impl Task {
+    fn abort(&self) {
+        self.0.abort();
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) -> Task {
+    Task(tokio::spawn(f))
+}
+
 pub trait Carrier: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Carrier for T {}
 
@@ -146,8 +172,8 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
     mut r: R,
     tx: mpsc::Sender<CarrierEv>,
     pool: Option<Arc<Pool>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) -> Task {
+    spawn(async move {
         let mut dec = FrameDecoder::new();
         let mut dec_charge = pool.as_ref().map(|p| PoolGrant::new(p, false));
         let mut buf = ReadBuffer::new(pool);
@@ -278,13 +304,13 @@ fn spawn_writer<W, F>(
     mut w: W,
     writable: Arc<Notify>,
     on_err: F,
-) -> (mpsc::Sender<Out>, JoinHandle<()>)
+) -> (mpsc::Sender<Out>, Task)
 where
     W: AsyncWrite + Unpin + Send + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
     let (tx, mut rx) = mpsc::channel::<Out>(WRITE_QUEUE);
-    let h = tokio::spawn(async move {
+    let h = spawn(async move {
         while let Some(m) = rx.recv().await {
             let r = if m.data.is_empty() {
                 w.shutdown().await
@@ -312,11 +338,11 @@ const DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
 /// aborted. Everything left is aborted when the driver ends.
 #[derive(Default)]
 struct Tasks {
-    draining: Vec<(tokio::time::Instant, JoinHandle<()>)>,
+    draining: Vec<(tokio::time::Instant, Task)>,
 }
 
 impl Tasks {
-    fn drain(&mut self, h: JoinHandle<()>) {
+    fn drain(&mut self, h: Task) {
         self.draining.push((tokio::time::Instant::now() + DRAIN, h));
     }
 
@@ -342,7 +368,7 @@ impl Tasks {
     /// Wait for every draining task until its deadline, then abort it.
     async fn finish(mut self) {
         for (d, mut h) in std::mem::take(&mut self.draining) {
-            if tokio::time::timeout_at(d, &mut h).await.is_err() {
+            if tokio::time::timeout_at(d, &mut h.0).await.is_err() {
                 h.abort();
             }
         }
@@ -359,8 +385,8 @@ impl Drop for Tasks {
 
 struct CarrierIo {
     tx: mpsc::Sender<Out>,
-    reader: JoinHandle<()>,
-    writer: JoinHandle<()>,
+    reader: Task,
+    writer: Task,
     /// The reader's buffer (client side).
     _charge: Option<PoolGrant>,
 }
@@ -420,7 +446,7 @@ where
     let (conn_tx, mut conn_rx) = mpsc::channel::<(u64, io::Result<BoxCarrier>)>(4);
     let mut carriers: HashMap<u64, CarrierIo> = HashMap::new();
     let mut tasks = Tasks::default();
-    let mut dial: Option<JoinHandle<()>> = None;
+    let mut dial: Option<Task> = None;
     let mut next_cid = 0u64;
     let mut connecting = false;
     let mut connect_backoff: Option<tokio::time::Instant> = None;
@@ -441,7 +467,7 @@ where
             let cid = next_cid;
             let fut = connect();
             let tx = conn_tx.clone();
-            dial = Some(tokio::spawn(async move {
+            dial = Some(spawn(async move {
                 let _ = tx.send((cid, fut.await)).await;
             }));
         }
@@ -669,8 +695,8 @@ enum SiteEv {
 struct SiteIo {
     tx: mpsc::Sender<Out>,
     req: mpsc::Sender<usize>,
-    reader: JoinHandle<()>,
-    writer: JoinHandle<()>,
+    reader: Task,
+    writer: Task,
     outstanding: bool,
     shut: bool,
     eof: bool,
@@ -718,7 +744,7 @@ pub async fn run_relay_ctl(
     let mut carriers: HashMap<u64, CarrierIo> = HashMap::new();
     let mut sites: HashMap<SessionId, SiteIo> = HashMap::new();
     // Site connects in flight, cancelled when their session ends.
-    let mut dials: HashMap<SessionId, JoinHandle<()>> = HashMap::new();
+    let mut dials: HashMap<SessionId, Task> = HashMap::new();
     let mut tasks = Tasks::default();
     let mut next_cid = 0u64;
     let mut accepting = true;
@@ -744,7 +770,7 @@ pub async fn run_relay_ctl(
                         exit_class,
                     });
                     let tx = site_tx.clone();
-                    let h = tokio::spawn(async move {
+                    let h = spawn(async move {
                         let _ = tx.send(SiteEv::Connected(session_id, fut.await)).await;
                     });
                     if let Some(old) = dials.insert(session_id, h) {
@@ -896,7 +922,7 @@ pub async fn run_relay_ctl(
                         });
                         let (req, mut req_rx) = mpsc::channel::<usize>(1);
                         let stx = site_tx.clone();
-                        let reader = tokio::spawn(async move {
+                        let reader = spawn(async move {
                             let mut b = vec![0u8; CHUNK];
                             while let Some(n) = req_rx.recv().await {
                                 match r.read(&mut b[..n]).await {
