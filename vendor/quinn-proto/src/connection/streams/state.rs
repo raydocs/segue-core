@@ -1387,6 +1387,51 @@ mod tests {
         );
     }
 
+    /// A reset stream the application stops before reading the reset was
+    /// already credited to its final size by the reset; stopping it adds
+    /// nothing.
+    #[test]
+    fn reset_then_stop_credits_unread_bytes_once() {
+        let mut client = make(Side::Client);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let initial_max = client.local_max_data;
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 4096]),
+                },
+                4096,
+            )
+            .unwrap();
+        let _ = client
+            .received_reset(frame::ResetStream {
+                id,
+                error_code: 0u32.into(),
+                final_offset: 5120u32.into(),
+            })
+            .unwrap();
+        assert_eq!(client.local_max_data - initial_max, 5120);
+
+        let mut pending = Retransmits::default();
+        RecvStream {
+            id,
+            state: &mut client,
+            pending: &mut pending,
+        }
+        .stop(0u32.into())
+        .unwrap();
+        assert!(pending.stop_sending.is_empty());
+        assert!(!client.recv.contains_key(&id), "stream state is freed");
+        assert_eq!(
+            client.local_max_data - initial_max,
+            5120,
+            "unread bytes credited twice"
+        );
+    }
+
     #[test]
     fn stopped_reset() {
         let mut client = make(Side::Client);

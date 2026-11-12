@@ -143,3 +143,43 @@ async fn stopped_and_reset_streams_do_not_inflate_the_connection_window() {
         );
     }
 }
+
+/// The other order: the server abandons the download with RESET_STREAM
+/// before the client has read it, and the client then drops the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_then_dropped_streams_do_not_inflate_the_connection_window() {
+    let (_server, _client, server_connection, client_connection) = connected_pair().await;
+
+    let mut accepted = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let mut send = server_connection.open_uni().await.expect("open stream");
+        let writer = tokio::spawn(async move {
+            let written = write_until_blocked(&mut send).await;
+            (send, written)
+        });
+        let recv = client_connection.accept_uni().await.expect("accept stream");
+        let (mut send, written) = writer.await.expect("writer task");
+        accepted.push(written);
+
+        sleep(Duration::from_millis(100)).await;
+        send.reset(0u32.into()).expect("reset the stream");
+        // Let the client process the reset before it drops the stream unread.
+        sleep(Duration::from_millis(100)).await;
+        drop(recv);
+        drop(send);
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let window = CONNECTION_WINDOW as usize;
+    for (round, &written) in accepted.iter().enumerate() {
+        assert!(
+            written >= window / 2,
+            "round {round}: only {written} bytes accepted: {accepted:?}"
+        );
+        assert!(
+            written <= window,
+            "round {round}: {written} bytes in flight exceed the {window}-byte \
+             connection window: {accepted:?}"
+        );
+    }
+}

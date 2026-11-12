@@ -93,8 +93,12 @@ impl Recv {
 
         self.stopped = true;
         self.assembler.clear();
-        // Issue flow control credit for unread data
-        let read_credits = self.end - self.assembler.bytes_read();
+        // Issue flow control credit for unread data. A reset already credited
+        // the stream up to its final size when it discarded the buffers.
+        let read_credits = match self.state {
+            RecvState::ResetRecvd { .. } => 0,
+            RecvState::Recv { .. } => self.end - self.assembler.bytes_read(),
+        };
         // This may send a spurious STOP_SENDING if we've already received all data, but it's a bit
         // fiddly to distinguish that from the case where we've received a FIN but are missing some
         // data that the peer might still be trying to retransmit, in which case a STOP_SENDING is

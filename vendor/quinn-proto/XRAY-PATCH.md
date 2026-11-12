@@ -235,3 +235,14 @@ load stays flat at about 23 MB of heap and 38 MB RSS over five rounds.
 `stopped_reset_credits_unread_bytes_once` receives 4,096 bytes, stops the
 stream and resets it at offset 5,120, and checks that the connection window
 grew by exactly 5,120; it fails with 9,216 when the correction is reverted.
+
+The same double credit happened in the other order. When the peer's
+RESET_STREAM arrives before the application stops the stream, the reset
+credits `final_offset - bytes_read` and discards the buffers, but `Recv::stop`
+then credited `end - bytes_read` again. quinn's `RecvStream` stops every
+stream it drops before reading to the end, so a download the server abandons
+while the client has unread data reaches this path. `Recv::stop` now
+credits nothing for a stream already in `ResetRecvd`.
+`reset_then_stop_credits_unread_bytes_once` receives 4,096 bytes, resets at
+5,120 and then stops, and checks the window grew by exactly 5,120; it fails
+with 9,216 without the correction.
