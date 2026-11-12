@@ -2268,6 +2268,7 @@ dependencies = [
 name = "segue-session"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rand 0.8.6",
  "thiserror 2.0.21",
  "tokio",

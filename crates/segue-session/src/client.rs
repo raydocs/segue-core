@@ -585,6 +585,12 @@ impl ClientSession {
         if self.recv.idle_deadline().is_some_and(|d| now >= d) {
             self.recv.update_credit(now);
         }
+        // A passed backoff is no longer a deadline: `wants_attach` already
+        // allows the attempt, and keeping it would make `poll_timeout`
+        // return the past while the connect is in flight (busy loop).
+        if self.backoff_until.is_some_and(|b| now >= b) {
+            self.backoff_until = None;
+        }
     }
 
     // ---- application side ----

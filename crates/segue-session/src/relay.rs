@@ -93,6 +93,8 @@ struct Session {
     /// Uplink (client → relay).
     recv: RecvHalf,
     rst: Option<u8>,
+    /// When OPEN created the session; fixed for its whole life.
+    created: Instant,
 }
 
 // Manual so the resume secret never reaches a log.
@@ -356,6 +358,7 @@ impl RelayTable {
                     send: SendHalf::new(&self.pool, &self.cfg.limits),
                     recv,
                     rst: None,
+                    created: now,
                 };
                 self.sessions.insert(sid, s);
                 self.carriers.get_mut(&cid).unwrap().session = Some(sid);
@@ -672,13 +675,16 @@ impl RelayTable {
         let mut d: Option<Instant> = self.tombs.values().map(|x| x.until).min();
         let mut put = |x: Instant| d = Some(d.map_or(x, |d| d.min(x)));
         for s in self.sessions.values() {
+            put(s.created + t.max_lifetime);
             if let Some(ds) = s.detached_since {
                 put(ds + t.t_detached);
             }
             if s.state == SessionState::Active && s.send.unacked() {
                 put(s.last_progress + t.t_live);
             }
-            if s.carrier.is_some() {
+            // ACKs go out only once connected (`poll_transmit` holds them
+            // back before), so an earlier deadline could never be served.
+            if s.carrier.is_some() && s.connected {
                 if let Some(a) = s.recv.ack_deadline() {
                     put(a);
                 }
@@ -695,7 +701,13 @@ impl RelayTable {
         let t = self.cfg.timing.clone();
         self.tombs.retain(|_, x| x.until > now);
         let mut expired = Vec::new();
+        let mut too_old = Vec::new();
         for (sid, s) in self.sessions.iter_mut() {
+            if now >= s.created + t.max_lifetime {
+                s.rst = Some(code::MAX_LIFETIME);
+                too_old.push(*sid);
+                continue;
+            }
             if s.detached_since.is_some_and(|ds| now >= ds + t.t_detached) {
                 expired.push(*sid);
                 continue;
@@ -718,6 +730,9 @@ impl RelayTable {
         }
         for sid in expired {
             self.finish(&sid, code::IDLE, false);
+        }
+        for sid in too_old {
+            self.finish(&sid, code::MAX_LIFETIME, true);
         }
     }
 }

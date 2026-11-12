@@ -178,3 +178,127 @@ async fn duplex_disconnect_mid_transfer_resumes_without_loss_or_duplication() {
     );
     assert_eq!(o.connects, 1, "site connected more than once");
 }
+
+/// CPU time of the calling thread (a current-thread runtime runs every task
+/// on it).
+fn thread_cpu() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: valid out pointer.
+    let r = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    assert_eq!(r, 0);
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+fn params() -> OpenParams {
+    OpenParams {
+        ticket: b"t".to_vec(),
+        kind: Kind::Tcp,
+        target: Target::Domain("example.com".into(), 443),
+        exit_class: 0,
+        anchor_node_id: 1,
+        instance_hint: INSTANCE,
+    }
+}
+
+const SLOW: Duration = Duration::from_millis(1500);
+const CPU_LIMIT: Duration = Duration::from_millis(300);
+
+#[tokio::test]
+async fn relay_does_not_spin_while_the_site_connect_is_slow() {
+    let cfg = Config::default();
+    let pool = Pool::new(8 << 20);
+    let table = RelayTable::new(cfg.clone(), pool.clone(), Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(4);
+    let site_conn: SiteConnector = Arc::new(move |_t, _k| {
+        Box::pin(async move {
+            tokio::time::sleep(SLOW).await;
+            Err(std::io::Error::other("refused"))
+        })
+    });
+    let relay = tokio::spawn(run_relay(table, accept_rx, site_conn, None));
+    let connector: Connector = Arc::new(move || {
+        let accept_tx = accept_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(64 << 10);
+            accept_tx
+                .send(Box::new(b))
+                .await
+                .map_err(|_| std::io::Error::other("gone"))?;
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+    let (mut app, far) = tokio::io::duplex(64 << 10);
+    // First bytes ride in OPEN, so the relay holds unacknowledged data
+    // while it waits for the site.
+    app.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    let cpu = thread_cpu();
+    let wall = Instant::now();
+    let reason = tokio::time::timeout(Duration::from_secs(10), run_client(s, far, connector))
+        .await
+        .expect("client hung");
+    let used = thread_cpu() - cpu;
+    assert!(wall.elapsed() >= SLOW);
+    assert_ne!(reason, CloseReason::Clean);
+    assert!(used < CPU_LIMIT, "drivers burnt {used:?} CPU in {SLOW:?}");
+    relay.abort();
+}
+
+#[tokio::test]
+async fn client_does_not_spin_while_a_reconnect_is_slow() {
+    use segue_session::codec::{code, Frame, FrameDecoder, Reject};
+    let pool = Pool::new(8 << 20);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let connector: Connector = {
+        let calls = calls.clone();
+        Arc::new(move || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n > 0 {
+                    // The retry after the backoff: slow, then fails.
+                    tokio::time::sleep(SLOW).await;
+                    return Err(std::io::Error::other("slow network"));
+                }
+                // First carrier: the relay cannot reach the anchor (B2).
+                let (a, mut b) = tokio::io::duplex(64 << 10);
+                tokio::spawn(async move {
+                    let mut dec = FrameDecoder::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = b.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        dec.push(&buf[..n]);
+                        if let Ok(Some(Frame::Open(o))) = dec.next_frame() {
+                            let rj = Frame::Reject(Reject {
+                                code: code::ANCHOR_UNREACHABLE,
+                                attach_gen: o.attach_gen,
+                                closed: None,
+                            });
+                            let _ = b.write_all(&rj.to_bytes()).await;
+                        }
+                    }
+                });
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    let s = ClientSession::new(Config::default(), &pool, params(), Instant::now()).unwrap();
+    let (_app, far) = tokio::io::duplex(64 << 10);
+    let client = tokio::spawn(run_client(s, far, connector));
+    // Backoff (200 ms) passes, then the slow connect is in flight.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "retry not started");
+    let cpu = thread_cpu();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let used = thread_cpu() - cpu;
+    assert!(
+        used < CPU_LIMIT,
+        "client burnt {used:?} CPU waiting on a connect"
+    );
+    client.abort();
+}

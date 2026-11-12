@@ -61,6 +61,9 @@ pub struct Timing {
     pub ack_delay: Duration,
     /// Receive credit falls back to the floor after this long without data.
     pub idle_after: Duration,
+    /// Relay: absolute session lifetime from OPEN; RESUME does not extend
+    /// it (§5.2 "会话超过最长寿命 → RST(max_lifetime)").
+    pub max_lifetime: Duration,
 }
 
 impl Default for Timing {
@@ -74,6 +77,7 @@ impl Default for Timing {
             t_tomb: Duration::from_secs(60),
             ack_delay: Duration::from_millis(20),
             idle_after: Duration::from_secs(1),
+            max_lifetime: Duration::from_secs(24 * 3600),
         }
     }
 }

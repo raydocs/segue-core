@@ -433,7 +433,10 @@ impl RecvHalf {
 
     /// Idle check for timeouts: lets credit fall back when no data arrives.
     pub fn idle_deadline(&self) -> Option<Instant> {
+        // Buffered data keeps the flow active (`update_credit` would not
+        // shrink), so there is nothing to time out until it is read.
         if self.fin.is_some()
+            || !self.buf.is_empty()
             || self.grant.bytes() <= self.min_credit.max((self.adv_max - self.consumed) as usize)
         {
             return None;
