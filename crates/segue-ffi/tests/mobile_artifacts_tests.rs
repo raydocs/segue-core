@@ -1232,7 +1232,7 @@ fn assert_native_staticlib_exports_symbols() {
 
     assert_command_success("native segue-ffi release build", &build);
 
-    let library = root.join("target/ffi-symbol-scan/release/libxray_ffi.a");
+    let library = root.join("target/ffi-symbol-scan/release/libsegue_ffi.a");
     assert!(
         library.exists(),
         "native staticlib missing at {}",

@@ -93,7 +93,7 @@ test_android_adapter_verifies_packaged_native_alignment() {
   local adapter_script="$REPOSITORY_ROOT/scripts/build-android-adapter.sh"
   for required_text in \
     "verify_aar_native_libraries" \
-    "libxray_ffi.so" \
+    "libsegue_ffi.so" \
     "libxray_mobile_jni.so" \
     "0x4000" \
     "absolute DT_NEEDED" \
@@ -111,7 +111,7 @@ test_android_adapter_verifies_packaged_native_alignment() {
     echo "Android Gradle build does not consume the selected FFI artifact directory" >&2
     return 1
   fi
-  if ! grep -Fq 'keepDebugSymbols += "**/libxray_ffi.so"' "$module_build"; then
+  if ! grep -Fq 'keepDebugSymbols += "**/libsegue_ffi.so"' "$module_build"; then
     echo "Android packaging can rewrite the selected FFI library before provenance verification" >&2
     return 1
   fi

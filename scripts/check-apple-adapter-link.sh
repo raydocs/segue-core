@@ -57,7 +57,7 @@ build_link_target() {
 
 verify_macos_universal_library() {
   local binary
-  binary="$(find "$XCFRAMEWORK_PATH" -path '*/macos-*/libxray_ffi.a' -type f -print -quit)"
+  binary="$(find "$XCFRAMEWORK_PATH" -path '*/macos-*/libsegue_ffi.a' -type f -print -quit)"
   if [[ -z "$binary" ]]; then
     echo "macOS static library not found in $XCFRAMEWORK_PATH" >&2
     exit 1

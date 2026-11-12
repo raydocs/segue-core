@@ -16,7 +16,7 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS='-Dwarnings -C link-arg=-Wl,
 cargo build --locked --offline --release --package segue-ffi --target aarch64-linux-android
 mkdir -p "$CAMPAIGN/native/include" "$CAMPAIGN/native/jniLibs/arm64-v8a"
 cp crates/segue-ffi/include/segue_ffi.h "$CAMPAIGN/native/include/"
-cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libxray_ffi.so" "$CAMPAIGN/native/jniLibs/arm64-v8a/"
-"$TOOLCHAIN/llvm-readelf" -lW "$CAMPAIGN/native/jniLibs/arm64-v8a/libxray_ffi.so"
-shasum -a 256 "$CAMPAIGN/native/jniLibs/arm64-v8a/libxray_ffi.so" "$CAMPAIGN/native/include/segue_ffi.h"
+cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libsegue_ffi.so" "$CAMPAIGN/native/jniLibs/arm64-v8a/"
+"$TOOLCHAIN/llvm-readelf" -lW "$CAMPAIGN/native/jniLibs/arm64-v8a/libsegue_ffi.so"
+shasum -a 256 "$CAMPAIGN/native/jniLibs/arm64-v8a/libsegue_ffi.so" "$CAMPAIGN/native/include/segue_ffi.h"
 test -z "$(git status --porcelain)"

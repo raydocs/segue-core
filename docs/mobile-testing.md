@@ -60,7 +60,7 @@ The static XCFramework contains:
 | `tvos-arm64_x86_64-simulator` | `arm64`, `x86_64` simulator |
 | `macos-arm64_x86_64` | universal `arm64`, `x86_64` |
 
-Each XCFramework slice contains `libxray_ffi.a`, `segue_ffi.h`, and the Clang
+Each XCFramework slice contains `libsegue_ffi.a`, `segue_ffi.h`, and the Clang
 module map that exposes the Swift import name `XrayRust`. The artifact uses
 Xcode's static-library XCFramework layout; it is not a dynamic framework and is
 not embedded in application bundles.
@@ -225,10 +225,10 @@ Output:
 
 ```text
 target/mobile/android/include/segue_ffi.h
-target/mobile/android/jniLibs/arm64-v8a/libxray_ffi.so
-target/mobile/android/jniLibs/armeabi-v7a/libxray_ffi.so
-target/mobile/android/jniLibs/x86/libxray_ffi.so
-target/mobile/android/jniLibs/x86_64/libxray_ffi.so
+target/mobile/android/jniLibs/arm64-v8a/libsegue_ffi.so
+target/mobile/android/jniLibs/armeabi-v7a/libsegue_ffi.so
+target/mobile/android/jniLibs/x86/libsegue_ffi.so
+target/mobile/android/jniLibs/x86_64/libsegue_ffi.so
 ```
 
 The build requires API level 24 and the pinned NDK. Each generated shared
@@ -248,7 +248,7 @@ platform/android/xraymobile/build/outputs/aar/xraymobile-debug.aar
 ```
 
 The adapter build compiles the C++ JNI bridge for all four ABIs, packages both
-`libxray_ffi.so` and `libxray_mobile_jni.so`, verifies 16 KiB alignment, and
+`libsegue_ffi.so` and `libxray_mobile_jni.so`, verifies 16 KiB alignment, and
 checks that the packaged FFI libraries exactly match the selected Rust
 artifacts. Set `XRAY_USE_PREBUILT_ARTIFACTS=1` only when the native artifact
 directory has already been built and verified.

@@ -15,7 +15,7 @@ add_library(segue_ffi SHARED IMPORTED)
 set_target_properties(
     segue_ffi
     PROPERTIES
-    IMPORTED_LOCATION "${XRAY_FFI_ANDROID_DIR}/jniLibs/${ANDROID_ABI}/libxray_ffi.so"
+    IMPORTED_LOCATION "${XRAY_FFI_ANDROID_DIR}/jniLibs/${ANDROID_ABI}/libsegue_ffi.so"
     # Rust cdylibs do not currently carry an ELF SONAME. Without this hint,
     # CMake records the build-machine absolute path in libxray_mobile_jni.so's
     # DT_NEEDED entry, which Android's namespace loader cannot resolve.

@@ -10,7 +10,7 @@
   "files": [
     {
       "bytes": 50973896,
-      "path": "target/issue69-ios/cargo/aarch64-apple-ios/release/libxray_ffi.a",
+      "path": "target/issue69-ios/cargo/aarch64-apple-ios/release/libsegue_ffi.a",
       "sha256": "e6cd1f7c5648a8426252eebf1244693d9efef0247a8e2f7885fafc219a0c261b"
     },
     {

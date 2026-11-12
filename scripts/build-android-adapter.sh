@@ -101,7 +101,7 @@ verify_elf_dependencies() {
       echo "Android library contains an absolute DT_NEEDED dependency: $library ($needed)" >&2
       return 1
     fi
-    if [[ "$needed" == "libxray_ffi.so" ]]; then
+    if [[ "$needed" == "libsegue_ffi.so" ]]; then
       has_xray_ffi=1
     fi
   done < <(
@@ -111,7 +111,7 @@ verify_elf_dependencies() {
 
   if [[ "$(basename "$library")" == *"libxray_mobile_jni.so" ]] &&
     (( has_xray_ffi == 0 )); then
-    echo "Android JNI library does not depend on portable libxray_ffi.so: $library" >&2
+    echo "Android JNI library does not depend on portable libsegue_ffi.so: $library" >&2
     return 1
   fi
 }
@@ -132,7 +132,7 @@ verify_aar_native_libraries() (
   trap 'rm -rf "$unpack_dir"' EXIT
   local abi library
   for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-    for library in libxray_ffi.so libxray_mobile_jni.so; do
+    for library in libsegue_ffi.so libxray_mobile_jni.so; do
       unzip -p "$aar" "jni/$abi/$library" >"$unpack_dir/$abi-$library"
       verify_elf_alignment \
         "$toolchain_dir/bin/llvm-readelf" \
@@ -140,7 +140,7 @@ verify_aar_native_libraries() (
       verify_elf_dependencies \
         "$toolchain_dir/bin/llvm-readelf" \
         "$unpack_dir/$abi-$library"
-      if [[ "$library" == "libxray_ffi.so" ]] &&
+      if [[ "$library" == "libsegue_ffi.so" ]] &&
         ! cmp -s "$ffi_dir/jniLibs/$abi/$library" "$unpack_dir/$abi-$library"; then
         echo "packaged Android FFI library does not match the selected artifact: $abi/$library" >&2
         return 1

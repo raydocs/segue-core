@@ -9,7 +9,7 @@ OUT_DIR="${OUT_DIR:-"$WORKSPACE_ROOT/target/mobile/android"}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-"$WORKSPACE_ROOT/target"}"
 HEADER_DIR="$WORKSPACE_ROOT/crates/segue-ffi/include"
 CRATE_PACKAGE="segue-ffi"
-LIB_NAME="libxray_ffi.so"
+LIB_NAME="libsegue_ffi.so"
 PINNED_ANDROID_NDK_VERSION="26.3.11579264"
 ANDROID_PAGE_SIZE=16384
 

@@ -392,7 +392,7 @@ load/start/stop/set/free operations. See [the C ABI contract](ffi.md).
 
 - Apple builds `segue-ffi` as static-library XCFramework slices and exposes
   Swift wrappers plus `NEPacketTunnelProvider` reference code.
-- Android builds `libxray_ffi.so`, links a small C++ JNI bridge, and exposes a
+- Android builds `libsegue_ffi.so`, links a small C++ JNI bridge, and exposes a
   Kotlin wrapper plus `VpnService`.
 - Outbound socket protection is injected before config load so Android can call
   `VpnService.protect(fd)` for every launched TCP/UDP candidate before that

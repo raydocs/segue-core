@@ -11,7 +11,7 @@
   "files": [
     {
       "bytes": 50910064,
-      "path": "target/issue69-tvos/cargo/aarch64-apple-tvos/release/libxray_ffi.a",
+      "path": "target/issue69-tvos/cargo/aarch64-apple-tvos/release/libsegue_ffi.a",
       "sha256": "a6d60e114fecfd2058caf61b0f0deb55ed78e8b74d310737bafcd5a231b4bf87"
     },
     {

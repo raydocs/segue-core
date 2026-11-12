@@ -29,7 +29,7 @@ android {
 
     packaging {
         jniLibs {
-            keepDebugSymbols += "**/libxray_ffi.so"
+            keepDebugSymbols += "**/libsegue_ffi.so"
         }
     }
 

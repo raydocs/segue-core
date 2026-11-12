@@ -6,7 +6,7 @@
   "canonicalDistributionArtifact": false,
   "files": [
     {
-      "path": "target/release-081/apple-cargo/aarch64-apple-ios/release/libxray_ffi.a",
+      "path": "target/release-081/apple-cargo/aarch64-apple-ios/release/libsegue_ffi.a",
       "bytes": 109889856,
       "sha256": "91009a0d8afc7d4bb68f43996646064af20264a09cb8bfa0c3f2ced0246b863c"
     },
@@ -21,7 +21,7 @@
       "sha256": "32518c674f2514ba295f083a8453f2f56a422f4c9ca7c58e92448332d7a86614"
     },
     {
-      "path": "target/mobile/android/jniLibs/arm64-v8a/libxray_ffi.so",
+      "path": "target/mobile/android/jniLibs/arm64-v8a/libsegue_ffi.so",
       "bytes": 15410104,
       "sha256": "6d20112576b9136123a8543bc73a455201da1ca27ea8666c66e3c53976d3cffa"
     },
