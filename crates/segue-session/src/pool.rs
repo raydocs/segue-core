@@ -116,6 +116,13 @@ impl Pool {
         }
     }
 
+    /// Resolves when blocks are returned (or spuriously).
+    pub async fn freed(&self) {
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+        let _w = Waiting(&self.waiters);
+        self.freed.notified().await;
+    }
+
     /// Run `f` until it returns `Some`, waiting for blocks to be returned
     /// between attempts.
     pub async fn wait_for<T>(&self, mut f: impl FnMut() -> Option<T>) -> T {

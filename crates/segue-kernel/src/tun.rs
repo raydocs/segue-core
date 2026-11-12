@@ -88,6 +88,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use segue_routing::TargetAddr;
+use segue_session::pool::Pool as SessionPool;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{self, State};
@@ -136,17 +137,27 @@ fn blocks_for(bytes: usize) -> usize {
 
 /// Bounded pool of 4 KiB blocks shared by every TCP flow of one stack. It is
 /// an accounting pool: memory is allocated by the user of a [`Charge`] and
-/// freed with it, and the pool bounds the total.
+/// freed with it, and the pool bounds the total. With a shared session pool
+/// (`NetstackConfig::shared_pool`) every block is also taken from that pool,
+/// so TUN buffers and session buffers count against one process budget
+/// (KERNEL_SPEC §6.3) and a flow waiting for blocks wakes when a session
+/// returns some.
 pub struct BufferPool {
     blocks: usize,
     high_water: usize,
     used: AtomicUsize,
     waiters: AtomicUsize,
     freed: Notify,
+    shared: Option<Arc<SessionPool>>,
 }
 
 impl BufferPool {
     pub fn new(bytes: usize) -> Arc<Self> {
+        Self::with_shared(bytes, None)
+    }
+
+    /// At most `bytes` for this stack, each block also charged to `shared`.
+    pub fn with_shared(bytes: usize, shared: Option<Arc<SessionPool>>) -> Arc<Self> {
         let blocks = bytes / BLOCK;
         Arc::new(Self {
             blocks,
@@ -154,6 +165,7 @@ impl BufferPool {
             used: AtomicUsize::new(0),
             waiters: AtomicUsize::new(0),
             freed: Notify::new(),
+            shared,
         })
     }
 
@@ -165,10 +177,11 @@ impl BufferPool {
         self.used.load(Ordering::Relaxed) * BLOCK
     }
 
-    /// Take between 1 and `want` blocks while staying at or under `limit`.
+    /// Take between `min` and `want` blocks while staying at or under `limit`
+    /// (and within the shared pool, if any).
     fn take(&self, want: usize, min: usize, limit: usize) -> usize {
         let mut used = self.used.load(Ordering::Relaxed);
-        loop {
+        let n = loop {
             let n = want.min(limit.saturating_sub(used));
             if n < min || n == 0 {
                 return 0;
@@ -179,15 +192,26 @@ impl BufferPool {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return n,
+                Ok(_) => break n,
                 Err(now) => used = now,
             }
+        };
+        let Some(shared) = &self.shared else {
+            return n;
+        };
+        let got = shared.take_blocks(n, min.max(1), shared.blocks());
+        if got < n {
+            self.used.fetch_sub(n - got, Ordering::AcqRel);
         }
+        got
     }
 
     fn give(&self, blocks: usize) {
         self.used.fetch_sub(blocks, Ordering::AcqRel);
-        if self.waiters.load(Ordering::Acquire) > 0 {
+        if let Some(shared) = &self.shared {
+            // Wakes our waiters too: they wait on the shared pool.
+            shared.give_blocks(blocks);
+        } else if self.waiters.load(Ordering::Acquire) > 0 {
             self.freed.notify_waiters();
         }
     }
@@ -213,6 +237,9 @@ impl BufferPool {
 
     /// Resolves when blocks are returned (or spuriously).
     async fn freed(&self) {
+        if let Some(shared) = &self.shared {
+            return shared.freed().await;
+        }
         self.waiters.fetch_add(1, Ordering::AcqRel);
         let _waiting = Waiting(&self.waiters);
         self.freed.notified().await;
@@ -220,6 +247,9 @@ impl BufferPool {
 
     /// Like [`Self::chunk`], waiting for blocks to be freed.
     pub async fn chunk_wait(self: &Arc<Self>, want: usize) -> Charge {
+        if let Some(shared) = &self.shared {
+            return shared.wait_for(|| self.chunk(want)).await;
+        }
         loop {
             let freed = self.freed.notified();
             tokio::pin!(freed);
@@ -396,6 +426,9 @@ pub struct NetstackConfig {
     pub tcp_tx_buffer: usize,
     /// Pool shared by every flow's TCP buffers and relay chunks (§4.2).
     pub buffer_pool: usize,
+    /// Process-wide pool the TUN blocks are also charged to, shared with the
+    /// session layer (KERNEL_SPEC §6.3: one budget). `None`: standalone.
+    pub shared_pool: Option<Arc<SessionPool>>,
     /// Abort a TCP flow when sent data stays unacknowledged this long.
     pub tcp_timeout: Duration,
     /// Reset an established flow with no traffic for this long.
@@ -426,6 +459,7 @@ impl Default for NetstackConfig {
             tcp_rx_buffer: 64 * 1024,
             tcp_tx_buffer: 64 * 1024,
             buffer_pool: 6 * 1024 * 1024,
+            shared_pool: None,
             tcp_timeout: Duration::from_secs(120),
             tcp_idle_timeout: Duration::from_secs(30 * 60),
             tcp_half_close_timeout: Duration::from_secs(60),
@@ -1033,7 +1067,7 @@ impl Netstack {
             burst: cfg.icmp_burst as f64,
             last: now,
         };
-        let pool = BufferPool::new(cfg.buffer_pool);
+        let pool = BufferPool::with_shared(cfg.buffer_pool, cfg.shared_pool.clone());
         Self {
             cfg,
             epoch: now,
@@ -2083,7 +2117,10 @@ impl TunStack {
     /// hijacked to `dns` when given.
     pub fn for_kernel(kernel: Arc<Kernel>, dns: Option<Arc<SmartDns>>) -> Self {
         let dialer = kernel.dialer.clone();
-        let mut config = NetstackConfig::default();
+        let mut config = NetstackConfig {
+            shared_pool: Some(crate::session::process_pool()),
+            ..NetstackConfig::default()
+        };
         if let Some(udp) = kernel.udp.as_ref() {
             config.udp_idle_timeout = udp.settings.idle_timeout;
         }

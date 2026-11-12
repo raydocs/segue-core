@@ -62,8 +62,18 @@ pub use stream::SessionStream;
 pub const EXIT_OVERSEAS: u8 = 0;
 pub const EXIT_AI: u8 = 1;
 
-/// Session memory for all client sessions of this process.
-pub const POOL_BYTES: usize = 32 << 20;
+/// The process buffer budget (KERNEL_SPEC §6.3: one 8 MB pool of 4 KB
+/// blocks for session receive/replay buffers, driver queues and the TUN
+/// stack's TCP buffers).
+pub const POOL_BYTES: usize = 8 << 20;
+
+/// The pool every [`KernelDialer`] and the TUN stack
+/// ([`crate::tun::TunStack::for_kernel`]) charge, so their buffers share
+/// one bound instead of each having its own.
+pub fn process_pool() -> Arc<Pool> {
+    static POOL: std::sync::OnceLock<Arc<Pool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::new(POOL_BYTES)).clone()
+}
 /// Longest wait for OPENED (covers the session's own OPEN retries).
 const OPEN_WAIT: Duration = Duration::from_secs(20);
 /// Fresh sessions after an UNKNOWN_SESSION answer to an OPEN retry.
@@ -242,7 +252,7 @@ impl KernelDialer {
             exits,
             routes,
             home,
-            pool: Pool::new(POOL_BYTES),
+            pool: process_pool(),
             state: Arc::new(Mutex::new(State {
                 user_off: false,
                 choice: None,
@@ -252,6 +262,16 @@ impl KernelDialer {
             channels: (0..exits_len).map(|_| Channel::default()).collect(),
             control: ControlTiming::default(),
         }
+    }
+
+    /// Charge sessions to `pool` instead of [`process_pool`].
+    pub fn with_pool(mut self, pool: Arc<Pool>) -> Self {
+        self.pool = pool;
+        self
+    }
+
+    pub fn pool(&self) -> &Arc<Pool> {
+        &self.pool
     }
 
     /// Control stream PING period and dead-channel threshold.
@@ -520,7 +540,9 @@ impl KernelDialer {
         let (stall_tx, stall_rx) = mpsc::unbounded_channel();
         ch.sessions.lock().unwrap().insert(sid, stall_tx);
         let sessions = ch.sessions.clone();
-        let (app, far) = tokio::io::duplex(64 << 10);
+        // Pool-charged and released when drained (tokio's duplex keeps a
+        // burst's capacity for the life of the stream).
+        let (app, far) = segue_session::pipe::pipe(&self.pool, 64 << 10);
         let (open_tx, open_rx) = tokio::sync::oneshot::channel();
         let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel();
         let ctl = ClientCtl {

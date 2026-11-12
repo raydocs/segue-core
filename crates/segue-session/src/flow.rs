@@ -105,6 +105,10 @@ impl SendHalf {
     pub fn held_bytes(&self) -> usize {
         self.buf.capacity()
     }
+    pub fn pool(&self) -> &Arc<Pool> {
+        self.grant.pool()
+    }
+
     pub fn grant_bytes(&self) -> usize {
         self.grant.bytes()
     }
@@ -299,6 +303,10 @@ impl RecvHalf {
     pub fn held_bytes(&self) -> usize {
         self.buf.capacity()
     }
+    pub fn pool(&self) -> &Arc<Pool> {
+        self.grant.pool()
+    }
+
     pub fn grant_bytes(&self) -> usize {
         self.grant.bytes()
     }

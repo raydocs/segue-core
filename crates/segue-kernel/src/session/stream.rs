@@ -11,19 +11,20 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use segue_session::client::CloseReason;
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+use segue_session::pipe::PipeEnd;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::oneshot;
 
-pub struct SessionStream {
-    pipe: DuplexStream,
+pub struct SessionStream<P = PipeEnd> {
+    pipe: P,
     closed: oneshot::Receiver<CloseReason>,
     /// None: the session has not ended (yet). Some(None): it ended without
     /// a reason (the driver was dropped).
     reason: Option<Option<CloseReason>>,
 }
 
-impl SessionStream {
-    pub fn new(pipe: DuplexStream, closed: oneshot::Receiver<CloseReason>) -> Self {
+impl<P> SessionStream<P> {
+    pub fn new(pipe: P, closed: oneshot::Receiver<CloseReason>) -> Self {
         Self {
             pipe,
             closed,
@@ -56,7 +57,7 @@ impl SessionStream {
     }
 }
 
-impl AsyncRead for SessionStream {
+impl<P: AsyncRead + AsyncWrite + Unpin> AsyncRead for SessionStream<P> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -77,7 +78,7 @@ impl AsyncRead for SessionStream {
     }
 }
 
-impl AsyncWrite for SessionStream {
+impl<P: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SessionStream<P> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -99,7 +100,9 @@ impl AsyncWrite for SessionStream {
     }
 }
 
-impl segue_transport::TransportStream for SessionStream {
+impl<P: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static> segue_transport::TransportStream
+    for SessionStream<P>
+{
     fn poll_read_direct(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

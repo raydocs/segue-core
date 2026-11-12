@@ -195,6 +195,11 @@ impl ClientSession {
         })
     }
 
+    /// The pool this session's buffers are charged to.
+    pub fn pool(&self) -> &Arc<Pool> {
+        self.recv.pool()
+    }
+
     pub fn session_id(&self) -> SessionId {
         self.session_id
     }

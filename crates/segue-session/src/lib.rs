@@ -20,6 +20,7 @@ pub mod codec;
 pub mod driver;
 pub mod flow;
 pub mod park;
+pub mod pipe;
 pub mod pool;
 pub mod relay;
 

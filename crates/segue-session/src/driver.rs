@@ -17,7 +17,10 @@ use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
 use crate::client::{ClientSession, CloseReason, State};
-use crate::codec::{code, ty, CtrlHello, Frame, FrameDecoder, Kind, SessionId, Target};
+use crate::codec::{
+    code, ty, CtrlHello, Frame, FrameDecoder, Kind, SessionId, Target, MAX_PAYLOAD,
+};
+use crate::pool::{Grant as PoolGrant, Pool};
 use crate::relay::{Grant, RelayEvent, RelayTable};
 use crate::ProtoError;
 
@@ -81,9 +84,48 @@ pub enum RelayCtrl {
     ResetDevice { device: u64, close_code: u8 },
 }
 
-/// Frames per writer channel.
+/// Messages per writer channel.
 const WRITE_QUEUE: usize = 8;
 const CHUNK: usize = 16 * 1024;
+/// Largest encoded frame (payload plus type and length).
+const FRAME_MAX: usize = MAX_PAYLOAD + 16;
+
+/// A message for a writer task, with the pool blocks that cover it until
+/// it is written (client side: bytes leave the session's grants when they
+/// are queued, so the queue is charged on its own).
+struct Out {
+    data: Vec<u8>,
+    _charge: Option<PoolGrant>,
+}
+
+impl From<Vec<u8>> for Out {
+    fn from(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            _charge: None,
+        }
+    }
+}
+
+/// `data` charged with `g`, shrunk to what `data` holds.
+fn charged(data: Vec<u8>, mut g: Option<PoolGrant>) -> Out {
+    if let Some(g) = &mut g {
+        g.try_resize(data.capacity());
+    }
+    Out { data, _charge: g }
+}
+
+/// Blocks for a message of up to `bytes` about to be queued on `tx`:
+/// `Some(Some(_))` charged, `Some(None)` uncharged because the pool is short
+/// but the queue is empty (one message in flight keeps the session moving
+/// and cannot deadlock on its own grants), `None` wait for blocks.
+fn queue_charge(pool: &Arc<Pool>, tx: &mpsc::Sender<Out>, bytes: usize) -> Option<Option<PoolGrant>> {
+    match PoolGrant::fixed(pool, bytes) {
+        Some(g) => Some(Some(g)),
+        None if tx.capacity() == tx.max_capacity() => Some(None),
+        None => None,
+    }
+}
 
 fn now() -> std::time::Instant {
     tokio::time::Instant::now().into_std()
@@ -99,14 +141,18 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
     cid: u64,
     mut r: R,
     tx: mpsc::Sender<CarrierEv>,
+    pool: Option<Arc<Pool>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut dec = FrameDecoder::new();
-        let mut buf = vec![0u8; CHUNK];
+        let mut buf = ReadBuffer::new(pool);
         loop {
-            match r.read(&mut buf).await {
+            match r.read(buf.get()).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => dec.push(&buf[..n]),
+                Ok(n) => {
+                    dec.push(&buf.get()[..n]);
+                    buf.adapt(n);
+                }
             }
             loop {
                 match dec.next_frame() {
@@ -128,6 +174,54 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
     })
 }
 
+/// A read buffer that is small while its stream is idle or slow and grows to
+/// [`CHUNK`] while reads fill it, charged to `pool` when it has one (a
+/// session's idle carrier or app stream then holds a few hundred bytes, not
+/// 16 KiB). The decoder may still keep a partial frame.
+struct ReadBuffer {
+    buf: Vec<u8>,
+    pool: Option<Arc<Pool>>,
+    charge: Option<PoolGrant>,
+}
+
+const SMALL_READ: usize = 512;
+
+impl ReadBuffer {
+    fn new(pool: Option<Arc<Pool>>) -> Self {
+        Self {
+            buf: vec![0; SMALL_READ],
+            pool,
+            charge: None,
+        }
+    }
+
+    fn get(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// After a read of `n` bytes.
+    fn adapt(&mut self, n: usize) {
+        if n == self.buf.len() && self.buf.len() < CHUNK {
+            let charge = match &self.pool {
+                Some(p) => match PoolGrant::fixed(p, CHUNK) {
+                    Some(g) => Some(g),
+                    None => return,
+                },
+                None => None,
+            };
+            self.charge = charge;
+            self.buf = vec![0; CHUNK];
+        } else if self.buf.len() > SMALL_READ && n < SMALL_READ {
+            self.buf = vec![0; SMALL_READ];
+            self.charge = None;
+        }
+    }
+}
+
 /// Writer task: write each message; an empty message shuts the write side.
 /// Dropping the sender flushes what is queued and shuts down (the owner
 /// bounds that with [`Tasks::drain`] or aborts the task). A write failure
@@ -137,19 +231,20 @@ fn spawn_writer<W, F>(
     mut w: W,
     writable: Arc<Notify>,
     on_err: F,
-) -> (mpsc::Sender<Vec<u8>>, JoinHandle<()>)
+) -> (mpsc::Sender<Out>, JoinHandle<()>)
 where
     W: AsyncWrite + Unpin + Send + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE);
+    let (tx, mut rx) = mpsc::channel::<Out>(WRITE_QUEUE);
     let h = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
-            let r = if m.is_empty() {
+            let r = if m.data.is_empty() {
                 w.shutdown().await
             } else {
-                w.write_all(&m).await
+                w.write_all(&m.data).await
             };
+            drop(m);
             writable.notify_one();
             if r.is_err() {
                 drop(rx);
@@ -216,9 +311,11 @@ impl Drop for Tasks {
 }
 
 struct CarrierIo {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Out>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
+    /// The reader's buffer (client side).
+    _charge: Option<PoolGrant>,
 }
 
 /// Run one client session over carriers from `connect`, bridging `app`.
@@ -282,8 +379,10 @@ where
     let mut connect_backoff: Option<tokio::time::Instant> = None;
     let mut app_eof = false;
     let mut app_shut = false;
-    let mut abuf = vec![0u8; CHUNK];
-    let mut rbuf = vec![0u8; CHUNK];
+    let pool = s.pool().clone();
+    let mut abuf = ReadBuffer::new(Some(pool.clone()));
+    // A queued message the pool could not cover is waiting for blocks.
+    let mut pool_blocked;
 
     loop {
         let t = now();
@@ -306,27 +405,45 @@ where
             }
         }
         tasks.prune();
-        // Carrier output, generated only while the writer has room.
+        pool_blocked = false;
+        // Carrier output, generated only while the writer has room. Each
+        // queued frame is charged to the pool (an empty queue may take one
+        // uncharged so the session always progresses).
         if let Some(cid) = s.carrier() {
             if let Some(io) = carriers.get(&cid) {
                 while io.tx.capacity() > 0 {
+                    let Some(g) = queue_charge(&pool, &io.tx, FRAME_MAX) else {
+                        pool_blocked = true;
+                        break;
+                    };
                     match s.poll_transmit(cid, t) {
                         Some(f) => {
-                            let _ = io.tx.try_send(f.to_bytes());
+                            let _ = io.tx.try_send(charged(f.to_bytes(), g));
                         }
                         None => break,
                     }
                 }
             }
         }
-        // Data for the app.
+        // Data for the app, charged the same way.
         while app_tx.capacity() > 0 && !app_shut && !app_tx.is_closed() {
-            let n = s.read(&mut rbuf, t);
-            if n > 0 {
-                let _ = app_tx.try_send(rbuf[..n].to_vec());
+            let avail = s.recv_half().buffered().min(CHUNK);
+            if avail > 0 {
+                let Some(g) = queue_charge(&pool, &app_tx, avail) else {
+                    pool_blocked = true;
+                    break;
+                };
+                let mut v = vec![0u8; avail];
+                let n = s.read(&mut v, t);
+                if n == 0 {
+                    break;
+                }
+                v.truncate(n);
+                let _ = app_tx.try_send(charged(v, g));
             } else {
+                let _ = s.read(&mut [], t);
                 if s.read_eof() {
-                    let _ = app_tx.try_send(Vec::new());
+                    let _ = app_tx.try_send(Vec::new().into());
                     app_shut = true;
                 }
                 break;
@@ -372,12 +489,12 @@ where
                         Ok(stream) => {
                             connect_backoff = None;
                             let (r, w) = tokio::io::split(stream);
-                            let reader = spawn_reader(cid, r, ev_tx.clone());
+                            let reader = spawn_reader(cid, r, ev_tx.clone(), Some(pool.clone()));
                             let etx = ev_tx.clone();
                             let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                                 let _ = etx.send(CarrierEv::Closed(cid)).await;
                             });
-                            carriers.insert(cid, CarrierIo { tx, reader, writer });
+                            carriers.insert(cid, CarrierIo { tx, reader, writer, _charge: None });
                             s.attach(cid, now());
                         }
                         Err(_) => {
@@ -386,14 +503,18 @@ where
                     }
                 }
             }
-            r = app_r.read(&mut abuf[..cap.max(1)]), if cap > 0 => {
+            r = { let k = cap.min(abuf.len()).max(1); app_r.read(&mut abuf.get()[..k]) }, if cap > 0 => {
                 match r {
                     Ok(0) => { app_eof = true; s.close_write(); }
                     // A read error is not a clean end of the upload: reset,
                     // never FIN (the site must not see a truncated stream as
                     // complete).
                     Err(_) => { app_eof = true; s.abort(); }
-                    Ok(n) => { let w = s.write(&abuf[..n]); debug_assert_eq!(w, n); }
+                    Ok(n) => {
+                        let w = s.write(&abuf.get()[..n]);
+                        debug_assert_eq!(w, n);
+                        abuf.adapt(n);
+                    }
                 }
             }
             r = async { reattach.as_mut().expect("guarded").changed().await }, if reattach.is_some() => {
@@ -415,6 +536,7 @@ where
                 }
             }
             _ = writable.notified() => {}
+            _ = pool.freed(), if pool_blocked => {}
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
             _ = tokio::time::sleep_until(backoff.unwrap_or_else(tokio::time::Instant::now)), if backoff.is_some() => {}
             _ = tokio::time::sleep_until(drain.unwrap_or_else(tokio::time::Instant::now)), if drain.is_some() => {}
@@ -436,16 +558,18 @@ where
     if reason == CloseReason::Clean && !app_shut {
         let _ = tokio::time::timeout_at(until, async {
             loop {
-                let n = s.read(&mut rbuf, now());
+                let mut v = vec![0u8; s.recv_half().buffered().min(CHUNK)];
+                let n = s.read(&mut v, now());
                 if n == 0 {
                     break;
                 }
-                if app_tx.send(rbuf[..n].to_vec()).await.is_err() {
+                v.truncate(n);
+                if app_tx.send(v.into()).await.is_err() {
                     break;
                 }
             }
             if s.read_eof() {
-                let _ = app_tx.send(Vec::new()).await;
+                let _ = app_tx.send(Vec::new().into()).await;
             }
         })
         .await;
@@ -454,7 +578,7 @@ where
     if let Some(cid) = s.carrier() {
         if let Some(io) = carriers.get(&cid) {
             while let Some(f) = s.poll_transmit(cid, now()) {
-                if io.tx.try_send(f.to_bytes()).is_err() {
+                if io.tx.try_send(f.to_bytes().into()).is_err() {
                     break;
                 }
             }
@@ -486,7 +610,7 @@ enum SiteEv {
 }
 
 struct SiteIo {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Out>,
     req: mpsc::Sender<usize>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
@@ -616,7 +740,7 @@ pub async fn run_relay_ctl(
             while io.tx.capacity() > 0 {
                 match table.poll_transmit(cid, t) {
                     Some(f) => {
-                        let _ = io.tx.try_send(f.to_bytes());
+                        let _ = io.tx.try_send(f.to_bytes().into());
                     }
                     None => break,
                 }
@@ -625,7 +749,7 @@ pub async fn run_relay_ctl(
         for cid in table.take_closed_carriers() {
             if let Some(io) = carriers.remove(&cid) {
                 while let Some(f) = table.poll_transmit(cid, t) {
-                    if io.tx.try_send(f.to_bytes()).is_err() {
+                    if io.tx.try_send(f.to_bytes().into()).is_err() {
                         break;
                     }
                 }
@@ -641,10 +765,10 @@ pub async fn run_relay_ctl(
             while io.tx.capacity() > 0 && !io.shut && !io.tx.is_closed() {
                 let n = table.read(sid, &mut buf, t);
                 if n > 0 {
-                    let _ = io.tx.try_send(buf[..n].to_vec());
+                    let _ = io.tx.try_send(buf[..n].to_vec().into());
                 } else {
                     if table.read_eof(sid) {
-                        let _ = io.tx.try_send(Vec::new());
+                        let _ = io.tx.try_send(Vec::new().into());
                         io.shut = true;
                     }
                     break;
@@ -672,12 +796,12 @@ pub async fn run_relay_ctl(
                     next_cid += 1;
                     let cid = next_cid;
                     let (r, w) = tokio::io::split(stream);
-                    let reader = spawn_reader(cid, r, ev_tx.clone());
+                    let reader = spawn_reader(cid, r, ev_tx.clone(), None);
                     let etx = ev_tx.clone();
                     let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                         let _ = etx.send(CarrierEv::Closed(cid)).await;
                     });
-                    carriers.insert(cid, CarrierIo { tx, reader, writer });
+                    carriers.insert(cid, CarrierIo { tx, reader, writer, _charge: None });
                     table.add_carrier(cid);
                 }
                 None => accepting = false,
