@@ -488,3 +488,286 @@ async fn app_write_failure_resets_the_session() {
     assert_ne!(reason, CloseReason::Clean);
     relay.abort();
 }
+
+/// Sets its flag when dropped.
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A carrier that flags when the last owner lets go of it.
+struct Tracked {
+    io: DuplexStream,
+    _flag: DropFlag,
+}
+
+impl AsyncRead for Tracked {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Tracked {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+async fn wait_flag(f: &std::sync::atomic::AtomicBool, what: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !f.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what} outlived the aborted driver"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_the_client_driver_releases_its_carrier_and_dial() {
+    // r5 N9: dropping the driver future (user disconnect) must take its
+    // reader / writer / dial tasks with it.
+    use std::sync::atomic::AtomicBool;
+    let carrier_gone = Arc::new(AtomicBool::new(false));
+    let dial_gone = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let peers = Arc::new(Mutex::new(Vec::new()));
+    let connector: Connector = {
+        let (carrier_gone, dial_gone, calls, peers) = (
+            carrier_gone.clone(),
+            dial_gone.clone(),
+            calls.clone(),
+            peers.clone(),
+        );
+        Arc::new(move || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let (carrier_gone, dial_gone, peers) =
+                (carrier_gone.clone(), dial_gone.clone(), peers.clone());
+            Box::pin(async move {
+                if n > 0 {
+                    // A reconnect that never completes.
+                    let _f = DropFlag(dial_gone);
+                    std::future::pending::<()>().await;
+                }
+                // A silent relay: never answers, never closes.
+                let (a, b) = tokio::io::duplex(64 << 10);
+                peers.lock().unwrap().push(b);
+                Ok(Box::new(Tracked {
+                    io: a,
+                    _flag: DropFlag(carrier_gone),
+                }) as BoxCarrier)
+            })
+        })
+    };
+    let pool = Pool::new(8 << 20);
+    let s = ClientSession::new(Config::default(), &pool, params(), Instant::now()).unwrap();
+    let (mut app, far) = tokio::io::duplex(64 << 10);
+    app.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    let client = tokio::spawn(run_client(s, far, connector));
+    // T_attach passes on the silent carrier and a second dial starts.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .ok();
+    client.abort();
+    let _ = client.await;
+    wait_flag(&carrier_gone, "the carrier").await;
+    if calls.load(Ordering::SeqCst) >= 2 {
+        wait_flag(&dial_gone, "the dial").await;
+    }
+    assert_eq!(pool.used_blocks(), 0, "pool not returned");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_cut_short_is_never_reported_clean() {
+    // r5 N8: both sides FIN while the app is not reading; the drain bound
+    // passes with the tail still queued. The app must get either every byte
+    // or a non-clean reason, never a prefix and a clean EOF.
+    const BODY: usize = 256 << 10;
+    let body = pattern(BODY, 5);
+    let site_conn: SiteConnector = {
+        let body = body.clone();
+        Arc::new(move |_t, _k| {
+            let body = body.clone();
+            Box::pin(async move {
+                let (a, b) = tokio::io::duplex(64 << 10);
+                tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(b);
+                    let mut req = Vec::new();
+                    let _ = r.read_to_end(&mut req).await;
+                    let _ = w.write_all(&body).await;
+                    let _ = w.shutdown().await;
+                });
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    let cfg = Config::default();
+    let pool = Pool::new(8 << 20);
+    let table = RelayTable::new(cfg.clone(), pool.clone(), Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(4);
+    let relay = tokio::spawn(run_relay(table, accept_rx, site_conn, None));
+    let connector: Connector = Arc::new(move || {
+        let accept_tx = accept_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(256 << 10);
+            accept_tx
+                .send(Box::new(b))
+                .await
+                .map_err(|_| std::io::Error::other("gone"))?;
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+    // A small app pipe: the tail has to wait in the driver.
+    let (mut app, far) = tokio::io::duplex(4 << 10);
+    let (closed_tx, mut closed_rx) = oneshot::channel();
+    let ctl = segue_session::driver::ClientCtl {
+        closed: Some(closed_tx),
+        ..Default::default()
+    };
+    let client = tokio::spawn(segue_session::driver::run_client_ctl(
+        s, far, connector, ctl,
+    ));
+    app.write_all(b"GET /big HTTP/1.1\r\n\r\n").await.unwrap();
+    app.shutdown().await.unwrap();
+    // Paused well past the drain bound.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), app.read_to_end(&mut got))
+        .await
+        .expect("app stream never ended");
+    let reason = tokio::time::timeout(Duration::from_secs(5), &mut closed_rx)
+        .await
+        .expect("no close reason")
+        .ok();
+    if got.len() < BODY {
+        assert_ne!(
+            reason,
+            Some(CloseReason::Clean),
+            "{} of {BODY} bytes delivered, yet reported clean",
+            got.len()
+        );
+    } else {
+        assert_eq!(got, body);
+    }
+    let _ = client.await;
+    relay.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_admitted_before_the_pool_ran_out_still_finish() {
+    // r5 N12/N13: the client pool is spent exactly once the sessions are
+    // admitted. Each must still move its request and the echo (its send
+    // floor and driver reserve were taken at admission); a new session is
+    // refused instead of being admitted without progress; after release the
+    // pool admits again.
+    use segue_session::pipe::pipe;
+    use segue_session::pool::{Grant, BLOCK};
+    const N: usize = 4;
+    const LEN: usize = 64 << 10;
+    let cfg = Config::default();
+    let pool = Pool::new(1 << 20);
+    let relay_pool = Pool::new(8 << 20);
+    let table = RelayTable::new(cfg.clone(), relay_pool, Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(16);
+    let echo: SiteConnector = Arc::new(|_t, _k| {
+        Box::pin(async {
+            let (a, mut b) = tokio::io::duplex(64 << 10);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match b.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if b.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let relay = tokio::spawn(run_relay(table, accept_rx, echo, None));
+    let connector: Connector = Arc::new(move || {
+        let accept_tx = accept_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(64 << 10);
+            accept_tx
+                .send(Box::new(b))
+                .await
+                .map_err(|_| std::io::Error::other("gone"))?;
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let mut admitted = Vec::new();
+    for _ in 0..N {
+        let s = ClientSession::new(cfg.clone(), &pool, params(), Instant::now()).unwrap();
+        let (app, far) = pipe(&pool, 64 << 10).unwrap();
+        admitted.push((s, app, far));
+    }
+    let mut hog = Vec::new();
+    while let Some(g) = Grant::fixed(&pool, BLOCK) {
+        hog.push(g);
+    }
+    assert_eq!(pool.used_bytes(), pool.capacity_bytes());
+    assert!(
+        ClientSession::new(cfg.clone(), &pool, params(), Instant::now()).is_none(),
+        "admitted a session the spent pool cannot move"
+    );
+    assert!(pipe(&pool, 64 << 10).is_none());
+    let mut apps = Vec::new();
+    for (i, (s, app, far)) in admitted.into_iter().enumerate() {
+        let client = tokio::spawn(run_client(s, far, connector.clone()));
+        apps.push(tokio::spawn(async move {
+            let (mut r, mut w) = tokio::io::split(app);
+            let up = pattern(LEN, i as u8);
+            let want = up.clone();
+            let writer = tokio::spawn(async move { w.write_all(&up).await.map(|_| w) });
+            let mut got = vec![0u8; LEN];
+            r.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, want);
+            let mut w = writer.await.unwrap().unwrap();
+            w.shutdown().await.unwrap();
+            drop((r, w));
+            client.abort();
+        }));
+    }
+    for a in apps {
+        tokio::time::timeout(Duration::from_secs(20), a)
+            .await
+            .expect("a session admitted before the pool ran out stalled")
+            .unwrap();
+    }
+    drop(hog);
+    assert!(ClientSession::new(cfg, &pool, params(), Instant::now()).is_some());
+    relay.abort();
+}

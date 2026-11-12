@@ -225,6 +225,111 @@ impl Drop for Grant {
     }
 }
 
+/// Blocks a session takes from the pool when it is admitted and keeps for
+/// its whole life, lent out to the buffers that must exist for it to make
+/// progress at all when the pool is spent (r5 N12/N13): one queued carrier
+/// frame and one block for the app. Lending never touches the pool, so
+/// these buffers are inside the pool bound instead of exceptions to it.
+#[derive(Debug)]
+pub struct Reserve {
+    _grant: Grant,
+    free: AtomicUsize,
+    returned: Notify,
+}
+
+impl Reserve {
+    /// `None` when the pool cannot cover `bytes`: the session is refused.
+    pub fn new(pool: &Arc<Pool>, bytes: usize) -> Option<Arc<Self>> {
+        let g = Grant::fixed(pool, bytes)?;
+        Some(Arc::new(Self {
+            free: AtomicUsize::new(g.bytes()),
+            _grant: g,
+            returned: Notify::new(),
+        }))
+    }
+
+    /// Bytes not lent out.
+    pub fn available(&self) -> usize {
+        self.free.load(Ordering::Acquire)
+    }
+
+    /// Resolves when a loan comes back (or spuriously; callers retry).
+    pub async fn returned(&self) {
+        self.returned.notified().await;
+    }
+
+    /// Lend `bytes` until the loan is dropped; `None` if not that many are
+    /// free.
+    pub fn lend(self: &Arc<Self>, bytes: usize) -> Option<Loan> {
+        self.free
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |f| {
+                f.checked_sub(bytes)
+            })
+            .ok()?;
+        Some(Loan {
+            reserve: self.clone(),
+            bytes,
+        })
+    }
+}
+
+/// Part of a [`Reserve`], returned on drop.
+#[derive(Debug)]
+pub struct Loan {
+    reserve: Arc<Reserve>,
+    bytes: usize,
+}
+
+impl Loan {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Give back all but `bytes`.
+    pub fn shrink(&mut self, bytes: usize) {
+        if bytes < self.bytes {
+            self.reserve
+                .free
+                .fetch_add(self.bytes - bytes, Ordering::AcqRel);
+            self.bytes = bytes;
+            self.reserve.returned.notify_waiters();
+        }
+    }
+}
+
+impl Drop for Loan {
+    fn drop(&mut self) {
+        self.reserve.free.fetch_add(self.bytes, Ordering::AcqRel);
+        self.reserve.returned.notify_waiters();
+    }
+}
+
+/// Largest encoded frame (payload plus type and length).
+pub const FRAME_MAX: usize = crate::codec::MAX_PAYLOAD + 16;
+
+/// What one client session reserves at admission for its driver: one
+/// queued carrier frame, one block for the app, and the carrier reader's
+/// partial frame plus one decoded frame in flight. Each is used only when
+/// the pool itself cannot cover the buffer.
+#[derive(Debug)]
+pub struct SessionReserve {
+    pub carrier: Arc<Reserve>,
+    pub app: Arc<Reserve>,
+    pub reader: Arc<Reserve>,
+}
+
+impl SessionReserve {
+    pub const BYTES: usize = FRAME_MAX + BLOCK + 2 * FRAME_MAX;
+
+    pub fn new(pool: &Arc<Pool>) -> Option<Self> {
+        Some(Self {
+            carrier: Reserve::new(pool, FRAME_MAX)?,
+            app: Reserve::new(pool, BLOCK)?,
+            reader: Reserve::new(pool, 2 * FRAME_MAX)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +367,23 @@ mod tests {
         assert_eq!(pool.used_bytes(), 1000 * BLOCK);
         assert!(!pool.under_pressure());
         drop(grants);
+        assert_eq!(pool.used_bytes(), 0);
+    }
+
+    #[test]
+    fn reserve_lends_within_what_it_holds() {
+        let pool = Pool::new(4 * BLOCK);
+        let r = Reserve::new(&pool, 2 * BLOCK).unwrap();
+        assert_eq!(pool.used_bytes(), 2 * BLOCK);
+        assert!(Reserve::new(&pool, 3 * BLOCK).is_none());
+        let a = r.lend(BLOCK + 1).unwrap();
+        assert!(r.lend(BLOCK).is_none());
+        assert!(r.lend(BLOCK - 1).is_some());
+        drop(a);
+        assert_eq!(r.available(), 2 * BLOCK);
+        // Lending never moves the pool.
+        assert_eq!(pool.used_bytes(), 2 * BLOCK);
+        drop(r);
         assert_eq!(pool.used_bytes(), 0);
     }
 }

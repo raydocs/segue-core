@@ -129,7 +129,7 @@ fn start_relay() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
             });
             let net = Pool::new(1 << 30);
             let site: SiteConnector = Arc::new(move |_t, _k| {
-                let (ours, mut theirs) = pipe(&net, 64 << 10);
+                let (ours, mut theirs) = pipe(&net, 64 << 10).unwrap();
                 tokio::spawn(async move {
                     let chunk = vec![0x5a; 16 * 1024];
                     for _ in 0..DOWN / chunk.len() {
@@ -187,7 +187,7 @@ fn client_memory_is_bounded_by_the_pool_and_released_when_idle() {
             };
             let s = ClientSession::new(Config::default(), &pool, params, Instant::now())
                 .expect("session memory");
-            let (mut app, far) = pipe(&pool, 64 << 10);
+            let (mut app, far) = pipe(&pool, 64 << 10).expect("pipe memory");
             drivers.push(tokio::spawn(run_client(s, far, connector.clone())));
             let mut go = go_tx.subscribe();
             let done = done_tx.clone();

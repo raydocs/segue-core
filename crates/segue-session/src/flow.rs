@@ -58,19 +58,31 @@ pub struct SendHalf {
     promised: usize,
 }
 
+/// Send buffer every session keeps for its whole life (r5 N12): however
+/// the pool is spent, an admitted session can always take this much new
+/// application data once its buffer is acknowledged, so it never sits
+/// with `write_capacity() == 0` waiting on blocks other sessions hold.
+pub const SEND_FLOOR: usize = crate::pool::BLOCK;
+
 impl SendHalf {
-    pub fn new(pool: &Arc<Pool>, limits: &Limits) -> Self {
-        Self {
+    /// `None` when the pool cannot cover [`SEND_FLOOR`]: the session is
+    /// refused at admission instead of being admitted without progress.
+    pub fn new(pool: &Arc<Pool>, limits: &Limits) -> Option<Self> {
+        let mut grant = Grant::new(pool, false);
+        if !grant.try_resize(SEND_FLOOR.min(limits.replay_cap)) {
+            return None;
+        }
+        Some(Self {
             acked: 0,
             buf: VecDeque::new(),
             cursor: 0,
             sent_hw: 0,
             peer_max: limits.initial_credit as u64,
             fin: None,
-            grant: Grant::new(pool, false),
+            grant,
             replay_cap: limits.replay_cap,
             promised: 0,
-        }
+        })
     }
 
     /// End of application data (the FIN offset once closed).
@@ -174,7 +186,7 @@ impl SendHalf {
         self.buf.drain(..drop.min(self.buf.len()));
         self.acked = recv;
         self.cursor = self.cursor.max(recv);
-        let keep = self.buf.len() + self.promised;
+        let keep = (self.buf.len() + self.promised).max(SEND_FLOOR.min(self.replay_cap));
         self.grant.try_resize(keep);
         fit(&mut self.buf, self.grant.bytes());
         Ok(true)
@@ -505,7 +517,7 @@ mod tests {
         let l = Limits::default();
         let now = Instant::now();
         (
-            SendHalf::new(&pool, &l),
+            SendHalf::new(&pool, &l).unwrap(),
             RecvHalf::new(&pool, &l, &Timing::default(), now).unwrap(),
             now,
         )

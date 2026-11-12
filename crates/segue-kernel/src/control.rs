@@ -80,6 +80,7 @@ impl Control {
             "exit_choice": s.choice.name(),
             "current_exit": s.current_exit,
             "exits": s.exits,
+            "revoked": s.revoked.is_some(),
             "policy": self.policy.status(),
         })
     }

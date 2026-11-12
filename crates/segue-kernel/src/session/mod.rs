@@ -143,6 +143,10 @@ impl Health {
 
 struct State {
     user_off: bool,
+    /// The relay revoked this device (REVOKED on a control stream, r5
+    /// N10): the code. Every session was reset locally and new ones are
+    /// refused until the user connects again.
+    revoked: Option<u8>,
     /// None: Auto; Some(i): exits[i].
     choice: Option<usize>,
     health: Vec<Health>,
@@ -172,6 +176,9 @@ impl State {
     fn posture(&self) -> Posture {
         if self.user_off {
             return Posture::Disconnected;
+        }
+        if self.revoked.is_some() {
+            return Posture::Error;
         }
         match self.health.get(self.pick()) {
             Some(h) => h.ks.posture(),
@@ -206,6 +213,8 @@ pub struct Status {
     /// The exit new sessions use now (None: no exits configured).
     pub current_exit: Option<String>,
     pub exits: Vec<String>,
+    /// Set when the relay revoked this device: its code.
+    pub revoked: Option<u8>,
 }
 
 /// Engine outbounds plus session routes.
@@ -219,6 +228,9 @@ pub struct KernelDialer {
     state: Arc<Mutex<State>>,
     /// true while the user has Segue off; live sessions watch it.
     off: watch::Sender<bool>,
+    /// Some(code) once the relay revoked this device; live sessions reset
+    /// with that code.
+    revoked: Arc<watch::Sender<Option<u8>>>,
     /// Per exit, same order as `exits`.
     channels: Vec<Channel>,
     control: ControlTiming,
@@ -255,10 +267,12 @@ impl KernelDialer {
             pool: process_pool(),
             state: Arc::new(Mutex::new(State {
                 user_off: false,
+                revoked: None,
                 choice: None,
                 health,
             })),
             off: watch::channel(false).0,
+            revoked: Arc::new(watch::channel(None).0),
             channels: (0..exits_len).map(|_| Channel::default()).collect(),
             control: ControlTiming::default(),
         }
@@ -298,6 +312,8 @@ impl KernelDialer {
         let sessions = ch.sessions.clone();
         let sessions_idle = ch.sessions.clone();
         let name = self.exits[i].name.clone();
+        let state = self.state.clone();
+        let revoked = self.revoked.clone();
         *task = Some(tokio::spawn(async move {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let hints = async move {
@@ -315,8 +331,15 @@ impl KernelDialer {
                             eprintln!("segue-kernel: exit {name}: channel dead, resuming sessions");
                             epoch.send_modify(|e| *e += 1);
                         }
-                        // The relay resets the sessions itself.
-                        ControlHint::Revoked(_) => {}
+                        // The relay resets the sessions too, but its RSTs
+                        // ride the data carriers, which may be dead while
+                        // this stream works: reset every session locally and
+                        // refuse new ones (r5 N10).
+                        ControlHint::Revoked(c) => {
+                            eprintln!("segue-kernel: exit {name}: device revoked (code {c})");
+                            state.lock().unwrap().revoked = Some(c);
+                            revoked.send_replace(Some(c));
+                        }
                     }
                 }
             };
@@ -355,6 +378,7 @@ impl KernelDialer {
             choice,
             current_exit: (!self.exits.is_empty()).then(|| self.exits[st.pick()].name.clone()),
             exits: self.exits.iter().map(|e| e.name.clone()).collect(),
+            revoked: st.revoked,
         }
     }
 
@@ -382,6 +406,9 @@ impl KernelDialer {
             return;
         }
         st.user_off = false;
+        // A new start (fresh credentials): the relay judges them again.
+        st.revoked = None;
+        self.revoked.send_replace(None);
         for h in &mut st.health {
             h.ks.on_event(Event::UserConnect);
             h.last_fail = None;
@@ -506,6 +533,12 @@ impl KernelDialer {
             if st.user_off {
                 return Err((DialError("refused: disconnected".into()), None));
             }
+            if let Some(c) = st.revoked {
+                return Err((
+                    DialError(format!("refused: device revoked (code {c})")),
+                    Some(c),
+                ));
+            }
             if self.exits.is_empty() {
                 return Err((DialError("refused: no exits configured".into()), None));
             }
@@ -535,14 +568,16 @@ impl KernelDialer {
         };
         let s = ClientSession::new(Default::default(), &self.pool, params, Instant::now())
             .ok_or_else(|| (DialError("refused: session memory exhausted".into()), None))?;
+        // Pool-charged and released when drained (tokio's duplex keeps a
+        // burst's capacity for the life of the stream); its reserved blocks
+        // are taken here, so a spent pool refuses instead of overcommitting.
+        let (app, far) = segue_session::pipe::pipe(&self.pool, 64 << 10)
+            .ok_or_else(|| (DialError("refused: session memory exhausted".into()), None))?;
         let ch = &self.channels[i];
         let sid = s.session_id();
         let (stall_tx, stall_rx) = mpsc::unbounded_channel();
         ch.sessions.lock().unwrap().insert(sid, stall_tx);
         let sessions = ch.sessions.clone();
-        // Pool-charged and released when drained (tokio's duplex keeps a
-        // burst's capacity for the life of the stream).
-        let (app, far) = segue_session::pipe::pipe(&self.pool, 64 << 10);
         let (open_tx, open_rx) = tokio::sync::oneshot::channel();
         let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel();
         let ctl = ClientCtl {
@@ -550,6 +585,7 @@ impl KernelDialer {
             stall: Some(stall_rx),
             closed: Some(closed_tx),
             opened: Some(open_tx),
+            cancel: Some(self.revoked.subscribe()),
         };
         let run = run_client_ctl(s, far, self.connector(i), ctl);
         let mut off = self.off.subscribe();
