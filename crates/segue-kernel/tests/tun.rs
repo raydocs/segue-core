@@ -1327,7 +1327,6 @@ fn kernel_env(policy: Policy, sniff: bool, udp: bool, fail: bool, dns: bool) -> 
             DnsSettings {
                 // Never reached: every name asked here has a rule.
                 domestic: vec!["127.0.0.1:9".parse().unwrap()],
-                foreign: Action::Proxy("p1".into()),
                 query_timeout: Duration::from_millis(200),
                 cache_size: 64,
             },
@@ -1416,7 +1415,7 @@ async fn fake_ip_destination_is_dialled_by_name_and_stale_fake_is_refused() {
     let mut e = kernel_env(inline(), false, false, false, false);
     let ip = e
         .pool
-        .assign("api.openai.com", Action::Proxy("ai".into()))
+        .assign("api.openai.com", 0)
         .unwrap();
     let dst = SocketAddr::new(IpAddr::V4(ip), 443);
     connect(&mut e.h, dst).await;

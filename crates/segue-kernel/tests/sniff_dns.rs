@@ -461,7 +461,6 @@ async fn smart_dns(domestic: Vec<SocketAddr>, pool: Arc<FakeIpPool>) -> Arc<Smar
     ]);
     let settings = DnsSettings {
         domestic,
-        foreign: proxy("proxy"),
         query_timeout: Duration::from_millis(500),
         cache_size: 128,
     };
@@ -540,14 +539,12 @@ async fn smart_dns_classifies_and_caches() {
         ask(&dns, 7, "cdn.example", TYPE_A).await,
         (RCODE_OK, vec![v4("1.2.3.9")])
     );
-    // Unmatched, answer outside chnroute → fake-IP routed by dns.foreign.
+    // Unmatched, answer outside chnroute → fake-IP; the pool keeps only
+    // the name (flows follow the policy's foreign route, the default).
     let (_, ips) = ask(&dns, 8, "polluted.example", TYPE_A).await;
     assert!(pool.contains(ips[0]), "{ips:?}");
     let entry = pool.lookup(ips[0]).unwrap();
-    assert_eq!(
-        (entry.domain.as_str(), entry.action),
-        ("polluted.example", proxy("proxy"))
-    );
+    assert_eq!(entry.domain, "polluted.example");
     let hits = up.hits.load(Ordering::SeqCst);
     assert_eq!(ask(&dns, 9, "polluted.example", TYPE_A).await.1, ips);
     assert_eq!(

@@ -102,6 +102,7 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 
 use crate::dial::{Dialer, UdpSession};
 use crate::dns::SmartDns;
+use crate::policy::Policy;
 use crate::rules::{Action, RuleSet};
 use crate::sniff::{sniff, Sniff};
 use crate::socks::{Kernel, SniffSettings};
@@ -1859,13 +1860,15 @@ pub struct TunKernel {
 }
 
 impl TunKernel {
-    fn fake(&self, key: &FlowKey) -> Option<Option<Dial>> {
+    /// Fake-IP destination: the recorded name, authorized against the
+    /// policy in force now (the pool stores no decision).
+    fn fake(&self, policy: &Policy, key: &FlowKey) -> Option<Option<Dial>> {
         let ip = key.dst.ip();
         let pool = self.kernel.fake_ip.as_ref().filter(|p| p.contains(ip))?;
-        Some(
-            pool.lookup(ip)
-                .and_then(|e| Dial::from_action(&e.action, TargetAddr::Domain(e.domain))),
-        )
+        Some(pool.lookup(ip).and_then(|e| {
+            let action = policy.decide_fake(&e.domain).clone();
+            Dial::from_action(&action, TargetAddr::Domain(e.domain))
+        }))
     }
 }
 
@@ -1879,7 +1882,7 @@ impl TunRouter for TunKernel {
             // No valid policy bundle: fail closed, fake-IP included (§5.4).
             return TcpRoute::Refuse;
         }
-        if let Some(fake) = self.fake(key) {
+        if let Some(fake) = self.fake(&policy, key) {
             return fake.map_or(TcpRoute::Refuse, TcpRoute::Dial);
         }
         let rules = &policy.rules;

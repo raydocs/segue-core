@@ -303,7 +303,6 @@ mod mac {
                     // Only names with a rule are asked in this lab; anything
                     // else times out against the discard port.
                     domestic: vec!["127.0.0.1:9".parse().unwrap()],
-                    foreign: Action::Proxy("lab".into()),
                     query_timeout: Duration::from_millis(500),
                     cache_size: 256,
                 },

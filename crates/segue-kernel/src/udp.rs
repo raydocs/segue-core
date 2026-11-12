@@ -257,8 +257,13 @@ pub(crate) fn route(
     let (action, target) = match addr {
         TargetAddr::Ip(ip) if kernel.fake_ip.as_ref().is_some_and(|p| p.contains(*ip)) => {
             // A fake address is never dialled as an IP.
+            // Authorized against the policy in force now; the pool only
+            // remembers the name.
             let entry = kernel.fake_ip.as_ref()?.lookup(*ip)?;
-            (entry.action, TargetAddr::Domain(entry.domain))
+            (
+                policy.decide_fake(&entry.domain).clone(),
+                TargetAddr::Domain(entry.domain),
+            )
         }
         _ => (policy.rules.decide(addr).clone(), addr.clone()),
     };

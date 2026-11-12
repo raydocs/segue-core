@@ -7,7 +7,14 @@
 //! | `use-application-dns.net` | NXDOMAIN (Firefox turns its own DoH off) |
 //! | explicit `proxy` / `reject` domain rule | local fake-IP, no network request |
 //! | explicit `direct` domain rule (the domestic list) | domestic resolvers, real IP |
-//! | no domain rule | domestic resolvers only; every address inside chnroute → real IP, otherwise treated as polluted / foreign → fake-IP routed by `dns.foreign` |
+//! | no domain rule | domestic resolvers only; every address inside chnroute → real IP, otherwise treated as polluted / foreign → fake-IP routed by the policy's foreign route (the bundle `default`) |
+//!
+//! No valid policy (no bundle yet, or it expired): every query is REFUSED,
+//! with no cache read, no fake-IP and no upstream query.
+//!
+//! The fake-IP pool records only the name; a flow to a fake address is
+//! authorized against the policy in force when the flow starts
+//! ([`crate::policy::Policy::decide_fake`]).
 //!
 //! Foreign names are never resolved here: the relay resolves them at the exit
 //! (§5.2.5), so there is no DoH/DoT client in the kernel. A fake-IP CONNECT
@@ -31,7 +38,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
 use crate::fakeip::FakeIpPool;
-use crate::policy::PolicyStore;
+use crate::policy::{Policy, PolicyStore};
 use crate::rules::{normalize, Action};
 
 pub const TYPE_A: u16 = 1;
@@ -42,6 +49,7 @@ pub const RCODE_OK: u8 = 0;
 pub const RCODE_FORMERR: u8 = 1;
 pub const RCODE_SERVFAIL: u8 = 2;
 pub const RCODE_NXDOMAIN: u8 = 3;
+pub const RCODE_REFUSED: u8 = 5;
 
 /// Negative answers (NXDOMAIN / NODATA) are cached this long.
 const NEGATIVE_TTL: u32 = 30;
@@ -51,28 +59,26 @@ const TCP_IDLE: Duration = Duration::from_secs(10);
 
 pub struct DnsSettings {
     pub domestic: Vec<SocketAddr>,
-    /// Route for names with no domain rule whose domestic answer falls
-    /// outside chnroute. Never `Direct`.
-    pub foreign: Action,
     pub query_timeout: Duration,
     pub cache_size: usize,
 }
 
+/// What a domestic resolver said, independent of any policy. Classifying it
+/// (real IP vs foreign → fake-IP) happens when answering, against the policy
+/// in force then, so a cached answer never carries an old decision.
 #[derive(Clone, Debug)]
-enum Cached {
-    /// Real answer to hand back (possibly empty = NODATA, or NXDOMAIN).
-    Real { rcode: u8, ips: Vec<IpAddr> },
-    /// Unmatched name judged foreign: answer with a fake-IP.
-    Foreign,
+struct Raw {
+    rcode: u8,
+    ips: Vec<IpAddr>,
 }
 
 struct CacheEntry {
-    value: Cached,
+    value: Raw,
     expires: Instant,
 }
 
 pub struct SmartDns {
-    /// Rules and chnroute come from the policy in force (signed bundle).
+    /// Rules, chnroute and the foreign route come from the policy in force.
     policy: Arc<PolicyStore>,
     pool: Arc<FakeIpPool>,
     s: DnsSettings,
@@ -94,9 +100,20 @@ struct Question<'a> {
 }
 
 enum Class {
-    Fake(Action),
+    /// Explicit proxy / reject domain rule: fake-IP, no network request.
+    Fake,
+    /// Explicit direct domain rule: real answer.
     Domestic,
+    /// No domain rule: real answer if all in chnroute, else foreign.
     Unmatched,
+}
+
+fn classify(policy: &Policy, name: &str) -> Class {
+    match policy.rules.lookup(&TargetAddr::Domain(name.to_owned())) {
+        Some((_, Action::Direct)) => Class::Domestic,
+        Some(_) => Class::Fake,
+        None => Class::Unmatched,
+    }
 }
 
 impl SmartDns {
@@ -113,40 +130,40 @@ impl SmartDns {
     }
 
     /// Answer one DNS message. None means "drop it" (not even a header).
+    ///
+    /// Without a valid policy every query is answered REFUSED before the
+    /// cache, the fake-IP pool or any upstream is touched (§5.4). The policy
+    /// is read again after every upstream wait; an answer is always rendered
+    /// under the policy in force when it is sent.
     pub async fn handle(self: &Arc<Self>, query: &[u8]) -> Option<Vec<u8>> {
         let q = match parse_question(query) {
             Ok(q) => q,
             Err(Some((id, rd))) => return Some(header_only(id, rd, RCODE_FORMERR)),
             Err(None) => return None,
         };
+        let policy = self.policy.current();
+        if policy.refuse_all {
+            return Some(respond(&q, RCODE_REFUSED, &[], 0));
+        }
         if q.name == "use-application-dns.net" {
             return Some(respond(&q, RCODE_NXDOMAIN, &[], 0));
         }
-        let policy = self.policy.current();
-        let class = match policy.rules.lookup(&TargetAddr::Domain(q.name.clone())) {
-            Some((_, Action::Direct)) => Class::Domestic,
-            Some((_, a)) => Class::Fake(a.clone()),
-            None => Class::Unmatched,
-        };
         if q.name.is_empty() {
             return self.passthrough(query, &q).await;
         }
-        match (class, q.qtype) {
-            (Class::Fake(action), TYPE_A) => Some(self.fake_answer(&q, action)),
+        match (classify(&policy, &q.name), q.qtype) {
+            (Class::Fake, TYPE_A) => Some(self.fake_answer(&q, &policy)),
             // The pool is IPv4 only; AAAA for proxied names is NODATA so
             // clients use the fake A record (§5.2.6).
-            (Class::Fake(_), _) => Some(respond(&q, RCODE_OK, &[], 0)),
-            (class, TYPE_A | TYPE_AAAA) => {
-                let unmatched = matches!(class, Class::Unmatched);
-                Some(self.resolve_cached(&q, unmatched).await)
-            }
+            (Class::Fake, _) => Some(respond(&q, RCODE_OK, &[], 0)),
+            (_, TYPE_A | TYPE_AAAA) => Some(self.resolve_cached(&q).await),
             // Non-A/AAAA for domestic / unmatched names: straight through.
             (_, _) => self.passthrough(query, &q).await,
         }
     }
 
-    fn fake_answer(&self, q: &Question<'_>, action: Action) -> Vec<u8> {
-        match self.pool.assign(&q.name, action) {
+    fn fake_answer(&self, q: &Question<'_>, policy: &Policy) -> Vec<u8> {
+        match self.pool.assign(&q.name, policy.version) {
             Some(ip) => respond(
                 q,
                 RCODE_OK,
@@ -157,7 +174,7 @@ impl SmartDns {
         }
     }
 
-    async fn resolve_cached(self: &Arc<Self>, q: &Question<'_>, unmatched: bool) -> Vec<u8> {
+    async fn resolve_cached(self: &Arc<Self>, q: &Question<'_>) -> Vec<u8> {
         let key = (q.name.clone(), q.qtype);
         let now = Instant::now();
         let hit = {
@@ -178,28 +195,52 @@ impl SmartDns {
         };
         if let Some((value, ttl, stale)) = hit {
             if stale {
-                self.spawn_refresh(key, unmatched);
+                self.spawn_refresh(key);
             }
             return self.render(q, value, ttl);
         }
-        match self.resolve(&q.name, q.qtype, unmatched).await {
+        match self.resolve(&q.name, q.qtype).await {
             Some((value, ttl)) => {
                 self.store(key, value.clone(), ttl);
                 self.render(q, value, ttl.max(1))
             }
-            None => respond(q, RCODE_SERVFAIL, &[], 0),
+            None => self.after_wait(q, || respond(q, RCODE_SERVFAIL, &[], 0)),
         }
     }
 
-    fn render(&self, q: &Question<'_>, value: Cached, ttl: u32) -> Vec<u8> {
-        match value {
-            Cached::Real { rcode, ips } => respond(q, rcode, &ips, ttl),
-            Cached::Foreign if q.qtype == TYPE_A => self.fake_answer(q, self.s.foreign.clone()),
-            Cached::Foreign => respond(q, RCODE_OK, &[], 0),
+    /// The answer for a name that needed (or once needed) the domestic
+    /// resolvers, decided under the policy in force now.
+    fn render(&self, q: &Question<'_>, value: Raw, ttl: u32) -> Vec<u8> {
+        let policy = self.policy.current();
+        if policy.refuse_all {
+            return respond(q, RCODE_REFUSED, &[], 0);
+        }
+        let foreign = match classify(&policy, &q.name) {
+            // The policy changed while we waited and now proxies the name.
+            Class::Fake => true,
+            Class::Domestic => false,
+            Class::Unmatched => {
+                !value.ips.is_empty() && !value.ips.iter().all(|ip| policy.chnroute.contains(*ip))
+            }
+        };
+        match (foreign, q.qtype) {
+            (false, _) => respond(q, value.rcode, &value.ips, ttl),
+            (true, TYPE_A) => self.fake_answer(q, &policy),
+            (true, _) => respond(q, RCODE_OK, &[], 0),
         }
     }
 
-    fn spawn_refresh(self: &Arc<Self>, key: (String, u16), unmatched: bool) {
+    /// After an upstream wait that produced no answer: REFUSED if the
+    /// policy went away meanwhile, else `other`.
+    fn after_wait(&self, q: &Question<'_>, other: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
+        if self.policy.current().refuse_all {
+            respond(q, RCODE_REFUSED, &[], 0)
+        } else {
+            other()
+        }
+    }
+
+    fn spawn_refresh(self: &Arc<Self>, key: (String, u16)) {
         if !self
             .refreshing
             .lock()
@@ -210,14 +251,17 @@ impl SmartDns {
         }
         let me = self.clone();
         tokio::spawn(async move {
-            if let Some((value, ttl)) = me.resolve(&key.0, key.1, unmatched).await {
-                me.store(key.clone(), value, ttl);
+            // A refresh is an upstream query too: none without a policy.
+            if !me.policy.current().refuse_all {
+                if let Some((value, ttl)) = me.resolve(&key.0, key.1).await {
+                    me.store(key.clone(), value, ttl);
+                }
             }
             me.refreshing.lock().expect("refreshing").remove(&key);
         });
     }
 
-    fn store(&self, key: (String, u16), value: Cached, ttl: u32) {
+    fn store(&self, key: (String, u16), value: Raw, ttl: u32) {
         let mut cache = self.cache.lock().expect("dns cache");
         if cache.len() >= self.s.cache_size && !cache.contains_key(&key) {
             let now = Instant::now();
@@ -235,8 +279,8 @@ impl SmartDns {
         );
     }
 
-    /// Ask the domestic resolvers and classify. None on upstream failure.
-    async fn resolve(&self, name: &str, qtype: u16, unmatched: bool) -> Option<(Cached, u32)> {
+    /// Ask the domestic resolvers. None on upstream failure.
+    async fn resolve(&self, name: &str, qtype: u16) -> Option<(Raw, u32)> {
         let id: u16 = rand::random();
         let mut packet = Vec::with_capacity(32 + name.len());
         packet.extend_from_slice(&id.to_be_bytes());
@@ -250,15 +294,7 @@ impl SmartDns {
             return None;
         }
         let ttl = if ips.is_empty() { NEGATIVE_TTL } else { ttl };
-        if unmatched
-            && !ips.is_empty()
-            && !ips
-                .iter()
-                .all(|ip| self.policy.current().chnroute.contains(*ip))
-        {
-            return Some((Cached::Foreign, ttl));
-        }
-        Some((Cached::Real { rcode, ips }, ttl))
+        Some((Raw { rcode, ips }, ttl))
     }
 
     /// Forward the client's own message to the domestic resolvers.
@@ -267,11 +303,14 @@ impl SmartDns {
         let mut packet = query.to_vec();
         packet[..2].copy_from_slice(&id.to_be_bytes());
         match self.race(packet).await {
+            Some(_) if self.policy.current().refuse_all => {
+                Some(respond(q, RCODE_REFUSED, &[], 0))
+            }
             Some(mut reply) => {
                 reply[..2].copy_from_slice(&q.id.to_be_bytes());
                 Some(reply)
             }
-            None => Some(respond(q, RCODE_SERVFAIL, &[], 0)),
+            None => Some(self.after_wait(q, || respond(q, RCODE_SERVFAIL, &[], 0))),
         }
     }
 

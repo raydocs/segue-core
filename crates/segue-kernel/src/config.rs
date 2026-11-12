@@ -13,6 +13,8 @@
 //!     "chnroute": ["1.0.1.0/24"], "chnroute_file": "chnroute.txt",
 //!     "foreign": {"type": "proxy", "outbound": "proxy"},
 //!     "fake_ip_range": "198.18.0.0/15", "fake_ip_ttl_secs": 60, "fake_ip_grace_secs": 600,
+//!     "fake_ip_quarantine_secs": 21600, "fake_ip_max_entries": 16384,
+//!     "fake_ip_state": "fakeip.state",
 //!     "query_timeout_ms": 2000, "cache_size": 4096
 //!   }
 //! }
@@ -212,7 +214,18 @@ struct RawDns {
     chnroute: Vec<String>,
     #[serde(default)]
     chnroute_file: Option<PathBuf>,
-    foreign: Action,
+    /// Lab only (inline rules): route for unmatched names judged foreign.
+    /// Defaults to `default`. With a signed policy it is the bundle's
+    /// `default` and setting it here is an error.
+    #[serde(default)]
+    foreign: Option<Action>,
+    /// Where the fake-IP key and mapping are kept across restarts.
+    #[serde(default)]
+    fake_ip_state: Option<PathBuf>,
+    #[serde(default = "default_fake_quarantine")]
+    fake_ip_quarantine_secs: u64,
+    #[serde(default = "default_fake_max")]
+    fake_ip_max_entries: usize,
     #[serde(default = "default_fake_range")]
     fake_ip_range: String,
     #[serde(default = "default_fake_ttl")]
@@ -234,6 +247,12 @@ fn default_fake_ttl() -> u64 {
 fn default_fake_grace() -> u64 {
     600
 }
+fn default_fake_quarantine() -> u64 {
+    crate::fakeip::DEFAULT_QUARANTINE.as_secs()
+}
+fn default_fake_max() -> usize {
+    crate::fakeip::DEFAULT_MAX_ENTRIES
+}
 fn default_query_timeout() -> u64 {
     2000
 }
@@ -249,6 +268,12 @@ pub struct DnsConfig {
     pub fake_ip_prefix: u8,
     pub fake_ip_ttl: Duration,
     pub fake_ip_grace: Duration,
+    pub fake_ip_quarantine: Duration,
+    pub fake_ip_max_entries: usize,
+    /// Absolute path of the fake-IP state file.
+    pub fake_ip_state: Option<PathBuf>,
+    /// Inline policy only: `dns.foreign`.
+    pub foreign: Option<Action>,
 }
 
 pub struct KernelConfig {
@@ -416,6 +441,13 @@ impl KernelConfig {
                             .into(),
                     );
                 }
+                if signed && d.foreign.is_some() {
+                    // An unsigned local route must not override the bundle's
+                    // decision for unknown names (the bundle `default`).
+                    return Err(
+                        "dns.foreign comes from the policy bundle (its default); remove it".into(),
+                    );
+                }
                 let (c, cidrs) = dns_config(d, &known, base)?;
                 (Some(c), cidrs)
             }
@@ -464,7 +496,10 @@ impl KernelConfig {
                         return Err(format!("rule refers to unknown outbound {tag:?}"));
                     }
                 }
-                let policy = Policy::inline(rules, CidrTable::new(&chnroute));
+                let mut policy = Policy::inline(rules, CidrTable::new(&chnroute));
+                if let Some(f) = dns.as_ref().and_then(|d| d.foreign.clone()) {
+                    policy = policy.with_foreign(f);
+                }
                 (PolicyStore::inline(policy), Vec::new())
             }
         };
@@ -562,11 +597,16 @@ fn dns_config(
     }
     match &d.foreign {
         // Names judged foreign / polluted must not go out from this device.
-        Action::Direct => return Err("dns.foreign must be proxy or reject, not direct".into()),
-        Action::Proxy(tag) if !outbounds.contains_key(tag) => {
+        Some(Action::Direct) => {
+            return Err("dns.foreign must be proxy or reject, not direct".into())
+        }
+        Some(Action::Proxy(tag)) if !outbounds.contains_key(tag) => {
             return Err(format!("dns.foreign refers to unknown outbound {tag:?}"))
         }
         _ => {}
+    }
+    if d.fake_ip_max_entries == 0 {
+        return Err("dns.fake_ip_max_entries must be > 0".into());
     }
     let mut cidrs = Vec::new();
     for (i, c) in d.chnroute.iter().enumerate() {
@@ -615,7 +655,6 @@ fn dns_config(
         listen: d.listen,
         settings: DnsSettings {
             domestic: d.domestic,
-            foreign: d.foreign,
             query_timeout: Duration::from_millis(d.query_timeout_ms),
             cache_size: d.cache_size,
         },
@@ -623,6 +662,10 @@ fn dns_config(
         fake_ip_prefix,
         fake_ip_ttl: Duration::from_secs(d.fake_ip_ttl_secs),
         fake_ip_grace: Duration::from_secs(d.fake_ip_grace_secs),
+        fake_ip_quarantine: Duration::from_secs(d.fake_ip_quarantine_secs),
+        fake_ip_max_entries: d.fake_ip_max_entries,
+        fake_ip_state: d.fake_ip_state.map(|f| if f.is_absolute() { f } else { base.join(f) }),
+        foreign: d.foreign,
     };
     Ok((cfg, cidrs))
 }
@@ -692,7 +735,12 @@ mod tests {
             .current()
             .chnroute
             .contains("1.0.1.9".parse().unwrap()));
-        assert_eq!(d.settings.foreign, Action::Proxy("p".into()));
+        assert_eq!(d.foreign, Some(Action::Proxy("p".into())));
+        assert_eq!(
+            c.policy.current().foreign,
+            Action::Proxy("p".into()),
+            "inline lab: dns.foreign overrides the default for foreign names"
+        );
     }
 
     #[test]
@@ -870,6 +918,16 @@ mod tests {
         .err()
         .unwrap();
         assert!(err.contains("policy bundle"), "{err}");
+        // So is a local foreign route: unknown names follow the bundle.
+        let err = KernelConfig::parse_in(
+            &doc(&format!(
+                r#"{pol},"dns":{{"listen":"127.0.0.1:5353","domestic":["223.5.5.5:53"],"foreign":{{"type":"proxy","outbound":"p"}}}}"#
+            )),
+            &dir,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("dns.foreign comes from the policy bundle"), "{err}");
         // A signed bundle in place installs at startup and is persisted.
         let body = br#"{"version":2,"expires_at":4000000000,"ai_domains":["openai.com"],"default":{"type":"direct"}}"#;
         std::fs::write(dir.join("b"), crate::policy::sign(&key, 1, body).unwrap()).unwrap();

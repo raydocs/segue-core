@@ -335,8 +335,8 @@ async fn fake_ip_destinations_are_dialled_by_name_and_stale_ones_dropped() {
         )
         .unwrap(),
     );
-    let fake = pool.assign("video.example", proxy("proxy")).unwrap();
-    let ai = pool.assign("chat.openai.com", proxy("home")).unwrap();
+    let fake = pool.assign("video.example", 0).unwrap();
+    let ai = pool.assign("chat.openai.com", 0).unwrap();
     let env = start(Some(settings()), Some(pool)).await;
     let (_, _ctl, relay) = associate(env.socks).await;
     let c = client(relay).await;
