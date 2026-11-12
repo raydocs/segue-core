@@ -758,15 +758,14 @@ async fn sessions_admitted_before_the_pool_ran_out_still_finish() {
             let mut w = writer.await.unwrap().unwrap();
             w.shutdown().await.unwrap();
             drop((r, w));
-            client
+            client.abort();
         }));
     }
     for a in apps {
-        let client = tokio::time::timeout(Duration::from_secs(20), a)
+        tokio::time::timeout(Duration::from_secs(20), a)
             .await
             .expect("a session admitted before the pool ran out stalled")
             .unwrap();
-        client.abort();
     }
     drop(hog);
     assert!(ClientSession::new(cfg, &pool, params(), Instant::now()).is_some());
