@@ -15,12 +15,15 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
 rand.workspace = true
 segue-config = { path = "../segue-config" }
 segue-engine = { path = "../segue-engine" }
 segue-routing = { path = "../segue-routing" }
 segue-session = { path = "../segue-session" }
 segue-transport = { path = "../segue-transport" }
+segue-tun = { path = "../segue-tun" }
+smoltcp = { workspace = true, features = ["socket-tcp-reno"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2.workspace = true
