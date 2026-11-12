@@ -225,7 +225,11 @@ where
             }
             r = app_r.read(&mut abuf[..cap.max(1)]), if cap > 0 => {
                 match r {
-                    Ok(0) | Err(_) => { app_eof = true; s.close_write(); }
+                    Ok(0) => { app_eof = true; s.close_write(); }
+                    // A read error is not a clean end of the upload: reset,
+                    // never FIN (the site must not see a truncated stream as
+                    // complete).
+                    Err(_) => { app_eof = true; s.abort(); }
                     Ok(n) => { let w = s.write(&abuf[..n]); debug_assert_eq!(w, n); }
                 }
             }
@@ -442,6 +446,12 @@ pub async fn run_relay(
                 let t = now();
                 match ev {
                     Some(SiteEv::Connected(sid, Ok(stream))) => {
+                        if table.state(&sid).is_none() {
+                            // Session ended while connecting (RST / timeout):
+                            // drop the site connection instead of leaking it.
+                            drop(stream);
+                            continue;
+                        }
                         let (mut r, w) = tokio::io::split(stream);
                         let (tx, _writer) = spawn_writer(w, writable.clone());
                         let (req, mut req_rx) = mpsc::channel::<usize>(1);

@@ -72,7 +72,6 @@ struct Tomb {
     until: Instant,
 }
 
-#[derive(Debug)]
 struct Session {
     device: u64,
     secret: Secret,
@@ -89,6 +88,20 @@ struct Session {
     /// Uplink (client → relay).
     recv: RecvHalf,
     rst: Option<u8>,
+}
+
+// Manual so the resume secret never reaches a log.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("device", &self.device)
+            .field("cur_gen", &self.cur_gen)
+            .field("carrier", &self.carrier)
+            .field("connected", &self.connected)
+            .field("state", &self.state)
+            .field("rst", &self.rst)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,6 +263,8 @@ impl RelayTable {
             {
                 self.fail(&sid, e)
             }
+            // OPEN / RESUME with another version (§10): REJECT(version).
+            None if matches!(e, ProtoError::Version(_)) => self.reject(cid, code::VERSION, 0, None),
             _ => self.close_carrier_now(cid),
         }
     }
@@ -280,8 +295,10 @@ impl RelayTable {
                     if o.anchor_instance_id != 0 && o.anchor_instance_id != self.instance_id {
                         return self.reject(cid, code::UNKNOWN_SESSION, o.attach_gen, None);
                     }
-                    if self.auth.resume(&o.ticket).is_err() {
-                        return self.reject(cid, code::AUTH, o.attach_gen, None);
+                    match self.auth.resume(&o.ticket) {
+                        Ok(d) if d == s.device => {}
+                        Ok(_) => return self.reject(cid, code::AUTH, o.attach_gen, None),
+                        Err(c) => return self.reject(cid, c, o.attach_gen, None),
                     }
                     // Retry of a known session: treated as a resume (no new
                     // connect). OPEN carries no offsets; the client has
@@ -396,7 +413,12 @@ impl RelayTable {
         now: Instant,
     ) -> Result<(), ProtoError> {
         let s = self.sessions.get_mut(sid).unwrap();
-        s.send.rewind(peer_recv, peer_max)?;
+        if let Err(e) = s.send.rewind(peer_recv, peer_max) {
+            // The new carrier is not bound yet: answer it here, the caller
+            // fails the session (and its current carrier).
+            self.reject(cid, code::PROTOCOL, gen, None);
+            return Err(e);
+        }
         let old = s.carrier.replace(cid);
         s.cur_gen = gen;
         s.reply = Some(reply);

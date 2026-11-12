@@ -103,7 +103,7 @@ pub enum Target {
     Domain(String, u16),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Open {
     pub version: u8,
     pub ticket: Vec<u8>,
@@ -130,7 +130,7 @@ pub struct Opened {
     pub ack_bytes: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Resume {
     pub version: u8,
     pub ticket: Vec<u8>,
@@ -141,6 +141,41 @@ pub struct Resume {
     pub attach_gen: u32,
     pub recv_offset: u64,
     pub max_offset: u64,
+}
+
+// Debug never prints the ticket or the resume secret (no secrets in logs).
+impl std::fmt::Debug for Open {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Open")
+            .field("version", &self.version)
+            .field("ticket", &"<redacted>")
+            .field("session_id", &self.session_id)
+            .field("resume_secret", &"<redacted>")
+            .field("attach_gen", &self.attach_gen)
+            .field("retry", &self.retry)
+            .field("anchor_instance_id", &self.anchor_instance_id)
+            .field("kind", &self.kind)
+            .field("target", &self.target)
+            .field("exit_class", &self.exit_class)
+            .field("first_data_len", &self.first_data.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Resume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resume")
+            .field("version", &self.version)
+            .field("ticket", &"<redacted>")
+            .field("anchor_node_id", &self.anchor_node_id)
+            .field("anchor_instance_id", &self.anchor_instance_id)
+            .field("session_id", &self.session_id)
+            .field("resume_secret", &"<redacted>")
+            .field("attach_gen", &self.attach_gen)
+            .field("recv_offset", &self.recv_offset)
+            .field("max_offset", &self.max_offset)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -27,7 +27,7 @@ use crate::{Config, ProtoError};
 pub type CarrierId = u64;
 
 /// What the client asks the relay to open.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OpenParams {
     pub ticket: Vec<u8>,
     pub kind: Kind,
@@ -83,10 +83,22 @@ impl CloseReason {
     }
 }
 
+impl std::fmt::Debug for OpenParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenParams")
+            .field("ticket", &"<redacted>")
+            .field("kind", &self.kind)
+            .field("target", &self.target)
+            .field("exit_class", &self.exit_class)
+            .field("anchor_node_id", &self.anchor_node_id)
+            .field("instance_hint", &self.instance_hint)
+            .finish()
+    }
+}
+
 /// Local code used when the client gives up re-attaching / retrying OPEN.
 pub const LOCAL_GIVE_UP: u8 = code::CONNECT_TIMEOUT;
 
-#[derive(Debug)]
 pub struct ClientSession {
     cfg: Config,
     session_id: SessionId,
@@ -114,6 +126,22 @@ pub struct ClientSession {
     send: SendHalf,
     recv: RecvHalf,
     park: ParkTracker,
+}
+
+// Manual so the resume secret and ticket never reach a log.
+impl std::fmt::Debug for ClientSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientSession")
+            .field("session_id", &self.session_id)
+            .field("params", &self.params)
+            .field("state", &self.state)
+            .field("gen", &self.gen)
+            .field("instance_id", &self.instance_id)
+            .field("carrier", &self.carrier)
+            .field("confirmed", &self.confirmed)
+            .field("rst", &self.rst)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClientSession {
