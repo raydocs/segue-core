@@ -19,6 +19,7 @@ rand.workspace = true
 segue-config = { path = "../segue-config" }
 segue-engine = { path = "../segue-engine" }
 segue-routing = { path = "../segue-routing" }
+segue-session = { path = "../segue-session" }
 segue-transport = { path = "../segue-transport" }
 serde = { workspace = true }
 serde_json = { workspace = true }

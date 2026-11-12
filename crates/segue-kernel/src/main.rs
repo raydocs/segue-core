@@ -5,6 +5,7 @@ use segue_kernel::config::KernelConfig;
 use segue_kernel::dial::EngineDialer;
 use segue_kernel::dns::{serve_tcp, serve_udp, SmartDns};
 use segue_kernel::fakeip::FakeIpPool;
+use segue_kernel::session::KernelDialer;
 use segue_kernel::socks::{serve, Kernel};
 use segue_kernel::udp::Udp;
 
@@ -31,7 +32,10 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let dialer = Arc::new(EngineDialer::new(&config.outbounds)?);
+        let dialer = Arc::new(KernelDialer::new(
+            EngineDialer::new(&config.outbounds)?,
+            config.segue.clone(),
+        ));
         let listener = tokio::net::TcpListener::bind(config.listen).await?;
         eprintln!("segue-kernel: listening on {}", listener.local_addr()?);
         let mut fake_ip = None;

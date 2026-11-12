@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
-use crate::client::{ClientSession, CloseReason};
+use crate::client::{ClientSession, CloseReason, State};
 use crate::codec::{code, Frame, FrameDecoder, Kind, SessionId, Target};
 use crate::relay::{RelayEvent, RelayTable};
 use crate::ProtoError;
@@ -163,10 +163,43 @@ struct CarrierIo {
 
 /// Run one client session over carriers from `connect`, bridging `app`.
 /// Returns how the local connection ended.
-pub async fn run_client<A>(mut s: ClientSession, app: A, connect: Connector) -> CloseReason
+pub async fn run_client<A>(s: ClientSession, app: A, connect: Connector) -> CloseReason
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    run_client_ctl(s, app, connect, ClientCtl::default()).await
+}
+
+/// Optional hooks for [`run_client_ctl`].
+#[derive(Default)]
+pub struct ClientCtl {
+    /// Every change (a network-change epoch) moves the session to a new
+    /// carrier with RESUME (KERNEL_SPEC §7.2 "网络变化").
+    pub reattach: Option<tokio::sync::watch::Receiver<u64>>,
+    /// Receives how the session ended as soon as it is known, before the
+    /// app stream is shut down, so the caller can tell a clean EOF from a
+    /// reset (the app stream itself can only show EOF).
+    pub closed: Option<tokio::sync::oneshot::Sender<CloseReason>>,
+    /// Fires once, when the relay first answers OPENED, so the caller can
+    /// report success to the app only after the relay accepted the flow.
+    pub opened: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// [`run_client`] with hooks.
+pub async fn run_client_ctl<A>(
+    mut s: ClientSession,
+    app: A,
+    connect: Connector,
+    ctl: ClientCtl,
+) -> CloseReason
+where
+    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let ClientCtl {
+        mut reattach,
+        closed,
+        mut opened,
+    } = ctl;
     let writable = Arc::new(Notify::new());
     let (mut app_r, app_w) = tokio::io::split(app);
     let (app_tx, app_writer) = spawn_writer(app_w, writable.clone());
@@ -228,6 +261,11 @@ where
                 break;
             }
         }
+        if s.state() == State::Active {
+            if let Some(tx) = opened.take() {
+                let _ = tx.send(());
+            }
+        }
         if s.is_closed() {
             break;
         }
@@ -281,6 +319,12 @@ where
                     Ok(n) => { let w = s.write(&abuf[..n]); debug_assert_eq!(w, n); }
                 }
             }
+            r = async { reattach.as_mut().expect("guarded").changed().await }, if reattach.is_some() => {
+                match r {
+                    Ok(()) => s.reattach(now()),
+                    Err(_) => reattach = None,
+                }
+            }
             _ = writable.notified() => {}
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
             _ = tokio::time::sleep_until(backoff.unwrap_or_else(tokio::time::Instant::now)), if backoff.is_some() => {}
@@ -289,6 +333,9 @@ where
     let reason = s
         .close_reason()
         .unwrap_or(CloseReason::Reset(code::INTERNAL));
+    if let Some(tx) = closed {
+        let _ = tx.send(reason);
+    }
     // A clean close can be learnt from a REJECT(closed) (B6) while received
     // data is still buffered: it belongs to the app.
     if reason == CloseReason::Clean && !app_shut {
@@ -399,7 +446,13 @@ pub async fn run_relay_ctl(
                     kind,
                     exit_class,
                 } => {
-                    let fut = site(SiteRequest { session_id, device, target, kind, exit_class });
+                    let fut = site(SiteRequest {
+                        session_id,
+                        device,
+                        target,
+                        kind,
+                        exit_class,
+                    });
                     let tx = site_tx.clone();
                     tokio::spawn(async move {
                         let _ = tx.send(SiteEv::Connected(session_id, fut.await)).await;

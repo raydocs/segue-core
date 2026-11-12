@@ -36,6 +36,11 @@ struct Raw {
     /// The node's own public addresses, inter-node subnets.
     #[serde(default)]
     blocked_cidrs: Vec<String>,
+    /// Lab only: ranges exempt from the SSRF guard (e.g. 127.0.0.1/32 for a
+    /// loopback end-to-end test). Never set on a real node; a warning is
+    /// logged at startup when it is non-empty.
+    #[serde(default)]
+    dev_allow_cidrs: Vec<String>,
     #[serde(default)]
     limits: RawLimits,
 }
@@ -177,6 +182,7 @@ pub struct Config {
     pub home_auto_failover: bool,
     pub home_assignments: Vec<(u64, String)>,
     pub blocked_cidrs: Vec<Cidr>,
+    pub dev_allow_cidrs: Vec<Cidr>,
     pub limits: Limits,
 }
 
@@ -285,6 +291,11 @@ impl Config {
             .iter()
             .map(|c| Cidr::parse(c))
             .collect::<Result<Vec<_>, _>>()?;
+        let dev_allow_cidrs = raw
+            .dev_allow_cidrs
+            .iter()
+            .map(|c| Cidr::parse(c))
+            .collect::<Result<Vec<_>, _>>()?;
         let r = &raw.limits;
         let limits = Limits {
             pool_bytes: r.pool_bytes,
@@ -337,6 +348,7 @@ impl Config {
             home_auto_failover: raw.home_auto_failover,
             home_assignments,
             blocked_cidrs,
+            dev_allow_cidrs,
             limits,
         })
     }

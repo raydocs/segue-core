@@ -153,6 +153,13 @@ fn run(path: &Path) -> ExitCode {
         .expect("runtime");
     rt.block_on(async move {
         let listen = cfg.listen;
+        if !cfg.dev_allow_cidrs.is_empty() {
+            log!(
+                "warn",
+                "dev_allow_cidrs set: SSRF guard exceptions active (lab only)",
+                "count" = cfg.dev_allow_cidrs.len()
+            );
+        }
         let relay = match Relay::new(cfg, system_clock(), None, None) {
             Ok(r) => Arc::new(r),
             Err(e) => {

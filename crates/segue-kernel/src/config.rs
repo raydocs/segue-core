@@ -37,6 +37,7 @@ use serde_json::Value;
 
 use crate::dns::DnsSettings;
 use crate::rules::{Action, Cidr, CidrTable, RuleSet, RuleSpec};
+use crate::session::SegueRoute;
 use crate::socks::SniffSettings;
 use crate::udp::UdpSettings;
 
@@ -55,6 +56,24 @@ struct RawConfig {
     dns: Option<RawDns>,
     #[serde(default)]
     udp: Option<RawUdp>,
+    /// Session-layer routes: tag → relay reached through an engine outbound.
+    #[serde(default)]
+    segue: BTreeMap<String, RawSegue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSegue {
+    /// Engine outbound that carries the session (Reality / Hy2).
+    carrier: String,
+    /// The relay address as the carrier's server sees it.
+    relay: SocketAddr,
+    /// File holding the device ticket (until the control plane).
+    ticket_file: PathBuf,
+    /// `overseas` or `ai` (a hint; the relay classifies by itself).
+    exit_class: String,
+    #[serde(default)]
+    anchor_node_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +180,8 @@ pub struct KernelConfig {
     pub dns: Option<DnsConfig>,
     /// None: UDP ASSOCIATE is refused as unsupported.
     pub udp: Option<UdpSettings>,
+    /// Session-layer routes (`segue` section), by tag.
+    pub segue: BTreeMap<String, SegueRoute>,
 }
 
 impl KernelConfig {
@@ -188,8 +209,52 @@ impl KernelConfig {
             .map(|(i, r)| r.into_rule().map_err(|e| format!("rules[{i}]: {e}")))
             .collect::<Result<Vec<_>, _>>()?;
         let rules = RuleSet::new(rules, raw.default);
+        let mut segue = BTreeMap::new();
+        for (tag, r) in &raw.segue {
+            if raw.outbounds.contains_key(tag) {
+                return Err(format!("segue.{tag}: tag also used by an outbound"));
+            }
+            if !raw.outbounds.contains_key(&r.carrier) {
+                return Err(format!(
+                    "segue.{tag}: unknown carrier outbound {:?}",
+                    r.carrier
+                ));
+            }
+            let exit_class = match r.exit_class.as_str() {
+                "overseas" => crate::session::EXIT_OVERSEAS,
+                "ai" => crate::session::EXIT_AI,
+                _ => return Err(format!("segue.{tag}: exit_class must be overseas or ai")),
+            };
+            let path = if r.ticket_file.is_absolute() {
+                r.ticket_file.clone()
+            } else {
+                base.join(&r.ticket_file)
+            };
+            // The error never carries the ticket.
+            let ticket = std::fs::read_to_string(&path)
+                .map_err(|e| format!("segue.{tag}: ticket_file {}: {e}", path.display()))?;
+            let ticket = ticket.trim().as_bytes().to_vec();
+            if ticket.is_empty() {
+                return Err(format!("segue.{tag}: ticket_file is empty"));
+            }
+            segue.insert(
+                tag.clone(),
+                SegueRoute {
+                    carrier: r.carrier.clone(),
+                    relay: r.relay,
+                    ticket,
+                    exit_class,
+                    anchor_node_id: r.anchor_node_id,
+                },
+            );
+        }
+        // Tags a rule may name: engine outbounds and session routes.
+        let mut known = raw.outbounds.clone();
+        for tag in segue.keys() {
+            known.insert(tag.clone(), Value::Null);
+        }
         for tag in rules.proxy_tags() {
-            if !raw.outbounds.contains_key(tag) {
+            if !known.contains_key(tag) {
                 return Err(format!("rule refers to unknown outbound {tag:?}"));
             }
         }
@@ -208,11 +273,8 @@ impl KernelConfig {
                 })
             }
         };
-        let dns = raw
-            .dns
-            .map(|d| dns_config(d, &raw.outbounds, base))
-            .transpose()?;
-        let udp = raw.udp.map(|u| udp_config(u, &raw.outbounds)).transpose()?;
+        let dns = raw.dns.map(|d| dns_config(d, &known, base)).transpose()?;
+        let udp = raw.udp.map(|u| udp_config(u, &known)).transpose()?;
         Ok(Self {
             listen: raw.listen,
             outbounds: raw.outbounds,
@@ -220,6 +282,7 @@ impl KernelConfig {
             sniff,
             dns,
             udp,
+            segue,
         })
     }
 }

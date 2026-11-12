@@ -93,7 +93,10 @@ impl Relay {
         )?);
         let dialer = Arc::new(Dialer {
             node_id: cfg.node_id,
-            guard: guard.unwrap_or_else(|| Guard::new(cfg.blocked_cidrs.clone())),
+            guard: guard.unwrap_or_else(|| Guard {
+                extra_blocked: cfg.blocked_cidrs.clone(),
+                exceptions: cfg.dev_allow_cidrs.clone(),
+            }),
             ai: cfg.ai.clone(),
             home: home.clone(),
             claims: claims.clone(),

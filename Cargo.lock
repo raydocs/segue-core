@@ -2192,6 +2192,7 @@ dependencies = [
  "segue-config",
  "segue-engine",
  "segue-routing",
+ "segue-session",
  "segue-transport",
  "serde",
  "serde_json",
