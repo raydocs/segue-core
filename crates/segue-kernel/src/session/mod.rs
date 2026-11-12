@@ -534,7 +534,10 @@ impl KernelDialer {
                 return Err((DialError("refused: disconnected".into()), None));
             }
             if let Some(c) = st.revoked {
-                return Err((DialError(format!("refused: device revoked (code {c})")), Some(c)));
+                return Err((
+                    DialError(format!("refused: device revoked (code {c})")),
+                    Some(c),
+                ));
             }
             if self.exits.is_empty() {
                 return Err((DialError("refused: no exits configured".into()), None));
@@ -565,14 +568,16 @@ impl KernelDialer {
         };
         let s = ClientSession::new(Default::default(), &self.pool, params, Instant::now())
             .ok_or_else(|| (DialError("refused: session memory exhausted".into()), None))?;
+        // Pool-charged and released when drained (tokio's duplex keeps a
+        // burst's capacity for the life of the stream); its reserved blocks
+        // are taken here, so a spent pool refuses instead of overcommitting.
+        let (app, far) = segue_session::pipe::pipe(&self.pool, 64 << 10)
+            .ok_or_else(|| (DialError("refused: session memory exhausted".into()), None))?;
         let ch = &self.channels[i];
         let sid = s.session_id();
         let (stall_tx, stall_rx) = mpsc::unbounded_channel();
         ch.sessions.lock().unwrap().insert(sid, stall_tx);
         let sessions = ch.sessions.clone();
-        // Pool-charged and released when drained (tokio's duplex keeps a
-        // burst's capacity for the life of the stream).
-        let (app, far) = segue_session::pipe::pipe(&self.pool, 64 << 10);
         let (open_tx, open_rx) = tokio::sync::oneshot::channel();
         let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel();
         let ctl = ClientCtl {

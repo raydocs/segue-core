@@ -440,6 +440,9 @@ impl RelayTable {
                 else {
                     return self.reject(cid, code::CAPACITY, o.attach_gen, None);
                 };
+                let Some(send) = SendHalf::new(&self.pool, &self.cfg.limits) else {
+                    return self.reject(cid, code::CAPACITY, o.attach_gen, None);
+                };
                 if !o.first_data.is_empty() && recv.on_data(0, &o.first_data, now).is_err() {
                     return self.reject(cid, code::PROTOCOL, o.attach_gen, None);
                 }
@@ -453,7 +456,7 @@ impl RelayTable {
                     state: SessionState::Connecting,
                     last_progress: now,
                     detached_since: None,
-                    send: SendHalf::new(&self.pool, &self.cfg.limits),
+                    send,
                     recv,
                     rst: None,
                     created: now,

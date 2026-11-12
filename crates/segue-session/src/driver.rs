@@ -17,10 +17,8 @@ use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
 use crate::client::{ClientSession, CloseReason, State};
-use crate::codec::{
-    code, ty, CtrlHello, Frame, FrameDecoder, Kind, SessionId, Target, MAX_PAYLOAD,
-};
-use crate::pool::{Grant as PoolGrant, Pool};
+use crate::codec::{code, ty, CtrlHello, Frame, FrameDecoder, Kind, SessionId, Target};
+use crate::pool::{Grant as PoolGrant, Loan, Pool, Reserve, FRAME_MAX};
 use crate::relay::{Grant, RelayEvent, RelayTable};
 use crate::ProtoError;
 
@@ -113,15 +111,21 @@ pub enum RelayCtrl {
 /// Messages per writer channel.
 const WRITE_QUEUE: usize = 8;
 const CHUNK: usize = 16 * 1024;
-/// Largest encoded frame (payload plus type and length).
-const FRAME_MAX: usize = MAX_PAYLOAD + 16;
 
-/// A message for a writer task, with the pool blocks that cover it until
-/// it is written (client side: bytes leave the session's grants when they
-/// are queued, so the queue is charged on its own).
+/// What covers a buffer: blocks from the pool, or a loan from the
+/// session's reserve when the pool is spent (r5 N13: no buffer is outside
+/// the pool, so its size is a real bound).
+enum Charge {
+    Pool(PoolGrant),
+    Loan(Loan),
+}
+
+/// A message for a writer task, with what covers it until it is written
+/// (client side: bytes leave the session's grants when they are queued, so
+/// the queue is charged on its own).
 struct Out {
     data: Vec<u8>,
-    _charge: Option<PoolGrant>,
+    _charge: Option<Charge>,
 }
 
 impl From<Vec<u8>> for Out {
@@ -133,27 +137,95 @@ impl From<Vec<u8>> for Out {
     }
 }
 
-/// `data` charged with `g`, shrunk to what `data` holds.
-fn charged(data: Vec<u8>, mut g: Option<PoolGrant>) -> Out {
-    if let Some(g) = &mut g {
-        g.try_resize(data.capacity());
+/// `data` charged with `c`, shrunk to what `data` holds.
+fn charged(data: Vec<u8>, mut c: Charge) -> Out {
+    match &mut c {
+        Charge::Pool(g) => {
+            g.try_resize(data.capacity());
+        }
+        Charge::Loan(l) => l.shrink(data.capacity()),
     }
-    Out { data, _charge: g }
+    Out {
+        data,
+        _charge: Some(c),
+    }
 }
 
-/// Blocks for a message of up to `bytes` about to be queued on `tx`:
-/// `Some(Some(_))` charged, `Some(None)` uncharged because the pool is short
-/// but the queue is empty (one message in flight keeps the session moving
-/// and cannot deadlock on its own grants), `None` wait for blocks.
-fn queue_charge(
+/// Cover `bytes` from the pool, else up to `loan_max` of them from
+/// `reserve`. Returns the charge and how many bytes it covers; `None`:
+/// wait for blocks or a returned loan.
+fn try_charge(
     pool: &Arc<Pool>,
-    tx: &mpsc::Sender<Out>,
+    reserve: &Arc<Reserve>,
     bytes: usize,
-) -> Option<Option<PoolGrant>> {
-    match PoolGrant::fixed(pool, bytes) {
-        Some(g) => Some(Some(g)),
-        None if tx.capacity() == tx.max_capacity() => Some(None),
-        None => None,
+    loan_max: usize,
+) -> Option<(Charge, usize)> {
+    if let Some(g) = PoolGrant::fixed(pool, bytes) {
+        return Some((Charge::Pool(g), bytes));
+    }
+    let n = bytes.min(loan_max);
+    reserve.lend(n).map(|l| (Charge::Loan(l), n))
+}
+
+/// Until blocks or a loan come back. The short timeout only covers a
+/// wake-up missed between the failed attempt and this call.
+async fn freed(pool: &Pool, reserve: &Reserve) {
+    tokio::select! {
+        _ = pool.freed() => {}
+        _ = reserve.returned() => {}
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+}
+
+async fn wait_charge(
+    pool: &Arc<Pool>,
+    reserve: &Arc<Reserve>,
+    bytes: usize,
+    loan_max: usize,
+) -> (Charge, usize) {
+    loop {
+        if let Some(c) = try_charge(pool, reserve, bytes, loan_max) {
+            return c;
+        }
+        freed(pool, reserve).await;
+    }
+}
+
+/// The decoder's memory: pool blocks as far as they go, the rest lent.
+struct DecoderCover {
+    pool: Arc<Pool>,
+    reserve: Arc<Reserve>,
+    grant: PoolGrant,
+    loan: Option<Loan>,
+}
+
+impl DecoderCover {
+    fn try_cover(&mut self, bytes: usize) -> bool {
+        if self.grant.bytes() > bytes {
+            self.grant.try_resize(bytes);
+        } else {
+            self.grant.grow_towards(bytes);
+        }
+        let short = bytes.saturating_sub(self.grant.bytes());
+        if short == 0 {
+            self.loan = None;
+            return true;
+        }
+        if let Some(l) = &mut self.loan {
+            if l.bytes() >= short {
+                l.shrink(short);
+                return true;
+            }
+        }
+        self.loan = None;
+        self.loan = self.reserve.lend(short);
+        self.loan.is_some()
+    }
+
+    async fn cover(&mut self, bytes: usize) {
+        while !self.try_cover(bytes) {
+            freed(&self.pool, &self.reserve).await;
+        }
     }
 }
 
@@ -162,35 +234,52 @@ fn now() -> std::time::Instant {
 }
 
 enum CarrierEv {
-    Frame(u64, Result<Frame, ProtoError>),
+    /// With what covers the decoded frame until it is handled.
+    Frame(u64, Result<Frame, ProtoError>, Option<Charge>),
     Closed(u64),
 }
 
-/// Reader task: decode frames until EOF or a decode error.
+/// Reader task: decode frames until EOF or a decode error. With `pool`
+/// (client side) the decoder and every decoded frame are covered by the
+/// pool or `reserve`: the decoder never holds more than one frame
+/// (reads stop at [`FRAME_MAX`]), and a frame that cannot be covered waits
+/// before it is queued.
 fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
     cid: u64,
     mut r: R,
     tx: mpsc::Sender<CarrierEv>,
-    pool: Option<Arc<Pool>>,
+    pool: Option<(Arc<Pool>, Arc<Reserve>)>,
 ) -> Task {
     spawn(async move {
         let mut dec = FrameDecoder::new();
-        let mut dec_charge = pool.as_ref().map(|p| PoolGrant::new(p, false));
-        let mut buf = ReadBuffer::new(pool);
+        let mut cover = pool.as_ref().map(|(p, r)| DecoderCover {
+            pool: p.clone(),
+            reserve: r.clone(),
+            grant: PoolGrant::new(p, false),
+            loan: None,
+        });
+        let mut buf = ReadBuffer::new(pool.as_ref().map(|(p, _)| p.clone()));
         loop {
+            let mut room = buf.len();
+            if let Some(c) = &mut cover {
+                room = room.min(FRAME_MAX.saturating_sub(dec.buffered())).max(1);
+                // `push` drops consumed bytes, then grows exactly.
+                c.cover(dec.held_bytes().max(dec.buffered() + room)).await;
+            }
             // A large buffer goes back once the stream has been quiet for
             // READ_IDLE (cancelling a pending read loses nothing).
             let idle = buf
                 .idle_at()
                 .or_else(|| (dec.held_bytes() > 0).then_some(buf.last + READ_IDLE));
             let read = match idle {
-                Some(at) => match tokio::time::timeout_at(at, r.read(buf.get())).await {
+                Some(at) => match tokio::time::timeout_at(at, r.read(&mut buf.get()[..room])).await
+                {
                     Ok(r) => r,
                     Err(_) => {
                         buf.shrink();
                         dec.release_idle();
-                        if let Some(g) = &mut dec_charge {
-                            g.try_resize(dec.held_bytes());
+                        if let Some(c) = &mut cover {
+                            c.try_cover(dec.held_bytes());
                         }
                         if dec.held_bytes() > 0 {
                             // A partial frame: wait for the rest.
@@ -199,30 +288,34 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
                         continue;
                     }
                 },
-                None => r.read(buf.get()).await,
+                None => r.read(&mut buf.get()[..room]).await,
             };
             match read {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     dec.push(&buf.get()[..n]);
-                    buf.adapt(n);
-                    if let Some(g) = &mut dec_charge {
-                        // Best effort: a partial frame must be kept anyway.
-                        g.try_resize(0);
-                        g.grow_towards(dec.held_bytes());
-                    }
+                    // A read cut short by `room` is not a slow stream.
+                    buf.adapt(if n == room { buf.len() } else { n });
                 }
             }
             loop {
+                let before = dec.buffered();
                 match dec.next_frame() {
                     Ok(Some(f)) => {
-                        if tx.send(CarrierEv::Frame(cid, Ok(f))).await.is_err() {
+                        let charge = match &pool {
+                            Some((p, r)) => {
+                                let bytes = before - dec.buffered();
+                                Some(wait_charge(p, r, bytes, bytes).await.0)
+                            }
+                            None => None,
+                        };
+                        if tx.send(CarrierEv::Frame(cid, Ok(f), charge)).await.is_err() {
                             return;
                         }
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        let _ = tx.send(CarrierEv::Frame(cid, Err(e))).await;
+                        let _ = tx.send(CarrierEv::Frame(cid, Err(e), None)).await;
                         let _ = tx.send(CarrierEv::Closed(cid)).await;
                         return;
                     }
@@ -300,11 +393,7 @@ impl ReadBuffer {
 /// bounds that with [`Tasks::drain`] or aborts the task). A write failure
 /// closes the queue (later sends fail, nothing is silently swallowed) and
 /// runs `on_err`, which reports it to the state machine.
-fn spawn_writer<W, F>(
-    mut w: W,
-    writable: Arc<Notify>,
-    on_err: F,
-) -> (mpsc::Sender<Out>, Task)
+fn spawn_writer<W, F>(mut w: W, writable: Arc<Notify>, on_err: F) -> (mpsc::Sender<Out>, Task)
 where
     W: AsyncWrite + Unpin + Send + 'static,
     F: Future<Output = ()> + Send + 'static,
@@ -461,6 +550,7 @@ where
     let mut app_eof = false;
     let mut app_shut = false;
     let pool = s.pool().clone();
+    let reserve = s.reserve().clone();
     let mut abuf = ReadBuffer::new(Some(pool.clone()));
     // A queued message the pool could not cover is waiting for blocks.
     let mut pool_blocked;
@@ -488,12 +578,14 @@ where
         tasks.prune();
         pool_blocked = false;
         // Carrier output, generated only while the writer has room. Each
-        // queued frame is charged to the pool (an empty queue may take one
-        // uncharged so the session always progresses).
+        // queued frame is charged to the pool, or with the pool spent to
+        // the session's reserve (one frame), so the session always
+        // progresses without memory outside the pool.
         if let Some(cid) = s.carrier() {
             if let Some(io) = carriers.get(&cid) {
                 while io.tx.capacity() > 0 {
-                    let Some(g) = queue_charge(&pool, &io.tx, FRAME_MAX) else {
+                    let Some((g, _)) = try_charge(&pool, &reserve.carrier, FRAME_MAX, FRAME_MAX)
+                    else {
                         pool_blocked = true;
                         break;
                     };
@@ -510,15 +602,11 @@ where
         while app_tx.capacity() > 0 && !app_shut && !app_tx.is_closed() {
             let avail = s.recv_half().buffered().min(CHUNK);
             if avail > 0 {
-                let Some(g) = queue_charge(&pool, &app_tx, avail) else {
+                // Pool short: one reserved block at a time.
+                let Some((g, avail)) = try_charge(&pool, &reserve.app, avail, crate::pool::BLOCK)
+                else {
                     pool_blocked = true;
                     break;
-                };
-                // Uncharged (pool short): one block at a time.
-                let avail = if g.is_some() {
-                    avail
-                } else {
-                    avail.min(crate::pool::BLOCK)
                 };
                 let mut v = vec![0u8; avail];
                 let n = s.read(&mut v, t);
@@ -557,8 +645,8 @@ where
             ev = ev_rx.recv() => {
                 let t = now();
                 match ev {
-                    Some(CarrierEv::Frame(cid, Ok(f))) => { let _ = s.on_frame(cid, f, t); }
-                    Some(CarrierEv::Frame(cid, Err(e))) => s.on_decode_error(cid, e),
+                    Some(CarrierEv::Frame(cid, Ok(f), _c)) => { let _ = s.on_frame(cid, f, t); }
+                    Some(CarrierEv::Frame(cid, Err(e), _)) => s.on_decode_error(cid, e),
                     Some(CarrierEv::Closed(cid)) => {
                         s.on_carrier_closed(cid, t);
                         if let Some(io) = carriers.remove(&cid) {
@@ -577,7 +665,12 @@ where
                         Ok(stream) => {
                             connect_backoff = None;
                             let (r, w) = tokio::io::split(stream);
-                            let reader = spawn_reader(cid, r, ev_tx.clone(), Some(pool.clone()));
+                            let reader = spawn_reader(
+                                cid,
+                                r,
+                                ev_tx.clone(),
+                                Some((pool.clone(), reserve.reader.clone())),
+                            );
                             let etx = ev_tx.clone();
                             let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                                 let _ = etx.send(CarrierEv::Closed(cid)).await;
@@ -632,7 +725,13 @@ where
                 }
             }
             _ = writable.notified() => {}
-            _ = pool.freed(), if pool_blocked => {}
+            _ = async {
+                tokio::select! {
+                    _ = pool.freed() => {}
+                    _ = reserve.carrier.returned() => {}
+                    _ = reserve.app.returned() => {}
+                }
+            }, if pool_blocked => {}
             _ = tokio::time::sleep_until(abuf_idle.unwrap_or_else(tokio::time::Instant::now)), if abuf_idle.is_some() => {
                 abuf.shrink();
             }
@@ -666,13 +765,19 @@ where
         if !app_shut {
             delivered = tokio::time::timeout_at(until, async {
                 loop {
-                    let mut v = vec![0u8; s.recv_half().buffered().min(CHUNK)];
+                    let avail = s.recv_half().buffered().min(CHUNK);
+                    if avail == 0 {
+                        break;
+                    }
+                    let (g, avail) =
+                        wait_charge(&pool, &reserve.app, avail, crate::pool::BLOCK).await;
+                    let mut v = vec![0u8; avail];
                     let n = s.read(&mut v, now());
                     if n == 0 {
                         break;
                     }
                     v.truncate(n);
-                    if app_tx.send(v.into()).await.is_err() {
+                    if app_tx.send(charged(v, g)).await.is_err() {
                         return false;
                     }
                 }
@@ -930,8 +1035,8 @@ pub async fn run_relay_ctl(
             ev = ev_rx.recv() => {
                 let t = now();
                 match ev {
-                    Some(CarrierEv::Frame(cid, Ok(f))) => table.on_frame(cid, f, t),
-                    Some(CarrierEv::Frame(cid, Err(e))) => table.on_decode_error(cid, e),
+                    Some(CarrierEv::Frame(cid, Ok(f), _)) => table.on_frame(cid, f, t),
+                    Some(CarrierEv::Frame(cid, Err(e), _)) => table.on_decode_error(cid, e),
                     Some(CarrierEv::Closed(cid)) => {
                         if let Some(io) = carriers.remove(&cid) {
                             io.reader.abort();

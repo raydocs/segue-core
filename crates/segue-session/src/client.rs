@@ -100,6 +100,9 @@ impl std::fmt::Debug for OpenParams {
 pub const LOCAL_GIVE_UP: u8 = code::CONNECT_TIMEOUT;
 
 pub struct ClientSession {
+    /// Taken at admission so the driver's buffers stay inside the pool
+    /// when it is spent (r5 N13).
+    reserve: Arc<crate::pool::SessionReserve>,
     cfg: Config,
     session_id: SessionId,
     secret: Secret,
@@ -165,8 +168,10 @@ impl ClientSession {
         now: Instant,
     ) -> Option<Self> {
         let recv = RecvHalf::new(pool, &cfg.limits, &cfg.timing, now)?;
-        let send = SendHalf::new(pool, &cfg.limits);
+        let send = SendHalf::new(pool, &cfg.limits)?;
+        let reserve = crate::pool::SessionReserve::new(pool)?;
         Some(Self {
+            reserve: Arc::new(reserve),
             backoff: std::time::Duration::from_millis(200),
             cfg,
             session_id,
@@ -198,6 +203,11 @@ impl ClientSession {
     /// The pool this session's buffers are charged to.
     pub fn pool(&self) -> &Arc<Pool> {
         self.recv.pool()
+    }
+
+    /// What the driver may use when the pool is spent.
+    pub fn reserve(&self) -> &Arc<crate::pool::SessionReserve> {
+        &self.reserve
     }
 
     pub fn session_id(&self) -> SessionId {

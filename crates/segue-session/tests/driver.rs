@@ -556,8 +556,12 @@ async fn aborting_the_client_driver_releases_its_carrier_and_dial() {
     let calls = Arc::new(AtomicUsize::new(0));
     let peers = Arc::new(Mutex::new(Vec::new()));
     let connector: Connector = {
-        let (carrier_gone, dial_gone, calls, peers) =
-            (carrier_gone.clone(), dial_gone.clone(), calls.clone(), peers.clone());
+        let (carrier_gone, dial_gone, calls, peers) = (
+            carrier_gone.clone(),
+            dial_gone.clone(),
+            calls.clone(),
+            peers.clone(),
+        );
         Arc::new(move || {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             let (carrier_gone, dial_gone, peers) =
@@ -648,7 +652,9 @@ async fn a_drain_cut_short_is_never_reported_clean() {
         closed: Some(closed_tx),
         ..Default::default()
     };
-    let client = tokio::spawn(segue_session::driver::run_client_ctl(s, far, connector, ctl));
+    let client = tokio::spawn(segue_session::driver::run_client_ctl(
+        s, far, connector, ctl,
+    ));
     app.write_all(b"GET /big HTTP/1.1\r\n\r\n").await.unwrap();
     app.shutdown().await.unwrap();
     // Paused well past the drain bound.
