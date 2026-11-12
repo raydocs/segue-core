@@ -39,12 +39,12 @@ cmp "$WORKSPACE_ROOT/tests/fixtures/chrome-parrot/initials.json" "$TEST_ROOT/ini
 # the same ClientHello but for the key shares' key material.
 cd "$WORKSPACE_ROOT"
 XRAY_CHROME_PARROT_INITIALS="$TEST_ROOT/initials.json" \
-  cargo test --locked -p xray-transport --test chrome_parrot_tests
+  cargo test --locked -p segue-transport --test chrome_parrot_tests
 XRAY_CHROME_PARROT_INITIALS="$TEST_ROOT/initials.json" \
-  cargo test --locked -p xray-transport --lib chrome_parrot::
-cargo test --locked -p xray-config --test chrome_parrot_tests
-cargo test --locked -p xray-core-rs --lib -- chrome_parrot quic_never_parrots_chrome
-cargo test --locked -p xray-core-rs --test core_lifecycle_tests chrome_parrot
+  cargo test --locked -p segue-transport --lib chrome_parrot::
+cargo test --locked -p segue-config --test chrome_parrot_tests
+cargo test --locked -p segue-engine --lib -- chrome_parrot quic_never_parrots_chrome
+cargo test --locked -p segue-engine --test core_lifecycle_tests chrome_parrot
 
 # Every recorded verdict of the disableChromeParrot corpus, rechecked with
 # `xray run -test`.
@@ -58,8 +58,8 @@ python3 scripts/check-config-verdicts.py \
 # core. A relay records the client's datagrams and the first flight on the
 # wire is checked for ChromeParrot's shape.
 env -u NATIVE_HYSTERIA_BINARY XRAY_HYSTERIA_BINARY="$TEST_ROOT/xray" \
-  cargo test --locked -p xray-transport --test hysteria_interop_tests chrome_parrot \
+  cargo test --locked -p segue-transport --test hysteria_interop_tests chrome_parrot \
     -- --ignored --nocapture
 XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" XRAY_CORE_CHECKOUT="$CHECKOUT" \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests xhttp_h3_chrome_parrot \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests xhttp_h3_chrome_parrot \
     -- --ignored --nocapture --test-threads=1

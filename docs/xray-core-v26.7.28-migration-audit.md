@@ -29,9 +29,9 @@ date-labelled result groups and sections.
 ## Implemented synchronization
 
 - The REALITY authenticated ClientHello advertises `[26, 7, 28]` in
-  `crates/xray-transport/src/reality_runtime.rs`. This is new enough for the
+  `crates/segue-transport/src/reality_runtime.rs`. This is new enough for the
   target server's default `minClientVer` of `26.3.27`.
-- `xray-utls` contains the target's explicit `hellochrome_133`,
+- `segue-utls` contains the target's explicit `hellochrome_133`,
   `hellofirefox_148`, and `hellosafari_26_3` names. Its random/modern pool is
   the target's eleven-profile pool; profiles removed from that pool remain
   available by explicit name.
@@ -307,19 +307,19 @@ go run ./tools/reality-oracle/session_id_vectors.go \
 go run ./tools/reality-oracle/clienthello_fixture.go \
   --check tests/fixtures/reality/clienthello_chrome_auto.json
 bash scripts/verify-oracle-fixtures.sh
-cargo test --locked -p xray-transport reality
+cargo test --locked -p segue-transport reality
 ```
 
 Then run the ignored local Xray-core suite and the complete XHTTP matrix:
 
 ```sh
 XRAY_CORE_CHECKOUT="$XRAY_CORE_CHECKOUT" \
-cargo test --locked -p xray-core-rs \
+cargo test --locked -p segue-engine \
   --test local_xray_interop_tests -- --ignored --nocapture
 
 XRAY_CORE_CHECKOUT="$XRAY_CORE_CHECKOUT" \
 XRAY_XHTTP_INTEROP_CASES=all \
-cargo test --locked -p xray-core-rs \
+cargo test --locked -p segue-engine \
   --test local_xray_interop_tests \
   rust_socks_client_reaches_echo_server_through_local_xray_vless_xhttp_selected_cases \
   -- --ignored --nocapture

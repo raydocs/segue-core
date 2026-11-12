@@ -91,12 +91,12 @@ fi
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- \
   -D warnings -W clippy::perf -W clippy::suspicious
-cargo test --workspace --exclude xray-rust-fuzz --all-targets --locked
+cargo test --workspace --exclude segue-fuzz --all-targets --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 bash scripts/tests/check-mobile-toolchains.test.sh
 ```
 
-The workspace test command excludes `xray-rust-fuzz` because `--all-targets`
+The workspace test command excludes `segue-fuzz` because `--all-targets`
 would otherwise build and launch libFuzzer binaries as ordinary test targets.
 Those targets have their own bounded RC gate and explicit longer-run workflow.
 
@@ -199,23 +199,23 @@ The main local integration target exercises SOCKS, HTTP CONNECT, TUN,
 Freedom/VLESS, TLS, routing, DNS, UDP/XUDP, Vision, backpressure, and ICMP:
 
 ```sh
-cargo test --locked -p xray-core-rs --test runtime_data_path_tests
+cargo test --locked -p segue-engine --test runtime_data_path_tests
 ```
 
 Protocol/transport tests can be run separately:
 
 ```sh
-cargo test --locked -p xray-proxy
-cargo test --locked -p xray-transport
-cargo test --locked -p xray-config
+cargo test --locked -p segue-proxy
+cargo test --locked -p segue-transport
+cargo test --locked -p segue-config
 ```
 
 The C header, exported artifacts, adapter contracts, and build-script target
 matrices are covered by:
 
 ```sh
-cargo test --locked -p xray-ffi --test ffi_tests
-cargo test --locked -p xray-ffi --test mobile_artifacts_tests -- --nocapture
+cargo test --locked -p segue-ffi --test ffi_tests
+cargo test --locked -p segue-ffi --test mobile_artifacts_tests -- --nocapture
 ```
 
 ## Deterministic REALITY checks
@@ -230,7 +230,7 @@ go run -tags reality_oracle_certificate_binding \
   --check tests/fixtures/reality/certificate_binding_vectors.json
 go run ./tools/reality-oracle/clienthello_fixture.go \
   --check tests/fixtures/reality/clienthello_chrome_auto.json
-cargo test --locked -p xray-transport reality
+cargo test --locked -p segue-transport reality
 ```
 
 They cover session-ID sealing, ClientHello shaping/patching, certificate
@@ -318,7 +318,7 @@ Run a focused REALITY+Vision interoperability test:
 
 ```sh
 XRAY_CORE_CHECKOUT="$XRAY_CORE_CHECKOUT" \
-cargo test --locked -p xray-core-rs \
+cargo test --locked -p segue-engine \
   --test local_xray_interop_tests \
   rust_socks_client_reaches_echo_server_through_local_xray_vless_reality_vision \
   -- --ignored --nocapture
@@ -328,7 +328,7 @@ Or run all ignored local Xray-core scenarios:
 
 ```sh
 XRAY_CORE_CHECKOUT="$XRAY_CORE_CHECKOUT" \
-cargo test --locked -p xray-core-rs \
+cargo test --locked -p segue-engine \
   --test local_xray_interop_tests -- --ignored --nocapture
 ```
 
@@ -447,7 +447,7 @@ Run the exact complete matrix with the stable `all` selector:
 ```sh
 XRAY_CORE_CHECKOUT="$XRAY_CORE_CHECKOUT" \
 XRAY_XHTTP_INTEROP_CASES=all \
-cargo test --locked -p xray-core-rs \
+cargo test --locked -p segue-engine \
   --test local_xray_interop_tests \
   rust_socks_client_reaches_echo_server_through_local_xray_vless_xhttp_selected_cases \
   -- --ignored --nocapture
@@ -459,7 +459,7 @@ pass comma-separated case ids; for example, the exact H3 slice is:
 ```sh
 XRAY_CORE_CHECKOUT="$XRAY_CORE_CHECKOUT" \
 XRAY_XHTTP_INTEROP_CASES=h3-tls-packet-up,h3-tls-stream-up,h3-tls-stream-one \
-cargo test --locked -p xray-core-rs \
+cargo test --locked -p segue-engine \
   --test local_xray_interop_tests \
   rust_socks_client_reaches_echo_server_through_local_xray_vless_xhttp_selected_cases \
   -- --ignored --nocapture
@@ -485,7 +485,7 @@ Five ignored scenarios reach a real Xray gRPC inbound. Run them together with:
 
 ```sh
 XRAY_CORE_CHECKOUT="$XRAY_CORE_CHECKOUT" \
-cargo test --locked -p xray-core-rs \
+cargo test --locked -p segue-engine \
   --test local_xray_interop_tests grpc -- --ignored --nocapture
 ```
 
@@ -522,7 +522,7 @@ Example for the Rust client only:
 ```sh
 XRAY_REALITY_LIVE_CONFIG_PATH=/absolute/path/to/private-config.json \
 XRAY_REALITY_LIVE_TARGETS=host-you-control.example:8080 \
-cargo test --locked -p xray-core-rs \
+cargo test --locked -p segue-engine \
   --test live_reality_node_tests \
   rust_core_live_reality_node_reads_parallel_speedtest_http_responses \
   -- --ignored --nocapture

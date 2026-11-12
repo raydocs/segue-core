@@ -1,7 +1,7 @@
 # C ABI
 
 The canonical interface is
-[`crates/xray-ffi/include/xray_ffi.h`](../crates/xray-ffi/include/xray_ffi.h).
+[`crates/segue-ffi/include/segue_ffi.h`](../crates/segue-ffi/include/segue_ffi.h).
 This page explains its lifecycle and ownership rules; the header remains the
 source of truth for declarations and enum values.
 

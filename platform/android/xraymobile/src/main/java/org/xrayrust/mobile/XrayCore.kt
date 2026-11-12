@@ -593,7 +593,7 @@ class XrayCore private constructor(handle: Long) : Closeable {
 
     companion object {
         init {
-            System.loadLibrary("xray_ffi")
+            System.loadLibrary("segue_ffi")
             System.loadLibrary("xray_mobile_jni")
         }
 

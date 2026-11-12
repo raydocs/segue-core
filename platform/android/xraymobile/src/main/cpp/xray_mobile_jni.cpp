@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "xray_ffi.h"
+#include "segue_ffi.h"
 
 namespace {
 

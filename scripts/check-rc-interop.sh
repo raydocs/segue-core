@@ -61,7 +61,7 @@ env \
   -u XRAY_REMOTE_XHTTP_PROBE_HOST \
   -u XRAY_REMOTE_XHTTP_PROBE_PORT \
   -u XRAY_REMOTE_XHTTP_HOLD_TOKEN_FILE \
-  cargo test --locked -p xray-core-rs \
+  cargo test --locked -p segue-engine \
   --test local_xray_interop_tests \
   -- \
   --ignored \
@@ -70,14 +70,14 @@ env \
   --nocapture \
   --test-threads=1
 
-cargo build --locked --release -p xray-cli --bin xray-rust
-xray_rust_binary="${CARGO_TARGET_DIR:-target}/release/xray-rust"
+cargo build --locked --release -p segue-cli --bin xray-rust
+xray_rust_binary="${CARGO_TARGET_DIR:-target}/release/segue"
 
 # The process-level harness runs the same bounded UDP workload through the
 # Rust core and the exact Xray-core binary. Together these cover VLESS UDP and
 # mux.cool XUDP without pretending that throughput samples are benchmarks.
 for workload in udp-vless udp-xudp; do
-  cargo run --locked --release -p xray-bench -- \
+  cargo run --locked --release -p segue-bench -- \
     compare \
     --workload "$workload" \
     --xray-rust-bin "$xray_rust_binary" \
@@ -93,7 +93,7 @@ done
 # DNS outbound has no compatible external process boundary in the current
 # harness. Make its end-to-end TUN/SOCKS/HTTP policy slice an explicit RC gate
 # while the Go semantic oracle remains covered by migration fixtures/tests.
-cargo test --locked -p xray-core-rs \
+cargo test --locked -p segue-engine \
   --test runtime_data_path_tests \
   dns_outbound \
   -- \
@@ -103,22 +103,22 @@ cargo test --locked -p xray-core-rs \
 # Protocol-library oracles make the Phase 2 DNS wire contract explicit: TLS
 # length framing, HTTP/2 POST semantics, DoQ ALPN/stream framing, bootstrap
 # failover, negative caching, singleflight, and bounded stale refresh.
-cargo test --locked -p xray-transport --lib \
+cargo test --locked -p segue-transport --lib \
   dns_over_ \
   -- \
   --nocapture \
   --test-threads=1
-cargo test --locked -p xray-transport --lib \
+cargo test --locked -p segue-transport --lib \
   caching_dns_ \
   -- \
   --nocapture \
   --test-threads=1
-cargo test --locked -p xray-transport --lib \
+cargo test --locked -p segue-transport --lib \
   configured_dns_ \
   -- \
   --nocapture \
   --test-threads=1
-cargo test --locked -p xray-core-rs --lib \
+cargo test --locked -p segue-engine --lib \
   managed_dns_over_ \
   -- \
   --nocapture \

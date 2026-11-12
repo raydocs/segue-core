@@ -4165,7 +4165,7 @@ The TUN-local `198.18.0.1:53` anchor and
 IPv4-mapped IPv6 literals. With `UseIP`, the resolver sends A and AAAA
 concurrently and retains all usable answers in DNS order (A before AAAA);
 single-family strategies send only their selected query. All modes validate
-A/AAAA records plus CNAME chains in `xray-transport`; a CNAME-only follow stays
+A/AAAA records plus CNAME chains in `segue-transport`; a CNAME-only follow stays
 on the server that supplied the alias. If that continuation fails, the next
 selected server is retried with the original name; after the plan is exhausted,
 the alias is not sent to any other resolver. Classic delivery starts with UDP

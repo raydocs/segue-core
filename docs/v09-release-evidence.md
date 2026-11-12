@@ -93,7 +93,7 @@ Before touching a phone, check the candidate CLI against each Apple suite on
 the host:
 
 ```bash
-python3 scripts/check-v09-fixture-loopback.py --suite v09 --reference-binary <xray> --client-binary target/release/xray-rust --work-dir <new-dir>
+python3 scripts/check-v09-fixture-loopback.py --suite v09 --reference-binary <xray> --client-binary target/release/segue --work-dir <new-dir>
 ```
 
 It runs each client config with a SOCKS ingress instead of TUN and checks TCP

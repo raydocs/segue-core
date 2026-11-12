@@ -79,7 +79,7 @@ The existing mock tests continue to check the Rust stream's own half-close behav
 
 Observed on macOS arm64, 2026-09-11: all eight native live scenarios, all six
 existing Xray live scenarios and all seven source-guard tests passed. Strict
-Clippy for `xray-transport` and `xray-core-rs` test targets, Rust formatting,
+Clippy for `segue-transport` and `segue-engine` test targets, Rust formatting,
 shell syntax and the scheduled/prerelease workflow guards passed. The workflow
 includes the new gate; a remote CI run has not been performed here.
 

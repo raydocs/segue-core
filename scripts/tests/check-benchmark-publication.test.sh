@@ -246,7 +246,7 @@ engine_hashes = {
 }
 workspace = pathlib.Path("/tmp/xray-rust-benchmark-workspace")
 engine_paths = {
-    "xray-rust": workspace / "target/release/xray-rust",
+    "xray-rust": workspace / "target/release/segue",
     "xray-core": workspace / "target/bench-bin/xray-core-v26.7.28",
     "sing-box": workspace
     / "target/benchmarks/2026-08-29-v26.7.28/comparators/bin/sing-box-v1.13.20",
@@ -493,7 +493,7 @@ for scenario, engine, fields in series:
     provenance = {
         "harness_profile": "release",
         "workspace_git": {"revision": candidate_revision, "dirty": False},
-        "harness_binary_path": str(workspace / "target/release/xray-bench"),
+        "harness_binary_path": str(workspace / "target/release/segue-bench"),
         "harness_binary_sha256": "d" * 64,
         "engine_binary_path": str(engine_paths[engine]),
         "engine_binary_sha256": engine_hashes[engine],

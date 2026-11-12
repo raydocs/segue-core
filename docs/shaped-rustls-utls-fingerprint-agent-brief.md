@@ -42,7 +42,7 @@ rustls = { git = "https://github.com/aimalygin/shaped-rustls", branch = "xray/ru
 This is enough for the basic REALITY handshake mechanics, but not enough for
 full browser/uTLS impersonation.
 
-`xray-rust` also has a small `xray-utls` crate that contains the xray-core
+`xray-rust` also has a small `segue-utls` crate that contains the xray-core
 REALITY fingerprint registry and validation helpers. It accepts xray-core names
 such as `chrome`, `firefox`, `hellochrome_131`, `hellosafari_16_0`,
 `randomizednoalpn`, etc. This is name-level compatibility only.
@@ -259,7 +259,7 @@ The exact types can differ, but the design should keep these principles:
 After the low-level knobs exist, add profile specs that map xray-core
 fingerprint names to concrete ClientHello plans.
 
-This mapping can live in `xray-utls` or a separate profile crate. The low-level
+This mapping can live in `segue-utls` or a separate profile crate. The low-level
 rustls fork should not know about xray-core names directly unless we decide to
 make `shaped-rustls` a product-specific fork rather than a generally useful
 library.
@@ -267,7 +267,7 @@ library.
 Recommended split:
 
 - `shaped-rustls`: generic ClientHello shaping primitives
-- `xray-utls`: xray-core/uTLS fingerprint registry and profile specs
+- `segue-utls`: xray-core/uTLS fingerprint registry and profile specs
 - `xray-rust`: config parsing, REALITY setup, and passing the selected profile
   into `ClientConfig.client_hello_customizer`
 

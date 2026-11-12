@@ -136,20 +136,20 @@ flowchart TB
         App --> SDK
     end
 
-    SDK -->|"JSON config, packets or TUN fd,<br/>socket protection"| FFI["xray-ffi<br/>C ABI + Tokio runtime"]
-    CLI["xray-cli<br/>xray-rust run"]
-    FFI --> Config["xray-config<br/>Xray JSON subset, geodata"]
+    SDK -->|"JSON config, packets or TUN fd,<br/>socket protection"| FFI["segue-ffi<br/>C ABI + Tokio runtime"]
+    CLI["segue-cli<br/>xray-rust run"]
+    FFI --> Config["segue-config<br/>Xray JSON subset, geodata"]
     CLI --> Config
     Config --> Core
     FFI -->|"lifecycle, packets"| Core
     CLI --> Core
 
-    subgraph Core["xray-core-rs"]
+    subgraph Core["segue-engine"]
         Inbounds["Inbounds<br/>SOCKS5 · HTTP · TUN (smoltcp)"]
-        Routing["xray-routing<br/>rules, balancers"]
+        Routing["segue-routing<br/>rules, balancers"]
         DNS["DNS<br/>DoT · DoH · DoQ · fake IP"]
-        Outbounds["Outbounds · xray-proxy<br/>VLESS · VMess · Trojan · Shadowsocks<br/>Hysteria 2 · WireGuard"]
-        Transports["xray-transport<br/>TCP · TLS/uTLS · REALITY<br/>WS · gRPC · XHTTP · QUIC"]
+        Outbounds["Outbounds · segue-proxy<br/>VLESS · VMess · Trojan · Shadowsocks<br/>Hysteria 2 · WireGuard"]
+        Transports["segue-transport<br/>TCP · TLS/uTLS · REALITY<br/>WS · gRPC · XHTTP · QUIC"]
         Inbounds --> Routing
         Routing --> DNS
         Routing --> Outbounds
@@ -271,10 +271,10 @@ numbers beyond run-to-run spread
 Build the `xray-rust` binary, export a starting profile, validate it and run it:
 
 ```sh
-cargo build --locked -p xray-cli          # produces target/debug/xray-rust
-target/debug/xray-rust config example vless-tls > client.json
-target/debug/xray-rust config check --config client.json --json
-target/debug/xray-rust run -config client.json
+cargo build --locked -p segue-cli          # produces target/debug/segue
+target/debug/segue config example vless-tls > client.json
+target/debug/segue config check --config client.json --json
+target/debug/segue run -config client.json
 ```
 
 `config check` parses the profile without starting the core or touching the
@@ -288,7 +288,7 @@ at `127.0.0.1:1080`, routes directly through the host network, and waits for
 `Ctrl-C`:
 
 ```sh
-cargo run --locked -p xray-cli -- run \
+cargo run --locked -p segue-cli -- run \
   -config examples/freedom.json
 ```
 
@@ -410,19 +410,19 @@ This produces
 
 ```text
 crates/
-├── xray-cli               xray-rust command: run, config check/example/contract
-├── xray-config            Xray JSON subset and geodata parser with path-aware diagnostics
-├── xray-core-rs           lifecycle, inbounds, routing, outbound selection, DNS, TUN runtime
-├── xray-ffi               stable C ABI with an embedded Tokio runtime
-├── xray-proxy             client protocol wire formats: SOCKS/HTTP, VLESS, VMess, Trojan, Shadowsocks, Hysteria 2, WireGuard, Mux
-├── xray-transport         TCP, TLS, REALITY, DNS, dialing and shaped ClientHellos
-├── xray-routing           routing matchers and policy evaluation
-├── xray-tun               bounded packet queues and TUN abstractions
-├── xray-utls              uTLS ClientHello profile data
-├── xray-vless-encryption  VLESS encryption client
-├── xray-wireguard         WireGuard client with a userspace TCP/UDP interface
-├── xray-runtime           shutdown coordination
-└── xray-bench             benchmark harness against Xray-core and sing-box
+├── segue-cli               xray-rust command: run, config check/example/contract
+├── segue-config            Xray JSON subset and geodata parser with path-aware diagnostics
+├── segue-engine           lifecycle, inbounds, routing, outbound selection, DNS, TUN runtime
+├── segue-ffi               stable C ABI with an embedded Tokio runtime
+├── segue-proxy             client protocol wire formats: SOCKS/HTTP, VLESS, VMess, Trojan, Shadowsocks, Hysteria 2, WireGuard, Mux
+├── segue-transport         TCP, TLS, REALITY, DNS, dialing and shaped ClientHellos
+├── segue-routing           routing matchers and policy evaluation
+├── segue-tun               bounded packet queues and TUN abstractions
+├── segue-utls              uTLS ClientHello profile data
+├── segue-vless-encryption  VLESS encryption client
+├── segue-wireguard         WireGuard client with a userspace TCP/UDP interface
+├── segue-runtime           shutdown coordination
+└── segue-bench             benchmark harness against Xray-core and sing-box
 platform/
 ├── android                Kotlin wrapper, JNI bridge, VpnService and device-test apps
 └── apple                  Swift Package, Packet Tunnel provider and Xcode sample app
@@ -461,13 +461,13 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) first. Run the same Rust checks used by 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- \
   -D warnings -W clippy::perf -W clippy::suspicious
-cargo test --workspace --exclude xray-rust-fuzz --all-targets --locked
+cargo test --workspace --exclude segue-fuzz --all-targets --locked
 ```
 
 For a self-contained data-path test that needs no external server:
 
 ```sh
-cargo test --locked -p xray-core-rs \
+cargo test --locked -p segue-engine \
   --test runtime_data_path_tests \
   socks_client_reaches_echo_target_through_freedom_outbound
 ```

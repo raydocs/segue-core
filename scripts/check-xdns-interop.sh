@@ -33,12 +33,12 @@ oracle "$TEST_ROOT/vectors-full.json" full
 
 cd "$WORKSPACE_ROOT"
 XRAY_XDNS_VECTORS="$TEST_ROOT/vectors-full.json" \
-  cargo test --locked -p xray-transport --lib xdns::
-cargo test --locked -p xray-transport --lib hysteria::carrier
-cargo test --locked -p xray-config --lib parser::xdns
-cargo test --locked -p xray-config --test xdns_tests
-cargo test --locked -p xray-core-rs --lib outbound::carrier::tests
-cargo test --locked -p xray-core-rs --lib outbound::hysteria
+  cargo test --locked -p segue-transport --lib xdns::
+cargo test --locked -p segue-transport --lib hysteria::carrier
+cargo test --locked -p segue-config --lib parser::xdns
+cargo test --locked -p segue-config --test xdns_tests
+cargo test --locked -p segue-engine --lib outbound::carrier::tests
+cargo test --locked -p segue-engine --lib outbound::hysteria
 
 # The client against Xray-core's own server, which answers as the domain's
 # DNS server: mKCP through UDP and TCP resolvers, masks inside xdns, and
@@ -46,10 +46,10 @@ cargo test --locked -p xray-core-rs --lib outbound::hysteria
 env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
   go -C "$CHECKOUT" build -mod=readonly -o "$TEST_ROOT/xray" ./main
 XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" XRAY_CORE_CHECKOUT="$CHECKOUT" \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests xdns:: \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests xdns:: \
     -- --ignored --nocapture --test-threads=1
 
 # Hysteria, alone and around Salamander.
 env -u NATIVE_HYSTERIA_BINARY XRAY_HYSTERIA_BINARY="$TEST_ROOT/xray" \
-  cargo test --locked -p xray-transport --test hysteria_interop_tests xdns:: \
+  cargo test --locked -p segue-transport --test hysteria_interop_tests xdns:: \
     -- --ignored --nocapture --test-threads=1

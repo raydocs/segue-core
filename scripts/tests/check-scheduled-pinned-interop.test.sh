@@ -168,7 +168,7 @@ option_value() {
 case "${1:-}" in
   test)
     assert_args "scheduled interop test" \
-      test --locked -p xray-core-rs --test local_xray_interop_tests \
+      test --locked -p segue-engine --test local_xray_interop_tests \
       -- --ignored --skip vless_encryption:: --skip xhttp_download:: --skip rust_socks_client_reaches_target_through_remote_xhttp_profile --nocapture --test-threads=1
 
     [[ -z "${GOFLAGS+x}" ]] || die 'scheduled interop test inherited GOFLAGS'
@@ -196,7 +196,7 @@ case "${1:-}" in
     ;;
   build)
     assert_args "scheduled xray-rust build" \
-      build --locked --release -p xray-cli --bin xray-rust
+      build --locked --release -p segue-cli --bin xray-rust
     case "$FAKE_EXPECTED_CARGO_TARGET_MODE" in
       unset)
         [[ -z "${CARGO_TARGET_DIR+x}" ]] || \
@@ -235,7 +235,7 @@ case "${1:-}" in
         [[ "$out_dir" == */"many-idle-flows-$engine" ]] || \
           die "unexpected many-idle output directory: $out_dir"
         assert_args "scheduled many-idle run" \
-          run --locked --release -p xray-bench -- run \
+          run --locked --release -p segue-bench -- run \
           --engine "$engine" --workload many-idle-flows \
           --xray-rust-bin "$xray_rust_bin" --xray-core-bin "$xray_core_bin" \
           --no-auto-build --runs 1 --connections 100 --duration-ms 1000 \
@@ -248,7 +248,7 @@ case "${1:-}" in
         [[ "$out_dir" == */"xhttp-held-open-$engine" ]] || \
           die "unexpected XHTTP output directory: $out_dir"
         assert_args "scheduled XHTTP held-open run" \
-          run --locked --release -p xray-bench -- run \
+          run --locked --release -p segue-bench -- run \
           --engine "$engine" --workload stream-transport --stream-transport xhttp-h2 \
           --traffic held-open --xhttp-mode stream-one \
           --xray-rust-bin "$xray_rust_bin" --xray-core-bin "$xray_core_bin" \
@@ -281,7 +281,7 @@ PATH="$FAKE_BIN:$PATH" \
   FAKE_GO_LOG="$FAKE_GO_LOG" \
   FAKE_CORE_PATH_LOG="$FAKE_CORE_PATH_LOG" \
   FAKE_INVOCATION_LOG="$TEST_ROOT/invocations.log" \
-  FAKE_EXPECTED_XRAY_RUST_BIN="$FAKE_TARGET/release/xray-rust" \
+  FAKE_EXPECTED_XRAY_RUST_BIN="$FAKE_TARGET/release/segue" \
   FAKE_EXPECTED_CARGO_TARGET_MODE='set' \
   FAKE_EXPECTED_CARGO_TARGET_VALUE="$FAKE_TARGET" \
   FAKE_EXPECTED_CORE="$FAKE_CORE" \
@@ -298,7 +298,7 @@ PATH="$FAKE_BIN:$PATH" \
 
 scheduled_xray_core_binary="$(<"$FAKE_CORE_PATH_LOG")"
 scheduled_tmp="$(dirname "$scheduled_xray_core_binary")"
-scheduled_xray_rust_binary="$FAKE_TARGET/release/xray-rust"
+scheduled_xray_rust_binary="$FAKE_TARGET/release/segue"
 
 assert_line_count() {
   local expected_count="$1"
@@ -325,9 +325,9 @@ assert_prefix_count() {
 }
 
 assert_line_count 1 \
-  "test|command=test --locked -p xray-core-rs --test local_xray_interop_tests -- --ignored --skip vless_encryption:: --skip xhttp_download:: --skip rust_socks_client_reaches_target_through_remote_xhttp_profile --nocapture --test-threads=1|fingerprints=$BROAD_FINGERPRINTS|burst_fingerprints=hellofirefox_148|burst_flows=32|xhttp_cases=all|goflags=unset|goexperiment=unset|core_expected_revision=unset|goenv=off|gowork=off|gotoolchain=local|cgo=0"
+  "test|command=test --locked -p segue-engine --test local_xray_interop_tests -- --ignored --skip vless_encryption:: --skip xhttp_download:: --skip rust_socks_client_reaches_target_through_remote_xhttp_profile --nocapture --test-threads=1|fingerprints=$BROAD_FINGERPRINTS|burst_fingerprints=hellofirefox_148|burst_flows=32|xhttp_cases=all|goflags=unset|goexperiment=unset|core_expected_revision=unset|goenv=off|gowork=off|gotoolchain=local|cgo=0"
 assert_line_count 1 \
-  'build|command=build --locked --release -p xray-cli --bin xray-rust'
+  'build|command=build --locked --release -p segue-cli --bin xray-rust'
 
 for engine in xray-rust xray-core; do
   assert_line_count 1 \
@@ -382,13 +382,13 @@ run_target_dir_case() {
     unset)
       target_env=(-u CARGO_TARGET_DIR)
       expected_target_mode='unset'
-      expected_xray_rust_binary="$case_workspace/target/release/xray-rust"
+      expected_xray_rust_binary="$case_workspace/target/release/segue"
       ;;
     relative)
       expected_target_value='relative-cargo-target'
       expected_target_mode='set'
       target_env=("CARGO_TARGET_DIR=$expected_target_value")
-      expected_xray_rust_binary="$case_workspace/$expected_target_value/release/xray-rust"
+      expected_xray_rust_binary="$case_workspace/$expected_target_value/release/segue"
       ;;
     *)
       echo "unexpected target test mode: $target_mode" >&2

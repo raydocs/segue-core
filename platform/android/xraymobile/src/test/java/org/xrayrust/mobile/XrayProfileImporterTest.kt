@@ -220,7 +220,7 @@ class XrayProfileImporterNativeTest {
     }
     private fun fixture(name: String): String {
         val root = generateSequence(File(requireNotNull(System.getProperty("user.dir")))) { it.parentFile }
-            .first { File(it, "crates/xray-ffi/Cargo.toml").isFile }
+            .first { File(it, "crates/segue-ffi/Cargo.toml").isFile }
         return File(root, "tests/fixtures/profile-import/$name").readText()
     }
 

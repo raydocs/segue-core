@@ -116,7 +116,7 @@ The local clean Xray reference is revision
 26.7.28 / 5ca6f4b, and its SHA-256 is pinned in the manifest. Its full clean Go
 VCS stamp was not verified; binary identity does not establish provenance.
 
-Build the iOS device library with `--locked --offline --release -p xray-ffi
+Build the iOS device library with `--locked --offline --release -p segue-ffi
 --target aarch64-apple-ios`, refresh that XCFramework slice, then build/install
 the signed Debug `XrayClient` scheme for the physical device. Existing signing
 profiles included this iPhone; no account/device registration change was made.

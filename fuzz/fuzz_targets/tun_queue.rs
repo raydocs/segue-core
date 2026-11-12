@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use tokio::runtime::Builder;
-use xray_tun::{TunConfig, TunEndpoint};
+use segue_tun::{TunConfig, TunEndpoint};
 
 fuzz_target!(|data: &[u8]| {
     let mtu = usize::from(data.first().copied().unwrap_or_default()).max(1) * 32;

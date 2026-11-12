@@ -21,7 +21,7 @@ console.error(
   [
     "generate_utls_profiles.mjs is retired and refuses to run.",
     "",
-    "crates/xray-transport/src/utls_profiles.rs is hand-maintained: it carries a",
+    "crates/segue-transport/src/utls_profiles.rs is hand-maintained: it carries a",
     "per-process random/randomized draw this generator does not emit, and",
     "regenerating over it would silently revert that. See the header of either",
     "file for what reviving this script would require.",
@@ -37,7 +37,7 @@ import { fileURLToPath } from "node:url";
 
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const fingerprintsSource = readFileSync(
-  resolve(workspaceRoot, "crates/xray-utls/src/lib.rs"),
+  resolve(workspaceRoot, "crates/segue-utls/src/lib.rs"),
   "utf8",
 );
 const fingerprints = fingerprintsSource
@@ -48,7 +48,7 @@ const fingerprints = fingerprintsSource
 const oracleBinary = process.argv[2] ?? "/tmp/clienthello_shape";
 const outputPath =
   process.argv[3] ??
-  resolve(workspaceRoot, "crates/xray-transport/src/utls_profiles.rs");
+  resolve(workspaceRoot, "crates/segue-transport/src/utls_profiles.rs");
 
 function numericValue(value) {
   return value === "GREASE" ? 0x0a0a : Number.parseInt(value, 16);

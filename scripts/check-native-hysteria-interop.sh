@@ -14,15 +14,15 @@ python3 "$WORKSPACE_ROOT/scripts/verify-hysteria-reference.py" "$CHECKOUT"
 
 cd "$WORKSPACE_ROOT"
 env -u XRAY_HYSTERIA_BINARY NATIVE_HYSTERIA_BINARY="$TEST_ROOT/hysteria" \
-  cargo test --locked -p xray-transport --test hysteria_interop_tests \
+  cargo test --locked -p segue-transport --test hysteria_interop_tests \
   --test hysteria_native_interop_tests -- --ignored --nocapture
 env -u XRAY_HYSTERIA_BINARY NATIVE_HYSTERIA_BINARY="$TEST_ROOT/hysteria" \
-  cargo test --locked -p xray-core-rs --test hysteria_runtime_tests \
+  cargo test --locked -p segue-engine --test hysteria_runtime_tests \
   --test runtime_data_path_tests hysteria_runtime_ -- --ignored --nocapture
 
 env -u XRAY_HYSTERIA_BINARY NATIVE_HYSTERIA_BINARY="$TEST_ROOT/hysteria" \
-  cargo test --locked -p xray-core-rs --lib outbound::hysteria::tests -- --include-ignored --nocapture
+  cargo test --locked -p segue-engine --lib outbound::hysteria::tests -- --include-ignored --nocapture
 
 env -u XRAY_HYSTERIA_BINARY NATIVE_HYSTERIA_BINARY="$TEST_ROOT/hysteria" \
-  cargo test --locked -p xray-core-rs --test hysteria_runtime_tests \
+  cargo test --locked -p segue-engine --test hysteria_runtime_tests \
   udp_noise_ -- --ignored --nocapture

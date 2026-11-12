@@ -30,5 +30,5 @@ env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
 
 cd "$WORKSPACE_ROOT"
 python3 scripts/check-xray-default-fingerprint.py "$TEST_ROOT/xray" tests/fixtures/reality
-cargo test --locked -p xray-transport --test reality_rustls_tests matches_utls_oracle_for_risky
-cargo test --locked -p xray-utls
+cargo test --locked -p segue-transport --test reality_rustls_tests matches_utls_oracle_for_risky
+cargo test --locked -p segue-utls

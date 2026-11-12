@@ -67,7 +67,7 @@ entry point; no new share-link syntax is claimed by this increment.
 
 ## Development evidence (2026-09-05)
 
-- Full Rust workspace, `--exclude xray-rust-fuzz --all-targets --locked`:
+- Full Rust workspace, `--exclude segue-fuzz --all-targets --locked`:
   2,167 passed, zero failures, 45 explicitly ignored. Dedicated oracle gates
   below run their prerequisite-dependent ignored cases separately.
 - All-target/all-feature Clippy with warnings denied, rustdoc with warnings

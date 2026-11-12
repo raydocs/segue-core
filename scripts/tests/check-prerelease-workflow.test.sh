@@ -138,7 +138,7 @@ grep -Fq 'cargo +nightly-2026-05-22 install cargo-fuzz --version 0.13.2 --locked
   die "RC fuzz gate does not pin cargo-fuzz"
 grep -Fq 'bash scripts/run-v05-host-hardening.sh fuzz' "$WORKFLOW" || \
   die "RC fuzz gate does not run the extended hardening campaign"
-grep -Fq 'cargo test --workspace --exclude xray-rust-fuzz --all-targets --locked' "$WORKFLOW" || \
+grep -Fq 'cargo test --workspace --exclude segue-fuzz --all-targets --locked' "$WORKFLOW" || \
   die "ordinary workspace tests can execute unbounded libFuzzer targets"
 
 if grep -Fq -- '--clobber' <<<"$publish_job"; then

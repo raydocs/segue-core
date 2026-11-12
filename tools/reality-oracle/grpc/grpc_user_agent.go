@@ -18,7 +18,7 @@
 //
 // `xray-rust` refuses a `user_agent` that `http::HeaderValue` will not hold,
 // when the outbound is built rather than once per dial
-// (`crates/xray-transport/src/stream/grpc/config.rs`, `GrpcConfig::user_agent`).
+// (`crates/segue-transport/src/stream/grpc/config.rs`, `GrpcConfig::user_agent`).
 // The whole justification for refusing is that the value was unusable anyway —
 // that the set `HeaderValue` rejects is the set a grpc-go peer rejects. That is
 // a claim about two predicates in two languages, and nothing else in this

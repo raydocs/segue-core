@@ -1,0 +1,34 @@
+[package]
+name = "segue-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Process, routing, TUN, and protocol benchmark harness for xray-rust"
+
+[[bin]]
+name = "segue-bench"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+libc.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+smoltcp.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+segue-config = { path = "../segue-config" }
+segue-engine = { path = "../segue-engine" }
+segue-proxy = { path = "../segue-proxy" }
+segue-routing = { path = "../segue-routing" }
+segue-transport = { path = "../segue-transport" }
+segue-tun = { path = "../segue-tun" }
+segue-utls = { path = "../segue-utls" }

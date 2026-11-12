@@ -1,8 +1,8 @@
 //! A QUIC client's first flight, taken apart off the wire, and the shape
 //! Xray-core's ChromeParrot gives it.
 //!
-//! Shared by the live Hysteria (`xray-transport`) and XHTTP H3
-//! (`xray-core-rs`) interoperability tests: a [`RecordingRelay`] sits between
+//! Shared by the live Hysteria (`segue-transport`) and XHTTP H3
+//! (`segue-engine`) interoperability tests: a [`RecordingRelay`] sits between
 //! the client and the pinned Xray server and keeps every datagram the client
 //! sends; [`assert_chrome_first_flight`] decrypts the Initial packets with the
 //! keys their destination connection ID derives (RFC 9001 section 5.2) and

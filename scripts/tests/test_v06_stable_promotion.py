@@ -33,9 +33,9 @@ class StablePromotionTests(unittest.TestCase):
         self.git("config", "user.name", "Release fixture")
         self.git("config", "user.email", "fixture@example.invalid")
         self.write("Cargo.toml", '[workspace.package]\nversion = "0.6.0-rc.1"\n[workspace.dependencies]\nbytes = "1"\n')
-        self.write("Cargo.lock", 'version = 4\n[[package]]\nname = "xray-config"\nversion = "0.6.0-rc.1"\n[[package]]\nname = "bytes"\nversion = "1.0.0"\nsource = "registry+https://example.invalid"\nchecksum = "abc"\n')
+        self.write("Cargo.lock", 'version = 4\n[[package]]\nname = "segue-config"\nversion = "0.6.0-rc.1"\n[[package]]\nname = "bytes"\nversion = "1.0.0"\nsource = "registry+https://example.invalid"\nchecksum = "abc"\n')
         self.write("docs/config-contract.json", '{"coreVersion":"0.6.0-rc.1","supported":["vless"]}')
-        self.write("crates/xray-config/src/lib.rs", "pub const VALUE: u8 = 1;\n")
+        self.write("crates/segue-config/src/lib.rs", "pub const VALUE: u8 = 1;\n")
         self.write("README.md", "Candidate\n")
         self.commit()
         self.rc = self.git("rev-parse", "HEAD")
@@ -75,7 +75,7 @@ class StablePromotionTests(unittest.TestCase):
         self.assertIn("Cargo.lock", self.validate())
 
     def test_runtime_edit_is_rejected(self):
-        self.write("crates/xray-config/src/lib.rs", "pub const VALUE: u8 = 2;\n")
+        self.write("crates/segue-config/src/lib.rs", "pub const VALUE: u8 = 2;\n")
         self.commit()
         with self.assertRaisesRegex(ValueError, "runtime or unapproved"):
             self.validate()

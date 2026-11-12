@@ -5,7 +5,7 @@ Report: [issue #28](https://github.com/aimalygin/xray-rust/issues/28).
 
 ## XHTTP/H2 change
 
-`crates/xray-transport/src/stream/xhttp/h2.rs` now advertises a 4 MiB
+`crates/segue-transport/src/stream/xhttp/h2.rs` now advertises a 4 MiB
 per-stream receive window through `h2::client::Builder::initial_window_size`.
 This is the default used by the pinned Go `x/net/http2` client. The old
 65,535-byte stream window survived even though the connection window had
@@ -106,8 +106,8 @@ XHTTP/H2 policy change.
 ## Validation commands
 
 ```sh
-cargo test -p xray-transport --test stream_xhttp_h2_tests --locked --offline
-cargo test --workspace --exclude xray-rust-fuzz --all-targets --locked --offline
+cargo test -p segue-transport --test stream_xhttp_h2_tests --locked --offline
+cargo test --workspace --exclude segue-fuzz --all-targets --locked --offline
 cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings -W clippy::perf -W clippy::suspicious
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked --offline
 cargo fmt --all -- --check

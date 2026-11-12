@@ -12,7 +12,7 @@ separate device report. No device app or profile was changed for this run.
 ## Method
 
 - macOS, ARM64; optimized Rust CLI built with `cargo build --release
-  --locked --offline -p xray-cli`, including the final H2 and TUN repairs.
+  --locked --offline -p segue-cli`, including the final H2 and TUN repairs.
   Base revision: `8a86a7f762aba919ff75cad5980a28612ba2dfe8` (v0.6.0).
 - Go client **and** server: Xray-core 26.7.28,
   `5ca6f4b7d4dc20a881d4330e498892697627ec0c`, Go 1.26.0, `x/net` v0.57.0.
@@ -173,7 +173,7 @@ Build the Rust CLI and the pinned Go binary, then run:
 
 ```sh
 python3 scripts/bench-issue28-clients.py \
-  --rust-bin target/release/xray-rust \
+  --rust-bin target/release/segue \
   --go-bin target/issue28-xray-core \
   --out target/issue28-client-ab-repeat \
   --rounds 6 --payload-mib 64 --warmup-mib 16 \

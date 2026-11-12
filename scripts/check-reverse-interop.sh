@@ -30,11 +30,11 @@ env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
 cmp "$WORKSPACE_ROOT/tests/fixtures/reverse/vectors.json" "$TEST_ROOT/vectors.json"
 
 cd "$WORKSPACE_ROOT"
-cargo test --locked -p xray-proxy --lib reverse::
-cargo test --locked -p xray-proxy --lib mux::
-cargo test --locked -p xray-config --test vless_reverse_tests
-cargo test --locked -p xray-core-rs --lib reverse::
-cargo test --locked -p xray-core-rs --test reverse_bridge_tests
+cargo test --locked -p segue-proxy --lib reverse::
+cargo test --locked -p segue-proxy --lib mux::
+cargo test --locked -p segue-config --test vless_reverse_tests
+cargo test --locked -p segue-engine --lib reverse::
+cargo test --locked -p segue-engine --test reverse_bridge_tests
 
 # Every recorded verdict of the config corpus, rechecked with `xray run -test`.
 env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
@@ -50,5 +50,5 @@ python3 scripts/check-reverse-config-verdicts.py \
 # the next hop, while Mux and gRPC links are left alone as Xray-core leaves
 # them.
 XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" XRAY_CORE_CHECKOUT="$CHECKOUT" \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests reverse:: \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests reverse:: \
     -- --ignored --nocapture --test-threads=1

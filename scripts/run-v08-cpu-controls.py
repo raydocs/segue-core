@@ -72,7 +72,7 @@ def main():
                 "purpose": "paired controls; identical harness, reference fixture and payload; rotating order"}
     (out / "source.patch").write_text(c.bench.command(["git", "diff", "--binary", "HEAD"], ROOT))
     # Retain experimental untracked source as well as the tracked patch.
-    for source in (ROOT / "crates/xray-proxy/src/aead.rs", ROOT / "crates/xray-proxy/benches/aead_backends.rs"):
+    for source in (ROOT / "crates/segue-proxy/src/aead.rs", ROOT / "crates/segue-proxy/benches/aead_backends.rs"):
         if source.exists():
             shutil.copyfile(source, out / source.name)
     try:

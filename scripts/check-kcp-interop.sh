@@ -28,12 +28,12 @@ env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
 cmp "$WORKSPACE_ROOT/tests/fixtures/kcp/mask-vectors.json" "$TEST_ROOT/mask-vectors.json"
 
 cd "$WORKSPACE_ROOT"
-cargo test --locked -p xray-transport --lib kcp::
+cargo test --locked -p segue-transport --lib kcp::
 
 # The client against Xray-core's own mKCP server: each protocol plain and
 # under TLS, each mask, noise, Mux and Vision.
 env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
   go -C "$CHECKOUT" build -mod=readonly -o "$TEST_ROOT/xray" ./main
 XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" XRAY_CORE_CHECKOUT="$CHECKOUT" \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests kcp_ \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests kcp_ \
     -- --ignored --nocapture --test-threads=1

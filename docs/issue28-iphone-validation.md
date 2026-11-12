@@ -17,8 +17,8 @@ stalled-reader scenario. The latter was absent from the transport-only tests.
   Wi-Fi to a local Mac; USB was used for installation and console capture.
 - Baseline core: `8a86a7f762aba919ff75cad5980a28612ba2dfe8` (v0.6.0).
   Candidate: the same source plus only the receive-window change in
-  `crates/xray-transport/src/stream/xhttp/h2.rs`. Both Rust static libraries
-  were built with `cargo build -p xray-ffi --release --target aarch64-apple-ios
+  `crates/segue-transport/src/stream/xhttp/h2.rs`. Both Rust static libraries
+  were built with `cargo build -p segue-ffi --release --target aarch64-apple-ios
   --locked --offline`, Rust 1.96.0, deployment target 15.0. Swift host and
   NetworkExtension used identical Debug build settings and probe source.
 - Actual fd-backed Packet Tunnel, mobile TUN runtime profile, debug logging
@@ -99,7 +99,7 @@ treating the peak difference as an exact per-window allocation cost.
 ## Additional TUN bottleneck
 
 The behavior has a corresponding mechanism in unchanged
-`crates/xray-core-rs/src/tun.rs`:
+`crates/segue-engine/src/tun.rs`:
 
 1. `try_apply_stack_event` rejects `RemoteData` when a per-flow or global
    queue budget is full.

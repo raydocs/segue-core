@@ -926,7 +926,7 @@ def expected_paths(
     )
     return {
         "raw_root": raw_root,
-        "harness": working_directory / "target" / "release" / "xray-bench",
+        "harness": working_directory / "target" / "release" / "segue-bench",
         "xray-rust": working_directory / "target" / "release" / "xray-rust",
         "xray-core": (
             working_directory

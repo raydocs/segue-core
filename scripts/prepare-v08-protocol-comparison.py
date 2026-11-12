@@ -66,7 +66,7 @@ def main():
                          "rustc": build["rustc"], "build_arguments": build["buildArguments"],
                          "incremental": False}
         harness = build_identity(a.harness_build) if a.harness_build else {
-            **rust_identity, "sha256": candidate["binaries"]["xray-bench"]}
+            **rust_identity, "sha256": candidate["binaries"]["segue-bench"]}
     if sha(a.candidate) != recorded:
         raise ValueError("Rust binary differs from its recorded clean build")
     if sha(a.harness) != harness["sha256"]:

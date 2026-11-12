@@ -1,7 +1,7 @@
 # Publishing Rust crates and documentation
 
-The intended public entry points are `xray-core-rs` for Rust embedders,
-`xray-ffi` for C ABI consumers, and `xray-cli` for `cargo install`. Supporting
+The intended public entry points are `segue-engine` for Rust embedders,
+`segue-ffi` for C ABI consumers, and `segue-cli` for `cargo install`. Supporting
 workspace libraries must be published first because crates.io packages cannot
 depend on unpublished path-only crates.
 
@@ -14,7 +14,7 @@ documented TLS and REALITY fingerprint behavior and is not present in upstream
 
 Cargo removes local path overrides when creating a registry package, and a
 crates.io package cannot rely on the Git revision used by this workspace.
-Publishing `xray-transport`, `xray-core-rs`, or `xray-ffi` in the current shape
+Publishing `segue-transport`, `segue-engine`, or `segue-ffi` in the current shape
 would therefore produce a package that fails its registry build and fails on
 docs.rs. `cargo publish --no-verify` is not an acceptable workaround.
 
@@ -35,13 +35,13 @@ The safe path is:
 After the TLS dependency is registry-resolvable, publish synchronized versions
 in this order:
 
-1. `xray-utls`, `xray-routing`, `xray-runtime`, and `xray-tun`;
-2. `xray-config` and `xray-proxy`;
-3. `xray-transport`;
-4. `xray-core-rs`;
-5. `xray-ffi` and `xray-cli`.
+1. `segue-utls`, `segue-routing`, `segue-runtime`, and `segue-tun`;
+2. `segue-config` and `segue-proxy`;
+3. `segue-transport`;
+4. `segue-engine`;
+5. `segue-ffi` and `segue-cli`.
 
-`xray-bench` remains repository-only. Registry versions are immutable, so the
+`segue-bench` remains repository-only. Registry versions are immutable, so the
 first publication must use a fresh release tag created after all package
 metadata and dependency versions are committed.
 

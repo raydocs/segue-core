@@ -56,7 +56,7 @@
 //     encodes `:path` as a literal without indexing where grpc-go indexes it
 //     incrementally. Neither is reachable without forking the crate, so the
 //     field list is the bar, and it is the field list the Rust side in
-//     `crates/xray-transport/tests/stream_grpc_tests.rs` is held to.
+//     `crates/segue-transport/tests/stream_grpc_tests.rs` is held to.
 //
 //   - `hunk_framing` is byte-exact. Each vector is one `hc.Send(&Hunk{Data:
 //     ...})` as it left the wire, reassembled from the call's DATA frames, so

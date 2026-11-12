@@ -20,7 +20,7 @@ scripts/build-apple-xcframework.sh
 
 The XCFramework contains iOS/tvOS device and universal simulator slices plus a
 universal macOS `arm64 + x86_64` slice. Rerun the build after changing Rust code
-or `xray_ffi.h`; Xcode does not rebuild it automatically. Its slices use
+or `segue_ffi.h`; Xcode does not rebuild it automatically. Its slices use
 Xcode's static-library-plus-headers layout, so the Rust archive is linked into
 the host executable rather than embedded as a runtime framework.
 

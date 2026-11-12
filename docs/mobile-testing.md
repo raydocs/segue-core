@@ -28,7 +28,7 @@ testing.
 Run the platform-independent contract tests first:
 
 ```sh
-cargo test --locked -p xray-ffi --test mobile_artifacts_tests -- --nocapture
+cargo test --locked -p segue-ffi --test mobile_artifacts_tests -- --nocapture
 bash scripts/tests/check-mobile-toolchains.test.sh
 ```
 
@@ -60,7 +60,7 @@ The static XCFramework contains:
 | `tvos-arm64_x86_64-simulator` | `arm64`, `x86_64` simulator |
 | `macos-arm64_x86_64` | universal `arm64`, `x86_64` |
 
-Each XCFramework slice contains `libxray_ffi.a`, `xray_ffi.h`, and the Clang
+Each XCFramework slice contains `libxray_ffi.a`, `segue_ffi.h`, and the Clang
 module map that exposes the Swift import name `XrayRust`. The artifact uses
 Xcode's static-library XCFramework layout; it is not a dynamic framework and is
 not embedded in application bundles.
@@ -224,7 +224,7 @@ scripts/build-android-libs.sh
 Output:
 
 ```text
-target/mobile/android/include/xray_ffi.h
+target/mobile/android/include/segue_ffi.h
 target/mobile/android/jniLibs/arm64-v8a/libxray_ffi.so
 target/mobile/android/jniLibs/armeabi-v7a/libxray_ffi.so
 target/mobile/android/jniLibs/x86/libxray_ffi.so
@@ -427,7 +427,7 @@ address and port with an ephemeral loopback socket:
 ```sh
 chmod 600 /private/path/xhttp-client.json
 XRAY_REMOTE_XHTTP_CONFIG=/private/path/xhttp-client.json \
-  cargo test -p xray-core-rs --test local_xray_interop_tests \
+  cargo test -p segue-engine --test local_xray_interop_tests \
   rust_socks_client_reaches_target_through_remote_xhttp_profile \
   -- --ignored
 ```

@@ -28,15 +28,15 @@ env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
 cmp "$WORKSPACE_ROOT/tests/fixtures/xmc/vectors.json" "$TEST_ROOT/vectors.json"
 
 cd "$WORKSPACE_ROOT"
-cargo test --locked -p xray-transport --lib xmc::
-cargo test --locked -p xray-proxy --lib vless::udp
-cargo test --locked -p xray-config --test xmc_tests
-cargo test --locked -p xray-core-rs --lib outbound::carrier::tests
+cargo test --locked -p segue-transport --lib xmc::
+cargo test --locked -p segue-proxy --lib vless::udp
+cargo test --locked -p segue-config --test xmc_tests
+cargo test --locked -p segue-engine --lib outbound::carrier::tests
 
 # The client against Xray-core's own server on every TCP carrier, with TCP
 # and UDP through each, and strangers refused.
 env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
   go -C "$CHECKOUT" build -mod=readonly -o "$TEST_ROOT/xray" ./main
 XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" XRAY_CORE_CHECKOUT="$CHECKOUT" \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests xmc \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests xmc \
     -- --ignored --nocapture --test-threads=1

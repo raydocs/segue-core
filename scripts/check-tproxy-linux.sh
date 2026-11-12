@@ -44,5 +44,5 @@ cd "$WORKSPACE_ROOT"
 if [[ -n ${XRAY_TPROXY_TEST_BINARY:-} ]]; then
   "$XRAY_TPROXY_TEST_BINARY" --ignored --nocapture
 else
-  cargo test --locked -p xray-core-rs --test tproxy_tests -- --ignored --nocapture
+  cargo test --locked -p segue-engine --test tproxy_tests -- --ignored --nocapture
 fi

@@ -278,7 +278,7 @@ def main():
         "repeats":repeats,"cases":cases,"started_unix":time.time(),"platform":platform.platform(),
         "harness_sha256":sha(args.harness),"collector_sha256":sha(__file__),
         "fixture_policy":"shared suite reference after 8 second warmup; fresh client processes" if args.suite=="reality" else "fresh reference server and keys per run",
-        "harness_source_sha256":{str(p.relative_to(ROOT)):sha(p) for p in sorted((ROOT/"crates/xray-bench/src").glob("*.rs"))},
+        "harness_source_sha256":{str(p.relative_to(ROOT)):sha(p) for p in sorted((ROOT/"crates/segue-bench/src").glob("*.rs"))},
         "cleanup_policy":"RAII kill/wait; per-run process-group and engine inventory verification",
         "preflight_campaign_processes":existing,
         "reference_sha256":sha(args.root/"bin/xray-core"),"reference_commit":REFERENCE,
@@ -290,7 +290,7 @@ def main():
         manifest["versions"][version]={"commit":command(["git","rev-parse","HEAD"],source),
             "tree":command(["git","rev-parse","HEAD^{tree}"],source),"dirty":False,
             "engine_sha256":sha(args.root/"bin"/version/"xray-rust"),
-            "original_harness_sha256":sha(args.root/"bin"/version/"xray-bench"),
+            "original_harness_sha256":sha(args.root/"bin"/version/"segue-bench"),
             "cargo_lock_sha256":sha(source/"Cargo.lock")}
     save(args.output/"manifest.json",manifest)
     with contextlib.ExitStack() as fixtures:
@@ -306,7 +306,7 @@ def main():
                     context=contextlib.nullcontext(shared) if shared is not None else contextlib.nullcontext({}) if args.suite=="legacy" else fixture(args.root/"bin/xray-core",args.output/f"{identifier}-server",client_protocols=args.suite if args.suite in ("v08","v09") else False)
                     with context as configs:
                         if args.suite=="legacy":
-                            invocation=[str(args.root/"bin"/version/"xray-bench"),"run","--engine","xray-rust",
+                            invocation=[str(args.root/"bin"/version/"segue-bench"),"run","--engine","xray-rust",
                                 "--xray-rust-bin",str(args.root/"bin"/version/"xray-rust"),
                                 "--xray-core-bin",str(args.root/"bin/xray-core"),"--no-auto-build","--runs","1",
                                 "--run-timeout-ms","150000","--out-dir",str(output),*case["args"]]

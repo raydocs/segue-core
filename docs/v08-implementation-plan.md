@@ -217,8 +217,8 @@ traffic or control frames; closing the parent must reclaim every child.
 The first increment is checked with:
 
 ```sh
-cargo test --locked -p xray-proxy
-cargo clippy --locked -p xray-proxy --all-targets -- -D warnings -W clippy::perf -W clippy::suspicious
+cargo test --locked -p segue-proxy
+cargo clippy --locked -p segue-proxy --all-targets -- -D warnings -W clippy::perf -W clippy::suspicious
 cargo fmt --all -- --check
 bash scripts/check-v08-protocol-oracle.sh
 bash scripts/tests/check-public-fixtures.test.sh
@@ -231,7 +231,7 @@ every truncation, concatenated frames, invalid metadata, bounds and redaction.
 This provides codec evidence only. It does not test TLS, a running server,
 async cancellation, mobile devices or full protocol authentication behavior.
 
-Local validation on 2026-09-30 passed: all 96 `xray-proxy` tests (including six
+Local validation on 2026-09-30 passed: all 96 `segue-proxy` tests (including six
 Trojan tests), Clippy, formatting, pinned oracle regeneration/comparison and
 all 13 public-fixture guard tests. Shell syntax and `git diff --check` also
 passed. The pinned Xray-core checkout remained clean. These results cover the
@@ -300,7 +300,7 @@ Reproduction:
 - `CARGO_INCREMENTAL=0 bash scripts/check-v08-protocol-oracle.sh`
 - `CARGO_INCREMENTAL=0 bash scripts/check-trojan-interop.sh`
 - `CARGO_INCREMENTAL=0 bash scripts/check-shadowsocks2022-interop.sh`
-- `CARGO_INCREMENTAL=0 cargo test --locked -p xray-config -- --test-threads=1`
+- `CARGO_INCREMENTAL=0 cargo test --locked -p segue-config -- --test-threads=1`
 - `scripts/test-profile-import-jni.sh --tests '*XrayV07DnsBootstrap*'`
 
 ### Measured bounds and remaining acceptance
@@ -382,9 +382,9 @@ Additional reproduction:
 
 - `CARGO_INCREMENTAL=0 bash scripts/check-vmess-interop.sh`
 - `CARGO_INCREMENTAL=0 bash scripts/check-mux-interop.sh`
-- `CARGO_INCREMENTAL=0 cargo test --locked -p xray-core-rs --lib`:
+- `CARGO_INCREMENTAL=0 cargo test --locked -p segue-engine --lib`:
   489 passed, two existing ignored tests after Mux integration.
-- `cargo test --locked -p xray-ffi --test profile_import_tests`:
+- `cargo test --locked -p segue-ffi --test profile_import_tests`:
   all five formats pass exact ABI sizing and native config load.
 - New `v08_protocols` sanitizer-fuzz target and seeds are wired into the existing
   blocking extended campaign. A local 61-second ASan smoke completed 839,361

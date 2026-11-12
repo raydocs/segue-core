@@ -1,6 +1,6 @@
 # shaped-rustls uTLS Fingerprint Parity Report
 
-This report compares every fingerprint in `xray_utls::XRAY_UTLS_FINGERPRINTS` against the Go uTLS oracle used by xray-core-compatible REALITY tests.
+This report compares every fingerprint in `segue_utls::XRAY_UTLS_FINGERPRINTS` against the Go uTLS oracle used by xray-core-compatible REALITY tests.
 
 ## What a `match` here does and does not mean
 
@@ -13,7 +13,7 @@ What uTLS draws per connection does not show here either. The shape JSON writes 
 ## Reproduce
 
 ```sh
-XRAY_UTLS_REPORT_MD=docs/shaped-rustls-utls-fingerprint-parity-report.md cargo test -p xray-transport --test reality_rustls_tests rustls_reality_provider_reports_utls_xray_fingerprint_parity -- --ignored --nocapture
+XRAY_UTLS_REPORT_MD=docs/shaped-rustls-utls-fingerprint-parity-report.md cargo test -p segue-transport --test reality_rustls_tests rustls_reality_provider_reports_utls_xray_fingerprint_parity -- --ignored --nocapture
 ```
 
 ## Summary

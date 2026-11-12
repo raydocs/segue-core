@@ -34,9 +34,9 @@
   "hostProfile": "Debug",
   "nativeProfile": "release; LTO off",
   "nativeSourceDigests": {
-    "crates/xray-core-rs/src/lib.rs": "b4c2a0a86ddaf583584abb0813f5ead6f520037a1bdd1a421e99f855a3c1ddfc",
-    "crates/xray-ffi/include/xray_ffi.h": "08d5b3e82bcd8687c7395a2de136285da18afad17838aed9c8c398c8b04796d7",
-    "crates/xray-ffi/src/lib.rs": "fef15f617d7e3de146d6e7a6e896b9d0ea3980966a84225cf298cbaceebb26c8"
+    "crates/segue-engine/src/lib.rs": "b4c2a0a86ddaf583584abb0813f5ead6f520037a1bdd1a421e99f855a3c1ddfc",
+    "crates/segue-ffi/include/segue_ffi.h": "08d5b3e82bcd8687c7395a2de136285da18afad17838aed9c8c398c8b04796d7",
+    "crates/segue-ffi/src/lib.rs": "fef15f617d7e3de146d6e7a6e896b9d0ea3980966a84225cf298cbaceebb26c8"
   },
   "referenceRevision": "5ca6f4b7d4dc20a881d4330e498892697627ec0c",
   "sdkSourceDigests": {

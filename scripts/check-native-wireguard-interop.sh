@@ -16,9 +16,9 @@ go -C "$MODULE" test -mod=readonly ./...
 
 cd "$WORKSPACE_ROOT"
 env -u XRAY_WIREGUARD_BINARY NATIVE_WIREGUARD_BINARY="$TEST_ROOT/wireguard-reference" \
-  cargo test --locked -p xray-wireguard --test interop --test multi_peer_tests \
+  cargo test --locked -p segue-wireguard --test interop --test multi_peer_tests \
   --test native_lifecycle --test network_change \
   -- --include-ignored --nocapture
 env -u XRAY_WIREGUARD_BINARY NATIVE_WIREGUARD_BINARY="$TEST_ROOT/wireguard-reference" \
-  cargo test --locked -p xray-core-rs --lib --test wireguard_runtime_tests \
+  cargo test --locked -p segue-engine --lib --test wireguard_runtime_tests \
   --test runtime_data_path_tests wireguard_runtime_ -- --ignored --nocapture

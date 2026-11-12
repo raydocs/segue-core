@@ -38,7 +38,7 @@ source commits, compiler versions, build commands and executable SHA256s.
 
 ```sh
 python3 scripts/prepare-v07-protocol-parity.py --root /absolute/parity \
-  --rust /absolute/frozen/xray-rust --harness /absolute/frozen/xray-bench \
+  --rust /absolute/frozen/xray-rust --harness /absolute/frozen/segue-bench \
   --xray /absolute/pinned/xray --singbox /absolute/pinned/sing-box \
   --hysteria /absolute/pinned/hysteria --wireguard /absolute/pinned/native-wireguard-client
 python3 scripts/run-v07-protocol-parity.py --root /absolute/parity \
@@ -87,8 +87,8 @@ and phone recovery timings are separate from these process measurements.
 
 Create clean baseline/candidate checkouts at the exact commits named in the dated
 report, plus a separate checkout containing this driver. Build each engine and
-its original `xray-bench` from its own checkout, using `cargo build --locked --release -p xray-cli --bin xray-rust`
-and `cargo build --locked --release -p xray-bench --bin xray-bench`.
+its original `segue-bench` from its own checkout, using `cargo build --locked --release -p segue-cli --bin xray-rust`
+and `cargo build --locked --release -p segue-bench --bin segue-bench`.
 Copy them immediately to
 `CAMPAIGN/bin/{baseline,candidate}/`; later builds must not replace these copies.
 Build the modified driver separately as `CAMPAIGN/bin/protocol-bench`.
@@ -124,8 +124,8 @@ its first reported failure does not mean subsequent budgets passed.
 
 `scripts/run-v07-performance.py` consumes a campaign directory containing clean
 `baseline` and `candidate` source checkouts and their matching release binaries
-under `bin/{baseline,candidate}/{xray-rust,xray-bench}`. `bin/xray-core` must be built
-from exact clean Xray-core v26.7.28. The new `xray-bench protocol-run REQUEST.json`
+under `bin/{baseline,candidate}/{xray-rust,segue-bench}`. `bin/xray-core` must be built
+from exact clean Xray-core v26.7.28. The new `segue-bench protocol-run REQUEST.json`
 driver is built separately, leaving both measured engines unchanged.
 
 ```sh

@@ -17,7 +17,7 @@ The default Rust validation is:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- \
   -D warnings -W clippy::perf -W clippy::suspicious
-cargo test --workspace --exclude xray-rust-fuzz --all-targets --locked
+cargo test --workspace --exclude segue-fuzz --all-targets --locked
 bash scripts/tests/check-mobile-toolchains.test.sh
 bash scripts/tests/check-public-fixtures.test.sh
 ```
@@ -27,7 +27,7 @@ Platform changes should also run the relevant checks documented in
 
 Configuration changes must keep the shared parser field registry, accepted and
 rejected tooling fixtures, and generated `docs/config-contract.json` in sync.
-Regenerate it with `cargo run --locked -p xray-config --example config_contract`;
+Regenerate it with `cargo run --locked -p segue-config --example config_contract`;
 see [configuration tooling](docs/config-tooling.md) for the output command and
 focused parser/CLI checks. Do not advertise an ignored input as runtime support.
 

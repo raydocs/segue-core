@@ -62,11 +62,11 @@ cmp "$WORKSPACE_ROOT/tests/fixtures/masque/warp-config-vectors.json" "$TEST_ROOT
 
 cd "$WORKSPACE_ROOT"
 XRAY_MASQUE_VECTORS="$TEST_ROOT/vectors-full.json" \
-  cargo test --locked -p xray-transport --lib masque::
-cargo test --locked -p xray-wireguard --lib netstack
-cargo test --locked -p xray-config --lib parser::masque
-cargo test --locked -p xray-config --test masque_tests
-cargo test --locked -p xray-core-rs --lib outbound::masque
+  cargo test --locked -p segue-transport --lib masque::
+cargo test --locked -p segue-wireguard --lib netstack
+cargo test --locked -p segue-config --lib parser::masque
+cargo test --locked -p segue-config --test masque_tests
+cargo test --locked -p segue-engine --lib outbound::masque
 
 # Every recorded verdict of the config corpus, rechecked with `xray run -test`.
 env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
@@ -89,8 +89,8 @@ env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
 # password, and TCP and UDP from the TUN; and WARP against the stand-in.
 XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" XRAY_CORE_CHECKOUT="$CHECKOUT" \
   XRAY_MASQUE_WARP_SERVER="$TEST_ROOT/warp-server" \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests masque:: \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests masque:: \
     -- --ignored --nocapture --test-threads=1
 XRAY_CLIENT_PROTOCOL_BINARY="$TEST_ROOT/xray" \
-  cargo test --locked -p xray-core-rs --test runtime_data_path_tests masque_tun \
+  cargo test --locked -p segue-engine --test runtime_data_path_tests masque_tun \
     -- --ignored --nocapture

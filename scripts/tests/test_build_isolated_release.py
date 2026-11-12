@@ -19,7 +19,7 @@ class IsolatedReleaseBuildTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.source = Path(self.temp.name) / 'src'
-        (self.source / 'crates/xray-config').mkdir(parents=True)
+        (self.source / 'crates/segue-config').mkdir(parents=True)
         (self.source / 'vendor/quinn').mkdir(parents=True)
 
     def tearDown(self):
@@ -34,23 +34,23 @@ class IsolatedReleaseBuildTests(unittest.TestCase):
             'Compiling text that is not JSON',
             artifact('registry+https://github.com/rust-lang/crates.io-index#libc@0.2.186',
                      '/registry/libc/Cargo.toml', True),
-            self.path_artifact('crates/xray-config'),
+            self.path_artifact('crates/segue-config'),
             self.path_artifact('vendor/quinn'),
             json.dumps({'reason': 'build-finished', 'success': True}),
         ])
         self.assertEqual(isolated.compiled_workspace_packages(messages, self.source),
-                         ['crates/xray-config', 'vendor/quinn'])
+                         ['crates/segue-config', 'vendor/quinn'])
 
     def test_reused_workspace_artifact_fails_closed(self):
-        # The 2026-10-27 "before" client reused xray-config this way.
+        # The 2026-10-27 "before" client reused segue-config this way.
         messages = '\n'.join([self.path_artifact('vendor/quinn'),
-                              self.path_artifact('crates/xray-config', fresh=True)])
-        with self.assertRaisesRegex(RuntimeError, 'reused instead of compiled.*xray-config'):
+                              self.path_artifact('crates/segue-config', fresh=True)])
+        with self.assertRaisesRegex(RuntimeError, 'reused instead of compiled.*segue-config'):
             isolated.compiled_workspace_packages(messages, self.source)
 
     def test_path_package_from_another_checkout_fails_closed(self):
-        other = Path(self.temp.name) / 'other/crates/xray-utls/Cargo.toml'
-        messages = '\n'.join([self.path_artifact('crates/xray-config'),
+        other = Path(self.temp.name) / 'other/crates/segue-utls/Cargo.toml'
+        messages = '\n'.join([self.path_artifact('crates/segue-config'),
                               artifact(f'path+file://{other.parent}#0.8.1', other, False)])
         with self.assertRaisesRegex(RuntimeError, 'outside the export'):
             isolated.compiled_workspace_packages(messages, self.source)

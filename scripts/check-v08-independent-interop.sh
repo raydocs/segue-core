@@ -37,12 +37,12 @@ Path('target/v08-independent/reference.json').write_text(json.dumps(evidence, in
 PY
 export XRAY_CLIENT_PROTOCOL_BINARY="$TEST_ROOT/sing-box"
 export XRAY_CLIENT_PROTOCOL_REFERENCE=sing-box
-cargo test --locked -p xray-core-rs \
+cargo test --locked -p segue-engine \
   --test trojan_runtime_tests --test shadowsocks_runtime_tests --test vmess_runtime_tests \
   -- --ignored --nocapture
 for protocol in trojan shadowsocks vmess; do
-  cargo test --locked -p xray-core-rs --test runtime_data_path_tests \
+  cargo test --locked -p segue-engine --test runtime_data_path_tests \
     "${protocol}_runtime_tun_" -- --ignored --nocapture
 done
-cargo test --locked -p xray-core-rs --test mux_runtime_tests \
+cargo test --locked -p segue-engine --test mux_runtime_tests \
   mux_runtime_ipv6_and_domain_datagrams -- --ignored --nocapture

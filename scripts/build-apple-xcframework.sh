@@ -4,9 +4,9 @@ set -euo pipefail
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="${PROFILE:-release}"
 OUT_DIR="${OUT_DIR:-"$WORKSPACE_ROOT/target/mobile/apple"}"
-HEADER_DIR="$WORKSPACE_ROOT/crates/xray-ffi/include"
+HEADER_DIR="$WORKSPACE_ROOT/crates/segue-ffi/include"
 XCFRAMEWORK_NAME="${XCFRAMEWORK_NAME:-XrayRust.xcframework}"
-CRATE_PACKAGE="xray-ffi"
+CRATE_PACKAGE="segue-ffi"
 LIB_NAME="libxray_ffi.a"
 CARGO_BIN="${CARGO_BIN:-cargo}"
 TVOS_BUILD_STD="${TVOS_BUILD_STD:-auto}"
@@ -53,7 +53,7 @@ validate_output_paths() {
 
 validate_headers() {
   local required
-  for required in xray_ffi.h module.modulemap; do
+  for required in segue_ffi.h module.modulemap; do
     if [[ ! -f "$HEADER_DIR/$required" ]]; then
       echo "missing Apple XCFramework header input: $HEADER_DIR/$required" >&2
       exit 1
@@ -145,11 +145,11 @@ build_target() {
     "$CARGO_BIN" "+$TVOS_RUST_TOOLCHAIN" build \
       --locked \
       -Z build-std=std,panic_unwind \
-      --package xray-ffi \
+      --package segue-ffi \
       --target "$target" \
       $(cargo_profile_args)
   else
-    "$CARGO_BIN" build --locked --package xray-ffi --target "$target" $(cargo_profile_args)
+    "$CARGO_BIN" build --locked --package segue-ffi --target "$target" $(cargo_profile_args)
   fi
 }
 

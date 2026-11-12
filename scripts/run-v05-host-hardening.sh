@@ -6,23 +6,23 @@ readonly MODE="${1:-all}"
 readonly NIGHTLY="nightly-2026-05-22"
 
 run_model() {
-  cargo test --locked -p xray-core-rs --test routing_policy_concurrency_model
+  cargo test --locked -p segue-engine --test routing_policy_concurrency_model
 }
 
 run_miri() {
   MIRIFLAGS="-Zmiri-strict-provenance" \
-    cargo "+$NIGHTLY" miri test --locked -p xray-routing --lib domain_matcher::tests
+    cargo "+$NIGHTLY" miri test --locked -p segue-routing --lib domain_matcher::tests
   MIRIFLAGS="-Zmiri-strict-provenance" \
-    cargo "+$NIGHTLY" miri test --locked -p xray-routing --lib ip_filter::tests
+    cargo "+$NIGHTLY" miri test --locked -p segue-routing --lib ip_filter::tests
   MIRIFLAGS="-Zmiri-strict-provenance" \
-    cargo "+$NIGHTLY" miri test --locked -p xray-routing --lib ip_range_set::tests
+    cargo "+$NIGHTLY" miri test --locked -p segue-routing --lib ip_range_set::tests
   MIRIFLAGS="-Zmiri-strict-provenance" \
-    cargo "+$NIGHTLY" miri test --locked -p xray-routing --lib \
+    cargo "+$NIGHTLY" miri test --locked -p segue-routing --lib \
       domain_host_index::tests::exact_names_win_over_earlier_broader_matchers
   MIRIFLAGS="-Zmiri-strict-provenance" \
-    cargo "+$NIGHTLY" miri test --locked -p xray-config --test model_tests
+    cargo "+$NIGHTLY" miri test --locked -p segue-config --test model_tests
   MIRIFLAGS="-Zmiri-strict-provenance" \
-    cargo "+$NIGHTLY" miri test --locked -p xray-proxy --lib erase::tests
+    cargo "+$NIGHTLY" miri test --locked -p segue-proxy --lib erase::tests
 }
 
 run_asan() {
@@ -38,20 +38,20 @@ run_asan() {
       -Zbuild-std \
       --target "$host_target" \
       --locked \
-      -p xray-config \
-      -p xray-proxy \
-      -p xray-vless-encryption \
-      -p xray-transport \
-      -p xray-tun \
-      -p xray-core-rs \
-      -p xray-ffi \
+      -p segue-config \
+      -p segue-proxy \
+      -p segue-vless-encryption \
+      -p segue-transport \
+      -p segue-tun \
+      -p segue-engine \
+      -p segue-ffi \
       --lib
   RUSTFLAGS="-Zsanitizer=address" \
     cargo "+$NIGHTLY" test \
       -Zbuild-std \
       --target "$host_target" \
       --locked \
-      -p xray-ffi \
+      -p segue-ffi \
       --test ffi_tests
 }
 

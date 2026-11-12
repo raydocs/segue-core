@@ -3,7 +3,7 @@
 Implemented 2026-09-08. Xray-core remains **v26.7.28**, commit
 `5ca6f4b7d4dc20a881d4330e498892697627ec0c`. GotaTun is pinned to **v0.9.1**,
 commit `dab390cdf9dcfb7a6fa85dd8798db92b681ad296`, with the reviewed
-[bounded-memory and PSK ownership patches](v07-wireguard-adapter.md). `xray-wireguard` provides a
+[bounded-memory and PSK ownership patches](v07-wireguard-adapter.md). `segue-wireguard` provides a
 userspace smoltcp 0.13.1 TCP/UDP interface; no system WireGuard/TUN device or host
 route is created by the outbound. Workspace package versions remain 0.6.0 until
 release preparation.
@@ -162,8 +162,8 @@ acknowledgements.
 ```sh
 # Go 1.26.5 on PATH; Rust 1.96.0. Reference is built by the guard.
 bash scripts/check-wireguard-runtime.sh
-cargo +1.96.0 test --locked -p xray-config -p xray-core-rs -p xray-cli
-cargo +1.96.0 clippy --locked -p xray-wireguard -p xray-config -p xray-core-rs --tests -- -D warnings
+cargo +1.96.0 test --locked -p segue-config -p segue-engine -p segue-cli
+cargo +1.96.0 clippy --locked -p segue-wireguard -p segue-config -p segue-engine --tests -- -D warnings
 ```
 
 The guard verifies the exact source archive, zero-fuzz patch and regenerated

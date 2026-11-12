@@ -11,9 +11,9 @@ if(NOT XRAY_FFI_ANDROID_DIR)
     )
 endif()
 
-add_library(xray_ffi SHARED IMPORTED)
+add_library(segue_ffi SHARED IMPORTED)
 set_target_properties(
-    xray_ffi
+    segue_ffi
     PROPERTIES
     IMPORTED_LOCATION "${XRAY_FFI_ANDROID_DIR}/jniLibs/${ANDROID_ABI}/libxray_ffi.so"
     # Rust cdylibs do not currently carry an ELF SONAME. Without this hint,
@@ -30,7 +30,7 @@ set_target_properties(
     VISIBILITY_INLINES_HIDDEN YES
 )
 target_include_directories(xray_mobile_jni PRIVATE "${XRAY_FFI_ANDROID_DIR}/include")
-target_link_libraries(xray_mobile_jni PRIVATE xray_ffi log)
+target_link_libraries(xray_mobile_jni PRIVATE segue_ffi log)
 target_link_options(
     xray_mobile_jni
     PRIVATE

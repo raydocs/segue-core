@@ -1,5 +1,5 @@
 [package]
-name = "xray-rust-fuzz"
+name = "segue-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -12,14 +12,14 @@ cargo-fuzz = true
 bytes = "1"
 libfuzzer-sys = "0.4"
 tokio = { version = "1.52.3", features = ["io-util", "rt"] }
-xray-config = { path = "../crates/xray-config" }
-xray-core-rs = { path = "../crates/xray-core-rs", features = ["fuzzing"] }
-xray-ffi = { path = "../crates/xray-ffi" }
-xray-proxy = { path = "../crates/xray-proxy", features = ["fuzzing"] }
-xray-routing = { path = "../crates/xray-routing" }
-xray-transport = { path = "../crates/xray-transport", features = ["fuzzing"] }
-xray-tun = { path = "../crates/xray-tun" }
-xray-vless-encryption = { path = "../crates/xray-vless-encryption", features = ["fuzzing"] }
+segue-config = { path = "../crates/segue-config" }
+segue-engine = { path = "../crates/segue-engine", features = ["fuzzing"] }
+segue-ffi = { path = "../crates/segue-ffi" }
+segue-proxy = { path = "../crates/segue-proxy", features = ["fuzzing"] }
+segue-routing = { path = "../crates/segue-routing" }
+segue-transport = { path = "../crates/segue-transport", features = ["fuzzing"] }
+segue-tun = { path = "../crates/segue-tun" }
+segue-vless-encryption = { path = "../crates/segue-vless-encryption", features = ["fuzzing"] }
 
 [[bin]]
 name = "vless_encryption_records"

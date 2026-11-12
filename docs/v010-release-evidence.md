@@ -124,7 +124,7 @@ run on a device ([#236](https://github.com/aimalygin/xray-rust/issues/236)).
 Before touching a phone, check the candidate CLI against each suite:
 
 ```bash
-python3 scripts/check-v010-fixture-loopback.py --suite v010 --reference-binary <xray> --client-binary target/release/xray-rust --work-dir <new-dir>
+python3 scripts/check-v010-fixture-loopback.py --suite v010 --reference-binary <xray> --client-binary target/release/segue --work-dir <new-dir>
 ```
 
 It runs each client config with a SOCKS ingress instead of TUN and checks TCP
@@ -295,7 +295,7 @@ directory outside version control.
 python3 scripts/build-isolated-release.py --rev v0.9.0 --name baseline --campaign "$C"
 python3 scripts/build-isolated-release.py --rev <candidate> --name candidate --campaign "$C"
 python3 scripts/build-isolated-release.py --rev <candidate> --name harness --campaign "$C" \
-    --package xray-bench --binary xray-bench
+    --package segue-bench --binary segue-bench
 ```
 
 `baseline` is the published `v0.9.0` tag, which the comparison against 0.9.0

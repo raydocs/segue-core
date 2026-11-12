@@ -88,7 +88,7 @@ die() {
 }
 
 expected=(
-  test --locked -p xray-core-rs
+  test --locked -p segue-engine
   --test local_xray_interop_tests
   rust_socks_client_reaches_echo_server_through_local_xray_vless_xhttp_selected_cases
   -- --ignored --nocapture --test-threads=1
@@ -291,8 +291,8 @@ expected_clean_git_log="$expected_git_log"$'\n'"git|-C|$FAKE_CORE|status|--porce
   exit 112
 }
 
-expected_cargo_entry_log="cargo-entry|test|--locked|-p|xray-core-rs|--test|local_xray_interop_tests|rust_socks_client_reaches_echo_server_through_local_xray_vless_xhttp_selected_cases|--|--ignored|--nocapture|--test-threads=1"
-expected_cargo_log="cargo|test|--locked|-p|xray-core-rs|--test|local_xray_interop_tests|rust_socks_client_reaches_echo_server_through_local_xray_vless_xhttp_selected_cases|--|--ignored|--nocapture|--test-threads=1|checkout=$FAKE_CORE|expected_revision=$VALID_REVISION|xhttp_cases=h2-tls-stream-one"
+expected_cargo_entry_log="cargo-entry|test|--locked|-p|segue-engine|--test|local_xray_interop_tests|rust_socks_client_reaches_echo_server_through_local_xray_vless_xhttp_selected_cases|--|--ignored|--nocapture|--test-threads=1"
+expected_cargo_log="cargo|test|--locked|-p|segue-engine|--test|local_xray_interop_tests|rust_socks_client_reaches_echo_server_through_local_xray_vless_xhttp_selected_cases|--|--ignored|--nocapture|--test-threads=1|checkout=$FAKE_CORE|expected_revision=$VALID_REVISION|xhttp_cases=h2-tls-stream-one"
 
 reset_logs
 relative_output="$TEST_ROOT/relative.log"

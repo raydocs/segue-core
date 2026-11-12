@@ -105,7 +105,7 @@ commit is recorded separately and must not be substituted for runtime identity.
 ```sh
 python3 scripts/prepare-v08-protocol-comparison.py \
   --root /absolute/comparison \
-  --candidate /absolute/frozen/xray-rust --harness /absolute/frozen/xray-bench \
+  --candidate /absolute/frozen/xray-rust --harness /absolute/frozen/segue-bench \
   --candidate-builds /absolute/frozen/builds.json \
   --xray /absolute/frozen/xray-core --singbox /absolute/build/sing-box \
   --singbox-source /absolute/build/sing-box-source.json

@@ -22,7 +22,7 @@ done
 grep -Fq 'CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_STRIP=none' "$HARDENING" || \
   die 'fuzz campaign must preserve dependency coverage and crash symbols'
 
-grep -Fq 'miri test --locked -p xray-routing --lib domain_matcher::tests' "$HARDENING" || \
+grep -Fq 'miri test --locked -p segue-routing --lib domain_matcher::tests' "$HARDENING" || \
   die 'host hardening omits Miri routing coverage'
 grep -Fq -- '-Zsanitizer=address' "$HARDENING" || \
   die 'host hardening omits AddressSanitizer coverage'

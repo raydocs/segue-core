@@ -241,11 +241,11 @@ repository-native provider scanning/push-protection controls.
 ### IR-09: resumed 0-RTT confirmation is outside the 30-second deadline — Low
 
 `ClientConfig::connect_cached` wraps handshake construction in a 30-second
-timeout (`crates/xray-vless-encryption/src/handshake.rs:60-76`). A resumed
+timeout (`crates/segue-vless-encryption/src/handshake.rs:60-76`). A resumed
 0-RTT path returns an `EncryptedStream` immediately after preparing the client
 prefix (`handshake.rs:128-157`). Reading the server random and the first
 authenticated record happens only on later stream I/O
-(`crates/xray-vless-encryption/src/stream.rs:402-488`). Ticket expiry is checked
+(`crates/segue-vless-encryption/src/stream.rs:402-488`). Ticket expiry is checked
 when the resumption is prepared, not while it waits for confirmation
 (`session.rs:89-110`). The existing deadline regression covers a cold
 handshake (`src/tests.rs:284-293`).
@@ -265,12 +265,12 @@ core call sites. Add paused-time tests for a blackholed peer and expiry between
 
 The cached resumption ticket is held in `Zeroizing<[u8; 16]>`, but the handshake
 copies it to an ordinary `Vec` and appends an AEAD tag
-(`crates/xray-vless-encryption/src/handshake.rs:141-147`). Reallocation can
+(`crates/segue-vless-encryption/src/handshake.rs:141-147`). Reallocation can
 leave the plaintext ticket in freed allocator memory. The VLESS UUID is also
 stored as a normal `Uuid`, encoded into an ordinary header `Vec`, and written
-without clearing that buffer (`crates/xray-config/src/model.rs:674-679`;
-`crates/xray-proxy/src/vless/wire.rs:59-74`;
-`crates/xray-core-rs/src/outbound.rs:3814-3823,3898-3911`).
+without clearing that buffer (`crates/segue-config/src/model.rs:674-679`;
+`crates/segue-proxy/src/vless/wire.rs:59-74`;
+`crates/segue-engine/src/outbound.rs:3814-3823,3898-3911`).
 
 Impact: crash dumps, allocator reuse, or another same-process memory disclosure
 can recover credentials after their required-use lifetime. No remote read
@@ -284,7 +284,7 @@ fault/cancellation lifetime regressions.
 ### IR-11: FFI returns string panic payloads verbatim — Low
 
 The panic boundary converts `&str` and `String` payloads directly into a public
-FFI error (`crates/xray-ffi/src/lib.rs:3618-3643`). No current production panic
+FFI error (`crates/segue-ffi/src/lib.rs:3618-3643`). No current production panic
 containing a key or complete configuration was identified, but a future assert
 or dependency panic can cross into a mobile log with its payload intact.
 
@@ -314,7 +314,7 @@ oversized-file fault-injection tests.
 With loopback access permitted, the documented command
 
 ```sh
-cargo test --workspace --exclude xray-rust-fuzz --all-targets --locked
+cargo test --workspace --exclude segue-fuzz --all-targets --locked
 ```
 
 failed three runtime-data-path tests in a parallel run:
@@ -324,7 +324,7 @@ failed three runtime-data-path tests in a parallel run:
 - `tun_regular_vision_udp443_storm_releases_flows_with_logging_on_and_off`.
 
 Each test passed when rerun individually. The relevant definitions are at
-`crates/xray-core-rs/tests/runtime_data_path_tests.rs:2379,2459,3445`.
+`crates/segue-engine/tests/runtime_data_path_tests.rs:2379,2459,3445`.
 
 Impact: this is not a demonstrated runtime vulnerability, but a release gate
 that intermittently fails or passes cannot be treated as reproducible evidence.
