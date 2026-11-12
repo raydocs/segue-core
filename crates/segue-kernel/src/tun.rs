@@ -104,7 +104,7 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 use crate::dial::{Dialer, UdpSession};
 use crate::dns::SmartDns;
 use crate::policy::Policy;
-use crate::quic::{InitialSniffer, Quic};
+use crate::quic::{ConnGuard, InitialSniffer, Quic, Step};
 use crate::rules::{Action, RuleSet};
 use crate::sniff::{sniff, Sniff};
 use crate::socks::{Kernel, SniffSettings};
@@ -499,6 +499,9 @@ pub struct NetstackStats {
     pub udp_refused_reserved: u64,
     pub udp_refused_full: u64,
     pub udp_refused_upstream: u64,
+    /// Datagrams of a further QUIC connection on a routed UDP flow that
+    /// would not route like the flow (or could not be classified).
+    pub udp_dropped_quic_conn: u64,
     pub icmp_sent: u64,
     pub icmp_too_big: u64,
     pub icmp_suppressed: u64,
@@ -2040,7 +2043,8 @@ enum TcpPlan {
 }
 
 enum UdpPlan {
-    Dial(Dial),
+    /// With the guard of a flow routed by sniffing (see [`UdpLive`]).
+    Dial(Dial, Option<Box<ConnGuard<Bytes>>>),
     /// Datagrams held while the QUIC ClientHello is incomplete. `skip`:
     /// datagrams already fed to the sniffer (the first one, at admission).
     Sniff {
@@ -2049,6 +2053,25 @@ enum UdpPlan {
         skip: usize,
     },
 }
+
+/// A UDP flow with its relay task.
+struct UdpLive {
+    tx: mpsc::Sender<Bytes>,
+    dial: Dial,
+    /// For a flow routed by sniffing: every further QUIC connection on the
+    /// flow is classified too, and allowed only if it routes like `dial`.
+    guard: Option<Box<ConnGuard<Bytes>>>,
+}
+
+/// The per-connection guard of a flow routed after `sniffer` said `q`.
+fn quic_guard(sniffer: &InitialSniffer, q: &Quic, key: &FlowKey) -> Box<ConnGuard<Bytes>> {
+    Box::new(ConnGuard::new(
+        matches!(q, Quic::Domain(_)).then_some(sniffer),
+        key.dst.port() == QUIC_PORT,
+    ))
+}
+
+const QUIC_PORT: u16 = 443;
 
 enum UdpMsg {
     Reply { key: FlowKey, payload: Bytes },
@@ -2144,8 +2167,10 @@ impl TunStack {
         // the device's one-packet receive slot.
         let packet_queues = (c.out_queue + 2 * c.udp_queue + 1) * mtu;
         // Per flow: queued datagrams, one receive buffer of a reply's size,
-        // bookkeeping.
-        let udp_flows = c.max_udp_flows * ((self.udp_flow_queue + 1) * mtu + 1024);
+        // bookkeeping; the QUIC guard's held datagrams and kept hellos.
+        let guard = (crate::quic::MAX_DATAGRAMS - 1) * mtu
+            + crate::quic::MAX_CONNS * crate::quic::MAX_HELLO;
+        let udp_flows = c.max_udp_flows * ((self.udp_flow_queue + 1) * mtu + 1024 + guard);
         // A query and its answer (TCP answers live in the pool).
         let dns = self.max_dns_in_flight * 2 * mtu;
         MemoryBudget {
@@ -2172,7 +2197,7 @@ impl TunStack {
         let mut pipes: HashMap<FlowId, Pipe> = HashMap::new();
         let mut tcp_plans: HashMap<FlowKey, TcpPlan> = HashMap::new();
         let mut udp_plans: HashMap<FlowKey, UdpPlan> = HashMap::new();
-        let mut udp_flows: HashMap<FlowKey, mpsc::Sender<Bytes>> = HashMap::new();
+        let mut udp_flows: HashMap<FlowKey, UdpLive> = HashMap::new();
         let (msg_tx, mut msg_rx) = mpsc::channel::<UdpMsg>(self.config.udp_queue.max(1));
         let dns_slots = Arc::new(Semaphore::new(self.max_dns_in_flight));
         let has_dns = self.dns.is_some();
@@ -2244,12 +2269,12 @@ impl TunStack {
                     });
                     continue;
                 }
-                let (tx, held) = match udp_flows.entry(d.key) {
-                    std::collections::hash_map::Entry::Occupied(e) => (e.into_mut(), Vec::new()),
+                let (live, held) = match udp_flows.entry(d.key) {
+                    std::collections::hash_map::Entry::Occupied(e) => (e.into_mut(), None),
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        let (dial, held) = match udp_plans.remove(&d.key) {
+                        let (dial, held, guard) = match udp_plans.remove(&d.key) {
                             None => continue,
-                            Some(UdpPlan::Dial(dial)) => (dial, Vec::new()),
+                            Some(UdpPlan::Dial(dial, guard)) => (dial, Vec::new(), guard),
                             Some(UdpPlan::Sniff {
                                 mut sniffer,
                                 mut held,
@@ -2274,7 +2299,10 @@ impl TunStack {
                                     continue;
                                 }
                                 match router.udp_sniffed(&d.key, &q) {
-                                    Some(dial) => (dial, held),
+                                    Some(dial) => {
+                                        let guard = quic_guard(&sniffer, &q, &d.key);
+                                        (dial, held, Some(guard))
+                                    }
                                     None => {
                                         // Unconfirmed QUIC or a refused name:
                                         // later datagrams get the ICMP refusal.
@@ -2288,21 +2316,42 @@ impl TunStack {
                         tokio::spawn(udp_flow(
                             ctx.clone(),
                             d.key,
-                            dial,
+                            dial.clone(),
                             rx,
                             msg_tx.clone(),
                             stack.max_udp_reply(&d.key),
                         ));
-                        (e.insert(tx), held)
+                        let live = UdpLive { tx, dial, guard };
+                        // Datagrams that classified the flow go out as is.
+                        (e.insert(live), Some(held))
                     }
                 };
-                for p in held {
-                    if tx.try_send(p).is_err() {
+                let out = if let Some(mut held) = held {
+                    held.push(d.payload);
+                    held
+                } else {
+                    match &mut live.guard {
+                        None => vec![d.payload],
+                        Some(g) => {
+                            let dial = &live.dial;
+                            let payload = d.payload.clone();
+                            let same =
+                                |q: &Quic| router.udp_sniffed(&d.key, q).as_ref() == Some(dial);
+                            match g.push(d.payload, &payload, same) {
+                                Step::Forward(ds) => ds,
+                                Step::Hold => Vec::new(),
+                                Step::Drop(ds) => {
+                                    stack.stats.udp_dropped_quic_conn += ds.len() as u64;
+                                    Vec::new()
+                                }
+                            }
+                        }
+                    }
+                };
+                for p in out {
+                    if live.tx.try_send(p).is_err() {
                         stack.stats.dropped_udp_queue_full += 1;
                     }
-                }
-                if tx.try_send(d.payload).is_err() {
-                    stack.stats.dropped_udp_queue_full += 1;
                 }
             }
             while let Some(pkt) = stack.pop_output() {
@@ -2404,7 +2453,8 @@ fn policy(
                 match router.udp_sniffed(key, &q) {
                     Some(d) => {
                         let tag = d.tag.clone();
-                        udp_plans.insert(*key, UdpPlan::Dial(d));
+                        let guard = quic_guard(&sniffer, &q, key);
+                        udp_plans.insert(*key, UdpPlan::Dial(d, Some(guard)));
                         Verdict::Accept(tag)
                     }
                     None => Verdict::Refuse,
@@ -2412,7 +2462,7 @@ fn policy(
             }
             UdpRoute::Dial(d) => {
                 let tag = d.tag.clone();
-                udp_plans.insert(*key, UdpPlan::Dial(d));
+                udp_plans.insert(*key, UdpPlan::Dial(d, None));
                 Verdict::Accept(tag)
             }
         },
