@@ -6,13 +6,19 @@
 //! [`RelayEvent::Connect`] exactly once per session (A2): the session entry
 //! exists before the connect starts, so an OPEN retry or a duplicate OPEN
 //! that arrives while connecting finds it.
+//!
+//! A carrier whose first frame is `CTRL_HELLO` is the device's control
+//! stream (§3): the table answers PING with PONG and sends `STALL` there
+//! when one of the device's sessions goes DETACHED (B1), and `REVOKED` on
+//! a device reset.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::codec::{
-    code, ClosedInfo, Frame, Kind, Opened, Reject, Resumed, Secret, SessionId, Target,
+    code, ty, ClosedInfo, CtrlHello, CtrlHelloReply, Frame, Kind, Opened, Reject, Resumed, Secret,
+    SessionId, Target,
 };
 use crate::flow::{RecvHalf, SendHalf};
 use crate::pool::Pool;
@@ -123,7 +129,17 @@ struct CarrierSlot {
     /// Frame queued before the carrier is bound or closed (REJECT).
     out: Option<Frame>,
     close_after: bool,
+    /// Control stream of this device (first frame was CTRL_HELLO).
+    control: Option<u64>,
+    /// Control frames to send (PONG, STALL, REVOKED), bounded.
+    ctrl_out: VecDeque<Frame>,
 }
+
+/// Control frames queued per control stream; PINGs beyond this are not
+/// answered (a peer that never reads cannot grow the queue).
+const CTRL_QUEUE: usize = 64;
+/// STALL entries per frame (20 bytes each, under MAX_PAYLOAD).
+const STALL_BATCH: usize = 512;
 
 pub struct RelayTable {
     cfg: Config,
@@ -241,6 +257,19 @@ impl RelayTable {
         if slot.close_after {
             return;
         }
+        if slot.control.is_some() {
+            if let Frame::Ping { nonce } = frame {
+                if slot.ctrl_out.len() < CTRL_QUEUE {
+                    slot.ctrl_out.push_back(Frame::Pong {
+                        nonce,
+                        extra: Vec::new(),
+                    });
+                }
+            }
+            // Other control frames (RESOLVE, REFRESH, PARK) are not
+            // implemented; session frames do not belong here.
+            return;
+        }
         match slot.session {
             None => self.on_first(cid, frame, now),
             Some(sid) => {
@@ -283,8 +312,50 @@ impl RelayTable {
         self.finish(sid, code::PROTOCOL, true);
     }
 
+    fn on_control_hello(&mut self, cid: CarrierId, payload: &[u8]) {
+        let hello = match CtrlHello::parse(payload) {
+            Ok(h) => h,
+            Err(ProtoError::Version(_)) => return self.reject(cid, code::VERSION, 0, None),
+            Err(_) => return self.close_carrier_now(cid),
+        };
+        // An expired ticket would still get a control stream for REFRESH
+        // (§6); REFRESH is not implemented, so it is refused like OPEN.
+        let device = match self.auth.resume(&hello.ticket) {
+            Ok(d) => d,
+            Err(c) => return self.reject(cid, c, 0, None),
+        };
+        let slot = self.carriers.entry(cid).or_default();
+        slot.control = Some(device);
+        slot.ctrl_out.push_back(
+            CtrlHelloReply {
+                node_id: 0,
+                instance_id: self.instance_id,
+                ticket_expired: false,
+            }
+            .to_frame(),
+        );
+    }
+
+    /// Queue `STALL` entries on every control stream of `device`.
+    fn send_stall(&mut self, device: u64, entries: &[(SessionId, u32)]) {
+        for slot in self.carriers.values_mut() {
+            if slot.control != Some(device) || slot.close_after {
+                continue;
+            }
+            for batch in entries.chunks(STALL_BATCH) {
+                if slot.ctrl_out.len() < CTRL_QUEUE {
+                    slot.ctrl_out.push_back(Frame::Stall(batch.to_vec()));
+                }
+            }
+        }
+    }
+
     fn on_first(&mut self, cid: CarrierId, frame: Frame, now: Instant) {
         match frame {
+            Frame::Control {
+                ty: ty::CTRL_HELLO,
+                payload,
+            } => self.on_control_hello(cid, &payload),
             Frame::Open(o) => {
                 let sid = o.session_id;
                 if let Some(t) = self.tombs.get(&sid) {
@@ -558,6 +629,9 @@ impl RelayTable {
         if let Some(f) = slot.out.take() {
             return Some(f);
         }
+        if slot.control.is_some() {
+            return slot.ctrl_out.pop_front();
+        }
         let sid = slot.session?;
         let s = self.sessions.get_mut(&sid)?;
         if s.carrier != Some(cid) {
@@ -666,6 +740,18 @@ impl RelayTable {
             }
             self.finish(&sid, close_code, true);
         }
+        // REVOKED on the device's control streams, then close them (§6).
+        for (&cid, slot) in self.carriers.iter_mut() {
+            if slot.control == Some(device) && !slot.close_after {
+                slot.ctrl_out.clear();
+                slot.ctrl_out.push_back(Frame::Control {
+                    ty: ty::REVOKED,
+                    payload: vec![close_code],
+                });
+                slot.close_after = true;
+                self.to_close.push(cid);
+            }
+        }
     }
 
     // ---- time ----
@@ -702,6 +788,7 @@ impl RelayTable {
         self.tombs.retain(|_, x| x.until > now);
         let mut expired = Vec::new();
         let mut too_old = Vec::new();
+        let mut stalled: Vec<(u64, SessionId, u32)> = Vec::new();
         for (sid, s) in self.sessions.iter_mut() {
             if now >= s.created + t.max_lifetime {
                 s.rst = Some(code::MAX_LIFETIME);
@@ -723,10 +810,16 @@ impl RelayTable {
                     session_id: *sid,
                     attach_gen: s.cur_gen,
                 });
+                stalled.push((s.device, *sid, s.cur_gen));
             }
             if s.recv.idle_deadline().is_some_and(|d| now >= d) {
                 s.recv.update_credit(now);
             }
+        }
+        stalled.sort_unstable_by_key(|x| x.0);
+        for group in stalled.chunk_by(|a, b| a.0 == b.0) {
+            let entries: Vec<_> = group.iter().map(|&(_, sid, g)| (sid, g)).collect();
+            self.send_stall(group[0].0, &entries);
         }
         for sid in expired {
             self.finish(&sid, code::IDLE, false);

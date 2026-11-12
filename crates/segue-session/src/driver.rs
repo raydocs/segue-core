@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
 use crate::client::{ClientSession, CloseReason, State};
-use crate::codec::{code, Frame, FrameDecoder, Kind, SessionId, Target};
+use crate::codec::{code, ty, CtrlHello, Frame, FrameDecoder, Kind, SessionId, Target};
 use crate::relay::{RelayEvent, RelayTable};
 use crate::ProtoError;
 
@@ -235,6 +235,9 @@ pub struct ClientCtl {
     /// Every change (a network-change epoch) moves the session to a new
     /// carrier with RESUME (KERNEL_SPEC §7.2 "网络变化").
     pub reattach: Option<tokio::sync::watch::Receiver<u64>>,
+    /// `STALL` hints for this session from the control stream: the
+    /// relay's `attach_gen` that it saw stall (B1).
+    pub stall: Option<mpsc::UnboundedReceiver<u32>>,
     /// Receives how the session ended as soon as it is known, before the
     /// app stream is shut down, so the caller can tell a clean EOF from a
     /// reset (the app stream itself can only show EOF).
@@ -256,6 +259,7 @@ where
 {
     let ClientCtl {
         mut reattach,
+        mut stall,
         closed,
         mut opened,
     } = ctl;
@@ -395,6 +399,12 @@ where
                 match r {
                     Ok(()) => s.reattach(now()),
                     Err(_) => reattach = None,
+                }
+            }
+            g = async { stall.as_mut().expect("guarded").recv().await }, if stall.is_some() => {
+                match g {
+                    Some(g) => s.on_stall(g, now()),
+                    None => stall = None,
                 }
             }
             r = &mut app_err_rx, if !app_failed => {
@@ -745,4 +755,143 @@ pub async fn run_relay_ctl(
             _ = tokio::time::sleep_until(drain.unwrap_or_else(tokio::time::Instant::now)), if drain.is_some() => {}
         }
     }
+}
+
+/// Health timing of a control stream.
+#[derive(Clone, Debug)]
+pub struct ControlTiming {
+    /// PING period.
+    pub ping_every: std::time::Duration,
+    /// No frame from the relay for this long: the channel is dead.
+    pub dead_after: std::time::Duration,
+    /// Wait after a failed control-stream connect.
+    pub retry: std::time::Duration,
+}
+
+impl Default for ControlTiming {
+    fn default() -> Self {
+        Self {
+            ping_every: std::time::Duration::from_secs(5),
+            dead_after: std::time::Duration::from_secs(12),
+            retry: std::time::Duration::from_secs(2),
+        }
+    }
+}
+
+/// What a control stream tells the sessions of its channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlHint {
+    /// The relay saw this session stall (`STALL`, B1): RESUME it.
+    Stall {
+        session_id: SessionId,
+        attach_gen: u32,
+    },
+    /// The control stream answered nothing for `dead_after`, or broke: the
+    /// channel is dead, move every session to a new carrier (§5.1 "通道判死").
+    Dead,
+    /// `REVOKED` on the control stream (§6).
+    Revoked(u8),
+}
+
+/// Keep a control stream to the relay (§3, KERNEL_SPEC §7.2): CTRL_HELLO,
+/// then PING every `ping_every`. Runs until `hints` is closed. A silent
+/// stream (a blackhole that drops packets but never closes the socket) is
+/// reported as [`ControlHint::Dead`] and replaced.
+pub async fn run_control(
+    connect: Connector,
+    hello: CtrlHello,
+    timing: ControlTiming,
+    hints: mpsc::UnboundedSender<ControlHint>,
+) {
+    use tokio::time::{sleep, Instant};
+    let mut nonce = 0u64;
+    while !hints.is_closed() {
+        let c = tokio::select! {
+            c = connect() => c,
+            _ = hints.closed() => return,
+        };
+        let c = match c {
+            Ok(c) => c,
+            Err(_) => {
+                sleep(timing.retry).await;
+                continue;
+            }
+        };
+        let (mut r, mut w) = tokio::io::split(c);
+        if !write_within(&mut w, hello.to_frame(), timing.dead_after).await {
+            sleep(timing.retry).await;
+            continue;
+        }
+        let mut dec = FrameDecoder::new();
+        let mut buf = vec![0u8; 4096];
+        let mut last_rx = Instant::now();
+        let mut ping = tokio::time::interval(timing.ping_every);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut revoked = false;
+        // Only a stream the relay accepted (answered CTRL_HELLO) can be
+        // judged dead; a refused or unreachable one is just retried.
+        let mut accepted = false;
+        'stream: loop {
+            tokio::select! {
+                n = r.read(&mut buf) => {
+                    let n = match n {
+                        Ok(0) | Err(_) => break 'stream,
+                        Ok(n) => n,
+                    };
+                    last_rx = Instant::now();
+                    accepted = true;
+                    dec.push(&buf[..n]);
+                    loop {
+                        match dec.next_frame() {
+                            Ok(Some(Frame::Stall(entries))) => {
+                                for (session_id, attach_gen) in entries {
+                                    let _ = hints.send(ControlHint::Stall { session_id, attach_gen });
+                                }
+                            }
+                            Ok(Some(Frame::Control { ty: ty::REVOKED, payload })) => {
+                                let _ = hints.send(ControlHint::Revoked(
+                                    payload.first().copied().unwrap_or(code::REVOKED),
+                                ));
+                                revoked = true;
+                                break 'stream;
+                            }
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(_) => break 'stream,
+                        }
+                    }
+                }
+                _ = ping.tick() => {
+                    if last_rx.elapsed() >= timing.dead_after {
+                        break 'stream;
+                    }
+                    nonce += 1;
+                    if !write_within(&mut w, Frame::Ping { nonce }, timing.dead_after).await {
+                        break 'stream;
+                    }
+                }
+                _ = sleep_until_dead(last_rx, timing.dead_after) => break 'stream,
+                _ = hints.closed() => return,
+            }
+        }
+        if revoked {
+            return;
+        }
+        if accepted {
+            let _ = hints.send(ControlHint::Dead);
+        } else {
+            sleep(timing.retry).await;
+        }
+    }
+}
+
+async fn write_within<W: AsyncWrite + Unpin>(w: &mut W, f: Frame, d: std::time::Duration) -> bool {
+    matches!(
+        tokio::time::timeout(d, w.write_all(&f.to_bytes())).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn sleep_until_dead(last_rx: tokio::time::Instant, dead_after: std::time::Duration) {
+    tokio::time::sleep_until(last_rx + dead_after).await
 }

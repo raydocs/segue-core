@@ -24,11 +24,19 @@
 //! if that fails. A user disconnect (L5) refuses every proxied flow and ends
 //! the live sessions.
 //!
+//! Channel health (SESSION_PROTOCOL §3, §5.1): each exit that has sessions
+//! keeps a control stream to its relay. A `STALL` from the relay (it sees
+//! a session's downstream unacknowledged, B1) moves that session to a new
+//! carrier with RESUME; a control stream that answers nothing for
+//! `dead_after` (a blackhole that drops packets without closing anything)
+//! moves every session of that exit. Without this a download-only session
+//! has nothing unacknowledged upstream and would never notice the stall.
+//!
 //! UDP is never carried to a `home` role route or outbound, whatever the
 //! UDP settings say (KERNEL_SPEC §5.4): [`KernelDialer::dial_udp`] is the
 //! one place every UDP flow passes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,10 +44,13 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use segue_routing::TargetAddr;
 use segue_session::client::{ClientSession, CloseReason, OpenParams};
-use segue_session::codec::{code, Kind, Target};
-use segue_session::driver::{run_client_ctl, BoxCarrier, ClientCtl, Connector};
+use segue_session::codec::{code, CtrlHello, Kind, SessionId, Target, VERSION};
+use segue_session::driver::{
+    run_client_ctl, run_control, BoxCarrier, ClientCtl, Connector, ControlHint, ControlTiming,
+};
 use segue_session::pool::Pool;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::dial::{Datagrams, DialError, Dialer};
 
@@ -159,6 +170,24 @@ impl State {
     }
 }
 
+/// One exit's control stream and the sessions it can hint.
+#[derive(Default)]
+struct Channel {
+    /// Bumped when the channel is judged dead: every session reattaches.
+    epoch: Arc<watch::Sender<u64>>,
+    /// Live sessions on this exit, for `STALL` hints.
+    sessions: Arc<Mutex<HashMap<SessionId, mpsc::UnboundedSender<u32>>>>,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Channel {
+    fn stop(&self) {
+        if let Some(h) = self.task.lock().unwrap().take() {
+            h.abort();
+        }
+    }
+}
+
 /// Snapshot for the control API.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
@@ -180,6 +209,17 @@ pub struct KernelDialer {
     state: Arc<Mutex<State>>,
     /// true while the user has Segue off; live sessions watch it.
     off: watch::Sender<bool>,
+    /// Per exit, same order as `exits`.
+    channels: Vec<Channel>,
+    control: ControlTiming,
+}
+
+impl Drop for KernelDialer {
+    fn drop(&mut self) {
+        for c in &self.channels {
+            c.stop();
+        }
+    }
 }
 
 impl KernelDialer {
@@ -189,6 +229,7 @@ impl KernelDialer {
         routes: BTreeMap<String, SegueRoute>,
         home: BTreeSet<String>,
     ) -> Self {
+        let exits_len = exits.len();
         let health = vec![
             Health {
                 ks: KillSwitch::new(),
@@ -208,7 +249,75 @@ impl KernelDialer {
                 health,
             })),
             off: watch::channel(false).0,
+            channels: (0..exits_len).map(|_| Channel::default()).collect(),
+            control: ControlTiming::default(),
         }
+    }
+
+    /// Control stream PING period and dead-channel threshold.
+    pub fn with_control_timing(mut self, t: ControlTiming) -> Self {
+        self.control = t;
+        self
+    }
+
+    /// Start exit `i`'s control stream unless it is running.
+    fn ensure_channel(&self, i: usize, ticket: &[u8]) {
+        let ch = &self.channels[i];
+        let mut task = ch.task.lock().unwrap();
+        if task.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let hello = CtrlHello {
+            version: VERSION,
+            ticket: ticket.to_vec(),
+            held_anchors: vec![self.exits[i].node_id],
+        };
+        let connect = self.connector(i);
+        let timing = self.control.clone();
+        let epoch = ch.epoch.clone();
+        let sessions = ch.sessions.clone();
+        let sessions_idle = ch.sessions.clone();
+        let name = self.exits[i].name.clone();
+        *task = Some(tokio::spawn(async move {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let hints = async move {
+                while let Some(h) = rx.recv().await {
+                    match h {
+                        ControlHint::Stall {
+                            session_id,
+                            attach_gen,
+                        } => {
+                            if let Some(s) = sessions.lock().unwrap().get(&session_id) {
+                                let _ = s.send(attach_gen);
+                            }
+                        }
+                        ControlHint::Dead => {
+                            eprintln!("segue-kernel: exit {name}: channel dead, resuming sessions");
+                            epoch.send_modify(|e| *e += 1);
+                        }
+                        // The relay resets the sessions itself.
+                        ControlHint::Revoked(_) => {}
+                    }
+                }
+            };
+            let idle_check = timing.ping_every;
+            let idle = {
+                let sessions = sessions_idle;
+                async move {
+                    loop {
+                        tokio::time::sleep(idle_check).await;
+                        if sessions.lock().unwrap().is_empty() {
+                            return;
+                        }
+                    }
+                }
+            };
+            tokio::select! {
+                _ = async { tokio::join!(run_control(connect, hello, timing, tx), hints) } => {}
+                // No sessions on this exit: no control stream (no idle wake-ups).
+                _ = idle => {}
+            }
+        }));
     }
 
     pub fn posture(&self) -> Posture {
@@ -269,6 +378,9 @@ impl KernelDialer {
             h.ks.on_event(Event::UserDisconnect);
         }
         self.off.send_replace(true);
+        for c in &self.channels {
+            c.stop();
+        }
     }
 
     /// Try a carrier to the current exit now, so the posture reflects
@@ -403,11 +515,17 @@ impl KernelDialer {
         };
         let s = ClientSession::new(Default::default(), &self.pool, params, Instant::now())
             .ok_or_else(|| (DialError("refused: session memory exhausted".into()), None))?;
+        let ch = &self.channels[i];
+        let sid = s.session_id();
+        let (stall_tx, stall_rx) = mpsc::unbounded_channel();
+        ch.sessions.lock().unwrap().insert(sid, stall_tx);
+        let sessions = ch.sessions.clone();
         let (app, far) = tokio::io::duplex(64 << 10);
         let (open_tx, open_rx) = tokio::sync::oneshot::channel();
         let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel();
         let ctl = ClientCtl {
-            reattach: None,
+            reattach: Some(ch.epoch.subscribe()),
+            stall: Some(stall_rx),
             closed: Some(closed_tx),
             opened: Some(open_tx),
         };
@@ -419,10 +537,18 @@ impl KernelDialer {
                 // Dropping the session drops its carriers and the app pipe.
                 _ = off.wait_for(|off| *off) => {}
             }
+            sessions.lock().unwrap().remove(&sid);
         });
         tokio::select! {
+            // OPENED first: a session reset right after it still counts as
+            // opened (its stream then ends with that reset).
+            biased;
             o = open_rx => match o {
-                Ok(()) => Ok(Box::new(SessionStream::new(app, closed_rx))),
+                Ok(()) => {
+                    // Only a working route gets (and keeps) a control stream.
+                    self.ensure_channel(i, &r.ticket);
+                    Ok(Box::new(SessionStream::new(app, closed_rx)))
+                }
                 Err(_) => Err(closed_err((&mut closed_rx).await.ok())),
             },
             c = &mut closed_rx => Err(closed_err(c.ok())),

@@ -403,6 +403,85 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// `CTRL_HELLO` from the client (§3): the first frame of a control stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CtrlHello {
+    pub version: u8,
+    pub ticket: Vec<u8>,
+    /// `anchor_node_id`s this device has sessions at.
+    pub held_anchors: Vec<u64>,
+}
+
+impl CtrlHello {
+    pub fn to_frame(&self) -> Frame {
+        let mut p = vec![self.version];
+        put_lp(&mut p, &self.ticket);
+        put_varint(&mut p, self.held_anchors.len() as u64);
+        for a in &self.held_anchors {
+            p.extend_from_slice(&a.to_be_bytes());
+        }
+        Frame::Control {
+            ty: ty::CTRL_HELLO,
+            payload: p,
+        }
+    }
+
+    pub fn parse(payload: &[u8]) -> Result<Self, ProtoError> {
+        let mut r = Reader { buf: payload };
+        let version = r.u8()?;
+        if version != VERSION {
+            return Err(ProtoError::Version(version));
+        }
+        let ticket = r.lp()?;
+        let n = r.count()?;
+        let held_anchors = (0..n).map(|_| r.u64()).collect::<Result<_, _>>()?;
+        r.end()?;
+        Ok(Self {
+            version,
+            ticket,
+            held_anchors,
+        })
+    }
+}
+
+/// `CTRL_HELLO` answer from the relay: node_id, instance_id, ticket_state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CtrlHelloReply {
+    pub node_id: u64,
+    pub instance_id: u64,
+    pub ticket_expired: bool,
+}
+
+impl CtrlHelloReply {
+    pub fn to_frame(&self) -> Frame {
+        let mut p = Vec::with_capacity(17);
+        p.extend_from_slice(&self.node_id.to_be_bytes());
+        p.extend_from_slice(&self.instance_id.to_be_bytes());
+        p.push(self.ticket_expired as u8);
+        Frame::Control {
+            ty: ty::CTRL_HELLO,
+            payload: p,
+        }
+    }
+
+    pub fn parse(payload: &[u8]) -> Result<Self, ProtoError> {
+        let mut r = Reader { buf: payload };
+        let node_id = r.u64()?;
+        let instance_id = r.u64()?;
+        let ticket_expired = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(ProtoError::Malformed),
+        };
+        r.end()?;
+        Ok(Self {
+            node_id,
+            instance_id,
+            ticket_expired,
+        })
+    }
+}
+
 fn put_lp(out: &mut Vec<u8>, b: &[u8]) {
     put_varint(out, b.len() as u64);
     out.extend_from_slice(b);

@@ -30,8 +30,12 @@ impl Authorizer for Deny {
 struct Node {
     accept: mpsc::Sender<BoxCarrier>,
     up: Arc<AtomicBool>,
-    /// Carriers handed out.
+    /// Carriers handed out (control streams excluded).
     carriers: Arc<AtomicUsize>,
+    /// Control streams (first frame CTRL_HELLO).
+    controls: Arc<AtomicUsize>,
+    /// Every carrier's blackhole switch, and whether it is a control stream.
+    holes: Holes,
     /// Site connects at this relay.
     sites: Arc<AtomicUsize>,
 }
@@ -43,6 +47,102 @@ struct Engine {
     nodes: HashMap<String, Node>,
     other_tcp: Mutex<Vec<Option<String>>>,
     udp: Mutex<Vec<Option<String>>>,
+}
+
+/// A carrier that moves itself from the carrier count to the control
+/// count when its first frame is CTRL_HELLO.
+struct Counted {
+    inner: tokio::io::DuplexStream,
+    carriers: Arc<AtomicUsize>,
+    controls: Arc<AtomicUsize>,
+    is_control: Arc<AtomicBool>,
+    seen: bool,
+}
+
+type Holes = Arc<Mutex<Vec<(Arc<AtomicBool>, Arc<AtomicBool>)>>>;
+
+/// One direction of a carrier's network path.
+async fn path<R, W>(mut r: R, mut w: W, hole: Arc<AtomicBool>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let n = match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if hole.load(Ordering::SeqCst) {
+            continue; // dropped
+        }
+        if w.write_all(&buf[..n]).await.is_err() {
+            break;
+        }
+    }
+    if !hole.load(Ordering::SeqCst) {
+        let _ = w.shutdown().await;
+    } else {
+        // A blackhole never delivers a close either.
+        std::future::pending::<()>().await;
+    }
+}
+
+impl tokio::io::AsyncRead for Counted {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Counted {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        b: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if !self.seen && !b.is_empty() {
+            self.seen = true;
+            if b[0] == segue_session::codec::ty::CTRL_HELLO {
+                self.carriers.fetch_sub(1, Ordering::SeqCst);
+                self.is_control.store(true, Ordering::SeqCst);
+                self.controls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, b)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl segue_transport::TransportStream for Counted {
+    fn poll_read_direct(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        output: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncRead::poll_read(self, cx, output)
+    }
+    fn poll_write_direct(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        input: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(self, cx, input)
+    }
 }
 
 struct NoUdp;
@@ -76,12 +176,31 @@ impl Dialer for Engine {
             return Err(DialError("mock: carrier down".into()));
         }
         node.carriers.fetch_add(1, Ordering::SeqCst);
-        let (client, relay) = tokio::io::duplex(64 << 10);
+        // client <-> [path] <-> relay; the path can turn into a blackhole
+        // that drops every byte both ways and closes nothing.
+        let (client, a) = tokio::io::duplex(64 << 10);
+        let (b, relay) = tokio::io::duplex(64 << 10);
+        let hole = Arc::new(AtomicBool::new(false));
+        let is_control = Arc::new(AtomicBool::new(false));
+        node.holes
+            .lock()
+            .unwrap()
+            .push((hole.clone(), is_control.clone()));
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        tokio::spawn(path(ar, bw, hole.clone()));
+        tokio::spawn(path(br, aw, hole));
         node.accept
             .send(Box::new(relay))
             .await
             .map_err(|_| DialError("mock: relay gone".into()))?;
-        Ok(Box::new(client))
+        Ok(Box::new(Counted {
+            inner: client,
+            carriers: node.carriers.clone(),
+            controls: node.controls.clone(),
+            is_control,
+            seen: false,
+        }))
     }
 
     async fn dial_udp(
@@ -138,6 +257,8 @@ fn node(auth: Box<dyn Authorizer>, site: Option<SiteConnector>) -> Node {
         accept: tx,
         up: Arc::new(AtomicBool::new(true)),
         carriers: Arc::default(),
+        controls: Arc::default(),
+        holes: Holes::default(),
         sites,
     }
 }
@@ -149,7 +270,20 @@ struct Lab {
     la_carriers: Arc<AtomicUsize>,
     ny_carriers: Arc<AtomicUsize>,
     la_sites: Arc<AtomicUsize>,
+    la_holes: Holes,
     engine: Arc<Engine>,
+}
+
+impl Lab {
+    /// Every la carrier open now (session carriers, and the control stream
+    /// too when `control`) starts dropping all packets. New ones work.
+    fn blackhole_la(&self, control: bool) {
+        for (hole, is_control) in self.la_holes.lock().unwrap().iter() {
+            if control || !is_control.load(Ordering::SeqCst) {
+                hole.store(true, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 fn lab_with(la_auth: Box<dyn Authorizer>) -> Lab {
@@ -162,6 +296,7 @@ fn lab_parts(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>) -> La
     let (la_up, ny_up) = (la.up.clone(), ny.up.clone());
     let (la_carriers, ny_carriers) = (la.carriers.clone(), ny.carriers.clone());
     let la_sites = la.sites.clone();
+    let la_holes = la.holes.clone();
     let engine = Arc::new(Engine {
         nodes: [("reality-la".to_string(), la), ("hy2-ny".to_string(), ny)].into(),
         ..Default::default()
@@ -198,6 +333,7 @@ fn lab_parts(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>) -> La
         la_carriers,
         ny_carriers,
         la_sites,
+        la_holes,
         engine,
     }
 }
@@ -527,4 +663,125 @@ async fn user_disconnect_ends_live_sessions_with_an_error() {
     l.d.disconnect();
     let (_, end) = read_to_end(&mut s).await;
     assert!(end.is_err(), "disconnect looked like a clean end");
+}
+
+/// A site that streams a numbered byte pattern for ever, 1 KiB every 5 ms.
+fn endless_download() -> SiteConnector {
+    Arc::new(move |_t, _k| {
+        Box::pin(async move {
+            let (a, mut b) = tokio::io::duplex(64 << 10);
+            tokio::spawn(async move {
+                let mut i = 0u64;
+                loop {
+                    let chunk: Vec<u8> = (i..i + 1024).map(|x| (x % 251) as u8).collect();
+                    if b.write_all(&chunk).await.is_err() {
+                        return;
+                    }
+                    i += 1024;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
+/// Read `n` more bytes of the pattern, checking every byte, within `limit`.
+async fn read_pattern(s: &mut crate::dial::Stream, at: &mut u64, n: u64, limit: Duration) {
+    let end = *at + n;
+    let mut buf = [0u8; 4096];
+    tokio::time::timeout(limit, async {
+        while *at < end {
+            let k = s.read(&mut buf).await.expect("download failed");
+            assert!(k > 0, "download ended");
+            for &b in &buf[..k] {
+                assert_eq!(b, (*at % 251) as u8, "byte {at} wrong (lost or duplicated)");
+                *at += 1;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("download stalled at byte {at}"));
+}
+
+fn quick_control() -> ControlTiming {
+    ControlTiming {
+        ping_every: Duration::from_millis(200),
+        dead_after: Duration::from_millis(1000),
+        retry: Duration::from_millis(200),
+    }
+}
+
+async fn download_lab() -> (Lab, crate::dial::Stream, u64) {
+    let mut l = lab_parts(Box::new(AllowAll), Some(endless_download()));
+    l.d = std::mem::replace(
+        &mut l.d,
+        KernelDialer::new(
+            Arc::new(Engine::default()),
+            vec![],
+            Default::default(),
+            Default::default(),
+        ),
+    )
+    .with_control_timing(quick_control());
+    let mut s = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    // The whole request is acknowledged; from here on the client only
+    // receives, so it has nothing unacknowledged of its own to notice a
+    // stall with.
+    s.write_all(b"GET /big HTTP/1.1\r\n\r\n").await.unwrap();
+    let mut at = 0;
+    read_pattern(&mut s, &mut at, 32 << 10, Duration::from_secs(5)).await;
+    // The control stream is up by now.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while l
+            .la_holes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, c)| !c.load(Ordering::SeqCst))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no control stream");
+    (l, s, at)
+}
+
+#[tokio::test]
+async fn download_survives_a_blackhole_on_the_whole_channel() {
+    // Packets on every la carrier (data and control) are dropped, nothing
+    // is closed: the control stream goes silent, the channel is judged
+    // dead, and the session RESUMEs on a new carrier.
+    let (l, mut s, mut at) = download_lab().await;
+    let before = l.la_carriers.load(Ordering::SeqCst);
+    l.blackhole_la(true);
+    read_pattern(&mut s, &mut at, 64 << 10, Duration::from_secs(6)).await;
+    assert!(
+        l.la_carriers.load(Ordering::SeqCst) > before,
+        "no new carrier"
+    );
+    assert!(l.engine.other_tcp.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn download_survives_a_blackhole_on_the_session_carrier_via_stall() {
+    // Only the session's carrier drops packets; the control stream is
+    // healthy. The relay sees its downstream unacknowledged for T_live,
+    // goes DETACHED and sends STALL on the control stream (B1); the client
+    // RESUMEs. Without STALL the client would wait for ever.
+    let (l, mut s, mut at) = download_lab().await;
+    let before = l.la_carriers.load(Ordering::SeqCst);
+    let controls = l.la_holes.lock().unwrap().len() - before;
+    l.blackhole_la(false);
+    read_pattern(&mut s, &mut at, 64 << 10, Duration::from_secs(8)).await;
+    assert!(
+        l.la_carriers.load(Ordering::SeqCst) > before,
+        "no new carrier"
+    );
+    assert_eq!(
+        l.la_holes.lock().unwrap().len() - l.la_carriers.load(Ordering::SeqCst),
+        controls,
+        "the control stream was not replaced: recovery came from STALL"
+    );
 }
