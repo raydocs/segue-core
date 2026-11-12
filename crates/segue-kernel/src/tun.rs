@@ -51,8 +51,12 @@
 //!   bytes and its charge to the 2-block minimum.
 //!
 //! [`TunStack::memory_budget`] states the worst case for a configuration;
-//! with the defaults it is about 11 MiB (pool 6 MiB, per-flow structures,
-//! packet queues, UDP sessions; see the test `default_memory_budget`).
+//! with the defaults it is 13 740 252 bytes ≈ 13.1 MiB: TCP pool 6 MiB,
+//! 512 TCP flows × 4 KiB bookkeeping = 2 MiB, packet queues 1.5 MiB
+//! ((512 out + 2 × 256 UDP) × 1500), 256 UDP flows × (9 × 1500 + 1 KiB)
+//! = 3.5 MiB, 32 DNS queries in flight 94 KiB (test
+//! `default_memory_budget_is_well_under_20_mib`). The PR #14 layout reserved
+//! 128 KiB per TCP flow up front: 64 MiB at 512 flows.
 //! Outbound transport state (TLS/QUIC buffers inside the dialer) is not part
 //! of the TUN budget.
 //!
@@ -115,9 +119,11 @@ const IPV6_MIN_MTU: usize = 1280;
 /// no scaling): a ring may not grow past what an unscaled window can offer.
 const MAX_RING: usize = 64 * 1024;
 const DNS_PORT: u16 = 53;
-/// Budget estimate for one TCP flow's bookkeeping outside the pool (flow
-/// table entries, relay task, two channels).
-const TCP_FLOW_OVERHEAD: usize = 2048;
+/// Budget for one TCP flow's bookkeeping outside the pool: socket struct,
+/// flow-table entries, relay task, two channels (~3.1 KiB measured by the
+/// unit test `per_flow_overhead_estimate_holds`, plus task header and
+/// allocator slack).
+const TCP_FLOW_OVERHEAD: usize = 4096;
 
 fn blocks_for(bytes: usize) -> usize {
     bytes.div_ceil(BLOCK)
@@ -165,10 +171,12 @@ impl BufferPool {
             if n < min || n == 0 {
                 return 0;
             }
-            match self
-                .used
-                .compare_exchange_weak(used, used + n, Ordering::AcqRel, Ordering::Relaxed)
-            {
+            match self.used.compare_exchange_weak(
+                used,
+                used + n,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return n,
                 Err(now) => used = now,
             }
@@ -375,7 +383,9 @@ pub struct NetstackConfig {
     /// stack advertises (MTU minus IP and TCP headers).
     pub mtu: usize,
     /// Address of the TUN interface itself; used as the source of ICMP
-    /// errors and as the stack's own address for any-IP routing.
+    /// errors and as the stack's own address for any-IP routing. Must lie
+    /// outside the fake-IP range (default 198.18.0.0/15), or the pool could
+    /// hand the interface's own address to a name.
     pub v4_addr: Ipv4Addr,
     pub v6_addr: Ipv6Addr,
     pub max_tcp_flows: usize,
@@ -408,7 +418,7 @@ impl Default for NetstackConfig {
     fn default() -> Self {
         Self {
             mtu: 1500,
-            v4_addr: Ipv4Addr::new(198, 18, 0, 1),
+            v4_addr: Ipv4Addr::new(172, 19, 0, 1),
             v6_addr: Ipv6Addr::new(0xfd00, 0x5e9e, 0, 0, 0, 0, 0, 1),
             max_tcp_flows: 512,
             tcp_rx_buffer: 64 * 1024,
@@ -925,6 +935,9 @@ struct TcpEntry {
     charge: Charge,
     rx_cap: usize,
     tx_cap: usize,
+    /// Bytes read since the receive ring last grew: a ring that turned over
+    /// completely is the flow's bottleneck and doubles.
+    rx_moved: usize,
     last_activity: Instant,
 }
 
@@ -1128,8 +1141,7 @@ impl Netstack {
             // (RFC 1191 / RFC 8201). IPv4 without DF may be fragmented by
             // the sender's stack; we do not reassemble, so it is dropped.
             self.stats.dropped_oversize += 1;
-            let df = parsed.key.src.is_ipv6()
-                || Ipv4Packet::new_unchecked(pkt).dont_frag();
+            let df = parsed.key.src.is_ipv6() || Ipv4Packet::new_unchecked(pkt).dont_frag();
             if df {
                 self.emit_icmp(pkt, &parsed, now, IcmpError::TooBig(self.cfg.mtu));
             }
@@ -1214,7 +1226,8 @@ impl Netstack {
             tcp::SocketBuffer::new(Vec::new()),
         );
         sock.set_nagle_enabled(false);
-        sock.set_timeout(Some(self.cfg.tcp_timeout.into()));
+        // Armed by `expire_tcp` only while data is unacknowledged.
+        sock.set_timeout(None);
         sock.set_tsval_generator(Some(tcp_timestamp));
         sock.set_congestion_control(tcp::CongestionControl::Reno);
         let listen = IpListenEndpoint {
@@ -1236,6 +1249,7 @@ impl Netstack {
                 charge,
                 rx_cap,
                 tx_cap: 0,
+                rx_moved: 0,
                 last_activity: now,
             },
         );
@@ -1417,12 +1431,22 @@ impl Netstack {
             self.cfg.tcp_half_close_timeout,
             self.cfg.buffer_idle,
         );
+        let unacked: smoltcp::time::Duration = self.cfg.tcp_timeout.into();
         for entry in self.tcp.values_mut() {
+            let sock = self.sockets.get_mut::<tcp::Socket>(entry.handle);
+            // smoltcp's timeout counts from the last segment received, also
+            // on a quiet flow with nothing in flight: arm it only while data
+            // waits for an ACK (smoltcp restarts the count when data is
+            // queued on an empty ring). Unacked SYN/FIN are covered by the
+            // half-close timeout below.
+            let armed = sock.send_queue() > 0;
+            if armed != sock.timeout().is_some() {
+                sock.set_timeout(armed.then_some(unacked));
+            }
             let quiet = now.saturating_duration_since(entry.last_activity);
             if quiet < release.min(half).min(idle) {
                 continue;
             }
-            let sock = self.sockets.get_mut::<tcp::Socket>(entry.handle);
             match sock.state() {
                 State::SynReceived
                 | State::FinWait1
@@ -1538,7 +1562,9 @@ impl Netstack {
             && (tx == entry.tx_cap || sock.resize_send_buffer(tx));
         entry.rx_cap = sock.recv_capacity();
         entry.tx_cap = sock.send_capacity();
-        entry.charge.shrink_to(ring_blocks(entry.rx_cap, entry.tx_cap));
+        entry
+            .charge
+            .shrink_to(ring_blocks(entry.rx_cap, entry.tx_cap));
         ok
     }
 
@@ -1568,9 +1594,13 @@ impl Netstack {
     pub fn tcp_read(&mut self, id: FlowId, buf: &mut [u8]) -> Result<usize, FlowGone> {
         let (rx, tx) = self.tcp_buffers(id)?;
         let queued = self.socket(id)?.recv_queue();
-        if rx > 0 && rx < self.max_rx() && queued * 2 >= rx {
-            // The window was mostly used: offer more before reading frees it.
-            self.resize(id, (rx * 2).min(self.max_rx()), tx);
+        let moved = self.entry(id)?.rx_moved;
+        if rx > 0 && rx < self.max_rx() && (queued * 2 >= rx || moved >= rx) {
+            // The window was mostly used, or turned over: offer more before
+            // reading frees it.
+            if self.resize(id, (rx * 2).min(self.max_rx()), tx) {
+                self.entry(id)?.rx_moved = 0;
+            }
         }
         let sock = self.socket(id)?;
         if !sock.can_recv() {
@@ -1578,7 +1608,10 @@ impl Netstack {
         }
         let n = sock.recv_slice(buf).map_err(|_| FlowGone::Gone)?;
         if n > 0 {
-            self.entry(id)?.last_activity = self.now;
+            let now = self.now;
+            let e = self.entry(id)?;
+            e.last_activity = now;
+            e.rx_moved += n;
         }
         Ok(n)
     }
@@ -1613,9 +1646,11 @@ impl Netstack {
         if !sock.may_send() {
             return Ok(0);
         }
-        let free = tx - sock.send_queue();
-        if data.len() > free && tx < self.max_tx() {
-            let want = (tx * 2).clamp(BLOCK, self.max_tx());
+        let queue = sock.send_queue();
+        if data.len() > tx - queue && tx < self.max_tx() {
+            // Double, or straight to what this write needs.
+            let need = blocks_for(queue + data.len()) * BLOCK;
+            let want = (tx * 2).max(need).clamp(BLOCK, self.max_tx());
             if !self.resize(id, rx, want) && tx == 0 {
                 // The reservation always covers one block each way.
                 self.resize(id, rx, BLOCK);
@@ -1868,8 +1903,8 @@ impl TunRouter for TunKernel {
         let ip = key.dst.ip();
         let by_ip = rules.lookup(&TargetAddr::Ip(ip));
         let by_domain = domain.and_then(|d| rules.lookup(&TargetAddr::Domain(d.to_owned())));
-        let action = crate::socks::stricter(by_ip, by_domain)
-            .unwrap_or_else(|| rules.default_action());
+        let action =
+            crate::socks::stricter(by_ip, by_domain).unwrap_or_else(|| rules.default_action());
         let target = match action {
             // Direct goes to the address the app asked for, never to a
             // locally resolved sniffed name (that lookup would leak it).
@@ -2099,28 +2134,35 @@ impl TunStack {
                     let out = msg_tx.clone();
                     tokio::spawn(async move {
                         if let Some(payload) = dns.handle(&d.payload).await {
-                            let _ = out.send(UdpMsg::Dns { key: d.key, payload }).await;
+                            let _ = out
+                                .send(UdpMsg::Dns {
+                                    key: d.key,
+                                    payload,
+                                })
+                                .await;
                         }
                         drop(slot);
                     });
                     continue;
                 }
-                if !udp_flows.contains_key(&d.key) {
-                    let Some(dial) = udp_plans.remove(&d.key) else {
-                        continue;
-                    };
-                    let (tx, rx) = mpsc::channel(self.udp_flow_queue.max(1));
-                    tokio::spawn(udp_flow(
-                        ctx.clone(),
-                        d.key,
-                        dial,
-                        rx,
-                        msg_tx.clone(),
-                        stack.max_udp_reply(&d.key),
-                    ));
-                    udp_flows.insert(d.key, tx);
-                }
-                let tx = &udp_flows[&d.key];
+                let tx = match udp_flows.entry(d.key) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let Some(dial) = udp_plans.remove(&d.key) else {
+                            continue;
+                        };
+                        let (tx, rx) = mpsc::channel(self.udp_flow_queue.max(1));
+                        tokio::spawn(udp_flow(
+                            ctx.clone(),
+                            d.key,
+                            dial,
+                            rx,
+                            msg_tx.clone(),
+                            stack.max_udp_reply(&d.key),
+                        ));
+                        e.insert(tx)
+                    }
+                };
                 if tx.try_send(d.payload).is_err() {
                     stack.stats.dropped_udp_queue_full += 1;
                 }
@@ -2260,6 +2302,14 @@ fn pump(stack: &mut Netstack, pool: &Arc<BufferPool>, id: FlowId, pipe: &mut Pip
     // Upstream → application.
     loop {
         if pipe.closed {
+            // After our FIN the relay may still report that upload to the
+            // site failed: the application must see a reset, not a clean
+            // close.
+            if pipe.fin && matches!(pipe.up.try_recv(), Ok(Up::Abort)) {
+                let _ = stack.tcp_abort(id);
+                pipe.fin = false;
+                progressed = true;
+            }
             break;
         }
         if let Some(mut chunk) = pipe.pending.take() {
@@ -2408,12 +2458,13 @@ async fn relay(
                 return;
             }
         }
-        while !eof {
-            let Some(c) = down.recv().await else { break };
-            ctx.notify.notify_one();
-            if w.write_all(&c.data).await.is_err() {
-                send_up(&ctx, &abort, Up::Abort).await;
-                return;
+        if !eof {
+            while let Some(c) = down.recv().await {
+                ctx.notify.notify_one();
+                if w.write_all(&c.data).await.is_err() {
+                    send_up(&ctx, &abort, Up::Abort).await;
+                    return;
+                }
             }
         }
         let _ = w.shutdown().await;
@@ -2422,7 +2473,10 @@ async fn relay(
 }
 
 /// Read whatever is ready without waiting (0 if nothing is).
-async fn read_ready<R: tokio::io::AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+async fn read_ready<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    buf: &mut [u8],
+) -> io::Result<usize> {
     use std::pin::Pin;
     use std::task::Poll;
     std::future::poll_fn(|cx| {
@@ -2514,8 +2568,7 @@ async fn udp_flow(
     let port = key.dst.port();
     let dialed = tokio::time::timeout(
         ctx.dial_timeout,
-        ctx.dialer
-            .dial_udp(dial.tag.as_deref(), &dial.target, port),
+        ctx.dialer.dial_udp(dial.tag.as_deref(), &dial.target, port),
     )
     .await;
     let Ok(Ok(session)) = dialed else {
@@ -2554,4 +2607,64 @@ async fn udp_flow(
         }
     }
     down.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoDial;
+    #[async_trait]
+    impl Dialer for NoDial {
+        async fn dial(
+            &self,
+            _: Option<&str>,
+            _: &TargetAddr,
+            _: u16,
+        ) -> Result<crate::dial::Stream, crate::dial::DialError> {
+            Err(crate::dial::DialError("test".into()))
+        }
+    }
+
+    /// `TCP_FLOW_OVERHEAD` must cover what one flow holds outside the pool.
+    #[test]
+    fn per_flow_overhead_estimate_holds() {
+        let (down_tx, down_rx) = mpsc::channel::<Chunk>(RELAY_CHUNKS);
+        let (up_tx, up_rx) = mpsc::channel::<Up>(RELAY_CHUNKS);
+        let ctx = Arc::new(Ctx {
+            dialer: Arc::new(NoDial),
+            router: Arc::new(RefuseAll),
+            dns: None,
+            pool: BufferPool::new(BLOCK * 4),
+            notify: Arc::new(Notify::new()),
+            dial_timeout: Duration::from_secs(1),
+        });
+        let key = FlowKey {
+            proto: Proto::Tcp,
+            src: "10.0.0.1:1".parse().unwrap(),
+            dst: "10.0.0.2:2".parse().unwrap(),
+        };
+        let plan = TcpPlan::Dial(Dial {
+            tag: None,
+            target: TargetAddr::Ip(key.dst.ip()),
+        });
+        let task = relay(ctx, plan, key, down_rx, up_tx);
+        // Socket (storage is pooled), table entries (key → entry, id → key,
+        // pipes), the relay task and its two channel headers.
+        // Channel headers and the tokio task header.
+        let channels = 2 * 256 + 256;
+        let tables = 2 * (size_of::<FlowKey>() + size_of::<TcpEntry>())
+            + size_of::<FlowKey>()
+            + size_of::<FlowId>()
+            + size_of::<Pipe>();
+        let total =
+            size_of::<tcp::Socket<'static>>() + tables + std::mem::size_of_val(&task) + channels;
+        println!(
+            "per-flow overhead: {total} bytes (socket {}, relay {})",
+            size_of::<tcp::Socket<'static>>(),
+            std::mem::size_of_val(&task)
+        );
+        assert!(total <= TCP_FLOW_OVERHEAD, "{total} > {TCP_FLOW_OVERHEAD}");
+        drop((down_tx, up_rx));
+    }
 }

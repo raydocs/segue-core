@@ -6,12 +6,18 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use segue_kernel::dial::{DialError, Dialer, Stream};
-use segue_kernel::rules::{Action, Cidr, Matcher, Rule, RuleSet};
+use segue_kernel::dial::{Datagrams, DialError, Dialer, Stream, UdpSession};
+use segue_kernel::dns::{answers_for_test, query_for_test, DnsSettings, SmartDns, TYPE_A};
+use segue_kernel::fakeip::FakeIpPool;
+use segue_kernel::policy::{Policy, PolicyStore};
+use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
+use segue_kernel::sniff::client_hello_for_test;
+use segue_kernel::socks::{Kernel, SniffSettings};
 use segue_kernel::tun::{
     mss_for, Event, FlowKey, Netstack, NetstackConfig, PacketIo, Proto, TunStack, UdpDatagram,
-    UdpHandler, UdpReply, Verdict,
+    Verdict, BLOCK,
 };
+use segue_kernel::udp::{Udp, UdpSettings};
 use segue_routing::TargetAddr;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
@@ -24,7 +30,7 @@ use tokio::sync::mpsc;
 // ---------------------------------------------------------------------------
 // Packet helpers (the "application" side)
 
-const CLIENT4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 2)), 40000);
+const CLIENT4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 40000);
 const SITE4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
 
 fn client6() -> SocketAddr {
@@ -524,12 +530,16 @@ fn malformed_fragmented_and_oversize_packets_are_dropped() {
         &mut accept_all,
     );
     stack.input(&[0x45, 0, 0], now, &mut accept_all);
-    assert!(drain(&mut stack).is_empty());
+    // Only the oversize datagram (DF set) is answered: frag-needed.
+    let icmp = drain(&mut stack);
+    assert_eq!(icmp.len(), 1);
+    assert_eq!(out(&icmp[0]).proto, IpProtocol::Icmp);
     let s = stack.stats();
     assert_eq!(
         (s.dropped_malformed, s.dropped_fragment, s.dropped_oversize),
         (2, 1, 1)
     );
+    assert_eq!(s.icmp_too_big, 1);
     assert_eq!(stack.tcp_flows() + stack.udp_flows(), 0);
 }
 
@@ -706,6 +716,7 @@ impl PacketIo for ChanIo {
 #[derive(Default)]
 struct FakeDialer {
     dials: Mutex<Vec<(Option<String>, TargetAddr, u16)>>,
+    udp_dials: Mutex<Vec<(Option<String>, TargetAddr, u16)>>,
     fail: bool,
     sites: Mutex<Vec<tokio::io::DuplexStream>>,
     notify: tokio::sync::Notify,
@@ -731,6 +742,58 @@ impl Dialer for FakeDialer {
         self.notify.notify_one();
         Ok(Box::new(a))
     }
+
+    async fn dial_udp(
+        &self,
+        tag: Option<&str>,
+        addr: &TargetAddr,
+        port: u16,
+    ) -> Result<Datagrams, DialError> {
+        self.udp_dials
+            .lock()
+            .unwrap()
+            .push((tag.map(str::to_owned), addr.clone(), port));
+        if self.fail {
+            return Err(DialError("proxy down".into()));
+        }
+        let (tx, rx) = mpsc::channel(8);
+        Ok(Box::new(EchoSession {
+            tx,
+            rx: tokio::sync::Mutex::new(rx),
+            from: (addr.clone(), port),
+        }))
+    }
+}
+
+/// UDP "site" that answers every datagram with `echo:` + payload.
+struct EchoSession {
+    tx: mpsc::Sender<Vec<u8>>,
+    rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    from: (TargetAddr, u16),
+}
+
+#[async_trait]
+impl UdpSession for EchoSession {
+    fn max_payload(&self, _: &TargetAddr, _: u16) -> usize {
+        1000
+    }
+    async fn send(&self, _: &TargetAddr, _: u16, p: &[u8]) -> Result<(), DialError> {
+        let mut v = b"echo:".to_vec();
+        v.extend_from_slice(p);
+        self.tx.send(v).await.map_err(|e| DialError(e.to_string()))
+    }
+    async fn recv(&self, buf: &mut Vec<u8>) -> Result<(TargetAddr, u16), DialError> {
+        let v = self
+            .rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(DialError("closed".into()))?;
+        buf.clear();
+        buf.extend_from_slice(&v);
+        Ok(self.from.clone())
+    }
 }
 
 impl FakeDialer {
@@ -750,15 +813,17 @@ struct Harness {
 }
 
 impl Harness {
-    fn start(rules: RuleSet, dialer: Arc<FakeDialer>, udp: Option<Arc<dyn UdpHandler>>) -> Self {
+    fn start(rules: RuleSet, dialer: Arc<FakeDialer>) -> Self {
+        Self::run(TunStack::new(Arc::new(rules), dialer))
+    }
+
+    fn run(tun: TunStack) -> Self {
         let (to_stack, rx) = mpsc::channel(256);
         let (tx, from_stack) = mpsc::channel(256);
         let io = Arc::new(ChanIo {
             rx: tokio::sync::Mutex::new(rx),
             tx,
         });
-        let mut tun = TunStack::new(Arc::new(rules), dialer);
-        tun.udp = udp;
         tokio::spawn(tun.run(io));
         Self {
             to_stack,
@@ -801,7 +866,7 @@ fn rules_proxy_default() -> RuleSet {
 #[tokio::test]
 async fn tcp_handshake_and_data_reach_the_dialer_and_back() {
     let dialer = Arc::new(FakeDialer::default());
-    let mut h = Harness::start(rules_proxy_default(), dialer.clone(), None);
+    let mut h = Harness::start(rules_proxy_default(), dialer.clone());
     h.send(tcp(CLIENT4, SITE4, SYN, 100, 0, b"")).await;
     let synack = h.next_meaningful().await;
     assert!(synack.syn && synack.ack && synack.ack_no == 101);
@@ -832,7 +897,7 @@ async fn tcp_handshake_and_data_reach_the_dialer_and_back() {
 #[tokio::test]
 async fn application_half_close_reaches_the_site() {
     let dialer = Arc::new(FakeDialer::default());
-    let mut h = Harness::start(rules_proxy_default(), dialer.clone(), None);
+    let mut h = Harness::start(rules_proxy_default(), dialer.clone());
     h.send(tcp(CLIENT4, SITE4, SYN, 100, 0, b"")).await;
     let sseq = h.next_meaningful().await.seq + 1;
     h.send(tcp(CLIENT4, SITE4, FIN, 101, sseq, b"req")).await;
@@ -849,7 +914,7 @@ async fn application_half_close_reaches_the_site() {
 #[tokio::test]
 async fn upload_lost_after_site_closed_resets_the_application() {
     let dialer = Arc::new(FakeDialer::default());
-    let mut h = Harness::start(rules_proxy_default(), dialer.clone(), None);
+    let mut h = Harness::start(rules_proxy_default(), dialer.clone());
     h.send(tcp(CLIENT4, SITE4, SYN, 100, 0, b"")).await;
     let sseq = h.next_meaningful().await.seq + 1;
     h.send(tcp(CLIENT4, SITE4, ACK, 101, sseq, b"")).await;
@@ -868,7 +933,7 @@ async fn upload_lost_after_site_closed_resets_the_application() {
 #[tokio::test]
 async fn rejected_route_gets_rst_and_never_dials() {
     let dialer = Arc::new(FakeDialer::default());
-    let mut h = Harness::start(rules_proxy_default(), dialer.clone(), None);
+    let mut h = Harness::start(rules_proxy_default(), dialer.clone());
     let blocked: SocketAddr = "203.0.113.9:443".parse().unwrap();
     h.send(tcp(CLIENT4, blocked, SYN, 100, 0, b"")).await;
     let rst = h.next_meaningful().await;
@@ -882,7 +947,7 @@ async fn failed_dial_resets_after_local_handshake_never_direct() {
         fail: true,
         ..Default::default()
     });
-    let mut h = Harness::start(rules_proxy_default(), dialer.clone(), None);
+    let mut h = Harness::start(rules_proxy_default(), dialer.clone());
     h.send(tcp(CLIENT4, SITE4, SYN, 100, 0, b"")).await;
     let synack = h.next_meaningful().await;
     assert!(synack.syn && synack.ack);
@@ -899,56 +964,587 @@ async fn failed_dial_resets_after_local_handshake_never_direct() {
 #[tokio::test]
 async fn udp_is_refused_with_icmp_without_a_handler() {
     let dialer = Arc::new(FakeDialer::default());
-    let mut h = Harness::start(rules_proxy_default(), dialer, None);
+    let mut h = Harness::start(rules_proxy_default(), dialer);
     h.send(udp(CLIENT4, "8.8.8.8:443".parse().unwrap(), b"quic"))
         .await;
     let o = out(&h.next().await);
     assert_eq!(o.proto, IpProtocol::Icmp);
 }
 
-struct Echo;
-impl UdpHandler for Echo {
-    fn datagram(&self, d: UdpDatagram, reply: UdpReply) {
-        let mut v = b"echo:".to_vec();
-        v.extend_from_slice(&d.payload);
-        assert!(reply.send(Bytes::from(v)));
+// ---------------------------------------------------------------------------
+// Netstack: size limits (ICMP packet-too-big)
+
+fn icmpv4(pkt: &[u8]) -> (u8, u8, Vec<u8>) {
+    let o = out(pkt);
+    assert_eq!(o.proto, IpProtocol::Icmp);
+    let icmp = Icmpv4Packet::new_checked(&o.l4[..]).unwrap();
+    assert!(icmp.verify_checksum());
+    (u8::from(icmp.msg_type()), icmp.msg_code(), o.l4.clone())
+}
+
+#[test]
+fn oversize_ipv4_with_df_gets_frag_needed_with_mtu() {
+    let now = Instant::now();
+    let cfg = NetstackConfig {
+        mtu: 1280,
+        ..Default::default()
+    };
+    let mut stack = Netstack::new(cfg, now);
+    let big = udp(CLIENT4, "8.8.8.8:443".parse().unwrap(), &[1u8; 1400]);
+    assert!(Ipv4Packet::new_unchecked(&big[..]).dont_frag());
+    stack.input(&big, now, &mut accept_all);
+    let (t, code, l4) = icmpv4(&one(&mut stack));
+    assert_eq!((t, code), (3, 4));
+    // Next-hop MTU (RFC 1191) in bytes 6..8.
+    assert_eq!(u16::from_be_bytes([l4[6], l4[7]]), 1280);
+    assert_eq!(&l4[8..36], &big[..28]);
+    assert_eq!(stack.udp_flows(), 0);
+}
+
+#[test]
+fn oversize_ipv4_without_df_is_dropped_silently() {
+    let now = Instant::now();
+    let cfg = NetstackConfig {
+        mtu: 1280,
+        ..Default::default()
+    };
+    let mut stack = Netstack::new(cfg, now);
+    let mut big = udp(CLIENT4, "8.8.8.8:443".parse().unwrap(), &[1u8; 1400]);
+    {
+        let mut p = Ipv4Packet::new_unchecked(&mut big[..]);
+        p.set_dont_frag(false);
+        p.fill_checksum();
+    }
+    stack.input(&big, now, &mut accept_all);
+    assert!(drain(&mut stack).is_empty());
+    assert_eq!(stack.stats().dropped_oversize, 1);
+}
+
+#[test]
+fn oversize_ipv6_gets_packet_too_big_with_mtu() {
+    let now = Instant::now();
+    let cfg = NetstackConfig {
+        mtu: 1280,
+        ..Default::default()
+    };
+    let mut stack = Netstack::new(cfg, now);
+    let big = tcp(client6(), site6(), ACK, 1, 1, &[2u8; 1300]);
+    stack.input(&big, now, &mut accept_all);
+    let pkt = one(&mut stack);
+    assert!(pkt.len() <= 1280);
+    let o = out(&pkt);
+    assert_eq!(o.proto, IpProtocol::Icmpv6);
+    let icmp = Icmpv6Packet::new_checked(&o.l4[..]).unwrap();
+    assert!(icmp.verify_checksum(&o.src.to_v6(), &o.dst.to_v6()));
+    assert_eq!((u8::from(icmp.msg_type()), icmp.msg_code()), (2, 0));
+    assert_eq!(
+        u32::from_be_bytes([o.l4[4], o.l4[5], o.l4[6], o.l4[7]]),
+        1280
+    );
+    assert_eq!(&o.l4[8..48], &big[..40]);
+    assert_eq!(stack.stats().icmp_too_big, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Netstack: timers
+
+fn acked_fin(stack: &mut Netstack, id: segue_kernel::tun::FlowId, cseq: u32, now: Instant) {
+    stack.tcp_close(id).unwrap();
+    stack.poll(now);
+    let fin = drain(stack)
+        .iter()
+        .map(|p| seg(p))
+        .find(|s| s.fin)
+        .expect("FIN");
+    // ACK the FIN but never send ours: FIN_WAIT2.
+    stack.input(
+        &tcp(CLIENT4, SITE4, ACK, cseq, fin.seq + 1, b""),
+        now,
+        &mut accept_all,
+    );
+}
+
+#[test]
+fn fin_wait2_flow_is_reaped_after_half_close_timeout() {
+    let (mut stack, id, cseq, _) = handshake(NetstackConfig::default(), CLIENT4, SITE4);
+    let now = Instant::now();
+    acked_fin(&mut stack, id, cseq, now);
+    stack.poll(now + Duration::from_secs(30));
+    assert_eq!(stack.tcp_flows(), 1, "still within the timeout");
+    stack.poll(now + Duration::from_secs(61));
+    assert_eq!(stack.tcp_flows(), 0);
+    assert_eq!(stack.stats().tcp_half_close_timeouts, 1);
+    assert!(drain(&mut stack).iter().any(|p| seg(p).rst));
+}
+
+#[test]
+fn close_wait_flow_is_reaped_after_half_close_timeout() {
+    let (mut stack, id, cseq, sseq) = handshake(NetstackConfig::default(), CLIENT4, SITE4);
+    let now = Instant::now();
+    stack.input(
+        &tcp(CLIENT4, SITE4, FIN, cseq, sseq, b""),
+        now,
+        &mut accept_all,
+    );
+    assert!(stack.tcp_peer_finished(id).unwrap());
+    stack.poll(now + Duration::from_secs(61));
+    assert_eq!(stack.tcp_flows(), 0);
+    assert_eq!(stack.stats().tcp_half_close_timeouts, 1);
+}
+
+#[test]
+fn activity_keeps_a_half_closed_flow_alive() {
+    let (mut stack, id, cseq, sseq) = handshake(NetstackConfig::default(), CLIENT4, SITE4);
+    let now = Instant::now();
+    stack.input(
+        &tcp(CLIENT4, SITE4, FIN, cseq, sseq, b""),
+        now,
+        &mut accept_all,
+    );
+    // We keep sending the response; the application keeps ACKing.
+    let mut t = now;
+    let mut acked = sseq;
+    for _ in 0..4 {
+        t += Duration::from_secs(40);
+        stack.tcp_write(id, b"chunk").unwrap();
+        stack.poll(t);
+        for p in drain(&mut stack) {
+            let s = seg(&p);
+            acked = acked.max(s.seq + s.payload.len() as u32);
+        }
+        stack.input(
+            &tcp(CLIENT4, SITE4, ACK, cseq + 1, acked, b""),
+            t,
+            &mut accept_all,
+        );
+    }
+    stack.poll(t);
+    assert_eq!(stack.tcp_flows(), 1);
+}
+
+#[test]
+fn idle_established_flow_is_reaped_after_idle_timeout() {
+    let cfg = NetstackConfig {
+        tcp_idle_timeout: Duration::from_secs(300),
+        ..Default::default()
+    };
+    let (mut stack, _, _, _) = handshake(cfg, CLIENT4, SITE4);
+    let now = Instant::now();
+    stack.poll(now + Duration::from_secs(200));
+    assert_eq!(stack.tcp_flows(), 1);
+    stack.poll(now + Duration::from_secs(301));
+    assert_eq!(stack.tcp_flows(), 0);
+    assert_eq!(stack.stats().tcp_idle_timeouts, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Netstack: pooled, lazily grown buffers (§4.2)
+
+#[test]
+fn buffers_start_small_grow_with_traffic_and_are_released_when_idle() {
+    let (mut stack, id, cseq, sseq) = handshake(NetstackConfig::default(), CLIENT4, SITE4);
+    let now = Instant::now();
+    assert_eq!(stack.tcp_buffers(id).unwrap(), (BLOCK, 0));
+    assert_eq!(stack.pool().used_bytes(), 2 * BLOCK);
+    // Upload through the receive ring, reading as it arrives.
+    let mut seq = cseq;
+    let mut total = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+    for _ in 0..40 {
+        let payload = vec![b'u'; 1400];
+        stack.input(
+            &tcp(CLIENT4, SITE4, ACK, seq, sseq, &payload),
+            now,
+            &mut accept_all,
+        );
+        seq += 1400;
+        total += stack.tcp_read(id, &mut buf).unwrap();
+        stack.poll(now);
+        drain(&mut stack);
+    }
+    assert_eq!(total, 40 * 1400);
+    let (rx, _) = stack.tcp_buffers(id).unwrap();
+    assert!(rx > BLOCK, "rx ring grew: {rx}");
+    assert!(rx <= 64 * 1024);
+    // Download: the transmit ring is grown on demand.
+    assert_eq!(stack.tcp_write(id, &[b'd'; 6000]).unwrap(), 6000);
+    let (_, tx) = stack.tcp_buffers(id).unwrap();
+    assert!(tx >= 6000);
+    stack.poll(now);
+    let mut acked = sseq;
+    for p in drain(&mut stack) {
+        let s = seg(&p);
+        acked = acked.max(s.seq + s.payload.len() as u32);
+    }
+    for _ in 0..10 {
+        stack.input(
+            &tcp(CLIENT4, SITE4, ACK, seq, acked, b""),
+            now,
+            &mut accept_all,
+        );
+        stack.poll(now);
+        for p in drain(&mut stack) {
+            let s = seg(&p);
+            acked = acked.max(s.seq + s.payload.len() as u32);
+        }
+    }
+    assert_eq!(acked, sseq + 6000);
+    assert!(stack.pool().used_bytes() > 2 * BLOCK);
+    // Idle: both rings go back to the pool.
+    let later = now + Duration::from_secs(11);
+    stack.poll(later);
+    assert_eq!(stack.tcp_buffers(id).unwrap(), (0, 0));
+    assert_eq!(stack.stats().buffers_released, 1);
+    assert_eq!(
+        stack.pool().used_bytes(),
+        2 * BLOCK,
+        "admission reservation kept"
+    );
+    // Traffic again: the flow still works.
+    stack.input(
+        &tcp(CLIENT4, SITE4, ACK, seq, acked, b"again"),
+        later,
+        &mut accept_all,
+    );
+    let n = stack.tcp_read(id, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"again");
+}
+
+#[test]
+fn exhausted_pool_refuses_new_flows_with_rst() {
+    let now = Instant::now();
+    let cfg = NetstackConfig {
+        buffer_pool: 5 * BLOCK,
+        ..Default::default()
+    };
+    let mut stack = Netstack::new(cfg, now);
+    for port in [1, 2] {
+        let src = SocketAddr::new(CLIENT4.ip(), port);
+        stack.input(&tcp(src, SITE4, SYN, 1, 0, b""), now, &mut accept_all);
+        assert!(seg(&one(&mut stack)).syn);
+    }
+    let src = SocketAddr::new(CLIENT4.ip(), 3);
+    stack.input(&tcp(src, SITE4, SYN, 1, 0, b""), now, &mut accept_all);
+    assert!(seg(&one(&mut stack)).rst);
+    assert_eq!(stack.tcp_flows(), 2);
+    assert_eq!(stack.stats().tcp_refused_memory, 1);
+}
+
+#[test]
+fn default_memory_budget_is_well_under_20_mib() {
+    let stack = TunStack::new(Arc::new(RefuseAllRules), Arc::new(FakeDialer::default()));
+    let b = stack.memory_budget();
+    println!("default TUN memory budget: {b:?}");
+    assert_eq!(
+        b.total,
+        b.tcp_pool + b.tcp_flows + b.packet_queues + b.udp_flows + b.dns
+    );
+    assert!(b.total < 16 * 1024 * 1024, "{b:?}");
+    // The pool, not the flow count, bounds TCP buffering.
+    let cfg = NetstackConfig::default();
+    assert!(b.tcp_pool < cfg.max_tcp_flows * (cfg.tcp_rx_buffer + cfg.tcp_tx_buffer) / 4);
+}
+
+struct RefuseAllRules;
+impl segue_kernel::tun::TunRouter for RefuseAllRules {
+    fn route_tcp(&self, _: &FlowKey) -> segue_kernel::tun::TcpRoute {
+        segue_kernel::tun::TcpRoute::Refuse
     }
 }
 
-struct UdpRouter;
-impl segue_kernel::tun::TunRouter for UdpRouter {
-    fn route_tcp(&self, _: &FlowKey) -> segue_kernel::tun::Route {
-        segue_kernel::tun::Route::Refuse
-    }
-    fn route_udp(&self, _: &FlowKey) -> segue_kernel::tun::Route {
-        segue_kernel::tun::Route::Dial(None)
-    }
+// ---------------------------------------------------------------------------
+// Driver with the kernel's routing (TunKernel)
+
+fn kernel_rules() -> RuleSet {
+    RuleSet::new(
+        vec![
+            Rule {
+                matcher: Matcher::DomainSuffix("openai.com".into()),
+                action: Action::Proxy("ai".into()),
+            },
+            Rule {
+                matcher: Matcher::DomainSuffix("blocked.test".into()),
+                action: Action::Reject,
+            },
+            Rule {
+                matcher: Matcher::Cidr(Cidr::parse("203.0.113.0/24").unwrap()),
+                action: Action::Reject,
+            },
+            Rule {
+                matcher: Matcher::Cidr(Cidr::parse("198.51.100.0/24").unwrap()),
+                action: Action::Proxy("ai".into()),
+            },
+        ],
+        Action::Proxy("p1".into()),
+    )
+}
+
+fn fake_pool() -> Arc<FakeIpPool> {
+    Arc::new(
+        FakeIpPool::new(
+            "198.18.0.0".parse().unwrap(),
+            15,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            [7; 32],
+        )
+        .unwrap(),
+    )
+}
+
+struct Env {
+    h: Harness,
+    dialer: Arc<FakeDialer>,
+    pool: Arc<FakeIpPool>,
+}
+
+fn kernel_env(policy: Policy, sniff: bool, udp: bool, fail: bool, dns: bool) -> Env {
+    let dialer = Arc::new(FakeDialer {
+        fail,
+        ..Default::default()
+    });
+    let pool = fake_pool();
+    let policy = PolicyStore::inline(policy);
+    let kernel = Arc::new(Kernel {
+        policy: policy.clone(),
+        dialer: dialer.clone(),
+        fake_ip: Some(pool.clone()),
+        sniff: sniff.then_some(SniffSettings {
+            timeout: Duration::from_millis(300),
+            max_bytes: 16 * 1024,
+        }),
+        udp: udp.then(|| {
+            Arc::new(Udp::new(UdpSettings {
+                refuse: ["ai".to_string()].into(),
+                ..Default::default()
+            }))
+        }),
+    });
+    let smart = dns.then(|| {
+        Arc::new(SmartDns::new(
+            policy,
+            pool.clone(),
+            DnsSettings {
+                // Never reached: every name asked here has a rule.
+                domestic: vec!["127.0.0.1:9".parse().unwrap()],
+                foreign: Action::Proxy("p1".into()),
+                query_timeout: Duration::from_millis(200),
+                cache_size: 64,
+            },
+        ))
+    });
+    let h = Harness::run(TunStack::for_kernel(kernel, smart));
+    Env { h, dialer, pool }
+}
+
+fn inline() -> Policy {
+    Policy::inline(kernel_rules(), CidrTable::default())
+}
+
+/// SYN + ACK; returns the server's next sequence number.
+async fn connect(h: &mut Harness, dst: SocketAddr) -> u32 {
+    h.send(tcp(CLIENT4, dst, SYN, 100, 0, b"")).await;
+    let synack = h.next_meaningful().await;
+    assert!(synack.syn && synack.ack, "{synack:?}");
+    let sseq = synack.seq + 1;
+    h.send(tcp(CLIENT4, dst, ACK, 101, sseq, b"")).await;
+    sseq
 }
 
 #[tokio::test]
-async fn udp_flows_reach_the_handler_and_replies_return() {
-    let (to_stack, rx) = mpsc::channel(16);
-    let (tx, mut from_stack) = mpsc::channel(16);
-    let io = Arc::new(ChanIo {
-        rx: tokio::sync::Mutex::new(rx),
-        tx,
-    });
-    let mut tun = TunStack::new(Arc::new(UdpRouter), Arc::new(FakeDialer::default()));
-    tun.udp = Some(Arc::new(Echo));
-    tokio::spawn(tun.run(io));
-    let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
-    to_stack
-        .send(Bytes::from(udp(CLIENT4, dst, b"q")))
-        .await
+async fn sniffed_sni_routes_a_bare_ip_by_name() {
+    let mut e = kernel_env(inline(), true, false, false, false);
+    let sseq = connect(&mut e.h, SITE4).await;
+    let hello = client_hello_for_test(Some("chat.openai.com"), 0);
+    e.h.send(tcp(CLIENT4, SITE4, ACK, 101, sseq, &hello)).await;
+    let mut site = e.dialer.site().await;
+    let mut got = vec![0u8; hello.len()];
+    site.read_exact(&mut got).await.unwrap();
+    assert_eq!(got, hello, "sniffed bytes are forwarded");
+    assert_eq!(
+        e.dialer.dials.lock().unwrap().clone(),
+        vec![(
+            Some("ai".to_string()),
+            TargetAddr::Domain("chat.openai.com".into()),
+            443
+        )]
+    );
+}
+
+#[tokio::test]
+async fn sniffed_rejected_name_resets_and_never_dials() {
+    let mut e = kernel_env(inline(), true, false, false, false);
+    let sseq = connect(&mut e.h, SITE4).await;
+    let hello = client_hello_for_test(Some("x.blocked.test"), 0);
+    e.h.send(tcp(CLIENT4, SITE4, ACK, 101, sseq, &hello)).await;
+    let rst = e.h.next_meaningful().await;
+    assert!(rst.rst, "{rst:?}");
+    assert!(e.dialer.dials.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sniff_without_a_name_falls_back_to_ip_rules() {
+    let mut e = kernel_env(inline(), true, false, false, false);
+    let dst: SocketAddr = "198.51.100.7:443".parse().unwrap();
+    let sseq = connect(&mut e.h, dst).await;
+    e.h.send(tcp(CLIENT4, dst, ACK, 101, sseq, b"\x00\x01binary"))
+        .await;
+    let _site = e.dialer.site().await;
+    assert_eq!(
+        e.dialer.dials.lock().unwrap().clone(),
+        vec![(Some("ai".to_string()), TargetAddr::Ip(dst.ip()), 443)]
+    );
+}
+
+#[tokio::test]
+async fn ip_reject_refuses_the_syn_even_with_sniffing() {
+    let mut e = kernel_env(inline(), true, false, false, false);
+    e.h.send(tcp(
+        CLIENT4,
+        "203.0.113.9:443".parse().unwrap(),
+        SYN,
+        100,
+        0,
+        b"",
+    ))
+    .await;
+    assert!(e.h.next_meaningful().await.rst);
+}
+
+#[tokio::test]
+async fn fake_ip_destination_is_dialled_by_name_and_stale_fake_is_refused() {
+    let mut e = kernel_env(inline(), false, false, false, false);
+    let ip = e
+        .pool
+        .assign("api.openai.com", Action::Proxy("ai".into()))
         .unwrap();
-    let pkt = tokio::time::timeout(Duration::from_secs(5), from_stack.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let o = out(&pkt);
+    let dst = SocketAddr::new(IpAddr::V4(ip), 443);
+    connect(&mut e.h, dst).await;
+    let _site = e.dialer.site().await;
+    assert_eq!(
+        e.dialer.dials.lock().unwrap().clone(),
+        vec![(
+            Some("ai".to_string()),
+            TargetAddr::Domain("api.openai.com".into()),
+            443
+        )]
+    );
+    // Unknown address inside the fake range: never dialled as an IP.
+    let stale: SocketAddr = "198.19.200.200:443".parse().unwrap();
+    e.h.send(tcp(CLIENT4, stale, SYN, 100, 0, b"")).await;
+    assert!(e.h.next_meaningful().await.rst);
+    assert_eq!(e.dialer.dials.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn fail_closed_policy_refuses_everything() {
+    let mut e = kernel_env(Policy::fail_closed(), true, true, false, false);
+    e.h.send(tcp(CLIENT4, SITE4, SYN, 100, 0, b"")).await;
+    assert!(e.h.next_meaningful().await.rst);
+    e.h.send(udp(CLIENT4, "8.8.8.8:443".parse().unwrap(), b"q"))
+        .await;
+    assert_eq!(out(&e.h.next().await).proto, IpProtocol::Icmp);
+    assert!(e.dialer.dials.lock().unwrap().is_empty());
+    assert!(e.dialer.udp_dials.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dns_over_udp_is_hijacked_to_the_smart_dns() {
+    let mut e = kernel_env(inline(), false, false, false, true);
+    // Any resolver address, even a private one, is answered locally.
+    let resolver: SocketAddr = "192.168.1.1:53".parse().unwrap();
+    e.h.send(udp(
+        CLIENT4,
+        resolver,
+        &query_for_test(7, "chat.openai.com", TYPE_A),
+    ))
+    .await;
+    let o = out(&e.h.next().await);
+    assert_eq!((o.src, o.dst), (resolver.ip(), CLIENT4.ip()));
+    let u = UdpPacket::new_checked(&o.l4[..]).unwrap();
+    assert_eq!((u.src_port(), u.dst_port()), (53, 40000));
+    let (id, rcode, ips) = answers_for_test(u.payload()).unwrap();
+    assert_eq!((id, rcode), (7, 0));
+    assert_eq!(ips.len(), 1);
+    let entry = e.pool.lookup(ips[0]).expect("fake-IP answer");
+    assert_eq!(entry.domain, "chat.openai.com");
+    assert!(e.dialer.udp_dials.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dns_over_tcp_is_hijacked_to_the_smart_dns() {
+    let mut e = kernel_env(inline(), false, false, false, true);
+    let resolver: SocketAddr = "192.168.1.1:53".parse().unwrap();
+    let sseq = connect(&mut e.h, resolver).await;
+    let q = query_for_test(9, "chat.openai.com", TYPE_A);
+    let mut framed = (q.len() as u16).to_be_bytes().to_vec();
+    framed.extend_from_slice(&q);
+    e.h.send(tcp(CLIENT4, resolver, ACK, 101, sseq, &framed))
+        .await;
+    let data = e.h.next_meaningful().await;
+    let len = u16::from_be_bytes([data.payload[0], data.payload[1]]) as usize;
+    assert_eq!(data.payload.len(), 2 + len);
+    let (id, rcode, ips) = answers_for_test(&data.payload[2..]).unwrap();
+    assert_eq!((id, rcode), (9, 0));
+    assert!(e.pool.lookup(ips[0]).is_some());
+    assert!(e.dialer.dials.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn udp_goes_through_the_kernel_dialer_and_replies_return() {
+    let mut e = kernel_env(inline(), false, true, false, false);
+    let dst: SocketAddr = "8.8.8.8:3478".parse().unwrap();
+    e.h.send(udp(CLIENT4, dst, b"stun")).await;
+    let o = out(&e.h.next().await);
+    assert_eq!(o.proto, IpProtocol::Udp);
     let u = UdpPacket::new_checked(&o.l4[..]).unwrap();
     assert_eq!(
-        (o.src, u.src_port(), u.payload()),
-        (dst.ip(), 53, &b"echo:q"[..])
+        (o.src, u.src_port(), u.dst_port(), u.payload()),
+        (dst.ip(), 3478, 40000, &b"echo:stun"[..])
     );
+    assert_eq!(
+        e.dialer.udp_dials.lock().unwrap().clone(),
+        vec![(Some("p1".to_string()), TargetAddr::Ip(dst.ip()), 3478)]
+    );
+}
+
+#[tokio::test]
+async fn udp_to_the_home_route_is_refused_with_icmp() {
+    let mut e = kernel_env(inline(), false, true, false, false);
+    e.h.send(udp(CLIENT4, "198.51.100.7:443".parse().unwrap(), b"quic"))
+        .await;
+    let (t, code, _) = icmpv4(&e.h.next().await);
+    assert_eq!((t, code), (3, 13));
+    assert!(e.dialer.udp_dials.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn failed_udp_proxy_is_refused_never_direct() {
+    let mut e = kernel_env(inline(), false, true, true, false);
+    let dst: SocketAddr = "8.8.8.8:3478".parse().unwrap();
+    e.h.send(udp(CLIENT4, dst, b"one")).await;
+    // The dial fails; the next datagram of the flow is answered with ICMP.
+    let mut icmp = None;
+    for _ in 0..50 {
+        e.h.send(udp(CLIENT4, dst, b"again")).await;
+        if let Ok(Some(p)) =
+            tokio::time::timeout(Duration::from_millis(100), e.h.from_stack.recv()).await
+        {
+            icmp = Some(p);
+            break;
+        }
+    }
+    let (t, code, _) = icmpv4(&icmp.expect("ICMP after failed dial"));
+    assert_eq!((t, code), (3, 13));
+    let dials = e.dialer.udp_dials.lock().unwrap().clone();
+    assert_eq!(dials.len(), 1, "no retry, no direct: {dials:?}");
+    assert_eq!(dials[0].0.as_deref(), Some("p1"));
+}
+
+#[tokio::test]
+async fn udp_without_kernel_udp_is_refused() {
+    let mut e = kernel_env(inline(), false, false, false, false);
+    e.h.send(udp(CLIENT4, "8.8.8.8:3478".parse().unwrap(), b"x"))
+        .await;
+    assert_eq!(out(&e.h.next().await).proto, IpProtocol::Icmp);
 }
