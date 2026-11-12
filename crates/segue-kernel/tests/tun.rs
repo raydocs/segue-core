@@ -11,7 +11,8 @@ use segue_kernel::dns::{answers_for_test, query_for_test, DnsSettings, SmartDns,
 use segue_kernel::fakeip::FakeIpPool;
 use segue_kernel::policy::{Policy, PolicyStore};
 use segue_kernel::quic::{
-    hex, QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2, RFC9001_CLIENT_INITIAL,
+    hex, initial_for_test, QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2,
+    RFC9001_CLIENT_INITIAL,
 };
 use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
 use segue_kernel::sniff::client_hello_for_test;
@@ -725,6 +726,10 @@ struct FakeDialer {
     session_reset: bool,
     sites: Mutex<Vec<tokio::io::DuplexStream>>,
     notify: tokio::sync::Notify,
+    /// UDP payload cap of the sessions (0: 1000).
+    udp_max: usize,
+    /// Every datagram a UDP session was asked to send.
+    udp_sent: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 #[async_trait]
@@ -777,6 +782,12 @@ impl Dialer for FakeDialer {
             tx,
             rx: tokio::sync::Mutex::new(rx),
             from: (addr.clone(), port),
+            max: if self.udp_max == 0 {
+                1000
+            } else {
+                self.udp_max
+            },
+            sent: self.udp_sent.clone(),
         }))
     }
 }
@@ -786,14 +797,17 @@ struct EchoSession {
     tx: mpsc::Sender<Vec<u8>>,
     rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     from: (TargetAddr, u16),
+    max: usize,
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 #[async_trait]
 impl UdpSession for EchoSession {
     fn max_payload(&self, _: &TargetAddr, _: u16) -> usize {
-        1000
+        self.max
     }
     async fn send(&self, _: &TargetAddr, _: u16, p: &[u8]) -> Result<(), DialError> {
+        self.sent.lock().unwrap().push(p.to_vec());
         let mut v = b"echo:".to_vec();
         v.extend_from_slice(p);
         self.tx.send(v).await.map_err(|e| DialError(e.to_string()))
@@ -1567,10 +1581,20 @@ struct Env {
 }
 
 fn kernel_env(policy: Policy, sniff: bool, udp: bool, fail: bool, dns: bool) -> Env {
-    let dialer = Arc::new(FakeDialer {
-        fail,
-        ..Default::default()
-    });
+    kernel_env_with(
+        policy,
+        sniff,
+        udp,
+        dns,
+        FakeDialer {
+            fail,
+            ..Default::default()
+        },
+    )
+}
+
+fn kernel_env_with(policy: Policy, sniff: bool, udp: bool, dns: bool, dialer: FakeDialer) -> Env {
+    let dialer = Arc::new(dialer);
     let pool = fake_pool();
     let policy = PolicyStore::inline(policy);
     let kernel = Arc::new(Kernel {
@@ -1905,4 +1929,61 @@ async fn tun_unconfirmed_quic_is_refused() {
     let (t, code, _) = icmpv4(&e.h.next().await);
     assert_eq!((t, code), (3, 13));
     assert!(e.dialer.udp_dials.lock().unwrap().is_empty());
+}
+
+/// Wait until the UDP sessions were asked to send `n` datagrams.
+async fn udp_sent(e: &Env, n: usize) -> Vec<Vec<u8>> {
+    for _ in 0..100 {
+        let s = e.dialer.udp_sent.lock().unwrap().clone();
+        if s.len() >= n {
+            return s;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    e.dialer.udp_sent.lock().unwrap().clone()
+}
+
+/// N7 over TUN: on one UDP tuple, an allowed QUIC connection, then a new
+/// Initial (new DCID) naming an AI host. The AI connection's datagrams
+/// never reach the flow's outbound; the first connection keeps flowing.
+#[tokio::test]
+async fn tun_second_quic_connection_on_same_tuple_is_classified() {
+    for (dst, first) in [
+        // UDP/443, first connection non-AI QUIC.
+        ("8.8.8.8:443", hex(RFC9001_CLIENT_INITIAL)),
+        // Another port, plain UDP first (routed by IP), then QUIC.
+        ("8.8.8.8:8443", b"\x12\x34plain".to_vec()),
+    ] {
+        let e = kernel_env_with(
+            inline(),
+            false,
+            true,
+            false,
+            FakeDialer {
+                udp_max: 1500,
+                ..Default::default()
+            },
+        );
+        let dst: SocketAddr = dst.parse().unwrap();
+        e.h.send(udp(CLIENT4, dst, &first)).await;
+        assert_eq!(udp_sent(&e, 1).await, vec![first.clone()], "{dst}");
+        let ai = initial_for_test(&[9; 8], "chatgpt.com");
+        e.h.send(udp(CLIENT4, dst, &ai)).await;
+        let (a, b) = (hex(QUIC_GO_CHATGPT_INITIAL), hex(QUIC_GO_CHATGPT_INITIAL_2));
+        e.h.send(udp(CLIENT4, dst, &a)).await;
+        e.h.send(udp(CLIENT4, dst, &b)).await;
+        // The first connection still flows.
+        let short = b"\x40short header".to_vec();
+        e.h.send(udp(CLIENT4, dst, &short)).await;
+        let sent = udp_sent(&e, 2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let sent2 = e.dialer.udp_sent.lock().unwrap().clone();
+        assert_eq!(sent, sent2);
+        assert_eq!(
+            sent,
+            vec![first.clone(), short],
+            "{dst}: AI Initials not sent"
+        );
+        assert_eq!(e.dialer.udp_dials.lock().unwrap().len(), 1);
+    }
 }

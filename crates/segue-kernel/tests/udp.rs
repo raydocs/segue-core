@@ -11,7 +11,8 @@ use segue_kernel::dial::{Datagrams, DialError, Dialer, Stream, UdpSession};
 use segue_kernel::fakeip::FakeIpPool;
 use segue_kernel::policy::{Policy, PolicyStore};
 use segue_kernel::quic::{
-    hex, QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2, RFC9001_CLIENT_INITIAL,
+    hex, initial_for_test, QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2,
+    RFC9001_CLIENT_INITIAL,
 };
 use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
 use segue_kernel::socks::{serve, Kernel, REP_CMD_UNSUPPORTED, REP_OK};
@@ -25,6 +26,10 @@ type Calls = Vec<(Option<String>, String)>;
 struct Fake {
     calls: Mutex<Calls>,
     echo: SocketAddr,
+    /// Session payload cap.
+    max: usize,
+    /// Every datagram a session was asked to send.
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 /// Sends every datagram to the echo server; replies claim to come from the
@@ -32,14 +37,17 @@ struct Fake {
 struct FakeSession {
     sock: UdpSocket,
     from: (TargetAddr, u16),
+    max: usize,
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 #[async_trait]
 impl UdpSession for FakeSession {
     fn max_payload(&self, _: &TargetAddr, _: u16) -> usize {
-        1000
+        self.max
     }
     async fn send(&self, _: &TargetAddr, _: u16, p: &[u8]) -> Result<(), DialError> {
+        self.sent.lock().unwrap().push(p.to_vec());
         self.sock
             .send(p)
             .await
@@ -87,6 +95,8 @@ impl Dialer for Fake {
         Ok(Box::new(FakeSession {
             sock,
             from: (addr.clone(), port),
+            max: self.max,
+            sent: self.sent.clone(),
         }))
     }
 }
@@ -163,9 +173,15 @@ struct Env {
 }
 
 async fn start(udp: Option<UdpSettings>, pool: Option<Arc<FakeIpPool>>) -> Env {
+    start_max(udp, pool, 1000).await
+}
+
+async fn start_max(udp: Option<UdpSettings>, pool: Option<Arc<FakeIpPool>>, max: usize) -> Env {
     let fake = Arc::new(Fake {
         calls: Mutex::default(),
         echo: udp_echo().await,
+        max,
+        sent: Arc::default(),
     });
     let udp = udp.map(|s| Arc::new(Udp::new(s)));
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -519,4 +535,41 @@ async fn unconfirmed_quic_is_refused() {
         env.fake.calls(),
         vec![(Some("proxy".into()), "8.8.8.8:3478".into())]
     );
+}
+
+/// N7: on one SOCKS UDP flow (same client socket, same destination), an
+/// allowed QUIC connection, then a new Initial (new DCID) naming an AI host.
+/// The AI connection is classified on its own: none of its datagrams reach
+/// the flow's outbound, while the first connection keeps flowing. Same for
+/// a non-443 flow that started as plain UDP.
+#[tokio::test]
+async fn second_quic_connection_on_same_flow_is_classified() {
+    for (port, first) in [
+        (443, hex(RFC9001_CLIENT_INITIAL)),
+        (8443, b"\x12\x34plain".to_vec()),
+    ] {
+        let env = start_max(Some(settings()), None, 1500).await;
+        let (_, _ctl, relay) = associate(env.socks).await;
+        let c = client(relay).await;
+        let dst = ip("8.8.8.8");
+        c.send(&packet(&dst, port, &first)).await.unwrap();
+        assert!(recv(&c, WAIT).await.is_some(), "{port}: first connection");
+        c.send(&packet(
+            &dst,
+            port,
+            &initial_for_test(&[9; 8], "chatgpt.com"),
+        ))
+        .await
+        .unwrap();
+        for d in [QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2] {
+            c.send(&packet(&dst, port, &hex(d))).await.unwrap();
+        }
+        assert_eq!(recv(&c, QUIET).await, None, "{port}: AI Initials echoed");
+        let short = b"\x40short header".to_vec();
+        c.send(&packet(&dst, port, &short)).await.unwrap();
+        assert!(recv(&c, WAIT).await.is_some(), "{port}: first still flows");
+        assert_eq!(*env.fake.sent.lock().unwrap(), vec![first.clone(), short]);
+        assert_eq!(env.fake.calls().len(), 1);
+        assert_eq!(env.udp.as_ref().unwrap().dropped(), 3);
+    }
 }

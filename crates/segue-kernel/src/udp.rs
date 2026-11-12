@@ -47,7 +47,7 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::dial::{Dialer, UdpSession};
-use crate::quic::{InitialSniffer, Quic};
+use crate::quic::{ConnGuard, InitialSniffer, Quic, Step};
 use crate::rules::Action;
 use crate::socks::{Kernel, REP_GENERAL, REP_OK};
 
@@ -123,7 +123,12 @@ type Key = (TargetAddr, u16);
 
 /// A destination of one association.
 enum Slot {
-    Live(mpsc::Sender<Vec<u8>>),
+    Live {
+        tx: mpsc::Sender<Vec<u8>>,
+        /// For a flow routed by sniffing: every further QUIC connection on
+        /// it is classified too (N7).
+        guard: Option<Box<Guarded>>,
+    },
     /// Waiting for the rest of a QUIC ClientHello.
     Held {
         sniffer: InitialSniffer,
@@ -135,16 +140,33 @@ enum Slot {
 impl Slot {
     fn stale(&self, idle: Duration) -> bool {
         match self {
-            Slot::Live(tx) => tx.is_closed(),
+            Slot::Live { tx, .. } => tx.is_closed(),
             Slot::Held { since, .. } => since.elapsed() >= idle,
         }
     }
 }
 
+struct Guarded {
+    guard: ConnGuard<Vec<u8>>,
+    /// The flow's route; a new connection must route the same way.
+    route: (Option<String>, TargetAddr),
+}
+
 fn release(queued: &AtomicUsize, slot: &Slot) {
-    if let Slot::Held { datagrams, .. } = slot {
-        let n: usize = datagrams.iter().map(Vec::len).sum();
-        queued.fetch_sub(n, Ordering::Relaxed);
+    let held: &[Vec<u8>] = match slot {
+        Slot::Held { datagrams, .. } => datagrams,
+        Slot::Live { guard: Some(g), .. } => g.guard.held(),
+        Slot::Live { .. } => &[],
+    };
+    let n: usize = held.iter().map(Vec::len).sum();
+    queued.fetch_sub(n, Ordering::Relaxed);
+}
+
+fn drop_all(udp: &Udp, queued: &AtomicUsize, ds: &[Vec<u8>]) {
+    let n: usize = ds.iter().map(Vec::len).sum();
+    queued.fetch_sub(n, Ordering::Relaxed);
+    for _ in ds {
+        udp.drop_one();
     }
 }
 
@@ -235,21 +257,51 @@ fn uplink(
     };
     let mut held = None;
     match flows.get_mut(&key) {
-        Some(Slot::Live(tx)) => {
+        Some(Slot::Live { tx, guard }) => {
             if !reserve(queued) {
                 return udp.drop_one();
             }
-            match tx.try_send(payload.to_vec()) {
-                Ok(()) => return,
-                Err(TrySendError::Full(_)) => {
-                    queued.fetch_sub(payload.len(), Ordering::Relaxed);
-                    return udp.drop_one();
+            let batch = match (guard, &key.0) {
+                (Some(g), TargetAddr::Ip(ip)) => {
+                    let Guarded { guard, route } = &mut **g;
+                    let same = |q: &Quic| {
+                        route_sniffed(kernel, &udp.settings, *ip, port, q).as_ref() == Some(route)
+                    };
+                    match guard.push(payload.to_vec(), payload, same) {
+                        Step::Hold => return,
+                        Step::Drop(ds) => return drop_all(udp, queued, &ds),
+                        Step::Forward(ds) => ds,
+                    }
                 }
-                // Went idle (or broke): route afresh below.
-                Err(TrySendError::Closed(_)) => {
-                    queued.fetch_sub(payload.len(), Ordering::Relaxed);
-                    flows.remove(&key);
+                _ => vec![payload.to_vec()],
+            };
+            let single = batch.len() == 1;
+            let mut batch = batch.into_iter();
+            for d in batch.by_ref() {
+                let n = d.len();
+                match tx.try_send(d) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        queued.fetch_sub(n, Ordering::Relaxed);
+                        udp.drop_one();
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        queued.fetch_sub(n, Ordering::Relaxed);
+                        let rest: Vec<_> = batch.by_ref().collect();
+                        drop_all(udp, queued, &rest);
+                        if let Some(old) = flows.remove(&key) {
+                            release(queued, &old);
+                        }
+                        if !single {
+                            return udp.drop_one();
+                        }
+                        // Went idle (or broke): route afresh below.
+                        break;
+                    }
                 }
+            }
+            if flows.contains_key(&key) {
+                return;
             }
         }
         Some(Slot::Held { .. }) => held = flows.remove(&key),
@@ -298,6 +350,7 @@ fn uplink(
                 q => (
                     route_sniffed(kernel, &udp.settings, *ip, port, &q),
                     datagrams,
+                    Some(guard_for(&sniffer, &q, port)),
                 ),
             }
         }
@@ -318,16 +371,18 @@ fn uplink(
                 q => (
                     route_sniffed(kernel, &udp.settings, *ip, port, &q),
                     vec![payload.to_vec()],
+                    Some(guard_for(&sniffer, &q, port)),
                 ),
             }
         }
         _ => (
             route(kernel, &udp.settings, &key.0, port),
             vec![payload.to_vec()],
+            None,
         ),
     };
-    let (route, datagrams) = decided;
-    let Some((tag, target)) = route else {
+    let (route, datagrams, guard) = decided;
+    let Some((tag, target)) = route.clone() else {
         let n: usize = datagrams.iter().map(Vec::len).sum();
         queued.fetch_sub(n, Ordering::Relaxed);
         for _ in &datagrams {
@@ -355,7 +410,21 @@ fn uplink(
         },
         rx,
     ));
-    flows.insert(key, Slot::Live(tx));
+    let guard = guard.map(|guard| {
+        Box::new(Guarded {
+            guard,
+            route: route.expect("routed"),
+        })
+    });
+    flows.insert(key, Slot::Live { tx, guard });
+}
+
+/// The per-connection guard of a flow routed after `sniffer` said `q`.
+fn guard_for(sniffer: &InitialSniffer, q: &Quic, port: u16) -> ConnGuard<Vec<u8>> {
+    ConnGuard::new(
+        matches!(q, Quic::Domain(_)).then_some(sniffer),
+        port == QUIC_PORT,
+    )
 }
 
 /// Whether a new flow to this bare IP is classified by its datagrams first

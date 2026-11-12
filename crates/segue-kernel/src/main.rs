@@ -108,15 +108,13 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut fake_ip = None;
         if let Some(d) = config.dns {
-            // Key + mapping persisted (spec §5.2.2) when fake_ip_state is
-            // set, so a restart never reinterprets an address a client
-            // still caches.
+            // Key + bindings persisted (spec §5.2.2), so a restart never
+            // reinterprets an address a client still caches.
             let (pool, log) = FakeIpPool::open(
                 d.fake_ip_base,
                 d.fake_ip_prefix,
                 d.fake_ip_ttl,
                 d.fake_ip_grace,
-                d.fake_ip_quarantine,
                 d.fake_ip_max_entries,
                 d.fake_ip_state.as_deref(),
             )?;
@@ -124,20 +122,16 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("segue-kernel: {line}");
             }
             let pool = Arc::new(pool);
-            if let Some(path) = d.fake_ip_state.clone() {
+            {
+                // New bindings are journaled synchronously; this only
+                // keeps last-use times and compacts the journal.
                 let pool = pool.clone();
                 tokio::spawn(async move {
-                    use segue_kernel::fakeip::{NEW_SAVE_INTERVAL, SAVE_INTERVAL};
-                    let mut tick = tokio::time::interval(NEW_SAVE_INTERVAL);
-                    let mut last = tokio::time::Instant::now();
+                    let mut tick = tokio::time::interval(segue_kernel::fakeip::SAVE_INTERVAL);
                     loop {
                         tick.tick().await;
-                        if !pool.has_unsaved_allocation() && last.elapsed() < SAVE_INTERVAL {
-                            continue;
-                        }
-                        last = tokio::time::Instant::now();
-                        if let Err(e) = pool.save(&path) {
-                            eprintln!("segue-kernel: fake-ip state {}: {e}", path.display());
+                        if let Err(e) = pool.save() {
+                            eprintln!("segue-kernel: fake-ip state: {e}");
                         }
                     }
                 });
