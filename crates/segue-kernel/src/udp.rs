@@ -376,8 +376,8 @@ async fn reply_bound(
     let mut r = vec![5, code, 0];
     let bound = bound.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
     put_header(&mut r, &TargetAddr::Ip(bound.ip()), bound.port());
-    // put_header wrote RSV RSV FRAG; a reply has only one RSV before ATYP.
-    r.drain(3..5);
+    // Drop the RSV RSV FRAG put_header wrote: a reply has its own VER REP RSV.
+    r.drain(3..6);
     conn.write_all(&r).await
 }
 
