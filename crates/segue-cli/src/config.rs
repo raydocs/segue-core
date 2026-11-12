@@ -16,9 +16,9 @@ use segue_config::{
 use crate::{geodata_dirs_for_config, CliError};
 
 const HELP: &str =
-    "usage: xray-rust config check -config <file|-> [--json] [--geodata-dir <dir>]...
-       xray-rust config contract
-       xray-rust config example <name>
+    "usage: segue config check -config <file|-> [--json] [--geodata-dir <dir>]...
+       segue config contract
+       segue config example <name>
 
 check validates with the linked parser, without starting the core.
 Use -config or --config; - reads UTF-8 JSON from stdin.

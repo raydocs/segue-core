@@ -16,7 +16,7 @@ use segue_engine::{
     TunRuntimeOptions, TunRuntimeProfile,
 };
 
-const USAGE: &str = "usage: xray-rust run -config <config.json>\n       xray-rust config <check|contract|example> (see config --help)";
+const USAGE: &str = "usage: segue run -config <config.json>\n       segue config <check|contract|example> (see config --help)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliArgs {
