@@ -77,6 +77,7 @@ pub struct SmartDns {
     s: DnsSettings,
     cache: Mutex<HashMap<(String, u16), CacheEntry>>,
     refreshing: Mutex<HashSet<(String, u16)>>,
+    upstream_limit: tokio::sync::Semaphore,
     /// Upstream exchanges started (tests use it to check cache hits).
     pub upstream_queries: std::sync::atomic::AtomicUsize,
 }
@@ -105,6 +106,7 @@ impl SmartDns {
             s,
             cache: Mutex::new(HashMap::new()),
             refreshing: Mutex::new(HashSet::new()),
+            upstream_limit: tokio::sync::Semaphore::new(MAX_UPSTREAM_IN_FLIGHT),
             upstream_queries: Default::default(),
         }
     }
@@ -268,6 +270,7 @@ impl SmartDns {
 
     /// Send `packet` to every domestic resolver at once; first valid reply.
     async fn race(&self, packet: Vec<u8>) -> Option<Vec<u8>> {
+        let _permit = self.upstream_limit.try_acquire().ok()?;
         self.upstream_queries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let packet = Arc::new(packet);
@@ -493,18 +496,19 @@ fn respond(q: &Question<'_>, rcode: u8, ips: &[IpAddr], ttl: u32) -> Vec<u8> {
     out
 }
 
-/// Most queries answered at once (UDP datagrams in flight plus TCP
-/// connections). Each one may hold a 64 KiB receive buffer per domestic
-/// resolver, so this caps the listener's memory; a datagram over the limit
-/// is dropped (the client retries) and a TCP connection waits.
-const MAX_IN_FLIGHT: usize = 256;
+/// Most upstream exchanges in flight (client queries and background
+/// refreshes). Each holds a 64 KiB receive buffer per domestic resolver, so
+/// this bounds memory when resolvers hang; over the limit a query gets
+/// SERVFAIL. Local answers (fake-IP, cache, canary) are never limited.
+const MAX_UPSTREAM_IN_FLIGHT: usize = 256;
+/// Most DNS-over-TCP connections at once; further accepts wait.
+const MAX_TCP_CONNS: usize = 256;
 
 /// Serve DNS over UDP on `sock`. Per-datagram errors (e.g. an ICMP
 /// port-unreachable from a client that went away, which some platforms
 /// report on the next receive) do not stop the listener.
 pub async fn serve_udp(sock: UdpSocket, dns: Arc<SmartDns>) -> std::io::Result<()> {
     let sock = Arc::new(sock);
-    let limit = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let mut buf = vec![0u8; 4096];
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
@@ -512,13 +516,9 @@ pub async fn serve_udp(sock: UdpSocket, dns: Arc<SmartDns>) -> std::io::Result<(
             Err(e) if transient(&e) => continue,
             Err(e) => return Err(e),
         };
-        let Ok(permit) = limit.clone().try_acquire_owned() else {
-            continue;
-        };
         let msg = buf[..n].to_vec();
         let (sock, dns) = (sock.clone(), dns.clone());
         tokio::spawn(async move {
-            let _permit = permit;
             if let Some(reply) = dns.handle(&msg).await {
                 let _ = sock.send_to(&reply, peer).await;
             }
@@ -536,7 +536,7 @@ fn transient(e: &std::io::Error) -> bool {
 
 /// Serve DNS over TCP (2-byte length framing, several queries per connection).
 pub async fn serve_tcp(listener: TcpListener, dns: Arc<SmartDns>) -> std::io::Result<()> {
-    let limit = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+    let limit = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNS));
     loop {
         let permit = limit
             .clone()
