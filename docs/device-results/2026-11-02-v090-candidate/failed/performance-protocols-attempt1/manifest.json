@@ -47,7 +47,7 @@
       },
       "case": "socks-auth-socks-full-duplex-1",
       "command": [
-        "<repo>/target/release-090/host/cargo/release/segue-bench",
+        "<repo>/target/release-090/host/cargo/release/xray-bench",
         "protocol-run",
         "<repo>/target/release-090/campaign.noindex/performance-protocols/socks-auth-socks-full-duplex-1-candidate-1.json"
       ],
@@ -75,7 +75,7 @@
       },
       "case": "socks-auth-socks-full-duplex-1",
       "command": [
-        "<repo>/target/release-090/host/cargo/release/segue-bench",
+        "<repo>/target/release-090/host/cargo/release/xray-bench",
         "protocol-run",
         "<repo>/target/release-090/campaign.noindex/performance-protocols/socks-auth-socks-full-duplex-1-xray-1.json"
       ],

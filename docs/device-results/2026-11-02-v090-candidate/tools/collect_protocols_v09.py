@@ -16,7 +16,7 @@ for key in ("GOMAXPROCS", "TOKIO_WORKER_THREADS", "GOMEMLIMIT", "GOGC"):
     os.environ.pop(key, None)
 out = pathlib.Path(sys.argv[1]); out.mkdir(exist_ok=False)
 R = pathlib.Path("<repo>/target/release-090")
-paths = {"candidate": R / "host/cargo/release/segue", "harness": R / "host/cargo/release/segue-bench",
+paths = {"candidate": R / "host/cargo/release/xray-rust", "harness": R / "host/cargo/release/xray-bench",
          "xray": R / "xray-core/xray"}
 c.device.verify_reference(paths["xray"])
 assert not b.command(["git", "status", "--porcelain"], ROOT)
