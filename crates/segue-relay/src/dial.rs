@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::guard::Guard;
-use crate::home::{HomeError, HomePool};
+use crate::home::HomePool;
 use crate::metrics::Metrics;
 use crate::policy::{normalize_domain, AiSet};
 use crate::ticket::{ClaimsCache, ExitClass};
@@ -93,7 +93,11 @@ impl<S> Drop for Site<S> {
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Site<S> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let r = Pin::new(&mut self.inner).poll_read(cx, buf);
         let n = (buf.filled().len() - before) as u64;
@@ -103,7 +107,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for Site<S> {
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for Site<S> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let r = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &r {
             self.bytes.fetch_add(*n as u64, Ordering::Relaxed);
@@ -180,10 +188,27 @@ impl Dialer {
         if is_ai != (hint == crate::hint::AI) {
             let n = self.metrics.reclass(device);
             if n == 1 || n.is_power_of_two() {
-                crate::log!("warn", "target reclassified", "device" = device, "hint" = hint, "ai" = is_ai, "count" = n);
+                crate::log!(
+                    "warn",
+                    "target reclassified",
+                    "device" = device,
+                    "hint" = hint,
+                    "ai" = is_ai,
+                    "count" = n
+                );
             }
         }
-        let allowed: Vec<IpAddr> = ips.iter().copied().filter(|&ip| self.guard.allows(ip)).collect();
+        let allowed: Vec<IpAddr> = ips
+            .iter()
+            .copied()
+            .filter(|&ip| self.guard.allows(ip))
+            .collect();
+        if allowed.len() != ips.len() {
+            // Any forbidden answer makes the whole name suspect (rebinding),
+            // for both overseas and Home targets.
+            Metrics::inc(&self.metrics.ssrf_blocked);
+            return Err(code::TARGET_DENIED);
+        }
         if is_ai {
             if !claims.allows(ExitClass::Ai) {
                 Metrics::inc(&self.metrics.exit_denied);
@@ -202,10 +227,6 @@ impl Dialer {
                 .find(|ip| crate::cidr::canon(*ip).is_ipv4() && (ai_name || self.ai.is_ai_ip(*ip)));
             return match pick {
                 Some(ip) => Ok(Route::Home(SocketAddr::new(crate::cidr::canon(ip), port))),
-                None if allowed.is_empty() => {
-                    Metrics::inc(&self.metrics.ssrf_blocked);
-                    Err(code::TARGET_DENIED)
-                }
                 None => {
                     Metrics::inc(&self.metrics.target_denied);
                     Err(code::TARGET_DENIED)
@@ -216,12 +237,16 @@ impl Dialer {
             Metrics::inc(&self.metrics.exit_denied);
             return Err(code::EXIT_DENIED);
         }
-        if allowed.len() != ips.len() || allowed.is_empty() {
-            // Any forbidden answer makes the whole name suspect (rebinding).
+        if allowed.is_empty() {
             Metrics::inc(&self.metrics.ssrf_blocked);
             return Err(code::TARGET_DENIED);
         }
-        Ok(Route::Overseas(allowed.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()))
+        Ok(Route::Overseas(
+            allowed
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect(),
+        ))
     }
 
     pub async fn connect(&self, r: SiteRequest) -> io::Result<BoxCarrier> {
@@ -229,11 +254,17 @@ impl Dialer {
             Metrics::inc(&self.metrics.exit_denied);
             return Err(self.deny(code::EXIT_DENIED));
         }
-        let Some(slot) = self.devices.try_acquire(r.device, self.max_sessions_per_device) else {
+        let Some(slot) = self
+            .devices
+            .try_acquire(r.device, self.max_sessions_per_device)
+        else {
             Metrics::inc(&self.metrics.session_limit);
             return Err(self.deny(code::CAPACITY));
         };
-        let route = self.route(r.device, &r.target, r.exit_class).await.map_err(|c| self.deny(c))?;
+        let route = self
+            .route(r.device, &r.target, r.exit_class)
+            .await
+            .map_err(|c| self.deny(c))?;
         match route {
             Route::Overseas(addrs) => {
                 let mut last = code::CONNECT_REFUSED;
@@ -268,7 +299,12 @@ impl Dialer {
                 }
                 Err(e) => {
                     Metrics::inc(&self.metrics.home_unavailable);
-                    let _ = matches!(e, HomeError::NoCapacity);
+                    crate::log!(
+                        "warn",
+                        "home unavailable",
+                        "device" = r.device,
+                        "reason" = format!("{e:?}")
+                    );
                     Err(self.deny(code::HOME_UNAVAILABLE))
                 }
             },

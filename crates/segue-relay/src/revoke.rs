@@ -84,7 +84,8 @@ impl Revocations {
         let mtime = meta.modified().ok();
         {
             let mut st = self.state.lock().unwrap();
-            if st.last_ok.is_some() && st.mtime == mtime && st.len == meta.len() && mtime.is_some() {
+            if st.last_ok.is_some() && st.mtime == mtime && st.len == meta.len() && mtime.is_some()
+            {
                 st.last_ok = Some(Instant::now());
                 return Ok(Vec::new());
             }

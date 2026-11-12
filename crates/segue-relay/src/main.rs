@@ -45,7 +45,10 @@ fn keygen(path: &Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let s = read_signer(0, &text).expect("fresh key");
-    println!("{}", base64::engine::general_purpose::STANDARD.encode(s.public_key()));
+    println!(
+        "{}",
+        base64::engine::general_purpose::STANDARD.encode(s.public_key())
+    );
     ExitCode::SUCCESS
 }
 
@@ -53,7 +56,11 @@ fn keygen(path: &Path) -> ExitCode {
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
     f.write_all(text.as_bytes())
 }
 
@@ -140,7 +147,10 @@ fn run(path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
     rt.block_on(async move {
         let listen = cfg.listen;
         let relay = match Relay::new(cfg, system_clock(), None, None) {
@@ -153,7 +163,12 @@ fn run(path: &Path) -> ExitCode {
         let listener = match tokio::net::TcpListener::bind(listen).await {
             Ok(l) => l,
             Err(e) => {
-                log!("error", "listen", "addr" = listen.to_string(), "error" = e.to_string());
+                log!(
+                    "error",
+                    "listen",
+                    "addr" = listen.to_string(),
+                    "error" = e.to_string()
+                );
                 return ExitCode::FAILURE;
             }
         };

@@ -20,7 +20,8 @@ pub fn normalize_domain(name: &str) -> Option<String> {
         && n.split('.').all(|l| {
             !l.is_empty()
                 && l.len() <= 63
-                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                && l.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         });
     ok.then_some(n)
 }

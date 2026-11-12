@@ -306,10 +306,16 @@ mod tests {
         assert_eq!(v.verify(&bad, 1000), Err(TicketError::Bad));
         // Unknown key id / other key.
         let other = Signer::from_pkcs8(7, &generate_pkcs8()).unwrap();
-        assert_eq!(v.verify(&other.sign(&claims(42, 1000)), 1000), Err(TicketError::Bad));
+        assert_eq!(
+            v.verify(&other.sign(&claims(42, 1000)), 1000),
+            Err(TicketError::Bad)
+        );
         let v2 = Verifier::new(vec![(8, s.public_key())]);
         assert_eq!(v2.verify(&t, 1000), Err(TicketError::Bad));
         assert_eq!(v.verify(b"junk", 1000), Err(TicketError::Bad));
-        assert_eq!(v.verify(&vec![b'S'; MAX_TICKET + 1], 1000), Err(TicketError::Bad));
+        assert_eq!(
+            v.verify(&vec![b'S'; MAX_TICKET + 1], 1000),
+            Err(TicketError::Bad)
+        );
     }
 }

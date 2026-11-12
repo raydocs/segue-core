@@ -27,18 +27,18 @@ const BUILTIN: &[&str] = &[
     "224.0.0.0/4",     // multicast
     "240.0.0.0/4",     // reserved, broadcast
     // IPv6
-    "::/96",           // unspecified, loopback, IPv4-compatible
-    "64:ff9b::/96",    // NAT64 (could reach internal IPv4)
-    "64:ff9b:1::/48",  // local-use NAT64
-    "100::/64",        // discard
-    "2001::/23",       // IETF protocol assignments incl. Teredo
-    "2001:db8::/32",   // documentation
-    "2002::/16",       // 6to4 (embeds arbitrary IPv4)
-    "3fff::/20",       // documentation
-    "fc00::/7",        // ULA (incl. fd00:ec2::254 metadata)
-    "fe80::/10",       // link-local
-    "fec0::/10",       // site-local (deprecated)
-    "ff00::/8",        // multicast
+    "::/96",          // unspecified, loopback, IPv4-compatible
+    "64:ff9b::/96",   // NAT64 (could reach internal IPv4)
+    "64:ff9b:1::/48", // local-use NAT64
+    "100::/64",       // discard
+    "2001::/23",      // IETF protocol assignments incl. Teredo
+    "2001:db8::/32",  // documentation
+    "2002::/16",      // 6to4 (embeds arbitrary IPv4)
+    "3fff::/20",      // documentation
+    "fc00::/7",       // ULA (incl. fd00:ec2::254 metadata)
+    "fe80::/10",      // link-local
+    "fec0::/10",      // site-local (deprecated)
+    "ff00::/8",       // multicast
 ];
 
 fn builtin() -> &'static [Cidr] {

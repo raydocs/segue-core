@@ -34,7 +34,9 @@ impl Cidr {
             Some((a, p)) => (a, Some(p)),
             None => (s, None),
         };
-        let ip: IpAddr = a.parse().map_err(|_| format!("bad address in prefix {s:?}"))?;
+        let ip: IpAddr = a
+            .parse()
+            .map_err(|_| format!("bad address in prefix {s:?}"))?;
         let max = if ip.is_ipv4() { 32 } else { 128 };
         let prefix = match p {
             Some(p) => p
@@ -54,7 +56,11 @@ impl Cidr {
         };
         Self {
             net,
-            prefix: if ip.is_ipv4() { prefix.min(32) } else { prefix.min(128) },
+            prefix: if ip.is_ipv4() {
+                prefix.min(32)
+            } else {
+                prefix.min(128)
+            },
         }
     }
 

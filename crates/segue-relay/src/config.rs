@@ -188,7 +188,9 @@ fn read_credentials(
 ) -> Result<Option<Credentials>, String> {
     let raw = match (file, env) {
         (Some(_), Some(_)) => {
-            return Err(format!("line {id}: set credentials_file or credentials_env, not both"))
+            return Err(format!(
+                "line {id}: set credentials_file or credentials_env, not both"
+            ))
         }
         (Some(f), None) => {
             let p = base.join(f);
@@ -196,13 +198,14 @@ fn read_credentials(
             std::fs::read_to_string(&p)
                 .map_err(|e| format!("line {id}: cannot read credentials file: {e}"))?
         }
-        (None, Some(v)) => std::env::var(v)
-            .map_err(|_| format!("line {id}: credentials env var is not set"))?,
+        (None, Some(v)) => {
+            std::env::var(v).map_err(|_| format!("line {id}: credentials env var is not set"))?
+        }
         (None, None) => return Ok(None),
     };
-    Credentials::parse(raw.trim())
-        .map(Some)
-        .ok_or_else(|| format!("line {id}: credentials must be `username:password` (1..=255 bytes each)"))
+    Credentials::parse(raw.trim()).map(Some).ok_or_else(|| {
+        format!("line {id}: credentials must be `username:password` (1..=255 bytes each)")
+    })
 }
 
 impl Config {
@@ -216,7 +219,9 @@ impl Config {
     pub fn parse_in(text: &str, base: &Path) -> Result<Self, String> {
         let raw: Raw = serde_json::from_str(text).map_err(|e| format!("config: {e}"))?;
         if !raw.listen.ip().is_loopback() {
-            return Err("listen must be a loopback address (the outer servers forward to it)".into());
+            return Err(
+                "listen must be a loopback address (the outer servers forward to it)".into(),
+            );
         }
         if let Some(m) = raw.metrics_listen {
             if !m.ip().is_loopback() {
@@ -245,7 +250,11 @@ impl Config {
             if l.id.is_empty() || home_lines.iter().any(|x| x.id == l.id) {
                 return Err(format!("home line id {:?} empty or duplicate", l.id));
             }
-            if l.server.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).is_none() {
+            if l.server
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+                .is_none()
+            {
                 return Err(format!("home line {}: server must be host:port", l.id));
             }
             let credentials = read_credentials(
@@ -263,7 +272,9 @@ impl Config {
         }
         let mut home_assignments = Vec::new();
         for (d, line) in &raw.home_assignments {
-            let d: u64 = d.parse().map_err(|_| format!("home_assignments: bad device id {d:?}"))?;
+            let d: u64 = d
+                .parse()
+                .map_err(|_| format!("home_assignments: bad device id {d:?}"))?;
             if !home_lines.iter().any(|l| &l.id == line) {
                 return Err(format!("home_assignments: unknown line {line:?}"));
             }
@@ -290,7 +301,10 @@ impl Config {
             probe_interval: Duration::from_secs(r.probe_interval_secs.max(1)),
             drain: Duration::from_secs(r.drain_secs),
         };
-        if limits.pool_bytes < 1 << 20 || limits.window_cap < 16 * 1024 || limits.replay_cap < 16 * 1024 {
+        if limits.pool_bytes < 1 << 20
+            || limits.window_cap < 16 * 1024
+            || limits.replay_cap < 16 * 1024
+        {
             return Err("limits: pool_bytes >= 1 MiB, window_cap / replay_cap >= 16 KiB".into());
         }
         if limits.max_carriers == 0 || limits.max_sessions_per_device == 0 {
@@ -299,7 +313,10 @@ impl Config {
         if limits.line_units == 0 || limits.line_units_failover < limits.line_units {
             return Err("limits: 0 < line_units <= line_units_failover".into());
         }
-        if limits.first_frame_timeout.is_zero() || limits.connect_timeout.is_zero() || limits.dns_timeout.is_zero() {
+        if limits.first_frame_timeout.is_zero()
+            || limits.connect_timeout.is_zero()
+            || limits.dns_timeout.is_zero()
+        {
             return Err("limits: timeouts must be > 0".into());
         }
         Ok(Self {

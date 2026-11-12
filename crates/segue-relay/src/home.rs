@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tokio::net::TcpStream;
 
-use crate::config::{LineConfig, Limits};
+use crate::config::{Limits, LineConfig};
 use crate::metrics::Metrics;
 use crate::socks5::{self, SocksError};
 
@@ -90,7 +90,13 @@ impl HomePool {
                 .iter()
                 .position(|l| &l.cfg.id == id)
                 .ok_or_else(|| format!("unknown line {id}"))?;
-            devices.insert(*d, Assign { primary: i, current: None });
+            devices.insert(
+                *d,
+                Assign {
+                    primary: i,
+                    current: None,
+                },
+            );
         }
         let p = Self {
             inner: Mutex::new(Inner { lines, devices }),
@@ -142,8 +148,19 @@ impl HomePool {
                     return Err(HomeError::NoCapacity);
                 }
                 let i = pick_new(&g, self.limits.line_units).ok_or(HomeError::NoCapacity)?;
-                g.devices.insert(device, Assign { primary: i, current: None });
-                crate::log!("info", "home line assigned", "device" = device, "line" = g.lines[i].cfg.id);
+                g.devices.insert(
+                    device,
+                    Assign {
+                        primary: i,
+                        current: None,
+                    },
+                );
+                crate::log!(
+                    "info",
+                    "home line assigned",
+                    "device" = device,
+                    "line" = g.lines[i].cfg.id
+                );
                 i
             }
         };
@@ -168,13 +185,21 @@ impl HomePool {
         let pisp = g.lines[primary].cfg.isp.clone();
         // Prefer another ISP, then fewest seats.
         let best = (0..g.lines.len())
-            .filter(|&i| i != primary && g.lines[i].state == LineState::Active && seats(&g, i) < cap)
+            .filter(|&i| {
+                i != primary && g.lines[i].state == LineState::Active && seats(&g, i) < cap
+            })
             .min_by_key(|&i| (g.lines[i].cfg.isp == pisp, seats(&g, i)));
         let Some(t) = best else {
             return Err(HomeError::LineDown);
         };
         g.devices.get_mut(&device).unwrap().current = Some(t);
-        crate::log!("warn", "home temporary failover", "device" = device, "from" = g.lines[primary].cfg.id, "to" = g.lines[t].cfg.id);
+        crate::log!(
+            "warn",
+            "home temporary failover",
+            "device" = device,
+            "from" = g.lines[primary].cfg.id,
+            "to" = g.lines[t].cfg.id
+        );
         Ok((t, g.lines[t].cfg.clone()))
     }
 
@@ -211,19 +236,38 @@ impl HomePool {
                 "isp" = isp,
                 "affected_units" = affected,
                 "auto_failover" = self.auto_failover,
-                "action" = if self.auto_failover { "temporary reassignment" } else { "manual failover required" }
+                "action" = if self.auto_failover {
+                    "temporary reassignment"
+                } else {
+                    "manual failover required"
+                }
             );
         }
     }
 
     fn last_addr(&self, i: usize) -> Option<SocketAddr> {
-        self.inner.lock().unwrap().lines.get(i).and_then(|l| l.last_addr)
+        self.inner
+            .lock()
+            .unwrap()
+            .lines
+            .get(i)
+            .and_then(|l| l.last_addr)
     }
 
     /// TCP to the line's gateway (resolving its host, falling back to the
     /// last good address) and SOCKS greeting/auth.
-    pub async fn open(&self, i: usize, line: &LineConfig, timeout: Duration) -> Result<(TcpStream, SocketAddr), SocksError> {
-        let addrs: Vec<SocketAddr> = match tokio::time::timeout(timeout, tokio::net::lookup_host(line.server.as_str())).await {
+    pub async fn open(
+        &self,
+        i: usize,
+        line: &LineConfig,
+        timeout: Duration,
+    ) -> Result<(TcpStream, SocketAddr), SocksError> {
+        let addrs: Vec<SocketAddr> = match tokio::time::timeout(
+            timeout,
+            tokio::net::lookup_host(line.server.as_str()),
+        )
+        .await
+        {
             Ok(Ok(a)) => a.collect(),
             _ => Vec::new(),
         };
@@ -251,7 +295,12 @@ impl HomePool {
     }
 
     /// Full Home dial: gateway, auth, CONNECT to `target` (an IP).
-    pub async fn dial(&self, device: u64, target: SocketAddr, timeout: Duration) -> Result<(TcpStream, String), HomeError> {
+    pub async fn dial(
+        &self,
+        device: u64,
+        target: SocketAddr,
+        timeout: Duration,
+    ) -> Result<(TcpStream, String), HomeError> {
         let (i, line) = self.line_for(device)?;
         let r = async {
             let (mut s, a) = self.open(i, &line, timeout).await?;
@@ -273,7 +322,12 @@ impl HomePool {
                     // Target refused through a working gateway.
                     self.report(i, true, None);
                 }
-                crate::log!("warn", "home dial failed", "line" = line.id, "error" = e.to_string());
+                crate::log!(
+                    "warn",
+                    "home dial failed",
+                    "line" = line.id,
+                    "error" = e.to_string()
+                );
                 Err(HomeError::LineDown)
             }
         }
@@ -282,7 +336,14 @@ impl HomePool {
     /// Active probe of every line: gateway + auth (§5.7). Exit-IP echo needs
     /// a known echo target and is left to deployment config.
     pub async fn probe_all(&self, timeout: Duration) {
-        let lines: Vec<LineConfig> = self.inner.lock().unwrap().lines.iter().map(|l| l.cfg.clone()).collect();
+        let lines: Vec<LineConfig> = self
+            .inner
+            .lock()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.cfg.clone())
+            .collect();
         for (i, l) in lines.iter().enumerate() {
             match self.open(i, l, timeout).await {
                 Ok((_, a)) => self.report(i, true, Some(a)),
@@ -310,13 +371,18 @@ fn seats(g: &Inner, i: usize) -> usize {
 fn pick_new(g: &Inner, cap: usize) -> Option<usize> {
     let mut isp_units: HashMap<&str, usize> = HashMap::new();
     for a in g.devices.values() {
-        *isp_units.entry(g.lines[a.primary].cfg.isp.as_str()).or_default() += 1;
+        *isp_units
+            .entry(g.lines[a.primary].cfg.isp.as_str())
+            .or_default() += 1;
     }
     (0..g.lines.len())
         .filter(|&i| g.lines[i].state == LineState::Active && seats(g, i) < cap)
         .min_by_key(|&i| {
             (
-                isp_units.get(g.lines[i].cfg.isp.as_str()).copied().unwrap_or(0),
+                isp_units
+                    .get(g.lines[i].cfg.isp.as_str())
+                    .copied()
+                    .unwrap_or(0),
                 seats(g, i),
                 i,
             )
@@ -408,6 +474,13 @@ mod tests {
     #[test]
     fn pinned_over_cap_rejected() {
         let pins: Vec<(u64, String)> = (0..6).map(|d| (d, "a".to_string())).collect();
-        assert!(HomePool::new(vec![line("a", "x")], &pins, Limits::default(), false, Arc::new(Metrics::default())).is_err());
+        assert!(HomePool::new(
+            vec![line("a", "x")],
+            &pins,
+            Limits::default(),
+            false,
+            Arc::new(Metrics::default())
+        )
+        .is_err());
     }
 }

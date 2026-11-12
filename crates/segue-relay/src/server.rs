@@ -34,13 +34,21 @@ struct Counted {
 }
 
 impl AsyncRead for Counted {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for Counted {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -64,7 +72,12 @@ pub struct Relay {
 }
 
 impl Relay {
-    pub fn new(cfg: Config, clock: Clock, resolver: Option<Resolver>, guard: Option<Guard>) -> Result<Self, String> {
+    pub fn new(
+        cfg: Config,
+        clock: Clock,
+        resolver: Option<Resolver>,
+        guard: Option<Guard>,
+    ) -> Result<Self, String> {
         let metrics = Arc::new(Metrics::default());
         let revoked = Arc::new(Revocations::new(cfg.revocation_file.clone()));
         if cfg.revocation_file.is_some() {
@@ -92,7 +105,16 @@ impl Relay {
             dns_timeout: cfg.limits.dns_timeout,
         });
         let verifier = Arc::new(Verifier::new(cfg.ticket_keys.clone()));
-        Ok(Self { cfg, metrics, revoked, claims, home, dialer, verifier, clock })
+        Ok(Self {
+            cfg,
+            metrics,
+            revoked,
+            claims,
+            home,
+            dialer,
+            verifier,
+            clock,
+        })
     }
 
     pub fn table(&self) -> RelayTable {
@@ -106,7 +128,12 @@ impl Relay {
             metrics: self.metrics.clone(),
             clock: self.clock.clone(),
         };
-        RelayTable::new(scfg, Pool::new(self.cfg.limits.pool_bytes), Box::new(auth), rand::random::<u64>() | 1)
+        RelayTable::new(
+            scfg,
+            Pool::new(self.cfg.limits.pool_bytes),
+            Box::new(auth),
+            (rand::random::<u64>() >> 2) | 1,
+        )
     }
 
     /// Re-read the revocation list; RST sessions of newly revoked devices.
@@ -115,15 +142,29 @@ impl Relay {
             Ok(added) => {
                 if !added.is_empty() {
                     Metrics::inc(&self.metrics.revocation_reloads);
-                    crate::log!("info", "revocation list reloaded", "entries" = self.revoked.len(), "new" = added.len());
+                    crate::log!(
+                        "info",
+                        "revocation list reloaded",
+                        "entries" = self.revoked.len(),
+                        "new" = added.len()
+                    );
                 }
                 for d in added {
                     self.claims.remove(d);
                     Metrics::inc(&self.metrics.devices_reset);
-                    let _ = ctrl.send(RelayCtrl::ResetDevice { device: d, close_code: code::REVOKED }).await;
+                    let _ = ctrl
+                        .send(RelayCtrl::ResetDevice {
+                            device: d,
+                            close_code: code::REVOKED,
+                        })
+                        .await;
                 }
             }
-            Err(e) => crate::log!("error", "revocation reload failed; keeping last list", "error" = e),
+            Err(e) => crate::log!(
+                "error",
+                "revocation reload failed; keeping last list",
+                "error" = e
+            ),
         }
     }
 }
@@ -134,7 +175,13 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<RelayCtrl>(256);
     let (note_tx, mut note_rx) = mpsc::unbounded_channel::<RelayNotice>();
     let table = relay.table();
-    let driver = tokio::spawn(run_relay_ctl(table, accept_rx, relay.dialer.connector(), Some(note_tx), Some(ctrl_rx)));
+    let driver = tokio::spawn(run_relay_ctl(
+        table,
+        accept_rx,
+        relay.dialer.connector(),
+        Some(note_tx),
+        Some(ctrl_rx),
+    ));
 
     let m = relay.metrics.clone();
     let notes = tokio::spawn(async move {
@@ -214,7 +261,11 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
             }
         }
     }
-    crate::log!("info", "shutting down; draining sessions", "drain_secs" = relay.cfg.limits.drain.as_secs());
+    crate::log!(
+        "info",
+        "shutting down; draining sessions",
+        "drain_secs" = relay.cfg.limits.drain.as_secs()
+    );
     drop(listener);
     drop(accept_tx);
     bg.abort();
@@ -222,7 +273,10 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
         h.abort();
     }
     let mut driver = driver;
-    if tokio::time::timeout(relay.cfg.limits.drain, &mut driver).await.is_err() {
+    if tokio::time::timeout(relay.cfg.limits.drain, &mut driver)
+        .await
+        .is_err()
+    {
         crate::log!("warn", "drain limit reached; closing remaining sessions");
         driver.abort();
     }
