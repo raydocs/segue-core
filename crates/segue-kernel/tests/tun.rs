@@ -9,14 +9,14 @@ use bytes::Bytes;
 use segue_kernel::dial::{DialError, Dialer, Stream};
 use segue_kernel::rules::{Action, Cidr, Matcher, Rule, RuleSet};
 use segue_kernel::tun::{
-    mss_for, Event, FlowKey, Netstack, NetstackConfig, PacketIo, Proto, TunStack, UdpDatagram, UdpHandler,
-    UdpReply, Verdict,
+    mss_for, Event, FlowKey, Netstack, NetstackConfig, PacketIo, Proto, TunStack, UdpDatagram,
+    UdpHandler, UdpReply, Verdict,
 };
 use segue_routing::TargetAddr;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
-    IpAddress, IpProtocol, Icmpv4Packet, Icmpv6Packet, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl,
-    TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+    Icmpv4Packet, Icmpv6Packet, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr,
+    TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -38,10 +38,22 @@ fn caps() -> ChecksumCapabilities {
     ChecksumCapabilities::default()
 }
 
-fn ip_packet(src: IpAddr, dst: IpAddr, proto: IpProtocol, len: usize, fill: impl FnOnce(&mut [u8])) -> Vec<u8> {
+fn ip_packet(
+    src: IpAddr,
+    dst: IpAddr,
+    proto: IpProtocol,
+    len: usize,
+    fill: impl FnOnce(&mut [u8]),
+) -> Vec<u8> {
     match (src, dst) {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
-            let repr = Ipv4Repr { src_addr: s, dst_addr: d, next_header: proto, payload_len: len, hop_limit: 64 };
+            let repr = Ipv4Repr {
+                src_addr: s,
+                dst_addr: d,
+                next_header: proto,
+                payload_len: len,
+                hop_limit: 64,
+            };
             let mut buf = vec![0u8; 20 + len];
             let mut p = Ipv4Packet::new_unchecked(&mut buf[..]);
             repr.emit(&mut p, &caps());
@@ -49,7 +61,13 @@ fn ip_packet(src: IpAddr, dst: IpAddr, proto: IpProtocol, len: usize, fill: impl
             buf
         }
         (IpAddr::V6(s), IpAddr::V6(d)) => {
-            let repr = Ipv6Repr { src_addr: s, dst_addr: d, next_header: proto, payload_len: len, hop_limit: 64 };
+            let repr = Ipv6Repr {
+                src_addr: s,
+                dst_addr: d,
+                next_header: proto,
+                payload_len: len,
+                hop_limit: 64,
+            };
             let mut buf = vec![0u8; 40 + len];
             let mut p = Ipv6Packet::new_unchecked(&mut buf[..]);
             repr.emit(&mut p);
@@ -68,9 +86,24 @@ struct Flags {
     rst: bool,
 }
 
-const SYN: Flags = Flags { syn: true, ack: false, fin: false, rst: false };
-const ACK: Flags = Flags { syn: false, ack: true, fin: false, rst: false };
-const FIN: Flags = Flags { syn: false, ack: true, fin: true, rst: false };
+const SYN: Flags = Flags {
+    syn: true,
+    ack: false,
+    fin: false,
+    rst: false,
+};
+const ACK: Flags = Flags {
+    syn: false,
+    ack: true,
+    fin: false,
+    rst: false,
+};
+const FIN: Flags = Flags {
+    syn: false,
+    ack: true,
+    fin: true,
+    rst: false,
+};
 
 fn tcp(src: SocketAddr, dst: SocketAddr, f: Flags, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
     let control = if f.syn {
@@ -97,17 +130,39 @@ fn tcp(src: SocketAddr, dst: SocketAddr, f: Flags, seq: u32, ack: u32, payload: 
         payload,
     };
     let (s, d) = (IpAddress::from(src.ip()), IpAddress::from(dst.ip()));
-    ip_packet(src.ip(), dst.ip(), IpProtocol::Tcp, repr.buffer_len(), |b| {
-        repr.emit(&mut TcpPacket::new_unchecked(b), &s, &d, &caps());
-    })
+    ip_packet(
+        src.ip(),
+        dst.ip(),
+        IpProtocol::Tcp,
+        repr.buffer_len(),
+        |b| {
+            repr.emit(&mut TcpPacket::new_unchecked(b), &s, &d, &caps());
+        },
+    )
 }
 
 fn udp(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let repr = UdpRepr { src_port: src.port(), dst_port: dst.port() };
+    let repr = UdpRepr {
+        src_port: src.port(),
+        dst_port: dst.port(),
+    };
     let (s, d) = (IpAddress::from(src.ip()), IpAddress::from(dst.ip()));
-    ip_packet(src.ip(), dst.ip(), IpProtocol::Udp, 8 + payload.len(), |b| {
-        repr.emit(&mut UdpPacket::new_unchecked(b), &s, &d, payload.len(), |p| p.copy_from_slice(payload), &caps());
-    })
+    ip_packet(
+        src.ip(),
+        dst.ip(),
+        IpProtocol::Udp,
+        8 + payload.len(),
+        |b| {
+            repr.emit(
+                &mut UdpPacket::new_unchecked(b),
+                &s,
+                &d,
+                payload.len(),
+                |p| p.copy_from_slice(payload),
+                &caps(),
+            );
+        },
+    )
 }
 
 /// Parsed view of an output packet.
@@ -123,10 +178,20 @@ fn out(pkt: &[u8]) -> Out {
     if pkt[0] >> 4 == 4 {
         let p = Ipv4Packet::new_checked(pkt).unwrap();
         assert!(p.verify_checksum());
-        Out { src: p.src_addr().into(), dst: p.dst_addr().into(), proto: p.next_header(), l4: p.payload().to_vec() }
+        Out {
+            src: p.src_addr().into(),
+            dst: p.dst_addr().into(),
+            proto: p.next_header(),
+            l4: p.payload().to_vec(),
+        }
     } else {
         let p = Ipv6Packet::new_checked(pkt).unwrap();
-        Out { src: p.src_addr().into(), dst: p.dst_addr().into(), proto: p.next_header(), l4: p.payload().to_vec() }
+        Out {
+            src: p.src_addr().into(),
+            dst: p.dst_addr().into(),
+            proto: p.next_header(),
+            l4: p.payload().to_vec(),
+        }
     }
 }
 
@@ -148,8 +213,17 @@ fn seg(pkt: &[u8]) -> Seg {
     let o = out(pkt);
     assert_eq!(o.proto, IpProtocol::Tcp, "expected TCP, got {o:?}");
     let t = TcpPacket::new_checked(&o.l4[..]).unwrap();
-    assert!(t.verify_checksum(&IpAddress::from(o.src), &IpAddress::from(o.dst)), "bad TCP checksum");
-    let repr = TcpRepr::parse(&t, &IpAddress::from(o.src), &IpAddress::from(o.dst), &caps()).unwrap();
+    assert!(
+        t.verify_checksum(&IpAddress::from(o.src), &IpAddress::from(o.dst)),
+        "bad TCP checksum"
+    );
+    let repr = TcpRepr::parse(
+        &t,
+        &IpAddress::from(o.src),
+        &IpAddress::from(o.dst),
+        &caps(),
+    )
+    .unwrap();
     Seg {
         src_port: t.src_port(),
         dst_port: t.dst_port(),
@@ -183,13 +257,24 @@ fn one(stack: &mut Netstack) -> Bytes {
 }
 
 /// SYN → SYN-ACK → ACK; returns (stack, flow id, client next seq, server next seq).
-fn handshake(cfg: NetstackConfig, client: SocketAddr, site: SocketAddr) -> (Netstack, segue_kernel::tun::FlowId, u32, u32) {
+fn handshake(
+    cfg: NetstackConfig,
+    client: SocketAddr,
+    site: SocketAddr,
+) -> (Netstack, segue_kernel::tun::FlowId, u32, u32) {
     let now = Instant::now();
     let mut stack = Netstack::new(cfg, now);
     stack.input(&tcp(client, site, SYN, 1000, 0, b""), now, &mut accept_all);
     let id = match stack.pop_event() {
         Some(Event::TcpAccepted { id, key, tag }) => {
-            assert_eq!(key, FlowKey { proto: Proto::Tcp, src: client, dst: site });
+            assert_eq!(
+                key,
+                FlowKey {
+                    proto: Proto::Tcp,
+                    src: client,
+                    dst: site
+                }
+            );
             assert_eq!(tag.as_deref(), Some("proxy"));
             id
         }
@@ -197,10 +282,17 @@ fn handshake(cfg: NetstackConfig, client: SocketAddr, site: SocketAddr) -> (Nets
     };
     let synack = seg(&one(&mut stack));
     assert!(synack.syn && synack.ack && !synack.rst);
-    assert_eq!((synack.src_port, synack.dst_port), (site.port(), client.port()));
+    assert_eq!(
+        (synack.src_port, synack.dst_port),
+        (site.port(), client.port())
+    );
     assert_eq!(synack.ack_no, 1001);
     let server_seq = synack.seq.wrapping_add(1);
-    stack.input(&tcp(client, site, ACK, 1001, server_seq, b""), now, &mut accept_all);
+    stack.input(
+        &tcp(client, site, ACK, 1001, server_seq, b""),
+        now,
+        &mut accept_all,
+    );
     assert!(stack.tcp_established(id).unwrap());
     (stack, id, 1001, server_seq)
 }
@@ -212,7 +304,11 @@ fn handshake(cfg: NetstackConfig, client: SocketAddr, site: SocketAddr) -> (Nets
 fn refused_syn_gets_rst_acking_the_syn() {
     let now = Instant::now();
     let mut stack = Netstack::new(NetstackConfig::default(), now);
-    stack.input(&tcp(CLIENT4, SITE4, SYN, 5000, 0, b""), now, &mut refuse_all);
+    stack.input(
+        &tcp(CLIENT4, SITE4, SYN, 5000, 0, b""),
+        now,
+        &mut refuse_all,
+    );
     let rst = seg(&one(&mut stack));
     assert!(rst.rst && rst.ack && !rst.syn);
     assert_eq!(rst.ack_no, 5001);
@@ -227,7 +323,11 @@ fn refused_syn_gets_rst_acking_the_syn() {
 fn refused_syn_v6_gets_rst() {
     let now = Instant::now();
     let mut stack = Netstack::new(NetstackConfig::default(), now);
-    stack.input(&tcp(client6(), site6(), SYN, 7, 0, b""), now, &mut refuse_all);
+    stack.input(
+        &tcp(client6(), site6(), SYN, 7, 0, b""),
+        now,
+        &mut refuse_all,
+    );
     let pkt = one(&mut stack);
     let o = out(&pkt);
     assert_eq!((o.src, o.dst), (site6().ip(), client6().ip()));
@@ -244,15 +344,33 @@ fn private_and_loopback_destinations_are_refused_without_asking_the_router() {
         asked += 1;
         Verdict::Accept(None)
     };
-    for dst in ["10.1.2.3:80", "192.168.1.1:80", "172.16.0.1:80", "127.0.0.1:80", "169.254.1.1:80", "100.64.0.1:80", "[fe80::1]:80", "[fc00::1]:80", "[::1]:80"] {
+    for dst in [
+        "10.1.2.3:80",
+        "192.168.1.1:80",
+        "172.16.0.1:80",
+        "127.0.0.1:80",
+        "169.254.1.1:80",
+        "100.64.0.1:80",
+        "[fe80::1]:80",
+        "[fc00::1]:80",
+        "[::1]:80",
+    ] {
         let dst: SocketAddr = dst.parse().unwrap();
         let src = if dst.is_ipv4() { CLIENT4 } else { client6() };
         stack.input(&tcp(src, dst, SYN, 1, 0, b""), now, &mut policy);
         assert!(seg(&one(&mut stack)).rst, "{dst} not refused");
     }
     // Multicast / broadcast: dropped silently.
-    stack.input(&udp(CLIENT4, "224.0.0.251:5353".parse().unwrap(), b"mdns"), now, &mut policy);
-    stack.input(&udp(CLIENT4, "255.255.255.255:67".parse().unwrap(), b"dhcp"), now, &mut policy);
+    stack.input(
+        &udp(CLIENT4, "224.0.0.251:5353".parse().unwrap(), b"mdns"),
+        now,
+        &mut policy,
+    );
+    stack.input(
+        &udp(CLIENT4, "255.255.255.255:67".parse().unwrap(), b"dhcp"),
+        now,
+        &mut policy,
+    );
     assert!(drain(&mut stack).is_empty());
     assert_eq!(asked, 0);
     assert_eq!(stack.stats().tcp_refused_reserved, 9);
@@ -261,7 +379,10 @@ fn private_and_loopback_destinations_are_refused_without_asking_the_router() {
 #[test]
 fn flow_table_full_refuses_new_flows_with_rst() {
     let now = Instant::now();
-    let cfg = NetstackConfig { max_tcp_flows: 2, ..Default::default() };
+    let cfg = NetstackConfig {
+        max_tcp_flows: 2,
+        ..Default::default()
+    };
     let mut stack = Netstack::new(cfg, now);
     for port in [1, 2] {
         let src = SocketAddr::new(CLIENT4.ip(), port);
@@ -279,12 +400,28 @@ fn flow_table_full_refuses_new_flows_with_rst() {
 fn segment_for_unknown_flow_gets_rst_from_its_ack() {
     let now = Instant::now();
     let mut stack = Netstack::new(NetstackConfig::default(), now);
-    stack.input(&tcp(CLIENT4, SITE4, ACK, 100, 777, b"late"), now, &mut accept_all);
+    stack.input(
+        &tcp(CLIENT4, SITE4, ACK, 100, 777, b"late"),
+        now,
+        &mut accept_all,
+    );
     let rst = seg(&one(&mut stack));
     assert!(rst.rst && !rst.ack);
     assert_eq!(rst.seq, 777);
     // A RST for an unknown flow is never answered.
-    let rst_in = tcp(CLIENT4, SITE4, Flags { syn: false, ack: false, fin: false, rst: true }, 1, 0, b"");
+    let rst_in = tcp(
+        CLIENT4,
+        SITE4,
+        Flags {
+            syn: false,
+            ack: false,
+            fin: false,
+            rst: true,
+        },
+        1,
+        0,
+        b"",
+    );
     stack.input(&rst_in, now, &mut accept_all);
     assert!(drain(&mut stack).is_empty());
 }
@@ -341,7 +478,11 @@ impl ToV6 for IpAddr {
 #[test]
 fn synthesized_icmp_is_rate_limited() {
     let now = Instant::now();
-    let cfg = NetstackConfig { icmp_burst: 3, icmp_per_sec: 1, ..Default::default() };
+    let cfg = NetstackConfig {
+        icmp_burst: 3,
+        icmp_per_sec: 1,
+        ..Default::default()
+    };
     let mut stack = Netstack::new(cfg, now);
     let dst: SocketAddr = "8.8.8.8:443".parse().unwrap();
     for _ in 0..10 {
@@ -349,14 +490,21 @@ fn synthesized_icmp_is_rate_limited() {
     }
     assert_eq!(drain(&mut stack).len(), 3);
     assert_eq!(stack.stats().icmp_suppressed, 7);
-    stack.input(&udp(CLIENT4, dst, b"x"), now + Duration::from_secs(2), &mut refuse_all);
+    stack.input(
+        &udp(CLIENT4, dst, b"x"),
+        now + Duration::from_secs(2),
+        &mut refuse_all,
+    );
     assert_eq!(drain(&mut stack).len(), 1);
 }
 
 #[test]
 fn malformed_fragmented_and_oversize_packets_are_dropped() {
     let now = Instant::now();
-    let cfg = NetstackConfig { mtu: 1280, ..Default::default() };
+    let cfg = NetstackConfig {
+        mtu: 1280,
+        ..Default::default()
+    };
     let mut stack = Netstack::new(cfg, now);
     let mut bad = tcp(CLIENT4, SITE4, SYN, 1, 0, b"");
     let last = bad.len() - 1;
@@ -370,11 +518,18 @@ fn malformed_fragmented_and_oversize_packets_are_dropped() {
         p.fill_checksum();
     }
     stack.input(&frag, now, &mut accept_all);
-    stack.input(&udp(CLIENT4, "8.8.8.8:53".parse().unwrap(), &[0u8; 1300]), now, &mut accept_all);
+    stack.input(
+        &udp(CLIENT4, "8.8.8.8:53".parse().unwrap(), &[0u8; 1300]),
+        now,
+        &mut accept_all,
+    );
     stack.input(&[0x45, 0, 0], now, &mut accept_all);
     assert!(drain(&mut stack).is_empty());
     let s = stack.stats();
-    assert_eq!((s.dropped_malformed, s.dropped_fragment, s.dropped_oversize), (2, 1, 1));
+    assert_eq!(
+        (s.dropped_malformed, s.dropped_fragment, s.dropped_oversize),
+        (2, 1, 1)
+    );
     assert_eq!(stack.tcp_flows() + stack.udp_flows(), 0);
 }
 
@@ -383,12 +538,19 @@ fn malformed_fragmented_and_oversize_packets_are_dropped() {
 
 #[test]
 fn syn_ack_mss_is_clamped_to_tun_mtu() {
-    let cfg = NetstackConfig { mtu: 1400, ..Default::default() };
+    let cfg = NetstackConfig {
+        mtu: 1400,
+        ..Default::default()
+    };
     let now = Instant::now();
     let mut stack = Netstack::new(cfg.clone(), now);
     stack.input(&tcp(CLIENT4, SITE4, SYN, 1, 0, b""), now, &mut accept_all);
     assert_eq!(seg(&one(&mut stack)).mss, Some(1360));
-    stack.input(&tcp(client6(), site6(), SYN, 1, 0, b""), now, &mut accept_all);
+    stack.input(
+        &tcp(client6(), site6(), SYN, 1, 0, b""),
+        now,
+        &mut accept_all,
+    );
     assert_eq!(seg(&one(&mut stack)).mss, Some(1340));
     assert_eq!(mss_for(1400, false), 1360);
     assert_eq!(mss_for(1400, true), 1340);
@@ -397,10 +559,17 @@ fn syn_ack_mss_is_clamped_to_tun_mtu() {
 #[test]
 fn tcp_data_flows_both_ways_and_segments_fit_mtu() {
     for (client, site) in [(CLIENT4, SITE4), (client6(), site6())] {
-        let cfg = NetstackConfig { mtu: 1280, ..Default::default() };
+        let cfg = NetstackConfig {
+            mtu: 1280,
+            ..Default::default()
+        };
         let (mut stack, id, cseq, sseq) = handshake(cfg, client, site);
         let now = Instant::now();
-        stack.input(&tcp(client, site, ACK, cseq, sseq, b"GET / HTTP/1.1\r\n\r\n"), now, &mut accept_all);
+        stack.input(
+            &tcp(client, site, ACK, cseq, sseq, b"GET / HTTP/1.1\r\n\r\n"),
+            now,
+            &mut accept_all,
+        );
         let mut buf = [0u8; 64];
         let n = stack.tcp_read(id, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"GET / HTTP/1.1\r\n\r\n");
@@ -423,7 +592,11 @@ fn tcp_data_flows_both_ways_and_segments_fit_mtu() {
                 break;
             }
             let acked = sseq.wrapping_add(got.len() as u32);
-            stack.input(&tcp(client, site, ACK, cseq + 18, acked, b""), now, &mut accept_all);
+            stack.input(
+                &tcp(client, site, ACK, cseq + 18, acked, b""),
+                now,
+                &mut accept_all,
+            );
         }
         assert_eq!(got, body);
     }
@@ -446,21 +619,36 @@ fn abort_after_accept_sends_rst_and_reaps_flow() {
 fn fin_from_application_is_seen_and_close_completes() {
     let (mut stack, id, cseq, sseq) = handshake(NetstackConfig::default(), CLIENT4, SITE4);
     let now = Instant::now();
-    stack.input(&tcp(CLIENT4, SITE4, FIN, cseq, sseq, b"bye"), now, &mut accept_all);
+    stack.input(
+        &tcp(CLIENT4, SITE4, FIN, cseq, sseq, b"bye"),
+        now,
+        &mut accept_all,
+    );
     let mut buf = [0u8; 8];
     assert_eq!(stack.tcp_read(id, &mut buf).unwrap(), 3);
     assert!(stack.tcp_peer_finished(id).unwrap());
     stack.tcp_close(id).unwrap();
     stack.poll(now);
-    let fin = drain(&mut stack).iter().map(|p| seg(p)).find(|s| s.fin).expect("FIN");
-    stack.input(&tcp(CLIENT4, SITE4, ACK, cseq + 4, fin.seq + 1, b""), now, &mut accept_all);
+    let fin = drain(&mut stack)
+        .iter()
+        .map(|p| seg(p))
+        .find(|s| s.fin)
+        .expect("FIN");
+    stack.input(
+        &tcp(CLIENT4, SITE4, ACK, cseq + 4, fin.seq + 1, b""),
+        now,
+        &mut accept_all,
+    );
     assert_eq!(stack.tcp_flows(), 0, "flow reaped after LAST_ACK");
 }
 
 #[test]
 fn udp_accepted_datagrams_queue_bounded_and_reply_is_addressed_back() {
     let now = Instant::now();
-    let cfg = NetstackConfig { udp_queue: 2, ..Default::default() };
+    let cfg = NetstackConfig {
+        udp_queue: 2,
+        ..Default::default()
+    };
     let mut stack = Netstack::new(cfg, now);
     let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
     for msg in [&b"a"[..], b"b", b"c"] {
@@ -468,7 +656,10 @@ fn udp_accepted_datagrams_queue_bounded_and_reply_is_addressed_back() {
     }
     assert_eq!(stack.udp_flows(), 1);
     let got: Vec<UdpDatagram> = std::iter::from_fn(|| stack.pop_udp()).collect();
-    assert_eq!(got.iter().map(|d| d.payload.clone()).collect::<Vec<_>>(), vec![Bytes::from("b"), Bytes::from("c")]);
+    assert_eq!(
+        got.iter().map(|d| d.payload.clone()).collect::<Vec<_>>(),
+        vec![Bytes::from("b"), Bytes::from("c")]
+    );
     assert_eq!(stack.stats().dropped_udp_queue_full, 1);
     stack.send_udp(&got[0].key, b"answer");
     let pkt = one(&mut stack);
@@ -476,7 +667,10 @@ fn udp_accepted_datagrams_queue_bounded_and_reply_is_addressed_back() {
     assert_eq!((o.src, o.dst), (dst.ip(), CLIENT4.ip()));
     let u = UdpPacket::new_checked(&o.l4[..]).unwrap();
     assert!(u.verify_checksum(&IpAddress::from(o.src), &IpAddress::from(o.dst)));
-    assert_eq!((u.src_port(), u.dst_port(), u.payload()), (53, 40000, &b"answer"[..]));
+    assert_eq!(
+        (u.src_port(), u.dst_port(), u.payload()),
+        (53, 40000, &b"answer"[..])
+    );
     // Expires after idle timeout.
     stack.poll(now + Duration::from_secs(61));
     assert_eq!(stack.udp_flows(), 0);
@@ -493,10 +687,18 @@ struct ChanIo {
 #[async_trait]
 impl PacketIo for ChanIo {
     async fn recv(&self) -> std::io::Result<Bytes> {
-        self.rx.lock().await.recv().await.ok_or_else(|| std::io::Error::other("closed"))
+        self.rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| std::io::Error::other("closed"))
     }
     async fn send(&self, pkt: Bytes) -> std::io::Result<()> {
-        self.tx.send(pkt).await.map_err(|_| std::io::Error::other("closed"))
+        self.tx
+            .send(pkt)
+            .await
+            .map_err(|_| std::io::Error::other("closed"))
     }
 }
 
@@ -511,8 +713,16 @@ struct FakeDialer {
 
 #[async_trait]
 impl Dialer for FakeDialer {
-    async fn dial(&self, tag: Option<&str>, addr: &TargetAddr, port: u16) -> Result<Stream, DialError> {
-        self.dials.lock().unwrap().push((tag.map(str::to_owned), addr.clone(), port));
+    async fn dial(
+        &self,
+        tag: Option<&str>,
+        addr: &TargetAddr,
+        port: u16,
+    ) -> Result<Stream, DialError> {
+        self.dials
+            .lock()
+            .unwrap()
+            .push((tag.map(str::to_owned), addr.clone(), port));
         if self.fail {
             return Err(DialError("proxy down".into()));
         }
@@ -543,11 +753,17 @@ impl Harness {
     fn start(rules: RuleSet, dialer: Arc<FakeDialer>, udp: Option<Arc<dyn UdpHandler>>) -> Self {
         let (to_stack, rx) = mpsc::channel(256);
         let (tx, from_stack) = mpsc::channel(256);
-        let io = Arc::new(ChanIo { rx: tokio::sync::Mutex::new(rx), tx });
+        let io = Arc::new(ChanIo {
+            rx: tokio::sync::Mutex::new(rx),
+            tx,
+        });
         let mut tun = TunStack::new(Arc::new(rules), dialer);
         tun.udp = udp;
         tokio::spawn(tun.run(io));
-        Self { to_stack, from_stack }
+        Self {
+            to_stack,
+            from_stack,
+        }
     }
 
     async fn send(&self, pkt: Vec<u8>) {
@@ -555,7 +771,10 @@ impl Harness {
     }
 
     async fn next(&mut self) -> Bytes {
-        tokio::time::timeout(Duration::from_secs(5), self.from_stack.recv()).await.expect("no packet").unwrap()
+        tokio::time::timeout(Duration::from_secs(5), self.from_stack.recv())
+            .await
+            .expect("no packet")
+            .unwrap()
     }
 
     /// Next TCP segment that is not a pure ACK.
@@ -571,7 +790,10 @@ impl Harness {
 
 fn rules_proxy_default() -> RuleSet {
     RuleSet::new(
-        vec![Rule { matcher: Matcher::Cidr(Cidr::parse("203.0.113.0/24").unwrap()), action: Action::Reject }],
+        vec![Rule {
+            matcher: Matcher::Cidr(Cidr::parse("203.0.113.0/24").unwrap()),
+            action: Action::Reject,
+        }],
         Action::Proxy("p1".into()),
     )
 }
@@ -637,12 +859,16 @@ async fn rejected_route_gets_rst_and_never_dials() {
 
 #[tokio::test]
 async fn failed_dial_resets_after_local_handshake_never_direct() {
-    let dialer = Arc::new(FakeDialer { fail: true, ..Default::default() });
+    let dialer = Arc::new(FakeDialer {
+        fail: true,
+        ..Default::default()
+    });
     let mut h = Harness::start(rules_proxy_default(), dialer.clone(), None);
     h.send(tcp(CLIENT4, SITE4, SYN, 100, 0, b"")).await;
     let synack = h.next_meaningful().await;
     assert!(synack.syn && synack.ack);
-    h.send(tcp(CLIENT4, SITE4, ACK, 101, synack.seq + 1, b"")).await;
+    h.send(tcp(CLIENT4, SITE4, ACK, 101, synack.seq + 1, b""))
+        .await;
     let rst = h.next_meaningful().await;
     assert!(rst.rst, "expected RST, got {rst:?}");
     // Exactly one dial, through the proxy tag: no direct retry.
@@ -655,7 +881,8 @@ async fn failed_dial_resets_after_local_handshake_never_direct() {
 async fn udp_is_refused_with_icmp_without_a_handler() {
     let dialer = Arc::new(FakeDialer::default());
     let mut h = Harness::start(rules_proxy_default(), dialer, None);
-    h.send(udp(CLIENT4, "8.8.8.8:443".parse().unwrap(), b"quic")).await;
+    h.send(udp(CLIENT4, "8.8.8.8:443".parse().unwrap(), b"quic"))
+        .await;
     let o = out(&h.next().await);
     assert_eq!(o.proto, IpProtocol::Icmp);
 }
@@ -683,14 +910,26 @@ impl segue_kernel::tun::TunRouter for UdpRouter {
 async fn udp_flows_reach_the_handler_and_replies_return() {
     let (to_stack, rx) = mpsc::channel(16);
     let (tx, mut from_stack) = mpsc::channel(16);
-    let io = Arc::new(ChanIo { rx: tokio::sync::Mutex::new(rx), tx });
+    let io = Arc::new(ChanIo {
+        rx: tokio::sync::Mutex::new(rx),
+        tx,
+    });
     let mut tun = TunStack::new(Arc::new(UdpRouter), Arc::new(FakeDialer::default()));
     tun.udp = Some(Arc::new(Echo));
     tokio::spawn(tun.run(io));
     let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
-    to_stack.send(Bytes::from(udp(CLIENT4, dst, b"q"))).await.unwrap();
-    let pkt = tokio::time::timeout(Duration::from_secs(5), from_stack.recv()).await.unwrap().unwrap();
+    to_stack
+        .send(Bytes::from(udp(CLIENT4, dst, b"q")))
+        .await
+        .unwrap();
+    let pkt = tokio::time::timeout(Duration::from_secs(5), from_stack.recv())
+        .await
+        .unwrap()
+        .unwrap();
     let o = out(&pkt);
     let u = UdpPacket::new_checked(&o.l4[..]).unwrap();
-    assert_eq!((o.src, u.src_port(), u.payload()), (dst.ip(), 53, &b"echo:q"[..]));
+    assert_eq!(
+        (o.src, u.src_port(), u.payload()),
+        (dst.ip(), 53, &b"echo:q"[..])
+    );
 }

@@ -46,8 +46,8 @@ use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{self, State};
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, IpProtocol, Icmpv4DstUnreachable,
-    Icmpv4Packet, Icmpv4Repr, Icmpv6DstUnreachable, Icmpv6Packet, Icmpv6Repr, Ipv4Packet,
+    HardwareAddress, Icmpv4DstUnreachable, Icmpv4Packet, Icmpv4Repr, Icmpv6DstUnreachable,
+    Icmpv6Packet, Icmpv6Repr, IpAddress, IpCidr, IpListenEndpoint, IpProtocol, Ipv4Packet,
     Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket,
     UdpRepr, IPV4_HEADER_LEN, IPV6_HEADER_LEN, UDP_HEADER_LEN,
 };
@@ -98,7 +98,11 @@ pub enum Verdict {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// A SYN was accepted and answered locally; the caller should dial.
-    TcpAccepted { id: FlowId, key: FlowKey, tag: Option<String> },
+    TcpAccepted {
+        id: FlowId,
+        key: FlowKey,
+        tag: Option<String>,
+    },
     /// The flow is gone (closed, reset or aborted); its id is dead.
     TcpClosed { id: FlowId, key: FlowKey },
     /// A UDP flow expired.
@@ -349,10 +353,22 @@ fn checksums() -> ChecksumCapabilities {
 }
 
 /// Build an IP packet `src → dst` whose L4 body (`len` bytes) `fill` writes.
-fn build_ip(src: IpAddr, dst: IpAddr, proto: IpProtocol, len: usize, fill: impl FnOnce(&mut [u8])) -> Vec<u8> {
+fn build_ip(
+    src: IpAddr,
+    dst: IpAddr,
+    proto: IpProtocol,
+    len: usize,
+    fill: impl FnOnce(&mut [u8]),
+) -> Vec<u8> {
     match (src, dst) {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
-            let repr = Ipv4Repr { src_addr: s, dst_addr: d, next_header: proto, payload_len: len, hop_limit: 64 };
+            let repr = Ipv4Repr {
+                src_addr: s,
+                dst_addr: d,
+                next_header: proto,
+                payload_len: len,
+                hop_limit: 64,
+            };
             let mut buf = vec![0u8; IPV4_HEADER_LEN + len];
             let mut ip = Ipv4Packet::new_unchecked(&mut buf[..]);
             repr.emit(&mut ip, &checksums());
@@ -360,7 +376,13 @@ fn build_ip(src: IpAddr, dst: IpAddr, proto: IpProtocol, len: usize, fill: impl 
             buf
         }
         (IpAddr::V6(s), IpAddr::V6(d)) => {
-            let repr = Ipv6Repr { src_addr: s, dst_addr: d, next_header: proto, payload_len: len, hop_limit: 64 };
+            let repr = Ipv6Repr {
+                src_addr: s,
+                dst_addr: d,
+                next_header: proto,
+                payload_len: len,
+                hop_limit: 64,
+            };
             let mut buf = vec![0u8; IPV6_HEADER_LEN + len];
             let mut ip = Ipv6Packet::new_unchecked(&mut buf[..]);
             repr.emit(&mut ip);
@@ -396,24 +418,39 @@ fn build_rst(key: &FlowKey, meta: &TcpMeta) -> Vec<u8> {
         payload: &[],
     };
     let (src, dst) = (IpAddress::from(key.dst.ip()), IpAddress::from(key.src.ip()));
-    build_ip(key.dst.ip(), key.src.ip(), IpProtocol::Tcp, repr.buffer_len(), |b| {
-        repr.emit(&mut TcpPacket::new_unchecked(b), &src, &dst, &checksums());
-    })
+    build_ip(
+        key.dst.ip(),
+        key.src.ip(),
+        IpProtocol::Tcp,
+        repr.buffer_len(),
+        |b| {
+            repr.emit(&mut TcpPacket::new_unchecked(b), &src, &dst, &checksums());
+        },
+    )
 }
 
 fn build_udp(from: SocketAddr, to: SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let repr = UdpRepr { src_port: from.port(), dst_port: to.port() };
+    let repr = UdpRepr {
+        src_port: from.port(),
+        dst_port: to.port(),
+    };
     let (src, dst) = (IpAddress::from(from.ip()), IpAddress::from(to.ip()));
-    build_ip(from.ip(), to.ip(), IpProtocol::Udp, UDP_HEADER_LEN + payload.len(), |b| {
-        repr.emit(
-            &mut UdpPacket::new_unchecked(b),
-            &src,
-            &dst,
-            payload.len(),
-            |p| p.copy_from_slice(payload),
-            &checksums(),
-        );
-    })
+    build_ip(
+        from.ip(),
+        to.ip(),
+        IpProtocol::Udp,
+        UDP_HEADER_LEN + payload.len(),
+        |b| {
+            repr.emit(
+                &mut UdpPacket::new_unchecked(b),
+                &src,
+                &dst,
+                payload.len(),
+                |p| p.copy_from_slice(payload),
+                &checksums(),
+            );
+        },
+    )
 }
 
 /// ICMP destination unreachable, administratively prohibited, quoting the
@@ -429,9 +466,15 @@ fn build_icmp_prohibited(own: IpAddr, pkt: &[u8], parsed: &Parsed<'_>) -> Option
                 header: orig,
                 data,
             };
-            Some(build_ip(IpAddr::V4(own), client, IpProtocol::Icmp, repr.buffer_len(), |b| {
-                repr.emit(&mut Icmpv4Packet::new_unchecked(b), &checksums());
-            }))
+            Some(build_ip(
+                IpAddr::V4(own),
+                client,
+                IpProtocol::Icmp,
+                repr.buffer_len(),
+                |b| {
+                    repr.emit(&mut Icmpv4Packet::new_unchecked(b), &checksums());
+                },
+            ))
         }
         (IpAddr::V6(own), IpAddr::V6(dst)) => {
             let orig = Ipv6Repr::parse(&Ipv6Packet::new_unchecked(pkt)).ok()?;
@@ -444,9 +487,20 @@ fn build_icmp_prohibited(own: IpAddr, pkt: &[u8], parsed: &Parsed<'_>) -> Option
                 data,
             };
             debug_assert_eq!(parsed.ip_header_len, IPV6_HEADER_LEN);
-            Some(build_ip(IpAddr::V6(own), client, IpProtocol::Icmpv6, repr.buffer_len(), |b| {
-                repr.emit(&own, &dst, &mut Icmpv6Packet::new_unchecked(b), &checksums());
-            }))
+            Some(build_ip(
+                IpAddr::V6(own),
+                client,
+                IpProtocol::Icmpv6,
+                repr.buffer_len(),
+                |b| {
+                    repr.emit(
+                        &own,
+                        &dst,
+                        &mut Icmpv6Packet::new_unchecked(b),
+                        &checksums(),
+                    );
+                },
+            ))
         }
         _ => None,
     }
@@ -486,10 +540,19 @@ impl phy::TxToken for TxTok<'_> {
 }
 
 impl Device for QueueDevice {
-    type RxToken<'a> = RxTok where Self: 'a;
-    type TxToken<'a> = TxTok<'a> where Self: 'a;
+    type RxToken<'a>
+        = RxTok
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = TxTok<'a>
+    where
+        Self: 'a;
 
-    fn receive(&mut self, _ts: smoltcp::time::Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _ts: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let pkt = self.rx.take()?;
         Some((RxTok(pkt), TxTok(&mut self.tx)))
     }
@@ -572,7 +635,11 @@ pub struct Netstack {
 
 impl Netstack {
     pub fn new(cfg: NetstackConfig, now: Instant) -> Self {
-        let mut dev = QueueDevice { mtu: cfg.mtu, rx: None, tx: VecDeque::new() };
+        let mut dev = QueueDevice {
+            mtu: cfg.mtu,
+            rx: None,
+            tx: VecDeque::new(),
+        };
         let ts = smoltcp::time::Instant::from_micros(0);
         let mut iface = Interface::new(IfaceConfig::new(HardwareAddress::Ip), &mut dev, ts);
         iface.set_any_ip(true);
@@ -627,7 +694,9 @@ impl Netstack {
     }
 
     fn ts(&self, now: Instant) -> smoltcp::time::Instant {
-        smoltcp::time::Instant::from_micros(now.saturating_duration_since(self.epoch).as_micros() as i64)
+        smoltcp::time::Instant::from_micros(
+            now.saturating_duration_since(self.epoch).as_micros() as i64
+        )
     }
 
     fn emit(&mut self, pkt: Vec<u8>) {
@@ -741,7 +810,10 @@ impl Netstack {
         sock.set_timeout(Some(self.cfg.tcp_timeout.into()));
         sock.set_tsval_generator(Some(tcp_timestamp));
         sock.set_congestion_control(tcp::CongestionControl::Reno);
-        let listen = IpListenEndpoint { addr: Some(IpAddress::from(key.dst.ip())), port: key.dst.port() };
+        let listen = IpListenEndpoint {
+            addr: Some(IpAddress::from(key.dst.ip())),
+            port: key.dst.port(),
+        };
         if sock.listen(listen).is_err() {
             self.stats.dropped_malformed += 1;
             return;
@@ -759,7 +831,8 @@ impl Netstack {
             return;
         }
         self.stats.tcp_accepted += 1;
-        self.events.push_back(Event::TcpAccepted { id, key: *key, tag });
+        self.events
+            .push_back(Event::TcpAccepted { id, key: *key, tag });
     }
 
     fn input_udp(
@@ -797,7 +870,13 @@ impl Netstack {
             }
             match policy(&key) {
                 Verdict::Accept(tag) => {
-                    self.udp.insert(key, UdpEntry { tag: tag.clone(), last_seen: now });
+                    self.udp.insert(
+                        key,
+                        UdpEntry {
+                            tag: tag.clone(),
+                            last_seen: now,
+                        },
+                    );
                     tag
                 }
                 Verdict::Refuse => {
@@ -847,7 +926,10 @@ impl Netstack {
             .tcp
             .iter()
             .filter(|(_, e)| {
-                matches!(self.sockets.get::<tcp::Socket>(e.handle).state(), State::Closed | State::TimeWait)
+                matches!(
+                    self.sockets.get::<tcp::Socket>(e.handle).state(),
+                    State::Closed | State::TimeWait
+                )
             })
             .map(|(k, _)| *k)
             .collect();
@@ -863,7 +945,10 @@ impl Netstack {
         if let Some(entry) = self.tcp.remove(key) {
             self.sockets.remove(entry.handle);
             self.ids.remove(&entry.id);
-            self.events.push_back(Event::TcpClosed { id: entry.id, key: *key });
+            self.events.push_back(Event::TcpClosed {
+                id: entry.id,
+                key: *key,
+            });
         }
     }
 
@@ -924,7 +1009,11 @@ impl Netstack {
     /// been read.
     pub fn tcp_peer_finished(&mut self, id: FlowId) -> Result<bool, FlowGone> {
         let sock = self.socket(id)?;
-        Ok(!sock.can_recv() && matches!(sock.state(), State::CloseWait | State::LastAck | State::Closing))
+        Ok(!sock.can_recv()
+            && matches!(
+                sock.state(),
+                State::CloseWait | State::LastAck | State::Closing
+            ))
     }
 
     /// Room for bytes towards the application.
@@ -948,7 +1037,10 @@ impl Netstack {
     /// The handshake with the application completed.
     pub fn tcp_established(&mut self, id: FlowId) -> Result<bool, FlowGone> {
         let sock = self.socket(id)?;
-        Ok(!matches!(sock.state(), State::Listen | State::SynReceived | State::SynSent))
+        Ok(!matches!(
+            sock.state(),
+            State::Listen | State::SynReceived | State::SynSent
+        ))
     }
 
     /// Half-close towards the application (FIN after queued data).
@@ -968,7 +1060,11 @@ impl Netstack {
     /// Send a UDP datagram back to the application of flow `key` (as it was
     /// received: `key.src` is the application). Oversize replies are dropped.
     pub fn send_udp(&mut self, key: &FlowKey, payload: &[u8]) {
-        let ip_hdr = if key.src.is_ipv4() { IPV4_HEADER_LEN } else { IPV6_HEADER_LEN };
+        let ip_hdr = if key.src.is_ipv4() {
+            IPV4_HEADER_LEN
+        } else {
+            IPV6_HEADER_LEN
+        };
         if ip_hdr + UDP_HEADER_LEN + payload.len() > self.cfg.mtu {
             self.stats.dropped_oversize += 1;
             return;
@@ -996,12 +1092,16 @@ pub trait PacketIo: Send + Sync {
 #[async_trait]
 impl PacketIo for segue_tun::TunEndpoint {
     async fn recv(&self) -> io::Result<Bytes> {
-        self.poll_inbound().await.map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))
+        self.poll_inbound()
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))
     }
 
     async fn send(&self, pkt: Bytes) -> io::Result<()> {
         match self.push_outbound(pkt).await {
-            Ok(()) | Err(segue_tun::TunError::QueueFull) | Err(segue_tun::TunError::PacketTooLarge { .. }) => Ok(()),
+            Ok(())
+            | Err(segue_tun::TunError::QueueFull)
+            | Err(segue_tun::TunError::PacketTooLarge { .. }) => Ok(()),
             Err(e) => Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())),
         }
     }
@@ -1135,7 +1235,16 @@ impl TunStack {
                         Event::TcpAccepted { id, key, tag } => {
                             let (down_tx, down_rx) = mpsc::channel(RELAY_CHUNKS);
                             let (up_tx, up_rx) = mpsc::channel(RELAY_CHUNKS);
-                            pipes.insert(id, Pipe { down: Some(down_tx), up: up_rx, pending: None, fin: false, closed: false });
+                            pipes.insert(
+                                id,
+                                Pipe {
+                                    down: Some(down_tx),
+                                    up: up_rx,
+                                    pending: None,
+                                    fin: false,
+                                    closed: false,
+                                },
+                            );
                             tokio::spawn(relay(
                                 self.dialer.clone(),
                                 tag,
@@ -1163,14 +1272,20 @@ impl TunStack {
             }
             while let Some(d) = stack.pop_udp() {
                 if let Some(handler) = &self.udp {
-                    let reply = UdpReply { key: d.key, tx: udp_tx.clone() };
+                    let reply = UdpReply {
+                        key: d.key,
+                        tx: udp_tx.clone(),
+                    };
                     handler.datagram(d, reply);
                 }
             }
             while let Some(pkt) = stack.pop_output() {
                 io.send(pkt).await?;
             }
-            let delay = stack.poll_delay(now).unwrap_or(Duration::from_secs(1)).min(Duration::from_secs(1));
+            let delay = stack
+                .poll_delay(now)
+                .unwrap_or(Duration::from_secs(1))
+                .min(Duration::from_secs(1));
             tokio::select! {
                 pkt = io.recv() => {
                     let pkt = pkt?;
@@ -1268,7 +1383,11 @@ async fn relay(
     notify: Arc<Notify>,
 ) {
     let target = TargetAddr::Ip(key.dst.ip());
-    let dialed = tokio::time::timeout(dial_timeout, dialer.dial(tag.as_deref(), &target, key.dst.port())).await;
+    let dialed = tokio::time::timeout(
+        dial_timeout,
+        dialer.dial(tag.as_deref(), &target, key.dst.port()),
+    )
+    .await;
     let Ok(Ok(stream)) = dialed else {
         // Refused, never retried direct (§5.4).
         let _ = up.send(Up::Abort).await;
