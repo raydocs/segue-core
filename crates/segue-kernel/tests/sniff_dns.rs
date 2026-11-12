@@ -12,10 +12,12 @@ use async_trait::async_trait;
 use segue_kernel::dial::{DialError, Dialer, Stream};
 use segue_kernel::dns::{
     answers_for_test, query_for_test, serve_tcp, serve_udp, DnsSettings, SmartDns, RCODE_NXDOMAIN,
-    RCODE_OK, RCODE_SERVFAIL, TYPE_A, TYPE_AAAA,
+    RCODE_OK, RCODE_REFUSED, RCODE_SERVFAIL, TYPE_A, TYPE_AAAA,
 };
 use segue_kernel::fakeip::FakeIpPool;
-use segue_kernel::policy::{Policy, PolicyStore};
+use segue_kernel::policy::{
+    generate_key, parse_public_key, sign, unix_now, Policy, PolicyStore, Verifier,
+};
 use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
 use segue_kernel::sniff::client_hello_for_test;
 use segue_kernel::socks::{serve, Kernel, SniffSettings, REP_NOT_ALLOWED, REP_OK};
@@ -112,11 +114,20 @@ fn rules() -> RuleSet {
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(150);
 
 async fn start_kernel(fake: Arc<Fake>, pool: Option<Arc<FakeIpPool>>) -> SocketAddr {
+    let policy = PolicyStore::inline(Policy::inline(rules(), CidrTable::default()));
+    start_kernel_with(fake, pool, policy).await
+}
+
+async fn start_kernel_with(
+    fake: Arc<Fake>,
+    pool: Option<Arc<FakeIpPool>>,
+    policy: Arc<PolicyStore>,
+) -> SocketAddr {
     *fake.echo.lock().unwrap() = Some(echo_server().await);
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let kernel = Kernel {
-        policy: PolicyStore::inline(Policy::inline(rules(), CidrTable::default())),
+        policy,
         dialer: fake,
         fake_ip: pool,
         sniff: Some(SniffSettings {
@@ -674,4 +685,114 @@ async fn dns_listeners_then_connect_to_fake_ip_dials_by_domain() {
             (Some("proxy".into()), "polluted.example:443".into()),
         ]
     );
+}
+
+/// #3: with no valid policy the DNS refuses before cache, fake-IP or any
+/// upstream query.
+#[tokio::test]
+async fn dns_without_policy_refuses_before_anything() {
+    let up = fake_resolver(&[("www.baidu.com", "36.152.44.95".parse().unwrap())]).await;
+    let pool = pool();
+    let settings = DnsSettings {
+        domestic: vec![up.addr],
+        query_timeout: Duration::from_millis(500),
+        cache_size: 128,
+    };
+    let (_, store) = signed_store();
+    let dns = Arc::new(SmartDns::new(store, pool.clone(), settings));
+    for (i, name) in ["chat.openai.com", "www.baidu.com", "polluted.example"]
+        .into_iter()
+        .enumerate()
+    {
+        for q in [TYPE_A, TYPE_AAAA] {
+            assert_eq!(
+                ask(&dns, i as u16, name, q).await,
+                (RCODE_REFUSED, vec![]),
+                "{name}"
+            );
+        }
+    }
+    assert_eq!(up.hits.load(Ordering::SeqCst), 0);
+    assert_eq!(dns.upstream_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(pool.tracked(), 0, "no fake-IP handed out");
+}
+
+struct Signer {
+    key: String,
+    version: std::sync::atomic::AtomicU64,
+}
+
+impl Signer {
+    /// A signed bundle with `rules` (JSON array) and `default` (JSON action).
+    fn bundle(&self, rules: &str, default: &str) -> Vec<u8> {
+        let v = self.version.fetch_add(1, Ordering::SeqCst) + 1;
+        let body = format!(
+            r#"{{"version":{v},"expires_at":{},"ai_domains":["openai.com"],
+                "rules":{rules},"default":{default},"chnroute":["36.0.0.0/8"]}}"#,
+            unix_now() + 3600
+        );
+        sign(&self.key, 1, body.as_bytes()).unwrap().into_bytes()
+    }
+}
+
+fn signed_store() -> (Signer, Arc<PolicyStore>) {
+    let (key, pubkey) = generate_key();
+    let known = ["ai", "overseas"].map(String::from).into();
+    let home = ["ai".to_string()].into();
+    let verifier = Verifier::new(
+        [(1, parse_public_key(&pubkey).unwrap())].into(),
+        "ai".into(),
+        known,
+        home,
+    )
+    .unwrap();
+    (
+        Signer {
+            key,
+            version: 0.into(),
+        },
+        Arc::new(PolicyStore::signed(verifier, None)),
+    )
+}
+
+/// #5: a fake address carries only its name; every new flow is authorized
+/// against the policy in force when it starts.
+#[tokio::test]
+async fn fake_ip_flow_follows_the_current_policy_not_the_one_at_answer_time() {
+    let (signer, store) = signed_store();
+    let pool = pool();
+    store
+        .install(&signer.bundle("[]", r#"{"type":"proxy","outbound":"overseas"}"#))
+        .unwrap();
+    let ip = pool.assign("example.org", store.current().version).unwrap();
+    let fake = Arc::new(Fake::default());
+    let kernel = start_kernel_with(fake.clone(), Some(pool.clone()), store.clone()).await;
+
+    let (rep, mut c) = connect_ip(kernel, ip, 443).await;
+    assert_eq!(rep, REP_OK);
+    assert_eq!(roundtrip(&mut c, b"hi", 1).await, b"hi");
+    assert_eq!(
+        fake.calls(),
+        vec![(Some("overseas".into()), "example.org:443".into())]
+    );
+
+    // New bundle: the name is now rejected. The same fake address no longer
+    // gets through, though it was handed out under the old version.
+    store
+        .install(&signer.bundle(
+            r#"[{"domain_suffix":"example.org","action":{"type":"reject"}}]"#,
+            r#"{"type":"proxy","outbound":"overseas"}"#,
+        ))
+        .unwrap();
+    let (rep, _c) = connect_ip(kernel, ip, 443).await;
+    assert_eq!(rep, REP_NOT_ALLOWED);
+    // And a bundle whose default (the foreign route) rejects refuses an
+    // unmatched name the same way.
+    let ip2 = pool.assign("other.example", 0).unwrap();
+    store
+        .install(&signer.bundle("[]", r#"{"type":"reject"}"#))
+        .unwrap();
+    let (rep, _c) = connect_ip(kernel, ip2, 443).await;
+    assert_eq!(rep, REP_NOT_ALLOWED);
+    assert_eq!(fake.calls().len(), 1);
 }
