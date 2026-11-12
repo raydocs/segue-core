@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use segue_kernel::dial::{DialError, Dialer, Stream};
 use segue_kernel::dns::{
     answers_for_test, query_for_test, serve_tcp, serve_udp, DnsSettings, SmartDns, RCODE_NXDOMAIN,
-    RCODE_OK, TYPE_A, TYPE_AAAA,
+    RCODE_OK, RCODE_SERVFAIL, TYPE_A, TYPE_AAAA,
 };
 use segue_kernel::fakeip::FakeIpPool;
 use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
@@ -366,6 +366,46 @@ async fn silent_resolver() -> SocketAddr {
     addr
 }
 
+/// A resolver that answers every query at once with SERVFAIL.
+async fn servfail_resolver() -> SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
+            let mut r = buf[..n].to_vec();
+            r[2] = 0x81;
+            r[3] = 0x80 | RCODE_SERVFAIL;
+            sock.send_to(&r, peer).await.unwrap();
+        }
+    });
+    addr
+}
+
+/// Forwards to `inner` after `delay`, so the other racer answers first.
+async fn delayed(inner: SocketAddr, delay: Duration) -> SocketAddr {
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
+            let q = buf[..n].to_vec();
+            let sock = sock.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                up.send_to(&q, inner).await.unwrap();
+                let mut b = [0u8; 1500];
+                let n = up.recv(&mut b).await.unwrap();
+                sock.send_to(&b[..n], peer).await.unwrap();
+            });
+        }
+    });
+    addr
+}
+
 fn pool() -> Arc<FakeIpPool> {
     Arc::new(
         FakeIpPool::new(
@@ -511,6 +551,23 @@ async fn smart_dns_classifies_and_caches() {
 async fn upstream_failure_is_servfail() {
     let dns = smart_dns(vec![silent_resolver().await], pool()).await;
     assert_eq!(ask(&dns, 1, "www.baidu.com", TYPE_A).await.0, 2);
+}
+
+#[tokio::test]
+async fn fast_servfail_does_not_beat_a_good_answer() {
+    let up = fake_resolver(&[("www.baidu.com", "36.152.44.95".parse().unwrap())]).await;
+    let slow = delayed(up.addr, Duration::from_millis(50)).await;
+    let dns = smart_dns(vec![servfail_resolver().await, slow], pool()).await;
+    assert_eq!(
+        ask(&dns, 3, "www.baidu.com", TYPE_A).await,
+        (RCODE_OK, vec![v4("36.152.44.95")])
+    );
+    // With only failing resolvers, the failure is still reported.
+    let dns = smart_dns(vec![servfail_resolver().await], pool()).await;
+    assert_eq!(
+        ask(&dns, 4, "www.baidu.com", TYPE_A).await.0,
+        RCODE_SERVFAIL
+    );
 }
 
 #[tokio::test]

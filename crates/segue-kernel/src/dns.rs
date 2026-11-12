@@ -279,12 +279,19 @@ impl SmartDns {
                 async move { tokio::time::timeout(timeout, exchange(server, &packet)).await },
             );
         }
+        // First definitive answer (NOERROR/NXDOMAIN) wins; a fast
+        // SERVFAIL/REFUSED must not beat a good answer still in flight.
+        let mut fallback = None;
         while let Some(done) = set.join_next().await {
             if let Ok(Ok(Ok(reply))) = done {
-                return Some(reply);
+                let rcode = reply.get(3).map_or(RCODE_SERVFAIL, |b| b & 0x0f);
+                if rcode == RCODE_OK || rcode == RCODE_NXDOMAIN {
+                    return Some(reply);
+                }
+                fallback = Some(reply);
             }
         }
-        None
+        fallback
     }
 }
 
