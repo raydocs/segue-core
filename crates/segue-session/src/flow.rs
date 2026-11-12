@@ -22,6 +22,26 @@ use crate::codec::{max_data_len, Frame};
 use crate::pool::{Grant, Pool};
 use crate::{Limits, ProtoError, Timing};
 
+/// Make room for `add` more bytes without growing past `limit` (the grant):
+/// capacity doubles as usual but stops at the grant, so the memory a buffer
+/// holds stays covered by the blocks it was charged for.
+fn reserve_within(buf: &mut VecDeque<u8>, add: usize, limit: usize) {
+    let need = buf.len() + add;
+    if need > buf.capacity() {
+        let target = (buf.capacity() * 2).max(need).min(limit.max(need));
+        buf.reserve_exact(target - buf.len());
+    }
+}
+
+/// After the grant shrank: release the capacity it no longer covers.
+/// `VecDeque::drain` never frees, so without this a buffer that was once
+/// full keeps its memory after its blocks went back to the pool.
+fn fit(buf: &mut VecDeque<u8>, limit: usize) {
+    if buf.capacity() > limit {
+        buf.shrink_to(limit);
+    }
+}
+
 #[derive(Debug)]
 pub struct SendHalf {
     acked: u64,
@@ -81,6 +101,10 @@ impl SendHalf {
     pub fn buffered(&self) -> usize {
         self.buf.len()
     }
+    /// Memory the buffer holds (its capacity); never more than the grant.
+    pub fn held_bytes(&self) -> usize {
+        self.buf.capacity()
+    }
     pub fn grant_bytes(&self) -> usize {
         self.grant.bytes()
     }
@@ -106,6 +130,7 @@ impl SendHalf {
     /// bounded by the replay cap and the pool).
     pub fn write(&mut self, data: &[u8]) -> usize {
         let n = data.len().min(self.write_capacity());
+        reserve_within(&mut self.buf, n, self.grant.bytes());
         self.buf.extend(&data[..n]);
         self.promised = self.promised.saturating_sub(n);
         n
@@ -147,6 +172,7 @@ impl SendHalf {
         self.cursor = self.cursor.max(recv);
         let keep = self.buf.len() + self.promised;
         self.grant.try_resize(keep);
+        fit(&mut self.buf, self.grant.bytes());
         Ok(true)
     }
 
@@ -269,6 +295,10 @@ impl RecvHalf {
     pub fn buffered(&self) -> usize {
         self.buf.len()
     }
+    /// Memory the buffer holds (its capacity); never more than the grant.
+    pub fn held_bytes(&self) -> usize {
+        self.buf.capacity()
+    }
     pub fn grant_bytes(&self) -> usize {
         self.grant.bytes()
     }
@@ -314,6 +344,7 @@ impl RecvHalf {
         }
         let skip = (self.recv - offset) as usize;
         let fresh = &data[skip..];
+        reserve_within(&mut self.buf, fresh.len(), self.grant.bytes());
         self.buf.extend(fresh);
         self.recv = end;
         self.last_data = now;
@@ -353,6 +384,7 @@ impl RecvHalf {
         if self.fin.is_some() {
             // Nothing more can arrive: hold only what is buffered.
             self.grant.try_resize(self.buf.len());
+            fit(&mut self.buf, self.grant.bytes());
             return;
         }
         let outstanding = (self.adv_max - self.consumed) as usize;
@@ -363,6 +395,11 @@ impl RecvHalf {
         } else {
             self.min_credit
         };
+        if !active {
+            // Idle and drained: the buffer's memory goes back now; it is
+            // re-reserved (within the grant) when data arrives.
+            self.buf.shrink_to_fit();
+        }
         let pool = self.grant.pool();
         if pool.under_pressure() {
             desired = desired.min(pool.fair_share_bytes());
@@ -370,6 +407,7 @@ impl RecvHalf {
         let need = desired.max(self.min_credit).max(outstanding);
         if need <= self.grant.bytes() {
             self.grant.try_resize(need);
+            fit(&mut self.buf, self.grant.bytes());
         } else {
             self.grant.grow_towards(need);
         }
@@ -591,5 +629,55 @@ mod tests {
         for r in &rs {
             assert!((r.max_offset() - r.consumed()) as usize <= r.grant_bytes());
         }
+    }
+
+    #[test]
+    fn returned_grant_also_returns_buffer_memory() {
+        // Fill the replay and receive buffers, drain them, and check that
+        // the memory they hold follows the grant back down (review R4 #15:
+        // `drain` keeps capacity, so the old code re-used one logical
+        // allowance for ever more resident memory).
+        let (mut s, mut r, now) = halves(8 << 20);
+        let mut sent = 0;
+        let mut out = vec![0u8; 64 * 1024];
+        while sent < 200 * 1024 {
+            let n = s.write(&[1u8; 8192]);
+            sent += n;
+            assert!(s.held_bytes() <= s.grant_bytes(), "send over grant");
+            while let Some(Frame::Data { offset, data, .. }) = s.poll_frame() {
+                r.on_data(offset, &data, now).unwrap();
+                assert!(r.held_bytes() <= r.grant_bytes(), "recv over grant");
+            }
+            if n == 0 {
+                while r.read(&mut out, now) > 0 {}
+                pump(&mut s, &mut r, now);
+            }
+        }
+        let peak = r.held_bytes();
+        assert!(peak >= 16 * 1024, "receive buffer never filled: {peak}");
+        for _ in 0..100 {
+            while r.read(&mut out, now) > 0 {}
+            pump(&mut s, &mut r, now);
+            if s.buffered() == 0 {
+                break;
+            }
+        }
+        while r.read(&mut out, now) > 0 {}
+        assert_eq!(s.buffered(), 0);
+        // Only the capacity promised to the last caller stays charged.
+        assert!(s.grant_bytes() <= 16 * 1024, "{}", s.grant_bytes());
+        assert!(
+            s.held_bytes() <= s.grant_bytes(),
+            "acked replay buffer keeps its memory: {} > {}",
+            s.held_bytes(),
+            s.grant_bytes()
+        );
+        // Idle: the receive grant drops to the floor and the buffer with it.
+        let later = now + Timing::default().idle_after * 2;
+        r.update_credit(later);
+        // (The grant still covers credit already advertised, which cannot
+        // be withdrawn; the memory behind it is released until used.)
+        assert!(r.held_bytes() <= r.grant_bytes(), "{} > {}", r.held_bytes(), r.grant_bytes());
+        assert_eq!(r.held_bytes(), 0, "idle drained receive buffer keeps {peak} bytes");
     }
 }

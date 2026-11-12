@@ -5,9 +5,19 @@
 //! never exceeds the pool (`try_resize` fails instead of overcommitting), and
 //! every byte a session buffers is covered by its grant, so the pool size is
 //! a hard bound on buffered session data.
+//!
+//! A grant is charged for the memory a buffer actually holds, not for the
+//! bytes in it: buffers keep their capacity within their grant (see
+//! `flow.rs`), so returning blocks to the pool also returns the memory.
+//! The same pool can back other users of the process budget (the TUN
+//! stack's rings and relay chunks, KERNEL_SPEC §6.3 "本地 TCP 收发缓冲、会话
+//! 接收缓冲、回放缓冲都从池里取") through [`Pool::take_blocks`] /
+//! [`Pool::give_blocks`].
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+use tokio::sync::Notify;
 
 pub const BLOCK: usize = 4096;
 
@@ -20,6 +30,8 @@ pub struct Pool {
     blocks: usize,
     used: AtomicUsize,
     sessions: AtomicUsize,
+    waiters: AtomicUsize,
+    freed: Notify,
 }
 
 impl Pool {
@@ -28,7 +40,19 @@ impl Pool {
             blocks: bytes / BLOCK,
             used: AtomicUsize::new(0),
             sessions: AtomicUsize::new(0),
+            waiters: AtomicUsize::new(0),
+            freed: Notify::new(),
         })
+    }
+
+    /// Pool size in blocks.
+    pub fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    /// Blocks in use.
+    pub fn used_blocks(&self) -> usize {
+        self.used.load(Ordering::Acquire)
     }
 
     pub fn capacity_bytes(&self) -> usize {
@@ -52,23 +76,71 @@ impl Pool {
     }
 
     fn try_take(&self, n: usize) -> bool {
+        n == 0 || self.take_blocks(n, n, self.blocks) == n
+    }
+
+    fn give(&self, n: usize) {
+        self.give_blocks(n);
+    }
+
+    /// Take up to `want` blocks (at least `min`, else none) while the pool
+    /// stays at or under `limit` blocks in use. Returns the blocks taken;
+    /// the caller returns them with [`give_blocks`](Self::give_blocks).
+    pub fn take_blocks(&self, want: usize, min: usize, limit: usize) -> usize {
+        let limit = limit.min(self.blocks);
         let mut cur = self.used.load(Ordering::Acquire);
         loop {
-            if cur + n > self.blocks {
-                return false;
+            let n = want.min(limit.saturating_sub(cur));
+            if n == 0 || n < min {
+                return 0;
             }
             match self
                 .used
                 .compare_exchange_weak(cur, cur + n, Ordering::AcqRel, Ordering::Acquire)
             {
-                Ok(_) => return true,
+                Ok(_) => return n,
                 Err(v) => cur = v,
             }
         }
     }
 
-    fn give(&self, n: usize) {
+    /// Return blocks taken with [`take_blocks`](Self::take_blocks) and wake
+    /// whoever waits in [`freed`](Self::freed).
+    pub fn give_blocks(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
         self.used.fetch_sub(n, Ordering::AcqRel);
+        if self.waiters.load(Ordering::Acquire) > 0 {
+            self.freed.notify_waiters();
+        }
+    }
+
+    /// Run `f` until it returns `Some`, waiting for blocks to be returned
+    /// between attempts.
+    pub async fn wait_for<T>(&self, mut f: impl FnMut() -> Option<T>) -> T {
+        loop {
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if let Some(v) = f() {
+                return v;
+            }
+            self.waiters.fetch_add(1, Ordering::AcqRel);
+            let _w = Waiting(&self.waiters);
+            if let Some(v) = f() {
+                return v;
+            }
+            freed.await;
+        }
+    }
+}
+
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -91,6 +163,14 @@ impl Grant {
             blocks: 0,
             counted,
         }
+    }
+
+    /// Exactly `bytes` (rounded up to blocks), for buffers whose size is
+    /// fixed for their lifetime (driver I/O buffers and queues). Not counted
+    /// in the fair share. `None` when the pool cannot cover it.
+    pub fn fixed(pool: &Arc<Pool>, bytes: usize) -> Option<Self> {
+        let mut g = Self::new(pool, false);
+        g.try_resize(bytes).then_some(g)
     }
 
     pub fn pool(&self) -> &Arc<Pool> {
