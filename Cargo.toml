@@ -13,6 +13,7 @@ members = [
     "crates/segue-ffi",
     "crates/segue-cli",
     "crates/segue-bench",
+    "crates/segue-kernel",
     "fuzz",
 ]
 resolver = "2"

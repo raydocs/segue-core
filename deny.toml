@@ -5,6 +5,9 @@ maximum-db-staleness = "P14D"
 
 [licenses]
 confidence-threshold = 0.93
+# Workspace crates with publish = false (e.g. the proprietary segue-kernel)
+# are ours and not subject to the third-party allow list.
+private = { ignore = true }
 allow = [
     "0BSD",
     "Apache-2.0",
