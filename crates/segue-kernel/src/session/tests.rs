@@ -119,11 +119,21 @@ fn echo_site(count: Arc<AtomicUsize>) -> SiteConnector {
     })
 }
 
-fn node(auth: Box<dyn Authorizer>) -> Node {
+fn node(auth: Box<dyn Authorizer>, site: Option<SiteConnector>) -> Node {
     let (tx, rx) = mpsc::channel(16);
     let sites = Arc::new(AtomicUsize::new(0));
     let table = RelayTable::new(Config::default(), Pool::new(8 << 20), auth, 9);
-    tokio::spawn(run_relay(table, rx, echo_site(sites.clone()), None));
+    let site = match site {
+        Some(f) => {
+            let n = sites.clone();
+            Arc::new(move |t, k| {
+                n.fetch_add(1, Ordering::SeqCst);
+                f(t, k)
+            })
+        }
+        None => echo_site(sites.clone()),
+    };
+    tokio::spawn(run_relay(table, rx, site, None));
     Node {
         accept: tx,
         up: Arc::new(AtomicBool::new(true)),
@@ -143,8 +153,12 @@ struct Lab {
 }
 
 fn lab_with(la_auth: Box<dyn Authorizer>) -> Lab {
-    let la = node(la_auth);
-    let ny = node(Box::new(AllowAll));
+    lab_parts(la_auth, None)
+}
+
+fn lab_parts(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>) -> Lab {
+    let la = node(la_auth, la_site);
+    let ny = node(Box::new(AllowAll), None);
     let (la_up, ny_up) = (la.up.clone(), ny.up.clone());
     let (la_carriers, ny_carriers) = (la.carriers.clone(), ny.carriers.clone());
     let la_sites = la.sites.clone();
@@ -404,4 +418,113 @@ async fn connect_while_on_keeps_kill_switch_state() {
     l.d.connect(); // already on: must not reset to Connecting / clear the failure
     assert_eq!(l.d.posture(), Posture::Error);
     assert!(l.d.dial(Some("ai"), &site(), 443).await.is_err());
+}
+
+/// A site that sends `body`, then ends with `end` (None: a clean FIN; Some:
+/// a read error, which the relay turns into RST(site_reset)).
+fn scripted_site(body: &'static [u8], fail: bool) -> SiteConnector {
+    struct Scripted {
+        body: &'static [u8],
+        fail: bool,
+    }
+    impl tokio::io::AsyncRead for Scripted {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if !self.body.is_empty() {
+                let n = self.body.len().min(buf.remaining());
+                buf.put_slice(&self.body[..n]);
+                self.body = &self.body[n..];
+                return std::task::Poll::Ready(Ok(()));
+            }
+            if self.fail {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    impl tokio::io::AsyncWrite for Scripted {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            b: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(b.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    Arc::new(move |_t, _k| {
+        Box::pin(async move { Ok(Box::new(Scripted { body, fail }) as BoxCarrier) })
+    })
+}
+
+/// Read until EOF or error; returns what arrived and how it ended.
+async fn read_to_end(s: &mut crate::dial::Stream) -> (Vec<u8>, std::io::Result<()>) {
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("stream hung")
+        {
+            Ok(0) => return (got, Ok(())),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => return (got, Err(e)),
+        }
+    }
+}
+
+#[tokio::test]
+async fn site_reset_mid_download_is_an_error_not_eof() {
+    let l = lab_parts(
+        Box::new(AllowAll),
+        Some(scripted_site(b"HTTP/1.0 200 OK\r\n\r\npart", true)),
+    );
+    let mut s = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    // The site fails at once, so the write may already see the reset.
+    let _ = s.write_all(b"GET / HTTP/1.0\r\n\r\n").await;
+    let (got, end) = read_to_end(&mut s).await;
+    assert!(b"HTTP/1.0 200 OK\r\n\r\npart".starts_with(&got));
+    let e = end.expect_err("a reset session ended like a complete download");
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(e.to_string().contains("code 23"), "{e}");
+}
+
+#[tokio::test]
+async fn clean_close_is_eof() {
+    let l = lab_parts(
+        Box::new(AllowAll),
+        Some(scripted_site(b"complete body", false)),
+    );
+    let mut s = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    s.write_all(b"GET").await.unwrap();
+    s.shutdown().await.unwrap();
+    let (got, end) = read_to_end(&mut s).await;
+    assert_eq!(got, b"complete body");
+    end.expect("clean close must be a plain EOF");
+}
+
+#[tokio::test]
+async fn user_disconnect_ends_live_sessions_with_an_error() {
+    let l = lab();
+    let mut s = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    s.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    s.read_exact(&mut buf).await.unwrap();
+    l.d.disconnect();
+    let (_, end) = read_to_end(&mut s).await;
+    assert!(end.is_err(), "disconnect looked like a clean end");
 }

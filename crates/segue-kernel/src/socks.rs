@@ -179,7 +179,7 @@ async fn connect_then_reply(
         Action::Direct => None,
         Action::Proxy(tag) => Some(tag.as_str()),
     };
-    let mut upstream = match dial(kernel, tag, &addr, port).await {
+    let upstream = match dial(kernel, tag, &addr, port).await {
         Some(stream) => stream,
         None => {
             reply(&mut conn, REP_HOST_UNREACHABLE).await?;
@@ -187,8 +187,21 @@ async fn connect_then_reply(
         }
     };
     reply(&mut conn, REP_OK).await?;
-    tokio::io::copy_bidirectional(&mut conn, &mut upstream).await?;
-    Ok(())
+    splice(conn, upstream).await
+}
+
+/// Relay both ways. An upstream that ends with an error (a session reset,
+/// revoked, failed) is passed on as RST, never as FIN: the client must not
+/// take a truncated response for a complete one.
+async fn splice(mut conn: TcpStream, mut upstream: Stream) -> Result<(), Fail> {
+    match tokio::io::copy_bidirectional(&mut conn, &mut upstream).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            drop(upstream);
+            let _ = reset(conn);
+            Err(e.into())
+        }
+    }
 }
 
 async fn dial(kernel: &Kernel, tag: Option<&str>, addr: &TargetAddr, port: u16) -> Option<Stream> {
@@ -251,11 +264,10 @@ async fn sniffed(
     let Some(mut upstream) = dial(kernel, tag, &target, port).await else {
         return reset(conn);
     };
-    if !first.is_empty() {
-        upstream.write_all(&first).await?;
+    if !first.is_empty() && upstream.write_all(&first).await.is_err() {
+        return reset(conn);
     }
-    tokio::io::copy_bidirectional(&mut conn, &mut upstream).await?;
-    Ok(())
+    splice(conn, upstream).await
 }
 
 /// Combine the IP and the sniffed-domain verdicts (§5.2a.3/4, D8). Only

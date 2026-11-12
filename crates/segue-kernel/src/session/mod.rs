@@ -42,7 +42,10 @@ use segue_session::pool::Pool;
 use tokio::sync::watch;
 
 use crate::dial::{Datagrams, DialError, Dialer};
+
+mod stream;
 use crate::killswitch::{Event, KillSwitch, Posture};
+pub use stream::SessionStream;
 
 /// `exit_class` hints in OPEN (the relay classifies by itself).
 pub const EXIT_OVERSEAS: u8 = 0;
@@ -419,7 +422,7 @@ impl KernelDialer {
         });
         tokio::select! {
             o = open_rx => match o {
-                Ok(()) => Ok(Box::new(app)),
+                Ok(()) => Ok(Box::new(SessionStream::new(app, closed_rx))),
                 Err(_) => Err(closed_err((&mut closed_rx).await.ok())),
             },
             c = &mut closed_rx => Err(closed_err(c.ok())),

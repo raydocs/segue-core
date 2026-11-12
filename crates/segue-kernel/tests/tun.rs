@@ -718,6 +718,8 @@ struct FakeDialer {
     dials: Mutex<Vec<(Option<String>, TargetAddr, u16)>>,
     udp_dials: Mutex<Vec<(Option<String>, TargetAddr, u16)>>,
     fail: bool,
+    /// Every dial is a session that sends "partial" and is then reset.
+    session_reset: bool,
     sites: Mutex<Vec<tokio::io::DuplexStream>>,
     notify: tokio::sync::Notify,
 }
@@ -736,6 +738,17 @@ impl Dialer for FakeDialer {
             .push((tag.map(str::to_owned), addr.clone(), port));
         if self.fail {
             return Err(DialError("proxy down".into()));
+        }
+        if self.session_reset {
+            use segue_session::client::CloseReason;
+            let (app, mut far) = tokio::io::duplex(4096);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                far.write_all(b"partial").await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = tx.send(CloseReason::Reset(segue_session::codec::code::REVOKED));
+            });
+            return Ok(Box::new(segue_kernel::session::SessionStream::new(app, rx)));
         }
         let (a, b) = tokio::io::duplex(64 * 1024);
         self.sites.lock().unwrap().push(b);
@@ -892,6 +905,23 @@ async fn tcp_handshake_and_data_reach_the_dialer_and_back() {
     let fin = h.next_meaningful().await;
     assert!(fin.fin && !fin.rst);
     assert_eq!(fin.seq, sseq + 5);
+}
+
+#[tokio::test]
+async fn session_reset_after_data_is_rst_not_fin() {
+    let dialer = Arc::new(FakeDialer {
+        session_reset: true,
+        ..Default::default()
+    });
+    let mut h = Harness::start(rules_proxy_default(), dialer.clone());
+    h.send(tcp(CLIENT4, SITE4, SYN, 100, 0, b"")).await;
+    let sseq = h.next_meaningful().await.seq + 1;
+    h.send(tcp(CLIENT4, SITE4, ACK, 101, sseq, b"")).await;
+    let data = h.next_meaningful().await;
+    assert_eq!(data.payload, b"partial");
+    h.send(tcp(CLIENT4, SITE4, ACK, 101, sseq + 7, b"")).await;
+    let end = h.next_meaningful().await;
+    assert!(end.rst && !end.fin, "a reset session ended with {end:?}");
 }
 
 #[tokio::test]

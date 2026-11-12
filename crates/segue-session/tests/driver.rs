@@ -452,7 +452,11 @@ async fn revoke_cancels_a_site_connect_in_flight() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(dropped.load(Ordering::SeqCst), 1, "site connect kept running");
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "site connect kept running"
+    );
     relay.abort();
 }
 
