@@ -327,3 +327,65 @@ fn control_stream_answers_ping_and_carries_stall_and_revoked() {
     assert!(got_revoked);
     assert!(r.take_closed_carriers().contains(&9));
 }
+
+/// Review r5 N11: one valid ticket repeating CTRL_HELLO cannot pile up
+/// control streams. The device keeps at most `MAX_CTRL_PER_DEVICE` (the
+/// newest; older ones are closed), a stream that stops sending is closed
+/// after `t_ctrl_idle`, and none outlives `max_lifetime`.
+#[test]
+fn control_streams_are_bounded_per_device_and_expire() {
+    use segue_session::codec::{CtrlHello, VERSION};
+    use segue_session::relay::MAX_CTRL_PER_DEVICE;
+    let t0 = Instant::now();
+    let mut r = RelayTable::new(
+        Config::default(),
+        Pool::new(1 << 20),
+        Box::new(AllowAll),
+        INSTANCE,
+    );
+    let hello = CtrlHello {
+        version: VERSION,
+        ticket: b"ticket".to_vec(),
+        held_anchors: vec![],
+    };
+    let n = 64u64;
+    let mut closed = std::collections::HashSet::new();
+    for cid in 1..=n {
+        r.add_carrier(cid);
+        r.on_frame(cid, hello.to_frame(), t0);
+        closed.extend(r.take_closed_carriers());
+        // A closed carrier leaves the table once the driver drops it.
+        for &c in &closed {
+            r.on_carrier_closed(c, t0);
+        }
+    }
+    let live: Vec<u64> = (1..=n).filter(|c| !closed.contains(c)).collect();
+    assert_eq!(live.len(), MAX_CTRL_PER_DEVICE, "live control streams");
+    assert_eq!(
+        live,
+        ((n - MAX_CTRL_PER_DEVICE as u64 + 1)..=n).collect::<Vec<_>>(),
+        "the newest are kept"
+    );
+    // Idle: one stream keeps pinging, the others go silent.
+    let timing = Config::default().timing;
+    let keep = *live.last().unwrap();
+    let mut t = t0;
+    let step = Duration::from_secs(5);
+    while t < t0 + timing.t_ctrl_idle + step {
+        t += step;
+        r.on_frame(keep, Frame::Ping { nonce: 1 }, t);
+        while r.poll_transmit(keep, t).is_some() {}
+        assert_relay_settled(&mut r, t);
+    }
+    let gone = r.take_closed_carriers();
+    for c in &live[..live.len() - 1] {
+        assert!(gone.contains(c), "idle control stream {c} not closed");
+    }
+    assert!(!gone.contains(&keep), "live control stream closed");
+    // Even a pinging stream ends at max_lifetime.
+    let end = t0 + timing.max_lifetime;
+    r.on_frame(keep, Frame::Ping { nonce: 2 }, end - Duration::from_secs(1));
+    assert!(r.poll_timeout().is_some_and(|d| d <= end));
+    assert_relay_settled(&mut r, end);
+    assert!(r.take_closed_carriers().contains(&keep));
+}

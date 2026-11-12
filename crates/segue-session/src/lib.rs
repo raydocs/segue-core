@@ -65,6 +65,10 @@ pub struct Timing {
     /// Relay: absolute session lifetime from OPEN; RESUME does not extend
     /// it (§5.2 "会话超过最长寿命 → RST(max_lifetime)").
     pub max_lifetime: Duration,
+    /// Relay: a control stream that sends nothing (no PING) for this long
+    /// is closed. Clients PING every 5 s and judge the stream dead after
+    /// 12 s, so a live client never comes near it.
+    pub t_ctrl_idle: Duration,
 }
 
 impl Default for Timing {
@@ -79,6 +83,7 @@ impl Default for Timing {
             ack_delay: Duration::from_millis(20),
             idle_after: Duration::from_secs(1),
             max_lifetime: Duration::from_secs(24 * 3600),
+            t_ctrl_idle: Duration::from_secs(30),
         }
     }
 }

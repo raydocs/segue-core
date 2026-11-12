@@ -10,7 +10,10 @@
 //! A carrier whose first frame is `CTRL_HELLO` is the device's control
 //! stream (§3): the table answers PING with PONG and sends `STALL` there
 //! when one of the device's sessions goes DETACHED (B1), and `REVOKED` on
-//! a device reset.
+//! a device reset. Control streams are bounded (review r5 N11): at most
+//! [`MAX_CTRL_PER_DEVICE`] per device (a new one replaces the oldest), and
+//! each is closed after `t_ctrl_idle` without a frame or `max_lifetime`
+//! after its CTRL_HELLO.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -160,11 +163,18 @@ struct CarrierSlot {
     control: Option<u64>,
     /// Control frames to send (PONG, STALL, REVOKED), bounded.
     ctrl_out: VecDeque<Frame>,
+    /// Control stream: when CTRL_HELLO was accepted, last frame received.
+    ctrl_since: Option<Instant>,
+    ctrl_seen: Option<Instant>,
 }
 
 /// Control frames queued per control stream; PINGs beyond this are not
 /// answered (a peer that never reads cannot grow the queue).
 const CTRL_QUEUE: usize = 64;
+/// Live control streams one device may hold on this relay (one per exit
+/// in the kernel; a few spare for a stream being replaced). The oldest is
+/// closed when another arrives, so one ticket cannot take carrier slots.
+pub const MAX_CTRL_PER_DEVICE: usize = 4;
 /// STALL entries per frame (20 bytes each, under MAX_PAYLOAD).
 const STALL_BATCH: usize = 512;
 
@@ -285,6 +295,7 @@ impl RelayTable {
             return;
         }
         if slot.control.is_some() {
+            slot.ctrl_seen = Some(now);
             if let Frame::Ping { nonce } = frame {
                 if slot.ctrl_out.len() < CTRL_QUEUE {
                     slot.ctrl_out.push_back(Frame::Pong {
@@ -339,7 +350,7 @@ impl RelayTable {
         self.finish(sid, code::PROTOCOL, true);
     }
 
-    fn on_control_hello(&mut self, cid: CarrierId, payload: &[u8]) {
+    fn on_control_hello(&mut self, cid: CarrierId, payload: &[u8], now: Instant) {
         let hello = match CtrlHello::parse(payload) {
             Ok(h) => h,
             Err(ProtoError::Version(_)) => return self.reject(cid, code::VERSION, 0, None),
@@ -351,8 +362,23 @@ impl RelayTable {
             Ok(d) => d,
             Err(c) => return self.reject(cid, c, 0, None),
         };
+        // Newest wins: close the device's oldest streams beyond the cap.
+        let mut mine: Vec<(Instant, CarrierId)> = self
+            .carriers
+            .iter()
+            .filter(|(c, x)| **c != cid && x.control == Some(device) && !x.close_after)
+            .map(|(c, x)| (x.ctrl_since.unwrap_or(now), *c))
+            .collect();
+        if mine.len() >= MAX_CTRL_PER_DEVICE {
+            mine.sort_unstable();
+            for &(_, old) in &mine[..=mine.len() - MAX_CTRL_PER_DEVICE] {
+                self.close_carrier_now(old);
+            }
+        }
         let slot = self.carriers.entry(cid).or_default();
         slot.control = Some(device);
+        slot.ctrl_since = Some(now);
+        slot.ctrl_seen = Some(now);
         slot.ctrl_out.push_back(
             CtrlHelloReply {
                 node_id: 0,
@@ -382,7 +408,7 @@ impl RelayTable {
             Frame::Control {
                 ty: ty::CTRL_HELLO,
                 payload,
-            } => self.on_control_hello(cid, &payload),
+            } => self.on_control_hello(cid, &payload, now),
             Frame::Open(o) => {
                 let sid = o.session_id;
                 if let Some(t) = self.tombs.get(&sid) {
@@ -806,6 +832,11 @@ impl RelayTable {
                 put(i);
             }
         }
+        for c in self.carriers.values().filter(|c| !c.close_after) {
+            if let (Some(since), Some(seen)) = (c.ctrl_since, c.ctrl_seen) {
+                put((seen + t.t_ctrl_idle).min(since + t.max_lifetime));
+            }
+        }
         d
     }
 
@@ -813,6 +844,21 @@ impl RelayTable {
         self.clock = self.clock.max(now);
         let t = self.cfg.timing.clone();
         self.tombs.retain(|_, x| x.until > now);
+        let ctrl_done: Vec<CarrierId> = self
+            .carriers
+            .iter()
+            .filter(|(_, c)| !c.close_after)
+            .filter(|(_, c)| match (c.ctrl_since, c.ctrl_seen) {
+                (Some(since), Some(seen)) => {
+                    now >= seen + t.t_ctrl_idle || now >= since + t.max_lifetime
+                }
+                _ => false,
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for cid in ctrl_done {
+            self.close_carrier_now(cid);
+        }
         let mut expired = Vec::new();
         let mut too_old = Vec::new();
         let mut stalled: Vec<(u64, SessionId, u32)> = Vec::new();
