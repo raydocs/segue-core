@@ -195,7 +195,20 @@ async fn dial(kernel: &Kernel, tag: Option<&str>, addr: &TargetAddr, port: u16) 
     // A proxy route that fails is refused, never retried as direct.
     match tokio::time::timeout(DIAL_TIMEOUT, kernel.dialer.dial(tag, addr, port)).await {
         Ok(Ok(stream)) => Some(stream),
-        Ok(Err(_)) | Err(_) => None,
+        Ok(Err(e)) => {
+            eprintln!(
+                "segue-kernel: dial via {} failed: {e}",
+                tag.unwrap_or("direct")
+            );
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "segue-kernel: dial via {} timed out",
+                tag.unwrap_or("direct")
+            );
+            None
+        }
     }
 }
 

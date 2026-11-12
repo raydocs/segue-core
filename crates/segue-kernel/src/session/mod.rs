@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use segue_routing::TargetAddr;
 use segue_session::client::{ClientSession, CloseReason, OpenParams};
-use segue_session::codec::{Kind, Target};
+use segue_session::codec::{code, Kind, Target};
 use segue_session::driver::{run_client_ctl, BoxCarrier, ClientCtl, Connector};
 use segue_session::pool::Pool;
 use tokio::sync::watch;
@@ -52,6 +52,8 @@ pub const EXIT_AI: u8 = 1;
 pub const POOL_BYTES: usize = 32 << 20;
 /// Longest wait for OPENED (covers the session's own OPEN retries).
 const OPEN_WAIT: Duration = Duration::from_secs(20);
+/// Fresh sessions after an UNKNOWN_SESSION answer to an OPEN retry.
+const FRESH_OPENS: u32 = 2;
 /// After this long since the last failed carrier connect, a strict route
 /// may try again (the next carrier attempt decides the posture), and Auto
 /// may pick that exit again.
@@ -243,6 +245,10 @@ impl KernelDialer {
     /// User turned Segue on (L5).
     pub fn connect(&self) {
         let mut st = self.state.lock().unwrap();
+        if !st.user_off {
+            // Already on: keep what the kill switch knows.
+            return;
+        }
         st.user_off = false;
         for h in &mut st.health {
             h.ks.on_event(Event::UserConnect);
@@ -314,10 +320,12 @@ impl KernelDialer {
                     }
                     Ok(Err(e)) => {
                         mark_failed(h);
+                        eprintln!("segue-kernel: carrier {carrier} failed: {e}");
                         Err(std::io::Error::other(e.0))
                     }
                     Err(_) => {
                         mark_failed(h);
+                        eprintln!("segue-kernel: carrier {carrier} timed out");
                         Err(std::io::ErrorKind::TimedOut.into())
                     }
                 }
@@ -325,27 +333,55 @@ impl KernelDialer {
         })
     }
 
+    /// Open a session. An OPEN retry the relay does not know (the first
+    /// carrier stalled past T_attach, so its OPEN never arrived) is answered
+    /// UNKNOWN_SESSION by design (A2): nothing was confirmed and no app byte
+    /// was sent (SOCKS success waits for OPENED), so a fresh session is safe.
     async fn open(
         &self,
         r: &SegueRoute,
         addr: &TargetAddr,
         port: u16,
     ) -> Result<crate::dial::Stream, DialError> {
+        let start = Instant::now();
+        let mut tries = 0;
+        loop {
+            match self.open_once(r, addr, port).await {
+                Err((e, Some(c)))
+                    if c == code::UNKNOWN_SESSION
+                        && tries < FRESH_OPENS
+                        && start.elapsed() < OPEN_WAIT =>
+                {
+                    tries += 1;
+                    eprintln!("segue-kernel: {e}; opening a fresh session");
+                }
+                res => return res.map_err(|(e, _)| e),
+            }
+        }
+    }
+
+    async fn open_once(
+        &self,
+        r: &SegueRoute,
+        addr: &TargetAddr,
+        port: u16,
+    ) -> Result<crate::dial::Stream, (DialError, Option<u8>)> {
         let i = {
             let st = self.state.lock().unwrap();
             if st.user_off {
-                return Err(DialError("refused: disconnected".into()));
+                return Err((DialError("refused: disconnected".into()), None));
             }
             if self.exits.is_empty() {
-                return Err(DialError("refused: no exits configured".into()));
+                return Err((DialError("refused: no exits configured".into()), None));
             }
             let i = st.pick();
             let h = &st.health[i];
             let down = matches!(h.ks.posture(), Posture::Reconnecting | Posture::Error)
                 && h.recently_failed();
             if r.exit_class == EXIT_AI && down {
-                return Err(DialError(
-                    "refused: tunnel reconnecting (strict route)".into(),
+                return Err((
+                    DialError("refused: tunnel reconnecting (strict route)".into()),
+                    None,
                 ));
             }
             i
@@ -363,7 +399,7 @@ impl KernelDialer {
             instance_hint: 0,
         };
         let s = ClientSession::new(Default::default(), &self.pool, params, Instant::now())
-            .ok_or_else(|| DialError("refused: session memory exhausted".into()))?;
+            .ok_or_else(|| (DialError("refused: session memory exhausted".into()), None))?;
         let (app, far) = tokio::io::duplex(64 << 10);
         let (open_tx, open_rx) = tokio::sync::oneshot::channel();
         let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel();
@@ -384,10 +420,10 @@ impl KernelDialer {
         tokio::select! {
             o = open_rx => match o {
                 Ok(()) => Ok(Box::new(app)),
-                Err(_) => Err(DialError(closed_text((&mut closed_rx).await.ok()))),
+                Err(_) => Err(closed_err((&mut closed_rx).await.ok())),
             },
-            c = &mut closed_rx => Err(DialError(closed_text(c.ok()))),
-            _ = tokio::time::sleep(OPEN_WAIT) => Err(DialError("session open timed out".into())),
+            c = &mut closed_rx => Err(closed_err(c.ok())),
+            _ = tokio::time::sleep(OPEN_WAIT) => Err((DialError("session open timed out".into()), None)),
         }
     }
 }
@@ -404,6 +440,14 @@ fn mark_failed(h: &mut Health) {
         _ => {}
     }
     h.last_fail = Some(Instant::now());
+}
+
+fn closed_err(r: Option<CloseReason>) -> (DialError, Option<u8>) {
+    let c = match r {
+        Some(CloseReason::Refused(c) | CloseReason::Reset(c)) => Some(c),
+        _ => None,
+    };
+    (DialError(closed_text(r)), c)
 }
 
 fn closed_text(r: Option<CloseReason>) -> String {

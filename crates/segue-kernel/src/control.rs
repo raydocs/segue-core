@@ -157,7 +157,7 @@ pub async fn serve(listener: TcpListener, control: Arc<Control>) -> std::io::Res
         }
         let c = control.clone();
         tokio::spawn(async move {
-            let _ = tokio::time::timeout(IO_TIMEOUT, conn_once(conn, &c)).await;
+            let _ = conn_once(conn, &c).await;
         });
     }
 }
@@ -254,7 +254,12 @@ fn loopback_host(host: &str) -> bool {
 }
 
 async fn conn_once(mut conn: TcpStream, c: &Control) -> std::io::Result<()> {
-    let (code, body) = match read_request(&mut conn).await {
+    // The I/O is bounded; the handler is not (connect probes carriers,
+    // bounded by the carrier timeout), and must not be cancelled midway.
+    let req = tokio::time::timeout(IO_TIMEOUT, read_request(&mut conn))
+        .await
+        .unwrap_or(Err(408));
+    let (code, body) = match req {
         Err(code) => (code, json!({"error": "bad request"})),
         Ok(req) => {
             let auth = req
@@ -280,6 +285,7 @@ async fn conn_once(mut conn: TcpStream, c: &Control) -> std::io::Result<()> {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         _ => "Error",
@@ -288,8 +294,12 @@ async fn conn_once(mut conn: TcpStream, c: &Control) -> std::io::Result<()> {
         "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{text}",
         text.len()
     );
-    conn.write_all(resp.as_bytes()).await?;
-    conn.shutdown().await
+    tokio::time::timeout(IO_TIMEOUT, async {
+        conn.write_all(resp.as_bytes()).await?;
+        conn.shutdown().await
+    })
+    .await
+    .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
 }
 
 #[cfg(test)]
