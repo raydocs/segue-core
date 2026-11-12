@@ -1,8 +1,17 @@
 //! Local SOCKS5 entry point (CONNECT only, no authentication, loopback only).
 //!
-//! The success reply is sent only after the outbound dial succeeds, so a
-//! failed proxy route reaches the application as a SOCKS error instead of a
-//! half-open connection.
+//! Domain targets: the success reply is sent only after the outbound dial
+//! succeeds, so a failed proxy route reaches the application as a SOCKS
+//! error instead of a half-open connection.
+//!
+//! Fake-IP targets (handed out by the smart DNS): routed by the recorded
+//! domain and dialled by name; an unknown or stale fake address is refused.
+//!
+//! Other bare-IP targets (KERNEL_SPEC §5.2a): when sniffing is on, the kernel
+//! answers success first, waits a bounded time for the client's first bytes,
+//! takes the TLS SNI or HTTP Host, and routes by both the IP and the domain
+//! (stricter wins). The sniffed bytes are replayed to the upstream unchanged.
+//! A flow refused after the early success is reset (RST), as in §5.2a.5.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -12,8 +21,10 @@ use segue_routing::TargetAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::dial::Dialer;
+use crate::dial::{Dialer, Stream};
+use crate::fakeip::FakeIpPool;
 use crate::rules::{Action, RuleSet};
+use crate::sniff::{sniff, Sniff};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -28,6 +39,40 @@ pub const REP_ATYP_UNSUPPORTED: u8 = 0x08;
 pub struct Kernel {
     pub rules: RuleSet,
     pub dialer: Arc<dyn Dialer>,
+    /// Present when the smart DNS is on; CONNECTs into its range are
+    /// resolved through it.
+    pub fake_ip: Option<Arc<FakeIpPool>>,
+    /// None turns sniffing off: bare IPs are routed by IP rules only.
+    pub sniff: Option<SniffSettings>,
+}
+
+impl Kernel {
+    /// Rules + dialer only: no fake-IP, no sniffing.
+    pub fn new(rules: RuleSet, dialer: Arc<dyn Dialer>) -> Self {
+        Self {
+            rules,
+            dialer,
+            fake_ip: None,
+            sniff: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SniffSettings {
+    /// Total time to wait for the client's first bytes (spec: 300 ms, TBD).
+    pub timeout: Duration,
+    /// Most bytes held back while looking for a host name.
+    pub max_bytes: usize,
+}
+
+impl Default for SniffSettings {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_millis(300),
+            max_bytes: 16 * 1024,
+        }
+    }
 }
 
 pub async fn serve(listener: TcpListener, kernel: Arc<Kernel>) -> std::io::Result<()> {
@@ -65,7 +110,39 @@ async fn handle(mut conn: TcpStream, kernel: &Kernel) -> Result<(), Fail> {
         }
         Err(e) => return Err(e),
     };
-    let tag = match kernel.rules.decide(&addr) {
+    if let TargetAddr::Ip(ip) = addr {
+        if let Some(pool) = kernel.fake_ip.as_ref().filter(|p| p.contains(ip)) {
+            // A fake address is never dialled as an IP.
+            let Some(entry) = pool.lookup(ip) else {
+                reply(&mut conn, REP_NOT_ALLOWED).await?;
+                return Ok(());
+            };
+            return connect_then_reply(
+                conn,
+                kernel,
+                &entry.action,
+                TargetAddr::Domain(entry.domain),
+                port,
+            )
+            .await;
+        }
+        if let Some(settings) = kernel.sniff {
+            return sniffed(conn, kernel, ip, port, settings).await;
+        }
+    }
+    let action = kernel.rules.decide(&addr).clone();
+    connect_then_reply(conn, kernel, &action, addr, port).await
+}
+
+/// Dial first, then tell the client how it went.
+async fn connect_then_reply(
+    mut conn: TcpStream,
+    kernel: &Kernel,
+    action: &Action,
+    addr: TargetAddr,
+    port: u16,
+) -> Result<(), Fail> {
+    let tag = match action {
         Action::Reject => {
             reply(&mut conn, REP_NOT_ALLOWED).await?;
             return Ok(());
@@ -73,17 +150,133 @@ async fn handle(mut conn: TcpStream, kernel: &Kernel) -> Result<(), Fail> {
         Action::Direct => None,
         Action::Proxy(tag) => Some(tag.as_str()),
     };
-    let dialed = tokio::time::timeout(DIAL_TIMEOUT, kernel.dialer.dial(tag, &addr, port)).await;
-    let mut upstream = match dialed {
-        Ok(Ok(stream)) => stream,
-        // A proxy route that fails is refused, never retried as direct.
-        Ok(Err(_)) | Err(_) => {
+    let mut upstream = match dial(kernel, tag, &addr, port).await {
+        Some(stream) => stream,
+        None => {
             reply(&mut conn, REP_HOST_UNREACHABLE).await?;
             return Ok(());
         }
     };
     reply(&mut conn, REP_OK).await?;
     tokio::io::copy_bidirectional(&mut conn, &mut upstream).await?;
+    Ok(())
+}
+
+async fn dial(kernel: &Kernel, tag: Option<&str>, addr: &TargetAddr, port: u16) -> Option<Stream> {
+    // A proxy route that fails is refused, never retried as direct.
+    match tokio::time::timeout(DIAL_TIMEOUT, kernel.dialer.dial(tag, addr, port)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+/// Bare-IP CONNECT with sniffing (§5.2a.1).
+async fn sniffed(
+    mut conn: TcpStream,
+    kernel: &Kernel,
+    ip: IpAddr,
+    port: u16,
+    s: SniffSettings,
+) -> Result<(), Fail> {
+    let by_ip = kernel.rules.lookup(&TargetAddr::Ip(ip));
+    if let Some((_, Action::Reject)) = by_ip {
+        // Nothing a sniffed name could do changes this; refuse before the
+        // early success so the client gets a proper SOCKS error.
+        reply(&mut conn, REP_NOT_ALLOWED).await?;
+        return Ok(());
+    }
+    reply(&mut conn, REP_OK).await?;
+    let (first, domain) = peek_host(&mut conn, s).await?;
+    let by_domain = domain
+        .as_ref()
+        .and_then(|d| kernel.rules.lookup(&TargetAddr::Domain(d.clone())));
+    let action = stricter(by_ip, by_domain)
+        .unwrap_or_else(|| kernel.rules.default_action())
+        .clone();
+    let (tag, target) = match &action {
+        Action::Reject => return reset(conn),
+        // Direct goes to the address the client asked for, never to a
+        // locally resolved sniffed name (that lookup would leak the name).
+        Action::Direct => (None, TargetAddr::Ip(ip)),
+        // The relay connects by name when there is one, which sidesteps a
+        // polluted or stale IP.
+        Action::Proxy(tag) => (
+            Some(tag.as_str()),
+            domain.map(TargetAddr::Domain).unwrap_or(TargetAddr::Ip(ip)),
+        ),
+    };
+    let Some(mut upstream) = dial(kernel, tag, &target, port).await else {
+        return reset(conn);
+    };
+    if !first.is_empty() {
+        upstream.write_all(&first).await?;
+    }
+    tokio::io::copy_bidirectional(&mut conn, &mut upstream).await?;
+    Ok(())
+}
+
+/// Combine the IP and the sniffed-domain verdicts (§5.2a.3/4): only explicit
+/// rule matches have an opinion; between two, Reject beats Proxy beats
+/// Direct, and between two different proxy routes the earlier rule wins
+/// (so AI rules go first in the table). None: neither matched.
+fn stricter<'a>(
+    a: Option<(usize, &'a Action)>,
+    b: Option<(usize, &'a Action)>,
+) -> Option<&'a Action> {
+    fn rank(a: &Action) -> u8 {
+        match a {
+            Action::Reject => 2,
+            Action::Proxy(_) => 1,
+            Action::Direct => 0,
+        }
+    }
+    match (a, b) {
+        (None, None) => None,
+        (Some((_, x)), None) | (None, Some((_, x))) => Some(x),
+        (Some((i, x)), Some((j, y))) => Some(match rank(x).cmp(&rank(y)) {
+            std::cmp::Ordering::Greater => x,
+            std::cmp::Ordering::Less => y,
+            std::cmp::Ordering::Equal if i <= j => x,
+            std::cmp::Ordering::Equal => y,
+        }),
+    }
+}
+
+/// Read the client's first bytes until a host name is found, the data is
+/// clearly not TLS/HTTP, `max_bytes` is reached or the deadline passes.
+/// The bytes are returned for replay; nothing is lost.
+async fn peek_host(
+    conn: &mut TcpStream,
+    s: SniffSettings,
+) -> std::io::Result<(Vec<u8>, Option<String>)> {
+    let deadline = tokio::time::Instant::now() + s.timeout;
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = vec![0u8; 4096];
+    loop {
+        let want = (s.max_bytes - buf.len()).min(chunk.len());
+        if want == 0 {
+            return Ok((buf, None));
+        }
+        let n = match tokio::time::timeout_at(deadline, conn.read(&mut chunk[..want])).await {
+            Ok(r) => r?,
+            Err(_) => return Ok((buf, None)), // server-speaks-first or slow client
+        };
+        if n == 0 {
+            return Ok((buf, None));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        match sniff(&buf) {
+            Sniff::Domain(d) => return Ok((buf, Some(d))),
+            Sniff::None => return Ok((buf, None)),
+            Sniff::NeedMore => {}
+        }
+    }
+}
+
+/// Refuse a flow that has already been told "success": RST, not FIN.
+fn reset(conn: TcpStream) -> Result<(), Fail> {
+    let _ = conn.set_zero_linger();
+    drop(conn);
     Ok(())
 }
 
