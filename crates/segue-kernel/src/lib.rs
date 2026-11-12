@@ -1,10 +1,17 @@
-//! Segue client kernel (prototype): local SOCKS5 → rule table → outer engine.
+//! Segue client kernel (prototype): local SOCKS5 → rule table → outer engine,
+//! with a loopback smart DNS (fake-IP for proxied names) and TLS SNI / HTTP
+//! Host sniffing for bare-IP flows (KERNEL_SPEC §5.2, §5.2a).
 //!
-//! Scope of this slice: TCP CONNECT only. UDP, TUN, smart DNS, SNI sniffing,
-//! the session layer and the kill-switch are specified in tono-next/spec and
-//! not implemented here yet.
+//! SOCKS5 UDP ASSOCIATE is routed per destination (KERNEL_SPEC §4.3).
+//!
+//! Not here yet: TUN, QUIC Initial sniffing, the session layer and the
+//! kill-switch (specified in tono-next/spec).
 
 pub mod config;
 pub mod dial;
+pub mod dns;
+pub mod fakeip;
 pub mod rules;
+pub mod sniff;
 pub mod socks;
+pub mod udp;

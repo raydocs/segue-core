@@ -19,12 +19,20 @@ struct Fake {
 
 #[async_trait]
 impl Dialer for Fake {
-    async fn dial(&self, tag: Option<&str>, addr: &TargetAddr, port: u16) -> Result<Stream, DialError> {
+    async fn dial(
+        &self,
+        tag: Option<&str>,
+        addr: &TargetAddr,
+        port: u16,
+    ) -> Result<Stream, DialError> {
         let shown = match addr {
             TargetAddr::Ip(ip) => format!("{ip}:{port}"),
             TargetAddr::Domain(d) => format!("{d}:{port}"),
         };
-        self.calls.lock().unwrap().push((tag.map(str::to_owned), shown));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((tag.map(str::to_owned), shown));
         if tag == Some("broken") {
             return Err(DialError("outer link down".into()));
         }
@@ -51,15 +59,24 @@ async fn echo_server() -> std::net::SocketAddr {
 async fn kernel(fake: Arc<Fake>) -> std::net::SocketAddr {
     let rules = RuleSet::new(
         vec![
-            Rule { matcher: Matcher::DomainSuffix("openai.com".into()), action: Action::Proxy("broken".into()) },
-            Rule { matcher: Matcher::DomainSuffix("ads.test".into()), action: Action::Reject },
-            Rule { matcher: Matcher::Cidr(Cidr::parse("192.168.0.0/16").unwrap()), action: Action::Direct },
+            Rule {
+                matcher: Matcher::DomainSuffix("openai.com".into()),
+                action: Action::Proxy("broken".into()),
+            },
+            Rule {
+                matcher: Matcher::DomainSuffix("ads.test".into()),
+                action: Action::Reject,
+            },
+            Rule {
+                matcher: Matcher::Cidr(Cidr::parse("192.168.0.0/16").unwrap()),
+                action: Action::Direct,
+            },
         ],
         Action::Proxy("proxy".into()),
     );
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    tokio::spawn(serve(l, Arc::new(Kernel { rules, dialer: fake })));
+    tokio::spawn(serve(l, Arc::new(Kernel::new(rules, fake))));
     addr
 }
 

@@ -28,6 +28,7 @@ pub use masque::MasqueOutbound;
 mod address_port;
 mod carrier;
 pub(crate) mod datagram;
+pub use datagram::OutboundUdpSession;
 mod domain_strategy;
 pub(crate) mod final_rules;
 pub(crate) mod proxy_protocol;
