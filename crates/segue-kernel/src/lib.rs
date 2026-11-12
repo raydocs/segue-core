@@ -8,3 +8,4 @@ pub mod config;
 pub mod dial;
 pub mod rules;
 pub mod socks;
+pub mod tun;

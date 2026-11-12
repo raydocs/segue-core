@@ -2188,12 +2188,15 @@ name = "segue-kernel"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "segue-config",
  "segue-engine",
  "segue-routing",
  "segue-transport",
+ "segue-tun",
  "serde",
  "serde_json",
+ "smoltcp",
  "tokio",
 ]
 
