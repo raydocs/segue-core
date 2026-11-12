@@ -10,7 +10,8 @@
 //! Other bare-IP targets (KERNEL_SPEC §5.2a): when sniffing is on, the kernel
 //! answers success first, waits a bounded time for the client's first bytes,
 //! takes the TLS SNI or HTTP Host, and routes by both the IP and the domain
-//! (stricter wins). The sniffed bytes are replayed to the upstream unchanged.
+//! (Reject wins, then the sniffed domain's rule, D8). The sniffed bytes are
+//! replayed to the upstream unchanged.
 //! A flow refused after the early success is reset (RST), as in §5.2a.5.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -215,29 +216,23 @@ async fn sniffed(
     Ok(())
 }
 
-/// Combine the IP and the sniffed-domain verdicts (§5.2a.3/4): only explicit
-/// rule matches have an opinion; between two, Reject beats Proxy beats
-/// Direct, and between two different proxy routes the earlier rule wins
-/// (so AI rules go first in the table). None: neither matched.
+/// Combine the IP and the sniffed-domain verdicts (§5.2a.3/4, D8). Only
+/// explicit rule matches have an opinion. Reject from either side wins.
+/// Otherwise a matched sniffed domain decides the route (D8: an AI domain on
+/// an IP that matched an ordinary proxy rule still goes to the AI exit), with
+/// one exception: a domain saying Direct never downgrades an IP that matched a
+/// proxy rule, so a forged or unrelated SNI cannot send AI/proxied IPs direct.
+/// None: neither matched.
 fn stricter<'a>(
-    a: Option<(usize, &'a Action)>,
-    b: Option<(usize, &'a Action)>,
+    by_ip: Option<(usize, &'a Action)>,
+    by_domain: Option<(usize, &'a Action)>,
 ) -> Option<&'a Action> {
-    fn rank(a: &Action) -> u8 {
-        match a {
-            Action::Reject => 2,
-            Action::Proxy(_) => 1,
-            Action::Direct => 0,
-        }
-    }
-    match (a, b) {
+    match (by_ip, by_domain) {
         (None, None) => None,
         (Some((_, x)), None) | (None, Some((_, x))) => Some(x),
-        (Some((i, x)), Some((j, y))) => Some(match rank(x).cmp(&rank(y)) {
-            std::cmp::Ordering::Greater => x,
-            std::cmp::Ordering::Less => y,
-            std::cmp::Ordering::Equal if i <= j => x,
-            std::cmp::Ordering::Equal => y,
+        (Some((_, ip)), Some((_, dom))) => Some(match (ip, dom) {
+            (Action::Reject, _) | (Action::Proxy(_), Action::Direct) => ip,
+            _ => dom,
         }),
     }
 }

@@ -102,6 +102,7 @@ fn rules() -> RuleSet {
             rule(cidr("10.66.0.0/16"), Action::Reject),
             rule(suffix("baidu.com"), Action::Direct),
             rule(cidr("10.0.0.0/8"), Action::Direct),
+            rule(cidr("5.5.0.0/16"), proxy("hk")),
         ],
         proxy("proxy"),
     )
@@ -199,6 +200,38 @@ async fn ai_cidr_beats_direct_sni() {
     assert_eq!(
         fake.calls(),
         vec![(Some("ai".into()), "www.baidu.com:443".into())]
+    );
+}
+
+/// D8: the IP matched an ordinary proxy rule (listed after the AI rules),
+/// the SNI is an AI domain: the domain's rule decides, so it goes to the AI
+/// exit, by name.
+#[tokio::test]
+async fn ai_sni_beats_later_proxy_ip_rule() {
+    let fake = Arc::new(Fake::default());
+    let k = start_kernel(fake.clone(), None).await;
+    let (rep, mut c) = connect_ip(k, "5.5.1.1".parse().unwrap(), 443).await;
+    assert_eq!(rep, REP_OK);
+    let hello = client_hello_for_test(Some("api.openai.com"), 0);
+    assert_eq!(roundtrip(&mut c, &hello, 7).await, hello);
+    assert_eq!(
+        fake.calls(),
+        vec![(Some("ai".into()), "api.openai.com:443".into())]
+    );
+}
+
+/// D8 keeps a direct SNI from downgrading a proxied IP.
+#[tokio::test]
+async fn direct_sni_does_not_downgrade_proxy_ip() {
+    let fake = Arc::new(Fake::default());
+    let k = start_kernel(fake.clone(), None).await;
+    let (rep, mut c) = connect_ip(k, "5.5.1.1".parse().unwrap(), 443).await;
+    assert_eq!(rep, REP_OK);
+    let hello = client_hello_for_test(Some("www.baidu.com"), 0);
+    assert_eq!(roundtrip(&mut c, &hello, 7).await, hello);
+    assert_eq!(
+        fake.calls(),
+        vec![(Some("hk".into()), "www.baidu.com:443".into())]
     );
 }
 
