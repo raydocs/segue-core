@@ -10,9 +10,9 @@ BIN=${BIN:?set BIN to the dir with segue-kernel and segue-relay}
 XRAY=${XRAY:?set XRAY to the official xray binary}
 unset NO_PROXY no_proxy http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 SINGBOX=${SINGBOX:-}
-KP=1090 RP=7443 XP=8443 HP=8091 DP=1099 UP=9999 YP=8444 CP_=7450
+KP=1090 RP=7443 XP=8443 HP=8091 DP=1099 UP=9999 YP=8444 CP_=7450 CN=8097
 # Stale lab processes holding our ports make every case lie; clear them.
-for p in $KP $RP 7444 $XP $HP $DP $CP_; do
+for p in $KP $RP 7444 $XP $HP $DP $CP_ $CN; do
   for pid in $(lsof -nP -tiTCP:$p -sTCP:LISTEN 2>/dev/null); do echo "killing stale pid $pid on :$p"; kill "$pid"; done
 done
 for p in $UP $YP; do for pid in $(lsof -nP -tiUDP:$p 2>/dev/null); do echo "killing stale pid $pid on udp :$p"; kill "$pid"; done; done
@@ -31,6 +31,9 @@ head -c 209715200 /dev/urandom > "$OUT/www/200m.bin"
 python3 -I "$HERE/http_log.py" $HP "$OUT/www" "$OUT/http.log" & PIDS+=($!)
 python3 -I "$HERE/fake_decodo.py" $DP "$OUT/decodo.log" lineuser linepass & PIDS+=($!)
 python3 -I "$HERE/udp_echo.py" $UP "$OUT/udp.log" & PIDS+=($!)
+# Reachable canary for refusal cases (127.0.0.1 and ::1): a refusal counts
+# only if it is the expected SOCKS reply, in time, with no canary accept.
+: > "$OUT/canary.log"; python3 -I "$HERE/canary.py" $CN "$OUT/canary.log" & PIDS+=($!)
 
 # Routing policy: a signed bundle (dev key). `localhost` is an AI domain →
 # the Home-role `ai` route; 127.0.0.1 → overseas; default reject. The user
@@ -101,7 +104,7 @@ cat > "$OUT/kernel.json" <<J
  "udp":{"refuse":[]}}
 J
 "$BIN/segue-kernel" "$OUT/kernel.json" > "$OUT/kernel.log" 2>&1 & PIDS+=($!)
-waitport $KP && waitport $RP && waitport $HP && waitport $DP && waitport $CP_ || { bad "startup"; exit 1; }
+waitport $KP && waitport $RP && waitport $HP && waitport $DP && waitport $CP_ && waitport $CN || { bad "startup"; exit 1; }
 TOKEN=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' "$OUT/control.json")
 api() { curl -s --max-time 30 -X "$1" -H "Authorization: Bearer $TOKEN" ${3:+-d "$3"} "http://127.0.0.1:$CP_$2"; }
 jf() { python3 -c 'import json,sys;d=json.load(sys.stdin);print(d'"$1"')'; }
@@ -116,12 +119,36 @@ c=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$CP_/v1/status")
 [ -n "$HY2" ] && api POST /v1/exit '{"exit":"la"}' > /dev/null
 
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+canary() { wc -l < "$OUT/canary.log" | tr -d ' '; }
+lt() { python3 -c "import sys;sys.exit(0 if $1 < $2 else 1)"; }
+# refuse <label> <want SOCKS REP hex> <host> <max secs>: one CONNECT to the
+# canary through the kernel must get exactly that reply within max secs,
+# and neither the canary nor the Home SOCKS may see a connection.
+refuse() {
+  local c0 d0 out kind code secs
+  c0=$(canary); d0=$(grep -c CONNECT "$OUT/decodo.log")
+  out=$(python3 -I "$HERE/socks_probe.py" $KP "$3" $CN $(( $4 + 10 )))
+  read -r kind code secs _ <<<"$out"
+  if [ "$kind" = REP ] && [ "$code" = "$2" ] && lt "$secs" "$4" \
+     && [ "$(canary)" = "$c0" ] && [ "$(grep -c CONNECT "$OUT/decodo.log")" = "$d0" ]; then
+    ok "$1: REP $code in ${secs}s, canary and Home untouched"
+  else
+    bad "$1: got '$out' (want REP $2 in <$4s); canary $c0→$(canary), Home CONNECT $d0→$(grep -c CONNECT "$OUT/decodo.log")"
+  fi
+}
+# The canary is reachable directly on both addresses, and through the
+# kernel where policy allows it, so a refusal below is the kernel's doing.
+[ "$(curl -s --max-time 5 "http://127.0.0.1:$CN/")" = canary ] && [ "$(curl -s -g --max-time 5 "http://[::1]:$CN/")" = canary ] \
+  && ok "canary reachable directly (127.0.0.1, ::1)" || bad "canary not reachable directly"
 fetch() { curl -s --max-time "${3:-60}" --socks5-hostname 127.0.0.1:$KP -o "$2" -w '%{http_code} %{size_download}' "$1"; }
 
 # 1. Overseas fetch
 r=$(fetch "http://127.0.0.1:$HP/1m.bin" "$OUT/o1.bin")
 [ "$(sha "$OUT/o1.bin" 2>/dev/null)" = "$(sha "$OUT/www/1m.bin")" ] && ok "overseas fetch 1 MiB sha match ($r)" || bad "overseas fetch ($r)"
 ! grep -q CONNECT "$OUT/decodo.log" && ok "overseas did not touch Home SOCKS" || bad "overseas used Home"
+c0=$(canary); out=$(python3 -I "$HERE/socks_probe.py" $KP 127.0.0.1 $CN 30)
+[ "${out%% *}" = OK ] && [ "${out##* }" = canary ] && [ "$(canary)" -gt "$c0" ] \
+  && ok "canary reachable through the kernel when allowed ($out)" || bad "canary via kernel: '$out'"
 
 # 2. AI fetch goes through fake Decodo, by IPv4, with auth
 r=$(fetch "http://localhost:$HP/1m.bin" "$OUT/a1.bin")
@@ -136,14 +163,11 @@ kill -9 "$XPID"; wait "$XPID" 2>/dev/null; XPID=
 echo "carrier killed at $s1 bytes" >> "$OUT/result.txt"
 # 4. While the carrier is down: AI refused at once, overseas refused, nothing direct.
 sleep 0.5
-before_d=$(grep -c CONNECT "$OUT/decodo.log"); before_h=$(wc -l < "$OUT/http.log")
-t0=$(python3 -c 'import time;print(time.time())')
-r=$(fetch "http://localhost:$HP/1m.bin" "$OUT/a2.bin" 10); rc=$?
-t1=$(python3 -c 'import time;print(time.time())')
-dt=$(python3 -c "print(round($t1-$t0,2))")
-[ $rc -ne 0 ] && [ "$(grep -c CONNECT "$OUT/decodo.log")" = "$before_d" ] && ok "AI refused while reconnecting in ${dt}s (curl rc=$rc)" || bad "AI not refused while down (rc=$rc $r)"
-r=$(fetch "http://127.0.0.1:$HP/1m.bin" "$OUT/o2.bin" 30); rc=$?
-[ $rc -ne 0 ] && ok "overseas refused while carrier down (curl rc=$rc)" || bad "overseas succeeded with carrier down ($r)"
+before_h=$(wc -l < "$OUT/http.log")
+# AI (strict): host unreachable at once. Overseas: tried for a bounded time
+# (OPEN_WAIT 20 s), then host unreachable. Never direct, never Home.
+refuse "AI refused while reconnecting" 04 localhost 1
+refuse "overseas refused while carrier down" 04 127.0.0.1 25
 [ "$(wc -l < "$OUT/http.log")" = "$before_h" ] && ok "no target request while carrier down (nothing went direct)" || bad "target got requests while carrier down"
 start_xray; echo "carrier restarted" >> "$OUT/result.txt"
 wait $CP; crc=$?
@@ -159,9 +183,9 @@ r=$(fetch "http://localhost:$HP/1m.bin" "$OUT/a3.bin")
 u=$(python3 -I "$HERE/udp_probe.py" $KP localhost $UP)
 [ "$u" != REPLY ] && [ ! -s "$OUT/udp.log" ] && ok "Home UDP refused ($u, echo got nothing)" || bad "Home UDP leaked ($u)"
 
-# 7. Rejected (default) never connects
-r=$(fetch "http://10.255.255.1:$HP/x" "$OUT/r.bin" 5); rc=$?
-[ $rc -ne 0 ] && ok "unmatched target rejected (rc=$rc)" || bad "unmatched target fetched"
+# 7. Rejected (default rule) never connects: ::1 matches no rule, and the
+# canary listens there.
+refuse "unmatched target rejected by policy" 02 ::1 1
 
 # 8. Hy2 carrier: pin exit ny via the control API, take Reality away.
 if [ -n "$HY2" ]; then
@@ -183,13 +207,8 @@ if [ -n "$HY2" ]; then
   t0=$(python3 -c 'import time;print(time.time())')
   st=$(api POST /v1/connect | jf '["state"]')
   pt=$(python3 -c "import time;print(round(time.time()-$t0,2))")
-  before_d=$(grep -c CONNECT "$OUT/decodo.log"); before_h=$(wc -l < "$OUT/http.log")
-  t0=$(python3 -c 'import time;print(time.time())')
-  fetch "http://localhost:$HP/1m.bin" "$OUT/h4.bin" 10 > /dev/null; rc=$?
-  dt=$(python3 -c "import time;print(round(time.time()-$t0,2))")
-  [ $rc -ne 0 ] && [ "$(grep -c CONNECT "$OUT/decodo.log")" = "$before_d" ] && [ "$(wc -l < "$OUT/http.log")" = "$before_h" ] && [ "$st" = reconnecting ] \
-    && python3 -c "import sys;sys.exit(0 if $dt < 1 else 1)" \
-    && ok "both carriers down: probe saw it in ${pt}s (state $st), AI refused in ${dt}s, nothing direct" || bad "both down: rc=$rc state=$st probe ${pt}s AI ${dt}s"
+  [ "$st" = reconnecting ] && ok "both carriers down: probe saw it in ${pt}s (state $st)" || bad "both down: state=$st after probe ${pt}s"
+  refuse "both carriers down: AI refused" 04 localhost 1
   # Auto fails over: Reality back (Hy2 still down) → Auto picks la.
   start_xray
   api POST /v1/exit '{"exit":"auto"}' > /dev/null
@@ -212,10 +231,11 @@ fi
 
 # 9. Disconnect via control API: everything refused.
 api POST /v1/disconnect > /dev/null
-r=$(fetch "http://127.0.0.1:$HP/1m.bin" "$OUT/d1.bin" 10); rc=$?
-[ $rc -ne 0 ] && ok "disconnected: overseas refused (rc=$rc)" || bad "disconnected but fetched ($r)"
+refuse "disconnected: overseas refused" 04 127.0.0.1 1
+refuse "disconnected: AI refused" 04 localhost 1
 
 curl -s http://127.0.0.1:7444/ > "$OUT/metrics.txt" 2>/dev/null
 grep -i "alert\|secret\|linepass\|$(head -c 20 "$OUT/device.ticket")" "$OUT/relay.log" "$OUT/kernel.log" | grep -v '"msg":"dev' > "$OUT/secrets-grep.txt"
 grep -q "linepass\|$(head -c 20 "$OUT/device.ticket")" "$OUT/relay.log" "$OUT/kernel.log" && bad "secret in logs" || ok "no ticket / SOCKS password in logs"
 echo "TOTAL pass=$PASS fail=$FAIL" | tee -a "$OUT/result.txt"
+[ "$FAIL" -eq 0 ] && [ "$PASS" -gt 0 ]
