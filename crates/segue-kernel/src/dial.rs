@@ -266,8 +266,12 @@ impl UdpSession for DirectUdp {
     async fn recv(&self, buf: &mut Vec<u8>) -> Result<(TargetAddr, u16), DialError> {
         // recv_buf fills spare capacity without zeroing it, so the 64 KiB
         // reserve is allocated once per flow and only touched pages count.
+        // A caller that sized the buffer itself (the TUN, to its MTU) keeps
+        // that size; a longer datagram is truncated to it.
         buf.clear();
-        buf.reserve(MAX_UDP_PAYLOAD);
+        if buf.capacity() == 0 {
+            buf.reserve(MAX_UDP_PAYLOAD);
+        }
         self.0
             .recv_buf(buf)
             .await

@@ -1295,6 +1295,30 @@ impl<'a> Socket<'a> {
         !self.tx_buffer.is_full()
     }
 
+    /// XRAY-PATCH: resize an owned receive buffer in place.
+    ///
+    /// Growing always succeeds for owned storage. Shrinking requires an empty
+    /// reassembly assembler and `capacity >= recv_queue()`. Window scaling is
+    /// fixed when the socket is created or reset, so callers that grow beyond
+    /// 64 KiB must create the socket with the largest buffer first. Segments
+    /// are only accepted into the physical buffer, so a window advertised
+    /// before a shrink cannot overrun storage; the excess is dropped and
+    /// retransmitted by the peer.
+    #[cfg(feature = "alloc")]
+    pub fn resize_recv_buffer(&mut self, capacity: usize) -> bool {
+        if capacity < self.rx_buffer.capacity() && !self.assembler.is_empty() {
+            return false;
+        }
+        self.rx_buffer.resize(capacity)
+    }
+
+    /// XRAY-PATCH: resize an owned transmit buffer in place. Requires
+    /// `capacity >= send_queue()`; unacknowledged octets are preserved.
+    #[cfg(feature = "alloc")]
+    pub fn resize_send_buffer(&mut self, capacity: usize) -> bool {
+        self.tx_buffer.resize(capacity)
+    }
+
     /// Return the maximum number of bytes inside the recv buffer.
     #[inline]
     pub fn recv_capacity(&self) -> usize {
@@ -1797,6 +1821,14 @@ impl<'a> Socket<'a> {
             last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
         } else {
             window_start
+        };
+        // XRAY-PATCH: never accept octets beyond the physical receive buffer.
+        // A buffer resized after the last advertisement must not overrun.
+        let physical_end = window_start + self.rx_buffer.window();
+        let window_end = if window_end > physical_end {
+            physical_end
+        } else {
+            window_end
         };
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();

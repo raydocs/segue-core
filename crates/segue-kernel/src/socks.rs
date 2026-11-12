@@ -241,7 +241,7 @@ async fn sniffed(
 /// one exception: a domain saying Direct never downgrades an IP that matched a
 /// proxy rule, so a forged or unrelated SNI cannot send AI/proxied IPs direct.
 /// None: neither matched.
-fn stricter<'a>(
+pub(crate) fn stricter<'a>(
     by_ip: Option<(usize, &'a Action)>,
     by_domain: Option<(usize, &'a Action)>,
 ) -> Option<&'a Action> {

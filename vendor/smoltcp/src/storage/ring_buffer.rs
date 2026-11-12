@@ -93,6 +93,39 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
         self.window() == 0
     }
 
+    /// XRAY-PATCH: change the capacity of an owned buffer in place.
+    ///
+    /// The ring is linearized starting at the read position. Allocated
+    /// octets and as much of the unallocated area as fits are preserved, so
+    /// out-of-order data written with `write_unallocated` survives growth.
+    /// Returns `false` (and changes nothing) for borrowed storage or when
+    /// `capacity` is smaller than the allocated length.
+    #[cfg(feature = "alloc")]
+    pub fn resize(&mut self, capacity: usize) -> bool
+    where
+        T: Copy + Default,
+    {
+        if capacity < self.length {
+            return false;
+        }
+        let read_at = self.read_at;
+        let ManagedSlice::Owned(old) = &mut self.storage else {
+            return false;
+        };
+        let cap = old.len();
+        if cap == capacity {
+            return true;
+        }
+        let mut next = alloc::vec::Vec::with_capacity(capacity);
+        for i in 0..cap.min(capacity) {
+            next.push(old[(read_at + i) % cap]);
+        }
+        next.resize(capacity, T::default());
+        *old = next;
+        self.read_at = 0;
+        true
+    }
+
     /// Shorthand for `(self.read + idx) % self.capacity()` with an
     /// additional check to ensure that the capacity is not zero.
     fn get_idx(&self, idx: usize) -> usize {

@@ -244,7 +244,7 @@ fn uplink(
 }
 
 /// The outbound (None: direct) and the address to dial, or None: refused.
-fn route(
+pub(crate) fn route(
     kernel: &Kernel,
     s: &UdpSettings,
     addr: &TargetAddr,
