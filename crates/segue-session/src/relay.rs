@@ -43,8 +43,13 @@ pub enum RelayEvent {
     /// Connect to the site; answer with [`RelayTable::connect_done`].
     Connect {
         session_id: SessionId,
+        /// Device the ticket authorized (for per-device exit policy).
+        device: u64,
         target: Target,
         kind: Kind,
+        /// The client's hint (R2-1: the relay classifies on its own; the
+        /// hint is only used to count reclassifications).
+        exit_class: u8,
     },
     /// Send `STALL` on the device's control stream (B1).
     Stall {
@@ -356,8 +361,10 @@ impl RelayTable {
                 self.carriers.get_mut(&cid).unwrap().session = Some(sid);
                 self.events.push_back(RelayEvent::Connect {
                     session_id: sid,
+                    device,
                     target: o.target,
                     kind: o.kind,
+                    exit_class: o.exit_class,
                 });
             }
             Frame::Resume(r) => {

@@ -28,9 +28,56 @@ pub type BoxCarrier = Box<dyn Carrier>;
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Opens a new carrier to the relay (client side).
 pub type Connector = Arc<dyn Fn() -> BoxFuture<io::Result<BoxCarrier>> + Send + Sync>;
-/// Connects to a site (relay side).
+/// Connects to a site (relay side). An error carrying a [`SiteError`] is
+/// answered with that code; any other error with `connect_refused`.
 pub type SiteConnector =
     Arc<dyn Fn(Target, Kind) -> BoxFuture<io::Result<BoxCarrier>> + Send + Sync>;
+/// Like [`SiteConnector`], also given the device the ticket authorized
+/// and the client's (untrusted) exit class hint.
+pub type DeviceSiteConnector =
+    Arc<dyn Fn(SiteRequest) -> BoxFuture<io::Result<BoxCarrier>> + Send + Sync>;
+
+/// One site connect request (relay side).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiteRequest {
+    pub device: u64,
+    pub target: Target,
+    pub kind: Kind,
+    pub exit_class: u8,
+}
+
+/// A site connect failure with a specific §8 code (e.g. `exit_denied`,
+/// `target_denied`, `home_unavailable`). Wrap it with `io::Error::other`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SiteError(pub u8);
+
+impl std::fmt::Display for SiteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "site connect refused with code {}", self.0)
+    }
+}
+
+impl std::error::Error for SiteError {}
+
+impl SiteError {
+    pub fn io(code: u8) -> io::Error {
+        io::Error::other(SiteError(code))
+    }
+
+    /// The code an error from a [`SiteConnector`] maps to.
+    pub fn code_of(e: &io::Error) -> u8 {
+        e.get_ref()
+            .and_then(|x| x.downcast_ref::<SiteError>())
+            .map_or(code::CONNECT_REFUSED, |x| x.0)
+    }
+}
+
+/// Commands into a running relay driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayCtrl {
+    /// RST every session of `device` with `close_code` (revocation, admin).
+    ResetDevice { device: u64, close_code: u8 },
+}
 
 /// Frames per writer channel.
 const WRITE_QUEUE: usize = 8;
@@ -313,10 +360,22 @@ pub enum RelayNotice {
 /// Run a relay table over carriers from `accept` and sites from `site`.
 /// Returns when `accept` is closed and no carriers or sessions remain.
 pub async fn run_relay(
-    mut table: RelayTable,
-    mut accept: mpsc::Receiver<BoxCarrier>,
+    table: RelayTable,
+    accept: mpsc::Receiver<BoxCarrier>,
     site: SiteConnector,
     notices: Option<mpsc::UnboundedSender<RelayNotice>>,
+) {
+    let site: DeviceSiteConnector = Arc::new(move |r: SiteRequest| site(r.target, r.kind));
+    run_relay_ctl(table, accept, site, notices, None).await
+}
+
+/// [`run_relay`] with a command channel (revocation resets).
+pub async fn run_relay_ctl(
+    mut table: RelayTable,
+    mut accept: mpsc::Receiver<BoxCarrier>,
+    site: DeviceSiteConnector,
+    notices: Option<mpsc::UnboundedSender<RelayNotice>>,
+    mut ctrl: Option<mpsc::Receiver<RelayCtrl>>,
 ) {
     let writable = Arc::new(Notify::new());
     let (ev_tx, mut ev_rx) = mpsc::channel::<CarrierEv>(64);
@@ -334,10 +393,12 @@ pub async fn run_relay(
             match ev {
                 RelayEvent::Connect {
                     session_id,
+                    device,
                     target,
                     kind,
+                    exit_class,
                 } => {
-                    let fut = site(target, kind);
+                    let fut = site(SiteRequest { device, target, kind, exit_class });
                     let tx = site_tx.clone();
                     tokio::spawn(async move {
                         let _ = tx.send(SiteEv::Connected(session_id, fut.await)).await;
@@ -469,7 +530,7 @@ pub async fn run_relay(
                         sites.insert(sid, SiteIo { tx, req, reader, outstanding: false, shut: false, eof: false });
                         table.connect_done(&sid, Ok(()), t);
                     }
-                    Some(SiteEv::Connected(sid, Err(_))) => table.connect_done(&sid, Err(code::CONNECT_REFUSED), t),
+                    Some(SiteEv::Connected(sid, Err(e))) => table.connect_done(&sid, Err(SiteError::code_of(&e)), t),
                     Some(SiteEv::Data(sid, d)) => {
                         if let Some(io) = sites.get_mut(&sid) {
                             io.outstanding = false;
@@ -486,6 +547,10 @@ pub async fn run_relay(
                     None => {}
                 }
             }
+            c = async { ctrl.as_mut().unwrap().recv().await }, if ctrl.is_some() => match c {
+                Some(RelayCtrl::ResetDevice { device, close_code }) => table.reset_device(device, close_code),
+                None => ctrl = None,
+            },
             _ = writable.notified() => {}
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
         }
