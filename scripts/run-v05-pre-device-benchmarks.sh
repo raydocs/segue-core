@@ -26,8 +26,8 @@ if [[ -e "$OUTPUT_ROOT" ]]; then
 fi
 
 cd "$WORKSPACE_ROOT"
-cargo build --locked --release -p xray-bench
-cargo build --locked --release -p xray-cli --bin xray-rust
+cargo build --locked --release -p segue-bench
+cargo build --locked --release -p segue-cli --bin xray-rust
 
 readonly TARGET_ARGUMENT="${CARGO_TARGET_DIR:-$WORKSPACE_ROOT/target}"
 if [[ "$TARGET_ARGUMENT" = /* ]]; then
@@ -35,8 +35,8 @@ if [[ "$TARGET_ARGUMENT" = /* ]]; then
 else
   readonly TARGET_DIR="$WORKSPACE_ROOT/$TARGET_ARGUMENT"
 fi
-readonly BENCH_BINARY="$TARGET_DIR/release/xray-bench"
-readonly XRAY_RUST_BINARY="$TARGET_DIR/release/xray-rust"
+readonly BENCH_BINARY="$TARGET_DIR/release/segue-bench"
+readonly XRAY_RUST_BINARY="$TARGET_DIR/release/segue"
 
 for repeat in $(seq 1 "$REPEATS"); do
   "$BENCH_BINARY" route-probe \

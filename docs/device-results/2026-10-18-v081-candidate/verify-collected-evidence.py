@@ -9,8 +9,8 @@ protocols=load('performance-protocols/manifest.json')
 assert protocols['status']=='pass' and len(protocols['runs'])==210
 assert protocols['candidate']['revision']==expected and protocols['candidate']['tree']==plan['coreTree']
 assert all(x['returncode']==0 and not x['surviving_process_group'] and not x['ambient_cpu']['compiler_load_detected'] for x in protocols['runs'])
-assert sha(r/'host-cargo/release/xray-rust')==protocols['binarySha256']['candidate']
-assert sha(r/'baseline-cargo/release/xray-rust')==protocols['binarySha256']['baseline']
+assert sha(r/'host-cargo/release/segue')==protocols['binarySha256']['candidate']
+assert sha(r/'baseline-cargo/release/segue')==protocols['binarySha256']['baseline']
 comparisons=load('performance-protocols/protocol-comparisons.json')
 assert comparisons['complete'] and len(comparisons['schema4Measurements'])==9
 for x in comparisons['schema4Measurements']:

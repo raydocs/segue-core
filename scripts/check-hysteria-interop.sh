@@ -28,32 +28,32 @@ env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
 cmp "$WORKSPACE_ROOT/tests/fixtures/noise/exp-vectors.json" "$TEST_ROOT/exp-vectors.json"
 
 cd "$WORKSPACE_ROOT"
-cargo test --locked -p xray-config --test noise_tests exp_
-cargo test --locked -p xray-transport --lib udp_noise::exp_tests
+cargo test --locked -p segue-config --test noise_tests exp_
+cargo test --locked -p segue-transport --lib udp_noise::exp_tests
 env -u NATIVE_HYSTERIA_BINARY XRAY_HYSTERIA_BINARY="$TEST_ROOT/xray" \
-  cargo test --locked -p xray-transport --test hysteria_interop_tests -- --ignored --nocapture
+  cargo test --locked -p segue-transport --test hysteria_interop_tests -- --ignored --nocapture
 
 env -u NATIVE_HYSTERIA_BINARY XRAY_HYSTERIA_BINARY="$TEST_ROOT/xray" \
-  cargo test --locked -p xray-core-rs --test hysteria_runtime_tests \
+  cargo test --locked -p segue-engine --test hysteria_runtime_tests \
   --test runtime_data_path_tests hysteria_runtime_ -- --ignored --nocapture
 
 env -u NATIVE_HYSTERIA_BINARY XRAY_HYSTERIA_BINARY="$TEST_ROOT/xray" \
-  cargo test --locked -p xray-core-rs --lib outbound::hysteria::tests -- --include-ignored --nocapture
+  cargo test --locked -p segue-engine --lib outbound::hysteria::tests -- --include-ignored --nocapture
 
 # FinalMask prelude must reach both QUIC carriers, including both Salamander orders.
 env -u NATIVE_HYSTERIA_BINARY XRAY_HYSTERIA_BINARY="$TEST_ROOT/xray" \
   XRAY_CORE_CHECKOUT="$CHECKOUT" XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" \
-  cargo test --locked -p xray-core-rs --test hysteria_runtime_tests \
+  cargo test --locked -p segue-engine --test hysteria_runtime_tests \
   --test local_xray_interop_tests udp_noise_ -- --ignored --nocapture
 
 # Salamander and Gecko outside Hysteria: XHTTP over HTTP/3 against Xray's
 # own server under the same mask.
 XRAY_CORE_CHECKOUT="$CHECKOUT" XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests salamander:: \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests salamander:: \
     -- --ignored --nocapture --test-threads=1
 
 # The UDP masks on freedom's flows and WireGuard's socket, against Xray's
 # tunnel and WireGuard inbounds under the same masks.
 XRAY_CORE_CHECKOUT="$CHECKOUT" XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests direct_udp_masks:: \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests direct_udp_masks:: \
     -- --ignored --nocapture --test-threads=1

@@ -1322,7 +1322,7 @@ owner-accepted limitations in the
   [2026-10-30 report](docs/benchmarks/results/2026-10-30-perf-branch/README.md)
   compares this branch with `main`, and the
   [2026-10-30 three-engine group](docs/benchmarks/results/2026-10-30-v26.10.21-three-engine/README.md)
-  compares it with Xray-core v26.10.21 and sing-box v1.14.4. `xray-bench
+  compares it with Xray-core v26.10.21 and sing-box v1.14.4. `segue-bench
   chart --omit-sing-box-1000-flows` leaves out a sing-box 1,000-flow series
   that did not complete, as `--omit-sing-box-reality` does for REALITY.
 
@@ -1902,7 +1902,7 @@ listed in [xray-rust-mobile releases](https://github.com/aimalygin/xray-rust-mob
 - Corrected roadmap, implementation-status, verification, configuration,
   migration, benchmark, and release documentation for RC4.
 - Routing `ip` matchers are compiled once at load time into a shared sorted
-  range index (`xray-routing::IpRangeSet`/`IpMatcherSet`), also used by DNS
+  range index (`segue-routing::IpRangeSet`/`IpMatcherSet`), also used by DNS
   `expectedIPs`/`unexpectedIPs` filters. Outbound selection cost no longer
   grows with the size of a `geoip:` list (route-probe, 16 rules x 5000 CIDRs:
   ~152 us -> ~0.5 us per selection).
@@ -1914,7 +1914,7 @@ listed in [xray-rust-mobile releases](https://github.com/aimalygin/xray-rust-mob
   configuration, so parsed configs are unaffected).
 - CIDR prefixes longer than the address family width are rejected with an
   error at every construction site instead of being clamped.
-- `xray-bench route-probe --cidrs-per-rule N` generates N distinct
+- `segue-bench route-probe --cidrs-per-rule N` generates N distinct
   non-merging CIDRs per rule to expose per-matcher routing cost; `0` is
   rejected.
 
@@ -2185,7 +2185,7 @@ listed in [xray-rust-mobile releases](https://github.com/aimalygin/xray-rust-mob
   across every cached selection of one outbound. H1/H2 mode, wire, lifecycle,
   and live Xray-core interoperability matrices cover the production paths.
 - Replaced the public one-shot `select_*` helpers with methods on a long-lived
-  `OutboundRouter`. Callers embedding `xray-core-rs` must construct one
+  `OutboundRouter`. Callers embedding `segue-engine` must construct one
   `Arc<OutboundRouter>` from their immutable `Arc<CoreConfig>`, retain it for
   that configuration's lifetime, and call its selector methods. Reconstructing
   a router for each selection discards the gRPC and XHTTP connection pools, so
@@ -2318,7 +2318,7 @@ listed in [xray-rust-mobile releases](https://github.com/aimalygin/xray-rust-mob
   becoming terminal, while the bounded cancellation-safe cache remains
   mobile-friendly.
 - Added a reusable DNS query-transport boundary: query construction and strict
-  A/AAAA/CNAME parsing stay in `xray-transport`, while TUN, SOCKS, HTTP, and
+  A/AAAA/CNAME parsing stay in `segue-transport`, while TUN, SOCKS, HTTP, and
   startup probes can send configured DNS through routed Freedom or VLESS.
   Valid truncated UDP answers retry over TCP, results are bounded/cached with
   cancellation-safe typed single-flight plus one-at-a-time LRU eviction, and

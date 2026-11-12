@@ -9,7 +9,7 @@
   "concurrent_flows": 1,
   "connections": 1,
   "cpu_millis": 40,
-  "engine_binary": "<campaign>/host-cargo/release/xray-rust",
+  "engine_binary": "<campaign>/host-cargo/release/segue",
   "engine_sha256": "7c8008dde7b0b920cff927b947ede178827fb8a220d05d6adb776c8587b7251c",
   "idle_connections": 0,
   "iterations": 1000,

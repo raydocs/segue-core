@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use xray_core_rs::{build_return_response, parse_dns_query, CompiledDnsOutboundPolicy};
+use segue_engine::{build_return_response, parse_dns_query, CompiledDnsOutboundPolicy};
 
 fuzz_target!(|data: &[u8]| {
     let policy = CompiledDnsOutboundPolicy::default();

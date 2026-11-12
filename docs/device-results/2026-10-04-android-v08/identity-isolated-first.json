@@ -11,7 +11,7 @@
     "devicehost": {
       "sha256": "fb67fbbf7677e9ab6193cf13a36a14347eceb4fea1391464d2c1386d5d2d99df",
       "nativeEntries": [
-        "lib/arm64-v8a/libxray_ffi.so",
+        "lib/arm64-v8a/libsegue_ffi.so",
         "lib/arm64-v8a/libxray_mobile_jni.so"
       ]
     },

@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 artifacts="$(mktemp -d "${TMPDIR:-/tmp}/xray-fuzz-replay.XXXXXX")"
 trap 'rm -rf "$artifacts"' EXIT
 
-cargo build --locked --manifest-path "$ROOT/Cargo.toml" -p xray-rust-fuzz --bins
+cargo build --locked --manifest-path "$ROOT/Cargo.toml" -p segue-fuzz --bins
 bin_dir="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 
 status=0

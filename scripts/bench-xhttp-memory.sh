@@ -49,13 +49,13 @@ fi
 if [[ "$use_explicit_binaries" == true ]]; then
   xray_rust_bin=$xray_rust_bin_override
 else
-  cargo build --locked --release -p xray-cli --bin xray-rust
+  cargo build --locked --release -p segue-cli --bin xray-rust
   cargo_target_dir=${CARGO_TARGET_DIR:-target}
-  xray_rust_bin="$cargo_target_dir/release/xray-rust"
+  xray_rust_bin="$cargo_target_dir/release/segue"
 fi
 
 common=(
-  cargo run --locked --release -p xray-bench -- compare
+  cargo run --locked --release -p segue-bench -- compare
   --workload stream-transport
   --xhttp-profile legacy-extra-h1-packet-up
   --sample-interval-ms "$sample_ms"

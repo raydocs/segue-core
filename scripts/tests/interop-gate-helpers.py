@@ -58,7 +58,7 @@ def main() -> int:
     tests = (
         Path(sys.argv[2])
         if len(sys.argv) > 2
-        else Path(__file__).resolve().parents[2] / "crates/xray-core-rs/tests"
+        else Path(__file__).resolve().parents[2] / "crates/segue-engine/tests"
     )
     helpers = required_helpers(tests)
     if not helpers:

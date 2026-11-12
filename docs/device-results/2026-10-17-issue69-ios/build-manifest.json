@@ -10,7 +10,7 @@
   "files": [
     {
       "bytes": 50973896,
-      "path": "target/issue69-ios/cargo/aarch64-apple-ios/release/libxray_ffi.a",
+      "path": "target/issue69-ios/cargo/aarch64-apple-ios/release/libsegue_ffi.a",
       "sha256": "e6cd1f7c5648a8426252eebf1244693d9efef0247a8e2f7885fafc219a0c261b"
     },
     {
@@ -27,9 +27,9 @@
   "hostProfile": "Debug",
   "nativeProfile": "release; LTO off",
   "nativeSourceDigests": {
-    "crates/xray-core-rs/src/lib.rs": "b4c2a0a86ddaf583584abb0813f5ead6f520037a1bdd1a421e99f855a3c1ddfc",
-    "crates/xray-ffi/include/xray_ffi.h": "08d5b3e82bcd8687c7395a2de136285da18afad17838aed9c8c398c8b04796d7",
-    "crates/xray-ffi/src/lib.rs": "fef15f617d7e3de146d6e7a6e896b9d0ea3980966a84225cf298cbaceebb26c8"
+    "crates/segue-engine/src/lib.rs": "b4c2a0a86ddaf583584abb0813f5ead6f520037a1bdd1a421e99f855a3c1ddfc",
+    "crates/segue-ffi/include/segue_ffi.h": "08d5b3e82bcd8687c7395a2de136285da18afad17838aed9c8c398c8b04796d7",
+    "crates/segue-ffi/src/lib.rs": "fef15f617d7e3de146d6e7a6e896b9d0ea3980966a84225cf298cbaceebb26c8"
   },
   "sdkSourceDigests": {
     "platform/apple/Sources/XrayAppleClient/Debug/XrayDeviceProbeSignals.swift": "2e0d3360b4042380779df22b16d9840c8af32c1c2db4a43f0e193eaa218efc34",

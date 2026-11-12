@@ -91,13 +91,13 @@ case "${1:-}" in
     exit 0
     ;;
   build)
-    [[ "$*" == *"--locked --release -p xray-cli --bin xray-rust"* ]] || {
+    [[ "$*" == *"--locked --release -p segue-cli --bin xray-rust"* ]] || {
       printf 'unexpected xray-rust build command: %s\n' "$*" >&2
       exit 92
     }
     mkdir -p "$CARGO_TARGET_DIR/release"
-    printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$CARGO_TARGET_DIR/release/xray-rust"
-    chmod +x "$CARGO_TARGET_DIR/release/xray-rust"
+    printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$CARGO_TARGET_DIR/release/segue"
+    chmod +x "$CARGO_TARGET_DIR/release/segue"
     ;;
   run)
     xray_rust_bin=''
@@ -128,7 +128,7 @@ case "${1:-}" in
       echo 'RC interop benchmark did not pass --xray-rust-bin' >&2
       exit 94
     }
-    [[ "$xray_rust_bin" == "$CARGO_TARGET_DIR/release/xray-rust" ]] || {
+    [[ "$xray_rust_bin" == "$CARGO_TARGET_DIR/release/segue" ]] || {
       printf 'unexpected xray-rust binary: %s\n' "$xray_rust_bin" >&2
       exit 95
     }

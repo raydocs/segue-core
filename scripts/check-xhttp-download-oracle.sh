@@ -26,7 +26,7 @@ env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
   "$WORKSPACE_ROOT/tests/fixtures/xhttp-download/config.json"
 
 cd "$WORKSPACE_ROOT"
-cargo test --locked -p xray-config --test xhttp_download_tests
+cargo test --locked -p segue-config --test xhttp_download_tests
 
 readonly TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
@@ -40,11 +40,11 @@ env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
   go -C "$CHECKOUT" build -mod=readonly -o "$TEST_ROOT/xray" ./main
 XRAY_DOWNLOAD_ORACLE="$TEST_ROOT/download-oracle" XRAY_VLESS_ENCRYPTION_ORACLE="$TEST_ROOT/encryption-oracle" \
 XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" XRAY_CORE_CHECKOUT="$CHECKOUT" \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests \
     xhttp_download::full_xray_download_carrier_matrix -- --ignored --nocapture
 
 # Xray-core v26.11.9 reads an OPTIONS request without a CORS preflight header
 # as an uplink; earlier servers answered it without reading the upload.
 XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" XRAY_CORE_CHECKOUT="$CHECKOUT" \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests \
     xhttp_options_uplink_interop -- --ignored --nocapture

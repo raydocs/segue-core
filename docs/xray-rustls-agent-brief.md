@@ -224,10 +224,10 @@ The customization flow should look like this:
 Xray JSON config
   |
   v
-xray-config parses fingerprint, REALITY public key, short id, server name, ALPN
+segue-config parses fingerprint, REALITY public key, short id, server name, ALPN
   |
   v
-xray-transport builds a rustls::ClientConfig
+segue-transport builds a rustls::ClientConfig
   |
   v
 ClientConfig contains an optional generic ClientHello customizer

@@ -75,13 +75,13 @@ env \
   GOWORK=off \
   GOTOOLCHAIN=local \
   CGO_ENABLED=0 \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests \
     -- --ignored --skip vless_encryption:: --skip xhttp_download:: \
     --skip rust_socks_client_reaches_target_through_remote_xhttp_profile \
     --nocapture --test-threads=1
 
-cargo build --locked --release -p xray-cli --bin xray-rust
-xray_rust_binary="${CARGO_TARGET_DIR:-target}/release/xray-rust"
+cargo build --locked --release -p segue-cli --bin xray-rust
+xray_rust_binary="${CARGO_TARGET_DIR:-target}/release/segue"
 if [[ "$xray_rust_binary" != /* ]]; then
   xray_rust_binary="$repository_root/$xray_rust_binary"
 fi
@@ -92,12 +92,12 @@ engine_args=(
 )
 
 for engine in xray-rust xray-core; do
-  cargo run --locked --release -p xray-bench -- run \
+  cargo run --locked --release -p segue-bench -- run \
     --engine "$engine" --workload many-idle-flows \
     "${engine_args[@]}" --no-auto-build --runs 1 --connections 100 --duration-ms 1000 \
     --out-dir "$scheduled_tmp/many-idle-flows-$engine"
 
-  cargo run --locked --release -p xray-bench -- run \
+  cargo run --locked --release -p segue-bench -- run \
     --engine "$engine" --workload stream-transport --stream-transport xhttp-h2 \
     --traffic held-open --xhttp-mode stream-one "${engine_args[@]}" \
     --no-auto-build --runs 1 --connections 32 --iterations 1 \

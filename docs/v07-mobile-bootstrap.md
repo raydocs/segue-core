@@ -66,7 +66,7 @@ Reproduce with a current local Apple XCFramework and the configured Android SDK:
 swift test --disable-sandbox --package-path platform/apple \
   --filter 'XrayMobileDNSPreflightTests|XrayPacketTunnelProviderTests'
 platform/android/gradlew -p platform/android :xraymobile:testDebugUnitTest
-cargo test --locked -p xray-ffi --test mobile_artifacts_tests
+cargo test --locked -p segue-ffi --test mobile_artifacts_tests
 ```
 
 Observed on macOS arm64, 2026-09-11 UTC: 147 selected Swift tests, all 89 Kotlin
@@ -74,7 +74,7 @@ adapter unit tests and all 30 mobile FFI contract tests passed. The Swift run
 compiled the package against a locally built debug macOS-arm64 native library
 in a temporary XCFramework; it did not use a published mobile binary. The
 mobile toolchain script guard, all 13 public-fixture checks, Rust formatting and
-strict Clippy for `xray-ffi --all-targets --all-features` also passed.
+strict Clippy for `segue-ffi --all-targets --all-features` also passed.
 
 This is host-side preparation evidence. Hysteria share-link and WireGuard file
 import plus capability discovery are covered by the subsequent

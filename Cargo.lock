@@ -2055,6 +2055,277 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "segue-bench"
+version = "0.9.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "libc",
+ "rcgen",
+ "rustls",
+ "segue-config",
+ "segue-engine",
+ "segue-proxy",
+ "segue-routing",
+ "segue-transport",
+ "segue-tun",
+ "segue-utls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smoltcp",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
+name = "segue-cli"
+version = "0.9.0"
+dependencies = [
+ "libc",
+ "segue-config",
+ "segue-engine",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "segue-config"
+version = "0.9.0"
+dependencies = [
+ "base64 0.23.1",
+ "libc",
+ "num-bigint",
+ "prost",
+ "segue-proxy",
+ "segue-routing",
+ "segue-utls",
+ "segue-vless-encryption",
+ "serde",
+ "serde_json",
+ "sha1",
+ "thiserror 2.0.21",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "segue-engine"
+version = "0.9.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "futures-util",
+ "h2",
+ "hkdf",
+ "http",
+ "libc",
+ "loom",
+ "quinn",
+ "rand 0.8.6",
+ "rcgen",
+ "rustls",
+ "segue-config",
+ "segue-proxy",
+ "segue-routing",
+ "segue-runtime",
+ "segue-transport",
+ "segue-tun",
+ "segue-vless-encryption",
+ "segue-wireguard",
+ "serde_json",
+ "sha2",
+ "smoltcp",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "uuid",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "segue-ffi"
+version = "0.9.0"
+dependencies = [
+ "bytes",
+ "libc",
+ "segue-config",
+ "segue-engine",
+ "segue-routing",
+ "segue-transport",
+ "segue-tun",
+ "serde_json",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "segue-fuzz"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "libfuzzer-sys",
+ "segue-config",
+ "segue-engine",
+ "segue-ffi",
+ "segue-proxy",
+ "segue-routing",
+ "segue-transport",
+ "segue-tun",
+ "segue-vless-encryption",
+ "tokio",
+]
+
+[[package]]
+name = "segue-proxy"
+version = "0.9.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "blake3",
+ "bytes",
+ "chacha20 0.10.2",
+ "chacha20poly1305 0.11.0",
+ "crc32fast",
+ "idna",
+ "md-5",
+ "prost",
+ "rand 0.8.6",
+ "segue-routing",
+ "serde_json",
+ "sha2",
+ "sha3",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "segue-routing"
+version = "0.9.0"
+dependencies = [
+ "aho-corasick",
+ "bytes",
+ "regex",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "segue-runtime"
+version = "0.9.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "segue-transport"
+version = "0.9.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "async-compression",
+ "async-trait",
+ "base64 0.23.1",
+ "blake2 0.11.0",
+ "bytes",
+ "futures-util",
+ "ghash",
+ "h2",
+ "h3",
+ "h3-quinn",
+ "hkdf",
+ "hmac 0.13.0",
+ "http",
+ "idna",
+ "libc",
+ "ml-dsa",
+ "num-bigint",
+ "polyval",
+ "quinn",
+ "quinn-proto",
+ "rand 0.8.6",
+ "rcgen",
+ "regex",
+ "rustls",
+ "segue-proxy",
+ "segue-routing",
+ "segue-utls",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots",
+ "x25519-dalek",
+ "x509-parser",
+ "zeroize",
+ "zstd",
+]
+
+[[package]]
+name = "segue-tun"
+version = "0.9.0"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "segue-utls"
+version = "0.9.0"
+
+[[package]]
+name = "segue-vless-encryption"
+version = "0.9.0"
+dependencies = [
+ "aes",
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "blake3",
+ "ctr",
+ "rand 0.8.6",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "segue-wireguard"
+version = "0.9.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "gotatun",
+ "rand 0.8.6",
+ "segue-proxy",
+ "segue-transport",
+ "serde_json",
+ "smoltcp",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2939,277 +3210,6 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.21",
  "time",
-]
-
-[[package]]
-name = "xray-bench"
-version = "0.9.0"
-dependencies = [
- "async-trait",
- "bytes",
- "libc",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "smoltcp",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "xray-config",
- "xray-core-rs",
- "xray-proxy",
- "xray-routing",
- "xray-transport",
- "xray-tun",
- "xray-utls",
-]
-
-[[package]]
-name = "xray-cli"
-version = "0.9.0"
-dependencies = [
- "libc",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "xray-config",
- "xray-core-rs",
-]
-
-[[package]]
-name = "xray-config"
-version = "0.9.0"
-dependencies = [
- "base64 0.23.1",
- "libc",
- "num-bigint",
- "prost",
- "serde",
- "serde_json",
- "sha1",
- "thiserror 2.0.21",
- "uuid",
- "xray-proxy",
- "xray-routing",
- "xray-utls",
- "xray-vless-encryption",
- "zeroize",
-]
-
-[[package]]
-name = "xray-core-rs"
-version = "0.9.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "async-trait",
- "base64 0.23.1",
- "bytes",
- "futures-util",
- "h2",
- "hkdf",
- "http",
- "libc",
- "loom",
- "quinn",
- "rand 0.8.6",
- "rcgen",
- "rustls",
- "serde_json",
- "sha2",
- "smoltcp",
- "socket2",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "uuid",
- "x25519-dalek",
- "xray-config",
- "xray-proxy",
- "xray-routing",
- "xray-runtime",
- "xray-transport",
- "xray-tun",
- "xray-vless-encryption",
- "xray-wireguard",
- "zeroize",
-]
-
-[[package]]
-name = "xray-ffi"
-version = "0.9.0"
-dependencies = [
- "bytes",
- "libc",
- "serde_json",
- "tokio",
- "xray-config",
- "xray-core-rs",
- "xray-routing",
- "xray-transport",
- "xray-tun",
- "zeroize",
-]
-
-[[package]]
-name = "xray-proxy"
-version = "0.9.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "aws-lc-rs",
- "base64 0.23.1",
- "blake3",
- "bytes",
- "chacha20 0.10.2",
- "chacha20poly1305 0.11.0",
- "crc32fast",
- "idna",
- "md-5",
- "prost",
- "rand 0.8.6",
- "serde_json",
- "sha2",
- "sha3",
- "thiserror 2.0.21",
- "tokio",
- "uuid",
- "xray-routing",
- "zeroize",
-]
-
-[[package]]
-name = "xray-routing"
-version = "0.9.0"
-dependencies = [
- "aho-corasick",
- "bytes",
- "regex",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "xray-runtime"
-version = "0.9.0"
-dependencies = [
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
-name = "xray-rust-fuzz"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "libfuzzer-sys",
- "tokio",
- "xray-config",
- "xray-core-rs",
- "xray-ffi",
- "xray-proxy",
- "xray-routing",
- "xray-transport",
- "xray-tun",
- "xray-vless-encryption",
-]
-
-[[package]]
-name = "xray-transport"
-version = "0.9.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "async-compression",
- "async-trait",
- "base64 0.23.1",
- "blake2 0.11.0",
- "bytes",
- "futures-util",
- "ghash",
- "h2",
- "h3",
- "h3-quinn",
- "hkdf",
- "hmac 0.13.0",
- "http",
- "idna",
- "libc",
- "ml-dsa",
- "num-bigint",
- "polyval",
- "quinn",
- "quinn-proto",
- "rand 0.8.6",
- "rcgen",
- "regex",
- "rustls",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "socket2",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tracing",
- "webpki-roots",
- "x25519-dalek",
- "x509-parser",
- "xray-proxy",
- "xray-routing",
- "xray-utls",
- "zeroize",
- "zstd",
-]
-
-[[package]]
-name = "xray-tun"
-version = "0.9.0"
-dependencies = [
- "bytes",
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
-name = "xray-utls"
-version = "0.9.0"
-
-[[package]]
-name = "xray-vless-encryption"
-version = "0.9.0"
-dependencies = [
- "aes",
- "aws-lc-rs",
- "base64 0.23.1",
- "blake3",
- "ctr",
- "rand 0.8.6",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "xray-wireguard"
-version = "0.9.0"
-dependencies = [
- "base64 0.23.1",
- "bytes",
- "gotatun",
- "rand 0.8.6",
- "serde_json",
- "smoltcp",
- "socket2",
- "thiserror 2.0.21",
- "tokio",
- "x25519-dalek",
- "xray-proxy",
- "xray-transport",
 ]
 
 [[package]]

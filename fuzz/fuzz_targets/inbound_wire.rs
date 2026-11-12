@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use tokio::io::BufReader;
 use tokio::runtime::Builder;
-use xray_proxy::inbound::{
+use segue_proxy::inbound::{
     copy_body_chunked, encode_socks5_udp_datagram, parse_http_connect,
     parse_socks5_request_message, parse_socks5_udp_datagram, read_http_request_head,
     read_http_response, PlainHttpRequest,

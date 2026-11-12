@@ -7,9 +7,9 @@ PINNED_ANDROID_API_LEVEL=24
 ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-$PINNED_ANDROID_API_LEVEL}"
 OUT_DIR="${OUT_DIR:-"$WORKSPACE_ROOT/target/mobile/android"}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-"$WORKSPACE_ROOT/target"}"
-HEADER_DIR="$WORKSPACE_ROOT/crates/xray-ffi/include"
-CRATE_PACKAGE="xray-ffi"
-LIB_NAME="libxray_ffi.so"
+HEADER_DIR="$WORKSPACE_ROOT/crates/segue-ffi/include"
+CRATE_PACKAGE="segue-ffi"
+LIB_NAME="libsegue_ffi.so"
 PINNED_ANDROID_NDK_VERSION="26.3.11579264"
 ANDROID_PAGE_SIZE=16384
 
@@ -174,7 +174,7 @@ build_target() {
   cargo build \
     --locked \
     --manifest-path "$WORKSPACE_ROOT/Cargo.toml" \
-    --package xray-ffi \
+    --package segue-ffi \
     --target "$target" \
     $(cargo_profile_args)
 }
@@ -236,7 +236,7 @@ main() {
   OUT_DIR="$canonical_out_dir"
 
   mkdir -p "$OUT_DIR/include"
-  cp "$HEADER_DIR/xray_ffi.h" "$OUT_DIR/include/xray_ffi.h"
+  cp "$HEADER_DIR/segue_ffi.h" "$OUT_DIR/include/segue_ffi.h"
   rm -rf "$OUT_DIR/jniLibs"
 
   local entry target abi

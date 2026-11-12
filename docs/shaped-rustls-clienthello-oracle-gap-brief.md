@@ -31,22 +31,22 @@ go run -tags reality_oracle_clienthello_shape ./tools/reality-oracle/clienthello
 Run the Rust-side comparison:
 
 ```sh
-cargo test -p xray-transport --test reality_rustls_tests \
+cargo test -p segue-transport --test reality_rustls_tests \
   rustls_reality_provider_matches_utls_hellochrome_100_shape_oracle -- --ignored
 ```
 
 Normal transport tests should remain green:
 
 ```sh
-cargo test -p xray-transport --test reality_rustls_tests
-cargo test -p xray-transport
+cargo test -p segue-transport --test reality_rustls_tests
+cargo test -p segue-transport
 ```
 
 ## Current Status After shaped-rustls `11d5691f`
 
 The latest fork update closed the original large blockers for
 `hellochrome_100`. `xray-rust` now exercises these APIs in
-`crates/xray-transport/src/reality_rustls.rs`.
+`crates/segue-transport/src/reality_rustls.rs`.
 
 The current Rust-generated `hellochrome_100` ClientHello already matches the
 Go uTLS structural oracle for:
@@ -295,7 +295,7 @@ Recommended unit tests:
 Recommended integration check from `xray-rust`:
 
 ```sh
-cargo test -p xray-transport --test reality_rustls_tests \
+cargo test -p segue-transport --test reality_rustls_tests \
   rustls_reality_provider_matches_utls_hellochrome_100_shape_oracle -- --ignored
 ```
 

@@ -1,0 +1,3110 @@
+use std::future::{poll_fn, Future};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
+
+use bytes::{Buf, Bytes};
+use h3::error::Code;
+use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use rand::rngs::mock::StepRng;
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
+use tokio::time::{timeout, Instant};
+use segue_routing::{Network, Target, TargetAddr};
+
+use segue_transport::stream::xhttp_composer_test_only::{
+    NormalizedRange, XhttpConfig, XhttpConfigInput, XhttpEndpoint, XhttpModeSelection, XhttpRange,
+    XhttpScheme,
+};
+use segue_transport::stream::xhttp_h3_test_only::{
+    connect_h3, H3BbrProfile, H3Client, H3Congestion, H3ConnectConfig, H3Error, H3QuicConfig,
+    H3QuicVersion, H3UdpHopConfig,
+};
+use segue_transport::stream::xhttp_transport_test_only::{
+    XhttpClock, XhttpH3Dial, XhttpHttpVersion, XhttpTransport, XhttpXmuxPolicy,
+};
+use segue_transport::stream::{HeaderMap as XhttpHeaderMap, TransportLayer};
+use segue_transport::{
+    ConnectorConfig, HappyEyeballsConfig, SocketHandle, SocketProtector, TlsClientConfig,
+    TlsConnector, TransportDialer,
+};
+
+const DEADLINE: Duration = Duration::from_secs(5);
+const GZIP_PONG: &[u8] = &[
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x2b, 0xc8, 0xcf, 0x4b, 0x07, 0x00,
+    0x4f, 0x41, 0x58, 0x21, 0x04, 0x00, 0x00, 0x00,
+];
+
+type ServerStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+type Exchange = (Request<()>, ServerStream);
+
+#[derive(Clone)]
+struct TestServer {
+    inner: Arc<TestServerInner>,
+    requests: Arc<Mutex<mpsc::UnboundedReceiver<Exchange>>>,
+}
+
+struct TestServerInner {
+    endpoint: quinn::Endpoint,
+    driver: JoinHandle<()>,
+}
+
+impl Drop for TestServerInner {
+    fn drop(&mut self) {
+        self.endpoint.close(
+            quinn::VarInt::from_u32(Code::H3_NO_ERROR.value() as u32),
+            b"test complete",
+        );
+        self.driver.abort();
+    }
+}
+
+impl TestServer {
+    async fn accept(&self) -> Exchange {
+        timeout(DEADLINE, self.requests.lock().await.recv())
+            .await
+            .expect("server request deadline")
+            .expect("server request before connection close")
+    }
+
+    fn close_connection(&self) {
+        self.inner.endpoint.close(
+            quinn::VarInt::from_u32(Code::H3_NO_ERROR.value() as u32),
+            b"server close",
+        );
+    }
+}
+
+async fn pair() -> (H3Client, TestServer) {
+    pair_with_options(None, None).await
+}
+
+async fn pair_with_protector(
+    socket_protector: Option<Arc<dyn SocketProtector>>,
+) -> (H3Client, TestServer) {
+    pair_with_options(socket_protector, None).await
+}
+
+async fn pair_with_server_stream_window(window: u32) -> (H3Client, TestServer) {
+    pair_with_options(None, Some(window)).await
+}
+
+async fn pair_with_options(
+    socket_protector: Option<Arc<dyn SocketProtector>>,
+    server_stream_receive_window: Option<u32>,
+) -> (H3Client, TestServer) {
+    let (client_tls, server_addr, server) = server_with_options(server_stream_receive_window).await;
+    let client = connect_h3(H3ConnectConfig {
+        remote_addr: server_addr,
+        server_name: "localhost".to_owned(),
+        tls_config: client_tls,
+        socket_protector,
+        quic: H3QuicConfig::default(),
+        realm: None,
+        network_changes: None,
+    })
+    .await
+    .expect("connect HTTP/3 client");
+    (client, server)
+}
+
+async fn server_with_options(
+    server_stream_receive_window: Option<u32>,
+) -> (Arc<rustls::ClientConfig>, SocketAddr, TestServer) {
+    server_with_transport_options(server_stream_receive_window, None).await
+}
+
+async fn server_with_transport_options(
+    server_stream_receive_window: Option<u32>,
+    max_concurrent_bidi_streams: Option<u32>,
+) -> (Arc<rustls::ClientConfig>, SocketAddr, TestServer) {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("generate test certificate");
+    let certificate = certified.cert.der().clone();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        certified.signing_key.serialize_der(),
+    ));
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut server_tls = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("ring supports TLS 1.3")
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], key)
+        .expect("server certificate");
+    server_tls.alpn_protocols = vec![b"h3".to_vec()];
+    let server_crypto = QuicServerConfig::try_from(server_tls).expect("QUIC server TLS");
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
+    if server_stream_receive_window.is_some() || max_concurrent_bidi_streams.is_some() {
+        let mut transport = quinn::TransportConfig::default();
+        if let Some(window) = server_stream_receive_window {
+            transport.stream_receive_window(quinn::VarInt::from_u32(window));
+        }
+        if let Some(limit) = max_concurrent_bidi_streams {
+            transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(limit));
+        }
+        server_config.transport_config(Arc::new(transport));
+    }
+    let endpoint = quinn::Endpoint::server(
+        server_config,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    )
+    .expect("bind QUIC server");
+    let server_addr = endpoint.local_addr().expect("QUIC server address");
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate).expect("add test root");
+    let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("ring supports TLS 1.3")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let (request_tx, request_rx) = mpsc::unbounded_channel();
+    let server_endpoint = endpoint.clone();
+    let driver = tokio::spawn(async move {
+        while let Some(incoming) = server_endpoint.accept().await {
+            let request_tx = request_tx.clone();
+            tokio::spawn(async move {
+                let connection = match incoming.await {
+                    Ok(connection) => connection,
+                    Err(_) => return,
+                };
+                let mut connection = match h3::server::Connection::new(h3_quinn::Connection::new(
+                    connection,
+                ))
+                .await
+                {
+                    Ok(connection) => connection,
+                    Err(_) => return,
+                };
+
+                loop {
+                    let resolver = match connection.accept().await {
+                        Ok(Some(resolver)) => resolver,
+                        Ok(None) | Err(_) => return,
+                    };
+                    let exchange = match resolver.resolve_request().await {
+                        Ok(exchange) => exchange,
+                        Err(_) => continue,
+                    };
+                    if request_tx.send(exchange).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let server = TestServer {
+        inner: Arc::new(TestServerInner { endpoint, driver }),
+        requests: Arc::new(Mutex::new(request_rx)),
+    };
+
+    (Arc::new(client_tls), server_addr, server)
+}
+
+fn request(method: Method, path: &str) -> Request<()> {
+    Request::builder()
+        .version(Version::HTTP_3)
+        .method(method)
+        .uri(format!("https://localhost{path}"))
+        .body(())
+        .expect("valid HTTP/3 request")
+}
+
+fn response(status: StatusCode) -> Response<()> {
+    Response::builder()
+        .version(Version::HTTP_3)
+        .status(status)
+        .body(())
+        .expect("valid HTTP/3 response")
+}
+
+async fn drain_request(stream: &mut ServerStream) -> Result<Vec<u8>, h3::error::StreamError> {
+    let mut output = Vec::new();
+    while let Some(mut data) = stream.recv_data().await? {
+        while data.has_remaining() {
+            let chunk = data.chunk();
+            output.extend_from_slice(chunk);
+            let consumed = chunk.len();
+            data.advance(consumed);
+        }
+    }
+    let _ = stream.recv_trailers().await?;
+    Ok(output)
+}
+
+fn xhttp_config(mode: XhttpModeSelection, max_post: i32) -> (XhttpConfig, XhttpEndpoint) {
+    xhttp_config_with_headers(mode, max_post, XhttpHeaderMap::new())
+}
+
+fn xhttp_config_with_headers(
+    mode: XhttpModeSelection,
+    max_post: i32,
+    headers: XhttpHeaderMap,
+) -> (XhttpConfig, XhttpEndpoint) {
+    let input = XhttpConfigInput {
+        mode,
+        path: "/api".to_owned(),
+        headers,
+        x_padding_bytes: XhttpRange::exact(1),
+        sc_max_each_post_bytes: XhttpRange::exact(max_post),
+        sc_min_posts_interval_ms: XhttpRange::exact(1),
+        sc_max_buffered_posts: 4,
+        ..XhttpConfigInput::default()
+    };
+    let mut config = XhttpConfig::normalize(input).expect("normalize XHTTP test config");
+    config.min_posts_interval_ms = NormalizedRange::exact(0);
+    let endpoint =
+        XhttpEndpoint::new(XhttpScheme::Https, "localhost").expect("valid XHTTP test endpoint");
+    (config, endpoint)
+}
+
+fn unlimited_xmux() -> XhttpXmuxPolicy {
+    XhttpXmuxPolicy {
+        max_concurrency: XhttpRange::exact(0),
+        max_connections: XhttpRange::exact(0),
+        c_max_reuse_times: XhttpRange::exact(0),
+        h_max_request_times: XhttpRange::exact(0),
+        h_max_reusable_secs: XhttpRange::exact(0),
+        h_keep_alive_period_secs: 0,
+    }
+}
+
+fn xhttp_h3_transport(
+    mode: XhttpModeSelection,
+    xmux: XhttpXmuxPolicy,
+    max_post: i32,
+) -> XhttpTransport {
+    let (config, endpoint) = xhttp_config(mode, max_post);
+    XhttpTransport::new(config, endpoint, XhttpHttpVersion::Http3, xmux)
+        .expect("build H3 XHTTP transport")
+        .with_rng(Box::new(StepRng::new(0x0102_0304_0506_0708, 1)))
+        .expect("inject deterministic XHTTP random source")
+}
+
+fn xhttp_h3_transport_with_headers(
+    mode: XhttpModeSelection,
+    xmux: XhttpXmuxPolicy,
+    max_post: i32,
+    headers: XhttpHeaderMap,
+) -> XhttpTransport {
+    let (config, endpoint) = xhttp_config_with_headers(mode, max_post, headers);
+    XhttpTransport::new(config, endpoint, XhttpHttpVersion::Http3, xmux)
+        .expect("build H3 XHTTP transport")
+        .with_rng(Box::new(StepRng::new(0x0102_0304_0506_0708, 1)))
+        .expect("inject deterministic XHTTP random source")
+}
+
+fn h3_dial(client: H3Client, dials: Arc<AtomicUsize>) -> XhttpH3Dial {
+    Arc::new(move || {
+        dials.fetch_add(1, Ordering::AcqRel);
+        let client = client.clone();
+        Box::pin(async move { Ok(client) })
+    })
+}
+
+fn h3_network_dial(
+    client_tls: Arc<rustls::ClientConfig>,
+    server_addr: SocketAddr,
+    dials: Arc<AtomicUsize>,
+) -> XhttpH3Dial {
+    Arc::new(move || {
+        dials.fetch_add(1, Ordering::AcqRel);
+        let client_tls = Arc::clone(&client_tls);
+        Box::pin(async move {
+            connect_h3(H3ConnectConfig {
+                remote_addr: server_addr,
+                server_name: "localhost".to_owned(),
+                tls_config: client_tls,
+                socket_protector: None,
+                quic: H3QuicConfig::default(),
+                realm: None,
+                network_changes: None,
+            })
+            .await
+        })
+    })
+}
+
+async fn serve_clean_exchange(server: &TestServer) -> (Method, String, Vec<u8>) {
+    let (request, mut stream) = server.accept().await;
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let body = drain_request(&mut stream).await.expect("request body");
+    stream
+        .send_response(response(StatusCode::OK))
+        .await
+        .expect("response headers");
+    stream.finish().await.expect("response finish");
+    (method, path, body)
+}
+
+/// Xray's XHTTP dialer installs its controller right after `DialEarly`:
+/// quinn's BBR and NewReno run from the start, the rest replace NewReno
+/// once the handshake is done.
+#[tokio::test]
+async fn each_congestion_choice_runs_its_controller_after_the_handshake() {
+    for (congestion, expected) in [
+        (H3Congestion::BbrStandard, "quinn-bbr"),
+        (H3Congestion::Reno, "new-reno"),
+        (H3Congestion::BbrConservative, "xray-bbr-conservative"),
+        (H3Congestion::BbrAggressive, "xray-bbr-aggressive"),
+        (
+            H3Congestion::ForceBrutal {
+                bytes_per_second: 10 << 20,
+            },
+            "brutal",
+        ),
+    ] {
+        let (client_tls, server_addr, server) = server_with_options(None).await;
+        let client = connect_h3(H3ConnectConfig {
+            remote_addr: server_addr,
+            server_name: "localhost".to_owned(),
+            tls_config: client_tls,
+            socket_protector: None,
+            quic: H3QuicConfig {
+                congestion,
+                ..H3QuicConfig::default()
+            },
+            realm: None,
+            network_changes: None,
+        })
+        .await
+        .expect("connect HTTP/3 client");
+        let handler = tokio::spawn({
+            let server = server.clone();
+            async move { serve_clean_exchange(&server).await }
+        });
+        let payload = Bytes::from(vec![0x5a; 256 * 1024]);
+        let mut body = client
+            .send_fixed(request(Method::POST, "/congestion"), payload.clone())
+            .await
+            .expect("status 200");
+        body.read_to_end(&mut Vec::new()).await.unwrap();
+        let (_, _, received) = handler.await.unwrap();
+        assert_eq!(received, payload, "{congestion:?}");
+        assert_eq!(client.congestion_controller(), expected, "{congestion:?}");
+    }
+}
+
+#[tokio::test]
+async fn empty_fixed_request_preserves_method_and_has_no_data_frame() {
+    let (client, server) = pair().await;
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (request, mut stream) = server.accept().await;
+            let body = drain_request(&mut stream).await.expect("request body");
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("response headers");
+            stream
+                .send_data(Bytes::from_static(b"ok"))
+                .await
+                .expect("response data");
+            stream.finish().await.expect("response finish");
+            (
+                request.method().clone(),
+                request.uri().path().to_owned(),
+                body,
+            )
+        }
+    });
+
+    let mut body = client
+        .send_fixed(request(Method::PATCH, "/empty-fixed"), Bytes::new())
+        .await
+        .expect("status 200");
+    let mut output = Vec::new();
+    body.read_to_end(&mut output).await.expect("response body");
+
+    assert_eq!(output, b"ok");
+    assert_eq!(
+        handler.await.expect("server handler"),
+        (Method::PATCH, "/empty-fixed".to_owned(), Vec::new())
+    );
+}
+
+#[tokio::test]
+async fn fixed_request_and_response_trailers_survive_partial_reads() {
+    let (client, server) = pair().await;
+    let payload: Vec<u8> = (0..128 * 1024).map(|index| (index % 251) as u8).collect();
+    let response_payload = payload.clone();
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_request, mut stream) = server.accept().await;
+            let request_body = drain_request(&mut stream).await.expect("request body");
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("response headers");
+            stream
+                .send_data(Bytes::from(response_payload))
+                .await
+                .expect("response data");
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-finished", "yes".parse().expect("trailer value"));
+            stream
+                .send_trailers(trailers)
+                .await
+                .expect("response trailers");
+            stream.finish().await.expect("response finish");
+            request_body
+        }
+    });
+
+    let mut body = client
+        .send_fixed(
+            request(Method::POST, "/trailers"),
+            Bytes::from_static(b"upload"),
+        )
+        .await
+        .expect("status 200");
+    let mut actual = Vec::new();
+    let mut small = [0_u8; 7];
+    loop {
+        let read = body.read(&mut small).await.expect("partial response read");
+        if read == 0 {
+            break;
+        }
+        actual.extend_from_slice(&small[..read]);
+    }
+
+    assert_eq!(actual, payload);
+    assert_eq!(handler.await.expect("server handler"), b"upload");
+    assert_eq!(
+        body.trailers()
+            .and_then(|trailers| trailers.get("x-finished"))
+            .and_then(|value| value.to_str().ok()),
+        Some("yes")
+    );
+}
+
+#[tokio::test]
+async fn response_delivers_a_small_prefix_before_the_next_data_or_fin() {
+    let (client, server) = pair().await;
+    let (prefix_read, wait_for_reader) = tokio::sync::oneshot::channel();
+    let payload: Vec<u8> = (0..65_537).map(|index| (index % 251) as u8).collect();
+    let expected = payload.clone();
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_, mut stream) = server.accept().await;
+            drain_request(&mut stream).await.expect("request FIN");
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("headers");
+            stream
+                .send_data(Bytes::from_static(b"x"))
+                .await
+                .expect("prefix");
+            // A response batch must never wait for future data to become full.
+            timeout(DEADLINE, wait_for_reader)
+                .await
+                .expect("reader sees prefix")
+                .expect("reader signal");
+            stream
+                .send_data(Bytes::from(payload))
+                .await
+                .expect("large DATA frame");
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-finished", "yes".parse().unwrap());
+            stream.send_trailers(trailers).await.expect("trailers");
+            stream.finish().await.expect("FIN");
+        }
+    });
+    let mut body = client
+        .send_fixed(request(Method::GET, "/batch-prefix"), Bytes::new())
+        .await
+        .expect("response");
+    let mut first = [0];
+    timeout(DEADLINE, body.read_exact(&mut first))
+        .await
+        .expect("prefix deadline")
+        .expect("prefix read");
+    assert_eq!(&first, b"x");
+    prefix_read.send(()).expect("release remaining response");
+    let mut actual = Vec::new();
+    timeout(DEADLINE, body.read_to_end(&mut actual))
+        .await
+        .expect("body deadline")
+        .expect("body and FIN");
+    assert_eq!(actual, expected);
+    assert_eq!(body.trailers().unwrap()["x-finished"], "yes");
+    handler.await.expect("handler");
+}
+
+#[tokio::test]
+async fn start_fixed_completes_upload_before_delayed_response_headers() {
+    let (client, server) = pair().await;
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_request, mut stream) = server.accept().await;
+            let body = drain_request(&mut stream).await.expect("request body");
+            wait.await.expect("release response");
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("response headers");
+            stream.finish().await.expect("response finish");
+            body
+        }
+    });
+
+    let pending = timeout(
+        DEADLINE,
+        client.start_fixed(
+            request(Method::POST, "/start-fixed"),
+            Bytes::from_static(b"complete upload"),
+        ),
+    )
+    .await
+    .expect("start_fixed must not await response")
+    .expect("fixed upload");
+    release.send(()).expect("release response");
+    let mut response = pending.open().await.expect("status 200");
+    let mut sink = Vec::new();
+    response.read_to_end(&mut sink).await.expect("response EOF");
+
+    assert_eq!(handler.await.expect("server handler"), b"complete upload");
+}
+
+#[tokio::test]
+async fn fixed_length_upload_accepts_remote_no_error_that_races_request_fin() {
+    let (client, server) = pair().await;
+    let payload = Bytes::from(vec![0x5a; 16 * 1024]);
+    let expected = payload.clone();
+    let (stopped, stopped_rx) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (request, mut stream) = server.accept().await;
+            assert_eq!(
+                request.headers().get(http::header::CONTENT_LENGTH),
+                Some(&http::HeaderValue::from_static("16384"))
+            );
+
+            let mut received = Vec::with_capacity(expected.len());
+            while received.len() < expected.len() {
+                let mut data = stream
+                    .recv_data()
+                    .await
+                    .expect("request DATA")
+                    .expect("request DATA before FIN");
+                while data.has_remaining() {
+                    let chunk = data.chunk();
+                    received.extend_from_slice(chunk);
+                    let consumed = chunk.len();
+                    data.advance(consumed);
+                }
+            }
+            assert_eq!(received, expected);
+
+            stream.stop_sending(Code::H3_NO_ERROR);
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("response headers");
+            stream.finish().await.expect("response FIN");
+            stopped.send(()).expect("publish STOP_SENDING");
+        }
+    });
+
+    let mut request = request(Method::POST, "/fixed-no-error-race");
+    request.headers_mut().insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_static("16384"),
+    );
+    let (mut upload, pending) = client
+        .start_streaming(request)
+        .await
+        .expect("open fixed-length request");
+    upload.write_all(&payload).await.expect("request DATA");
+    upload.flush().await.expect("deliver request DATA");
+    stopped_rx.await.expect("server STOP_SENDING");
+    let mut response = pending.open().await.expect("status 200 after STOP_SENDING");
+    upload
+        .shutdown()
+        .await
+        .expect("H3_NO_ERROR after all fixed-length DATA is a successful finish");
+
+    let mut sink = Vec::new();
+    response.read_to_end(&mut sink).await.expect("response EOF");
+    handler.await.expect("server handler");
+}
+
+#[tokio::test]
+async fn unknown_length_upload_rejects_remote_no_error_that_races_request_fin() {
+    let (client, server) = pair().await;
+    let (stopped, stopped_rx) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_request, mut stream) = server.accept().await;
+            let mut data = stream
+                .recv_data()
+                .await
+                .expect("request DATA")
+                .expect("request DATA before FIN");
+            assert_eq!(data.copy_to_bytes(data.remaining()), b"body".as_slice());
+            stream.stop_sending(Code::H3_NO_ERROR);
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("response headers");
+            stream.finish().await.expect("response FIN");
+            stopped.send(()).expect("publish STOP_SENDING");
+        }
+    });
+
+    let (mut upload, pending) = client
+        .start_streaming(request(Method::POST, "/unknown-no-error-race"))
+        .await
+        .expect("open unknown-length request");
+    upload.write_all(b"body").await.expect("request DATA");
+    upload.flush().await.expect("deliver request DATA");
+    stopped_rx.await.expect("server STOP_SENDING");
+    // The server-side notification only means the frames were queued. Wait
+    // for the client driver to receive the response instead of assuming that
+    // one scheduler yield delivers STOP_SENDING over the loopback socket.
+    let response = pending.open().await.expect("status 200 after STOP_SENDING");
+    let error = upload
+        .shutdown()
+        .await
+        .expect_err("H3_NO_ERROR must not mask an unknown-length request finish");
+    assert!(
+        error.to_string().contains("Remote reset: H3_NO_ERROR"),
+        "unexpected finish error: {error}"
+    );
+    drop(response);
+    handler.await.expect("server handler");
+}
+
+#[tokio::test]
+async fn streaming_upload_and_download_progress_full_duplex() {
+    let (client, server) = pair().await;
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_request, mut stream) = server.accept().await;
+            let mut first = stream
+                .recv_data()
+                .await
+                .expect("first request data")
+                .expect("request data before FIN");
+            let first = first.copy_to_bytes(first.remaining());
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("response headers");
+            stream
+                .send_data(Bytes::from_static(b"reply-before-fin"))
+                .await
+                .expect("early response data");
+            let mut rest = drain_request(&mut stream)
+                .await
+                .expect("remaining request body");
+            stream.finish().await.expect("response finish");
+            let mut whole = first.to_vec();
+            whole.append(&mut rest);
+            whole
+        }
+    });
+
+    let (mut upload, pending) = client
+        .start_streaming(request(Method::POST, "/full-duplex"))
+        .await
+        .expect("open streaming request");
+    upload.write_all(b"first-").await.expect("first upload");
+    let mut response = pending.open().await.expect("status 200");
+    let mut early = vec![0_u8; b"reply-before-fin".len()];
+    response
+        .read_exact(&mut early)
+        .await
+        .expect("early response before request FIN");
+    upload.write_all(b"second").await.expect("second upload");
+    upload.shutdown().await.expect("request FIN");
+    let mut tail = Vec::new();
+    response.read_to_end(&mut tail).await.expect("response EOF");
+
+    assert_eq!(early, b"reply-before-fin");
+    assert!(tail.is_empty());
+    assert_eq!(handler.await.expect("server handler"), b"first-second");
+}
+
+#[tokio::test]
+async fn slow_path_uploads_buffer_only_their_share_of_the_send_budget() {
+    // The server grants 16 MiB of stream credit, but a 100 ms round trip keeps
+    // the congestion window small, so accepted bytes wait in the client's own
+    // QUIC send buffer. quinn's default window let one request buffer 10 MB;
+    // a lone upload keeps 2 MiB and grows only with its congestion window.
+    let (client_tls, server_addr, server) = server_with_options(Some(16 * 1024 * 1024)).await;
+    let (relay_addr, relay) = udp_delay_relay(server_addr, Duration::from_millis(50)).await;
+    let client = connect_h3(H3ConnectConfig {
+        remote_addr: relay_addr,
+        server_name: "localhost".to_owned(),
+        tls_config: Arc::clone(&client_tls),
+        socket_protector: None,
+        quic: H3QuicConfig::default(),
+        realm: None,
+        network_changes: None,
+    })
+    .await
+    .expect("connect HTTP/3 client through the delay relay");
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_request, stream) = server.accept().await;
+            // Hold the stream open without reading it.
+            tokio::time::sleep(DEADLINE).await;
+            drop(stream);
+        }
+    });
+    let (mut upload, _pending) = client
+        .start_streaming(request(Method::POST, "/blocked"))
+        .await
+        .expect("open streaming request");
+
+    // Write for less than one round trip: no ACK can free buffer space yet,
+    // so the accepted bytes are what the client buffers before backpressure.
+    let chunk = vec![0x5a; 64 * 1024];
+    let mut accepted = 0usize;
+    let deadline = Instant::now() + Duration::from_millis(60);
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match timeout(remaining, upload.write(&chunk)).await {
+            Ok(Ok(written)) => accepted += written,
+            Ok(Err(error)) => panic!("upload failed on the slow path: {error}"),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        accepted >= 3 * 1024 * 1024 / 2,
+        "the initial window must still be usable: {accepted} bytes"
+    );
+    assert!(
+        accepted < 3 * 1024 * 1024,
+        "a slow-path upload buffered {accepted} bytes"
+    );
+    handler.abort();
+    relay.abort();
+
+    // Sixteen uploads, each with its own connection and a 400 ms round trip,
+    // share the budget. The first to sample take up to 2 MiB before the rest
+    // count, and each narrows to its 1 MiB share at its next sample: about
+    // 16 MiB in all, where every connection used to keep 2 MiB (32 MiB).
+    const UPLOADS: usize = 16;
+    let holder = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let mut exchanges = Vec::new();
+            for _ in 0..UPLOADS {
+                exchanges.push(server.accept().await);
+            }
+            tokio::time::sleep(DEADLINE).await;
+            drop(exchanges);
+        }
+    });
+    let opened = futures_util::future::join_all((0..UPLOADS).map(|_| {
+        let client_tls = Arc::clone(&client_tls);
+        async move {
+            let (relay_addr, relay) =
+                udp_delay_relay(server_addr, Duration::from_millis(200)).await;
+            let client = connect_h3(H3ConnectConfig {
+                remote_addr: relay_addr,
+                server_name: "localhost".to_owned(),
+                tls_config: client_tls,
+                socket_protector: None,
+                quic: H3QuicConfig::default(),
+                realm: None,
+                network_changes: None,
+            })
+            .await
+            .expect("connect HTTP/3 client through its delay relay");
+            let exchange = client
+                .start_streaming(request(Method::POST, "/shared"))
+                .await
+                .expect("open streaming request");
+            (exchange, relay)
+        }
+    }))
+    .await;
+
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let mut writers = tokio::task::JoinSet::new();
+    let mut relays = Vec::new();
+    for ((mut upload, pending), relay) in opened {
+        relays.push(relay);
+        let chunk = chunk.clone();
+        writers.spawn(async move {
+            let mut accepted = 0usize;
+            while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                match timeout(remaining, upload.write(&chunk)).await {
+                    Ok(Ok(written)) => accepted += written,
+                    Ok(Err(error)) => panic!("upload failed on the slow path: {error}"),
+                    Err(_) => break,
+                }
+            }
+            (accepted, upload, pending)
+        });
+    }
+    let mut total = 0usize;
+    let mut finished = Vec::new();
+    while let Some(writer) = writers.join_next().await {
+        let (accepted, upload, pending) = writer.expect("upload writer");
+        total += accepted;
+        finished.push((upload, pending));
+    }
+    assert!(
+        total > 4 * 1024 * 1024,
+        "{UPLOADS} slow-path uploads buffered only {total} bytes"
+    );
+    assert!(
+        total < 24 * 1024 * 1024,
+        "{UPLOADS} slow-path uploads buffered {total} bytes"
+    );
+    drop(finished);
+    holder.abort();
+    for relay in relays {
+        relay.abort();
+    }
+}
+
+/// Held by tests whose stream windows depend on how many connections of this
+/// process download at once: XHTTP H3 downloads share one receive budget.
+static RECEIVE_BUDGET: Mutex<()> = Mutex::const_new(());
+
+/// A download that keeps its reader busy grows the stream window past its
+/// initial 2 MiB, as quic-go auto-tunes it; fixed maxima keep it at 2 MiB.
+#[tokio::test]
+async fn a_fast_download_grows_the_stream_receive_window() {
+    let _budget = RECEIVE_BUDGET.lock().await;
+    let tuned = credit_after_a_fast_download(H3QuicConfig::default()).await;
+    let fixed = credit_after_a_fast_download(H3QuicConfig {
+        max_stream_receive_window: Some(2 * 1024 * 1024),
+        max_connection_receive_window: Some(3 * 1024 * 1024),
+        ..H3QuicConfig::default()
+    })
+    .await;
+
+    assert!(
+        fixed <= 2 * 1024 * 1024 + 256 * 1024,
+        "fixed window granted {fixed}"
+    );
+    assert!(tuned > 3 * 1024 * 1024, "tuned window granted {tuned}");
+}
+
+/// Reads 16 MiB as fast as it arrives over a 40 ms round trip, then stops,
+/// and returns how far past the bytes read the server could still write: the
+/// stream credit the client last granted.
+async fn credit_after_a_fast_download(quic: H3QuicConfig) -> usize {
+    const READ: usize = 16 * 1024 * 1024;
+
+    let (client_tls, server_addr, server) = server_with_options(None).await;
+    let (relay_addr, relay) = udp_delay_relay(server_addr, Duration::from_millis(20)).await;
+    let client = connect_h3(H3ConnectConfig {
+        remote_addr: relay_addr,
+        server_name: "localhost".to_owned(),
+        tls_config: client_tls,
+        socket_protector: None,
+        quic,
+        realm: None,
+        network_changes: None,
+    })
+    .await
+    .expect("connect HTTP/3 client through the delay relay");
+    let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_, mut stream) = server.accept().await;
+            drain_request(&mut stream).await.expect("request FIN");
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("headers");
+            let chunk = Bytes::from(vec![0x5a; 64 * 1024]);
+            let mut written = 0;
+            // A write that waits several round trips is out of credit.
+            while let Ok(sent) =
+                timeout(Duration::from_millis(500), stream.send_data(chunk.clone())).await
+            {
+                sent.expect("DATA");
+                written += chunk.len();
+            }
+            let _ = written_tx.send(written);
+            std::future::pending::<()>().await;
+        }
+    });
+
+    let mut body = client
+        .send_fixed(request(Method::GET, "/credit"), Bytes::new())
+        .await
+        .expect("response");
+    let mut downloaded = vec![0; READ];
+    timeout(Duration::from_secs(20), body.read_exact(&mut downloaded))
+        .await
+        .expect("download in time")
+        .expect("download");
+    let written = timeout(Duration::from_secs(20), written_rx)
+        .await
+        .expect("server runs out of credit")
+        .expect("written bytes");
+    handler.abort();
+    relay.abort();
+    written - READ
+}
+
+/// Sixteen downloads whose readers fall behind their servers share the
+/// receive budget: each stream grants about a 1 MiB share past its reader,
+/// where each used to grant its 2 MiB handshake window, 32 MiB in all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_reader_downloads_grant_only_their_share_of_the_receive_budget() {
+    let _budget = RECEIVE_BUDGET.lock().await;
+    let ahead = credit_ahead_of_readers(BudgetReader::FallsBehind).await;
+    // Each response task and body may hold three 16 KiB batches past its
+    // reader; QUIC packets add a little more.
+    assert!(
+        ahead <= 16 * 1024 * 1024 + BUDGET_DOWNLOADS * 128 * 1024,
+        "{BUDGET_DOWNLOADS} slow readers let their servers write {ahead} bytes ahead"
+    );
+    assert!(
+        ahead >= BUDGET_DOWNLOADS * 512 * 1024,
+        "{BUDGET_DOWNLOADS} slow readers granted only {ahead} bytes"
+    );
+    // These connections count as downloading for up to two seconds after
+    // their last read.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+}
+
+/// Sixteen downloads whose readers keep up hold almost nothing, so the
+/// receive budget leaves their 2 MiB windows alone: on a long path those
+/// windows are in flight, and holding them to a 1 MiB share would only slow
+/// the downloads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn downloads_whose_readers_keep_up_keep_their_windows() {
+    let _budget = RECEIVE_BUDGET.lock().await;
+    let ahead = credit_ahead_of_readers(BudgetReader::KeepsUp).await;
+    assert!(
+        ahead >= BUDGET_DOWNLOADS * 3 * 1024 * 1024 / 2,
+        "{BUDGET_DOWNLOADS} readers that kept up granted only {ahead} bytes"
+    );
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+}
+
+const BUDGET_DOWNLOADS: usize = 16;
+
+#[derive(Clone, Copy, PartialEq)]
+enum BudgetReader {
+    /// Takes each 64 KiB as it arrives, and its server writes the next 64 KiB
+    /// only once the reader has it, so the stream empties between pieces
+    /// however slow the host is. On Linux, GRO can hand a whole piece to the
+    /// response task at once, which then finds the stream empty only while it
+    /// waits for the next piece.
+    KeepsUp,
+    /// Pauses 25 ms after each 64 KiB: 42 MB/s for all sixteen, well below
+    /// what even a debug build receives, so data waits in each stream.
+    FallsBehind,
+}
+
+/// Runs sixteen downloads, each on its own connection, whose readers take
+/// 2 MiB each, past the 2 MiB handshake credit once a share applies. Each
+/// server writes as far as its credit allows, waiting for its reader at every
+/// 64 KiB while that reader keeps up. Returns how far the servers got ahead of
+/// their readers in all once these stopped: the stream credit granted past
+/// the bytes read.
+async fn credit_ahead_of_readers(reader: BudgetReader) -> usize {
+    const READ: usize = 2 * 1024 * 1024;
+    const PIECE: usize = 64 * 1024;
+    const SERVER_PIECE: usize = 32 * 1024;
+
+    let (client_tls, server_addr, server) = server_with_options(None).await;
+    let written: Arc<Vec<AtomicUsize>> =
+        Arc::new((0..BUDGET_DOWNLOADS).map(|_| AtomicUsize::new(0)).collect());
+    let taken: Arc<Vec<AtomicUsize>> =
+        Arc::new((0..BUDGET_DOWNLOADS).map(|_| AtomicUsize::new(0)).collect());
+    let handler = tokio::spawn({
+        let server = server.clone();
+        let written = Arc::clone(&written);
+        let taken = Arc::clone(&taken);
+        async move {
+            let mut writers = tokio::task::JoinSet::new();
+            for _ in 0..BUDGET_DOWNLOADS {
+                let (request, mut stream) = server.accept().await;
+                // Connections arrive in any order; the path names the reader.
+                let index: usize = request
+                    .uri()
+                    .path()
+                    .trim_start_matches("/budget/")
+                    .parse()
+                    .expect("download index");
+                let written = Arc::clone(&written);
+                let taken = Arc::clone(&taken);
+                writers.spawn(async move {
+                    drain_request(&mut stream).await.expect("request FIN");
+                    stream
+                        .send_response(response(StatusCode::OK))
+                        .await
+                        .expect("headers");
+                    let chunk = Bytes::from(vec![0x5a; SERVER_PIECE]);
+                    loop {
+                        stream.send_data(chunk.clone()).await.expect("DATA");
+                        let total = written[index].fetch_add(SERVER_PIECE, Ordering::Relaxed)
+                            + SERVER_PIECE;
+                        if reader == BudgetReader::KeepsUp && total <= READ {
+                            while taken[index].load(Ordering::Acquire) < total / PIECE * PIECE {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                        }
+                    }
+                });
+            }
+            writers.join_all().await;
+        }
+    });
+
+    let clients = futures_util::future::join_all((0..BUDGET_DOWNLOADS).map(|_| {
+        connect_h3(H3ConnectConfig {
+            remote_addr: server_addr,
+            server_name: "localhost".to_owned(),
+            tls_config: Arc::clone(&client_tls),
+            socket_protector: None,
+            quic: H3QuicConfig::default(),
+            realm: None,
+            network_changes: None,
+        })
+    }))
+    .await;
+    let start = Arc::new(tokio::sync::Barrier::new(BUDGET_DOWNLOADS));
+    let mut readers = tokio::task::JoinSet::new();
+    for (index, client) in clients.into_iter().enumerate() {
+        let client = client.expect("connect HTTP/3 client");
+        let start = Arc::clone(&start);
+        let taken = Arc::clone(&taken);
+        readers.spawn(async move {
+            let mut body = client
+                .send_fixed(
+                    request(Method::GET, &format!("/budget/{index}")),
+                    Bytes::new(),
+                )
+                .await
+                .expect("response");
+            // Read together, so that every share is sampled while all
+            // sixteen count as downloading.
+            start.wait().await;
+            let mut piece = vec![0; PIECE];
+            for _ in 0..READ / PIECE {
+                timeout(DEADLINE, body.read_exact(&mut piece))
+                    .await
+                    .expect("read in time")
+                    .expect("read");
+                taken[index].fetch_add(PIECE, Ordering::Release);
+                if reader == BudgetReader::FallsBehind {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+            (client, body)
+        });
+    }
+    let mut downloads = Vec::new();
+    while let Some(reader) = readers.join_next().await {
+        downloads.push(reader.expect("reader"));
+    }
+    // The servers use up the credit granted until the readers stopped.
+    let total = || -> usize { written.iter().map(|w| w.load(Ordering::Relaxed)).sum() };
+    let mut settled = total();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = total();
+        if now == settled || Instant::now() > deadline {
+            break;
+        }
+        settled = now;
+    }
+    handler.abort();
+    drop(downloads);
+    settled - BUDGET_DOWNLOADS * READ
+}
+
+/// A reader that keeps a server of small DATA frames waiting lets it write
+/// only about a stream window past the bytes read. h3 0.0.8 read one more
+/// QUIC chunk for every frame while the stream stayed full, buffering it
+/// outside flow control, and each such chunk let the server write that much
+/// further ahead.
+#[tokio::test]
+async fn small_data_frames_wait_in_the_stream_window() {
+    const WINDOW: u64 = 256 * 1024;
+    const READ: usize = 1024 * 1024;
+    const FRAME: usize = 700;
+
+    let (client_tls, server_addr, server) = server_with_options(None).await;
+    let client = connect_h3(H3ConnectConfig {
+        remote_addr: server_addr,
+        server_name: "localhost".to_owned(),
+        tls_config: client_tls,
+        socket_protector: None,
+        quic: H3QuicConfig {
+            initial_stream_receive_window: WINDOW,
+            max_stream_receive_window: Some(WINDOW),
+            initial_connection_receive_window: 2 * WINDOW,
+            max_connection_receive_window: Some(2 * WINDOW),
+            ..H3QuicConfig::default()
+        },
+        realm: None,
+        network_changes: None,
+    })
+    .await
+    .expect("connect HTTP/3 client");
+    let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_, mut stream) = server.accept().await;
+            drain_request(&mut stream).await.expect("request FIN");
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("headers");
+            let frame = Bytes::from(vec![0x5a; FRAME]);
+            let mut written = 0;
+            // A write that waits this long is out of credit.
+            while let Ok(sent) =
+                timeout(Duration::from_millis(500), stream.send_data(frame.clone())).await
+            {
+                sent.expect("DATA");
+                written += FRAME;
+            }
+            let _ = written_tx.send(written);
+            std::future::pending::<()>().await;
+        }
+    });
+
+    let mut body = client
+        .send_fixed(request(Method::GET, "/frames"), Bytes::new())
+        .await
+        .expect("response");
+    let mut downloaded = vec![0; 64 * 1024];
+    for _ in 0..READ / downloaded.len() {
+        timeout(DEADLINE, body.read_exact(&mut downloaded))
+            .await
+            .expect("read in time")
+            .expect("read");
+        // The server fills the window again while the reader waits.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let written = timeout(Duration::from_secs(20), written_rx)
+        .await
+        .expect("server runs out of credit")
+        .expect("written bytes");
+    handler.abort();
+    // The response task and body may hold three 16 KiB batches past the
+    // reader; QUIC packets add a little more.
+    let ahead = written - READ;
+    assert!(
+        ahead <= WINDOW as usize + 128 * 1024,
+        "server wrote {ahead} bytes past a {WINDOW}-byte window"
+    );
+}
+
+/// Forwards UDP between one client and `server`, delaying each datagram.
+async fn udp_delay_relay(server: SocketAddr, delay: Duration) -> (SocketAddr, JoinHandle<()>) {
+    let front = Arc::new(
+        tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind relay"),
+    );
+    let back = Arc::new(
+        tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind relay upstream"),
+    );
+    back.connect(server).await.expect("connect relay upstream");
+    let relay_addr = front.local_addr().expect("relay address");
+    let task = tokio::spawn(async move {
+        let mut client = None;
+        let mut up = vec![0; 65_535];
+        let mut down = vec![0; 65_535];
+        loop {
+            tokio::select! {
+                received = front.recv_from(&mut up) => {
+                    let Ok((len, from)) = received else { return };
+                    client = Some(from);
+                    let (back, datagram) = (Arc::clone(&back), up[..len].to_vec());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = back.send(&datagram).await;
+                    });
+                }
+                received = back.recv(&mut down) => {
+                    let (Ok(len), Some(to)) = (received, client) else { continue };
+                    let (front, datagram) = (Arc::clone(&front), down[..len].to_vec());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = front.send_to(&datagram, to).await;
+                    });
+                }
+            }
+        }
+    });
+    (relay_addr, task)
+}
+
+#[tokio::test]
+async fn flush_delivers_request_data_without_half_closing_upload() {
+    const SERVER_STREAM_WINDOW: u32 = 1024;
+    const PAYLOAD_BYTES: usize = 8 * 1024;
+
+    let (client, server) = pair_with_server_stream_window(SERVER_STREAM_WINDOW).await;
+    let (accepted, request_accepted) = tokio::sync::oneshot::channel();
+    let (release_reads, reads_released) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_request, mut stream) = server.accept().await;
+            accepted.send(()).expect("observe accepted request");
+            reads_released.await.expect("release request reads");
+            let mut received = Vec::new();
+            while received.len() < PAYLOAD_BYTES {
+                let mut data = stream
+                    .recv_data()
+                    .await
+                    .expect("flushed request data")
+                    .expect("request stays open after flush");
+                received.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+            }
+
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("response after flushed data");
+            stream
+                .send_data(Bytes::from_static(b"ack"))
+                .await
+                .expect("response data");
+            stream.finish().await.expect("response finish");
+            let rest = drain_request(&mut stream).await.expect("request FIN");
+            (received, rest)
+        }
+    });
+
+    let (mut upload, pending) = client
+        .start_streaming(request(Method::POST, "/flush"))
+        .await
+        .expect("open streaming request");
+    request_accepted.await.expect("server accepted request");
+    let payload = vec![0x5a; PAYLOAD_BYTES];
+    upload.write_all(&payload).await.expect("write request");
+
+    let mut flush = Box::pin(upload.flush());
+    assert!(
+        timeout(Duration::from_millis(100), &mut flush)
+            .await
+            .is_err(),
+        "flush must wait while QUIC stream flow control is blocked"
+    );
+    release_reads.send(()).expect("release request reads");
+    timeout(DEADLINE, &mut flush)
+        .await
+        .expect("flush after flow-control release")
+        .expect("flush request DATA to QUIC");
+    drop(flush);
+
+    let mut response = timeout(DEADLINE, pending.open())
+        .await
+        .expect("response before request shutdown")
+        .expect("status 200");
+    let mut ack = [0_u8; 3];
+    response
+        .read_exact(&mut ack)
+        .await
+        .expect("response to flushed request data");
+    upload.shutdown().await.expect("request FIN");
+    let mut tail = Vec::new();
+    response.read_to_end(&mut tail).await.expect("response EOF");
+
+    assert_eq!(ack, *b"ack");
+    assert!(tail.is_empty());
+    assert_eq!(
+        handler.await.expect("server handler"),
+        (payload, Vec::new())
+    );
+}
+
+#[tokio::test]
+async fn h3_quinn_recv_stream_remains_stoppable_after_a_pending_read() {
+    let (client_tls, server_addr, server) = server_with_options(None).await;
+    let (response_sent, response_ready) = tokio::sync::oneshot::channel();
+    let (observe_cancel, cancel_requested) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_request, mut stream) = server.accept().await;
+            drain_request(&mut stream).await.expect("request body");
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("response headers");
+            response_sent.send(()).expect("publish response headers");
+            cancel_requested.await.expect("release cancellation probe");
+
+            timeout(DEADLINE, async {
+                loop {
+                    match stream.send_data(Bytes::from_static(b"x")).await {
+                        Ok(()) => tokio::task::yield_now().await,
+                        Err(error) => break error,
+                    }
+                }
+            })
+            .await
+            .expect("server observes STOP_SENDING")
+        }
+    });
+
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .expect("bind direct QUIC client");
+    let crypto = QuicClientConfig::try_from(client_tls).expect("QUIC client TLS");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+    let connection = endpoint
+        .connect(server_addr, "localhost")
+        .expect("start direct QUIC connection")
+        .await
+        .expect("connect direct QUIC client");
+    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("start direct H3 client");
+    let driver = tokio::spawn(async move { poll_fn(|cx| driver.poll_close(cx)).await });
+
+    let stream = sender
+        .send_request(request(Method::GET, "/adapter-cancel"))
+        .await
+        .expect("send direct H3 request");
+    let (mut send, mut recv) = stream.split();
+    send.finish().await.expect("request FIN");
+    response_ready.await.expect("server response headers");
+    recv.recv_response()
+        .await
+        .expect("receive response headers");
+
+    // Poll exactly once into Pending, then cancel the future. h3-quinn 0.0.10
+    // used to move its raw RecvStream into that future and panic here because
+    // stop_sending subsequently unwrapped an empty Option.
+    let mut pending_read = Box::pin(recv.recv_data());
+    poll_fn(|cx| match pending_read.as_mut().poll(cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("idle response read unexpectedly completed"),
+    })
+    .await;
+    drop(pending_read);
+    recv.stop_sending(Code::H3_REQUEST_CANCELLED);
+    observe_cancel.send(()).expect("probe STOP_SENDING");
+
+    let error = handler.await.expect("server handler");
+    assert!(
+        matches!(
+            &error,
+            h3::error::StreamError::RemoteTerminate { code, .. }
+                if *code == Code::H3_REQUEST_CANCELLED
+        ),
+        "unexpected server stream error: {error:?}"
+    );
+
+    endpoint.close(
+        quinn::VarInt::from_u32(Code::H3_NO_ERROR.value() as u32),
+        b"adapter regression complete",
+    );
+    driver.abort();
+}
+
+#[tokio::test]
+async fn response_drop_after_upload_fin_cancels_stream_and_reuses_connection() {
+    let (client, server) = pair().await;
+    let (response_sent, response_ready) = tokio::sync::oneshot::channel();
+    let (observe_cancel, cancel_requested) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_first_request, mut first) = server.accept().await;
+            let upload = drain_request(&mut first).await.expect("completed upload");
+            first
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("first response headers");
+            first
+                .send_data(Bytes::from_static(b"ready"))
+                .await
+                .expect("first response data");
+            response_sent.send(()).expect("publish first response");
+            cancel_requested.await.expect("release cancellation probe");
+
+            let cancellation = timeout(DEADLINE, async {
+                loop {
+                    match first.send_data(Bytes::from_static(b"x")).await {
+                        Ok(()) => tokio::task::yield_now().await,
+                        Err(error) => break error,
+                    }
+                }
+            })
+            .await
+            .expect("server observes response cancellation");
+
+            let (_second_request, mut second) = server.accept().await;
+            drain_request(&mut second)
+                .await
+                .expect("second request body");
+            second
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("second response headers");
+            second.finish().await.expect("second response FIN");
+            (upload, cancellation)
+        }
+    });
+
+    let (mut upload, pending) = client
+        .start_streaming(request(Method::POST, "/completed-upload-cancel"))
+        .await
+        .expect("open first request");
+    upload
+        .write_all(b"complete before cancellation")
+        .await
+        .expect("first upload");
+    upload.shutdown().await.expect("first upload FIN");
+    let mut body = pending.open().await.expect("first response headers");
+    response_ready.await.expect("first response DATA sent");
+    let mut ready = [0_u8; 5];
+    body.read_exact(&mut ready)
+        .await
+        .expect("first response data");
+    assert_eq!(&ready, b"ready");
+
+    // Let the response worker enter its next idle recv_data poll, which is the
+    // state that triggered h3-quinn's detached cancellation panic.
+    tokio::task::yield_now().await;
+    drop(body);
+    observe_cancel
+        .send(())
+        .expect("probe response cancellation");
+    assert!(client.is_live(), "one cancelled stream must not kill H3");
+
+    let mut second = client
+        .send_fixed(request(Method::GET, "/after-body-drop"), Bytes::new())
+        .await
+        .expect("same H3 connection remains reusable");
+    let mut sink = Vec::new();
+    second
+        .read_to_end(&mut sink)
+        .await
+        .expect("second response EOF");
+
+    let (received, cancellation) = handler.await.expect("server handler");
+    assert_eq!(received, b"complete before cancellation");
+    assert!(
+        matches!(
+            &cancellation,
+            h3::error::StreamError::RemoteTerminate { code, .. }
+                if *code == Code::H3_REQUEST_CANCELLED
+        ),
+        "unexpected cancellation: {cancellation:?}"
+    );
+}
+
+#[tokio::test]
+async fn non_200_cancels_only_its_stream_and_connection_stays_reusable() {
+    let (client, server) = pair().await;
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_first, mut first) = server.accept().await;
+            drain_request(&mut first).await.expect("first request body");
+            first
+                .send_response(response(StatusCode::NOT_FOUND))
+                .await
+                .expect("404 response");
+            first.finish().await.expect("404 finish");
+
+            let (_second, mut second) = server.accept().await;
+            drain_request(&mut second)
+                .await
+                .expect("second request body");
+            second
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("second response");
+            second.finish().await.expect("second finish");
+        }
+    });
+
+    let error = client
+        .send_fixed(request(Method::GET, "/not-found"), Bytes::new())
+        .await
+        .expect_err("non-200 must fail");
+    assert!(matches!(
+        error,
+        H3Error::UnexpectedStatus {
+            status: StatusCode::NOT_FOUND
+        }
+    ));
+    assert!(client.is_live());
+
+    let mut body = client
+        .send_fixed(request(Method::GET, "/after-404"), Bytes::new())
+        .await
+        .expect("connection remains reusable");
+    let mut sink = Vec::new();
+    body.read_to_end(&mut sink).await.expect("second EOF");
+    handler.await.expect("server handler");
+}
+
+#[tokio::test]
+async fn dropping_pending_response_resets_exchange_without_killing_connection() {
+    let (client, server) = pair().await;
+    let (accepted, first_accepted) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (first_request, mut first) = server.accept().await;
+            assert_eq!(first_request.uri().path(), "/cancel");
+            accepted.send(()).expect("first request accepted");
+            let first_result = first.recv_data().await;
+
+            let (_second, mut second) = server.accept().await;
+            drain_request(&mut second)
+                .await
+                .expect("second request body");
+            second
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("second response");
+            second.finish().await.expect("second finish");
+            first_result
+        }
+    });
+
+    let (mut upload, pending) = client
+        .start_streaming(request(Method::POST, "/cancel"))
+        .await
+        .expect("open first stream");
+    timeout(DEADLINE, first_accepted)
+        .await
+        .expect("first request acceptance deadline")
+        .expect("first request accepted before cancellation");
+    drop(pending);
+    let error = timeout(DEADLINE, upload.shutdown())
+        .await
+        .expect("cancelled upload deadline")
+        .expect_err("sibling upload must fail");
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    assert!(client.is_live());
+
+    let mut body = client
+        .send_fixed(request(Method::GET, "/after-cancel"), Bytes::new())
+        .await
+        .expect("connection remains reusable");
+    let mut sink = Vec::new();
+    body.read_to_end(&mut sink).await.expect("second EOF");
+    assert!(handler.await.expect("server handler").is_err());
+}
+
+#[tokio::test]
+async fn immediate_pending_response_drop_keeps_connection_reusable() {
+    let (client, server) = pair().await;
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            // Reset may reach the peer before the first request's headers.
+            // Accept either ordering, but always require the next request.
+            loop {
+                let (request, mut stream) = server.accept().await;
+                if request.uri().path() == "/immediate-cancel" {
+                    drop(stream);
+                    continue;
+                }
+                assert_eq!(request.uri().path(), "/after-immediate-cancel");
+                drain_request(&mut stream)
+                    .await
+                    .expect("second request FIN");
+                stream
+                    .send_response(response(StatusCode::OK))
+                    .await
+                    .expect("response");
+                stream
+                    .send_data(Bytes::from_static(b"alive"))
+                    .await
+                    .expect("body");
+                stream.finish().await.expect("FIN");
+                break;
+            }
+        }
+    });
+    let (mut upload, pending) = client
+        .start_streaming(request(Method::POST, "/immediate-cancel"))
+        .await
+        .expect("open request");
+    drop(pending);
+    let error = timeout(DEADLINE, upload.shutdown())
+        .await
+        .expect("cancel deadline")
+        .expect_err("upload cancelled");
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    let mut body = client
+        .send_fixed(
+            request(Method::GET, "/after-immediate-cancel"),
+            Bytes::new(),
+        )
+        .await
+        .expect("reusable connection");
+    let mut actual = Vec::new();
+    timeout(DEADLINE, body.read_to_end(&mut actual))
+        .await
+        .expect("body deadline")
+        .expect("body and FIN");
+    assert_eq!(actual, b"alive");
+    handler.await.expect("handler");
+}
+
+#[tokio::test]
+async fn cloned_client_opens_concurrent_streams() {
+    let (client, server) = pair().await;
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let mut exchanges = vec![server.accept().await, server.accept().await];
+            exchanges.sort_by(|left, right| left.0.uri().path().cmp(right.0.uri().path()));
+            for (request, mut stream) in exchanges {
+                drain_request(&mut stream).await.expect("request body");
+                stream
+                    .send_response(response(StatusCode::OK))
+                    .await
+                    .expect("response headers");
+                stream
+                    .send_data(Bytes::from(request.uri().path().to_owned()))
+                    .await
+                    .expect("response data");
+                stream.finish().await.expect("response finish");
+            }
+        }
+    });
+
+    let first = client.send_fixed(request(Method::GET, "/a"), Bytes::new());
+    let second_client = client.clone();
+    let second = second_client.send_fixed(request(Method::GET, "/b"), Bytes::new());
+    let (mut first, mut second) = tokio::try_join!(first, second).expect("concurrent requests");
+    let mut first_body = Vec::new();
+    let mut second_body = Vec::new();
+    first
+        .read_to_end(&mut first_body)
+        .await
+        .expect("first body");
+    second
+        .read_to_end(&mut second_body)
+        .await
+        .expect("second body");
+
+    assert_eq!((first_body, second_body), (b"/a".to_vec(), b"/b".to_vec()));
+    handler.await.expect("server handler");
+}
+
+#[tokio::test]
+async fn head_response_is_logically_bodyless_even_if_peer_sends_data() {
+    let (client, server) = pair().await;
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (_request, mut stream) = server.accept().await;
+            drain_request(&mut stream).await.expect("HEAD request body");
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("response headers");
+            let _ = stream.send_data(Bytes::from_static(b"illegal")).await;
+            let _ = stream.finish().await;
+        }
+    });
+
+    let mut body = client
+        .send_fixed(request(Method::HEAD, "/head"), Bytes::new())
+        .await
+        .expect("HEAD status 200");
+    let mut byte = [0_u8; 1];
+    let read = timeout(DEADLINE, body.read(&mut byte))
+        .await
+        .expect("HEAD EOF deadline")
+        .expect("HEAD read");
+
+    assert_eq!(read, 0);
+    handler.await.expect("server handler");
+}
+
+#[tokio::test]
+async fn server_connection_close_retires_client_driver() {
+    let (client, server) = pair().await;
+    server.close_connection();
+
+    timeout(DEADLINE, async {
+        while client.is_live() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("connection-close retirement");
+}
+
+#[tokio::test]
+async fn xhttp_h3_stream_one_is_full_duplex() {
+    let (client, server) = pair().await;
+    let dials = Arc::new(AtomicUsize::new(0));
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (request, mut stream) = server.accept().await;
+            let mut first = stream
+                .recv_data()
+                .await
+                .expect("first request DATA")
+                .expect("stream-one upload before FIN");
+            let mut upload = first.copy_to_bytes(first.remaining()).to_vec();
+            stream
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("stream-one response headers");
+            stream
+                .send_data(Bytes::from_static(b"pong"))
+                .await
+                .expect("stream-one response DATA");
+            stream.finish().await.expect("stream-one response FIN");
+            upload.extend_from_slice(
+                &drain_request(&mut stream)
+                    .await
+                    .expect("remaining stream-one upload"),
+            );
+            (request.method().clone(), upload)
+        }
+    });
+    let transport = xhttp_h3_transport(XhttpModeSelection::StreamOne, unlimited_xmux(), 4);
+    let mut stream = transport
+        .open_stream_with_h3_dial(h3_dial(client, Arc::clone(&dials)))
+        .await
+        .expect("open H3 stream-one");
+
+    stream.write_all(b"ping").await.expect("write uplink");
+    stream.flush().await.expect("flush uplink before FIN");
+    let mut response_body = Vec::new();
+    stream
+        .read_to_end(&mut response_body)
+        .await
+        .expect("read response before upload FIN");
+    stream.shutdown().await.expect("finish uplink");
+
+    assert_eq!(response_body, b"pong");
+    assert_eq!(
+        handler.await.expect("server handler"),
+        (Method::POST, b"ping".to_vec())
+    );
+    assert_eq!(dials.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn h3_auto_gzip_decodes_only_exact_lowercase_content_encoding() {
+    let (client, server) = pair().await;
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dial = h3_dial(client, Arc::clone(&dials));
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            for encoding in ["gzip", "GZiP"] {
+                let (request, mut stream) = server.accept().await;
+                assert_eq!(request.headers()[http::header::ACCEPT_ENCODING], "gzip");
+                drain_request(&mut stream)
+                    .await
+                    .expect("stream-one request body");
+                let response = Response::builder()
+                    .version(Version::HTTP_3)
+                    .status(StatusCode::OK)
+                    .header(http::header::CONTENT_ENCODING, encoding)
+                    .body(())
+                    .unwrap();
+                stream.send_response(response).await.unwrap();
+                stream
+                    .send_data(Bytes::from_static(GZIP_PONG))
+                    .await
+                    .unwrap();
+                stream.finish().await.unwrap();
+            }
+        }
+    });
+    let transport = xhttp_h3_transport(XhttpModeSelection::StreamOne, unlimited_xmux(), 4);
+
+    for expected in [b"pong".as_slice(), GZIP_PONG] {
+        let mut stream = transport
+            .open_stream_with_h3_dial(Arc::clone(&dial))
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+        drop(stream);
+    }
+
+    handler.await.unwrap();
+    assert_eq!(dials.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn explicit_accept_encoding_keeps_h3_gzip_response_compressed() {
+    let (client, server) = pair().await;
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (request, mut stream) = server.accept().await;
+            assert_eq!(request.headers()[http::header::ACCEPT_ENCODING], "gzip");
+            drain_request(&mut stream).await.unwrap();
+            let response = Response::builder()
+                .version(Version::HTTP_3)
+                .status(StatusCode::OK)
+                .header(http::header::CONTENT_ENCODING, "gzip")
+                .body(())
+                .unwrap();
+            stream.send_response(response).await.unwrap();
+            stream
+                .send_data(Bytes::from_static(GZIP_PONG))
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+        }
+    });
+    let mut headers = XhttpHeaderMap::new();
+    headers.set("Accept-Encoding", "gzip");
+    let transport = xhttp_h3_transport_with_headers(
+        XhttpModeSelection::StreamOne,
+        unlimited_xmux(),
+        4,
+        headers,
+    );
+    let mut stream = transport
+        .open_stream_with_h3_dial(h3_dial(client, Arc::new(AtomicUsize::new(0))))
+        .await
+        .unwrap();
+    stream.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+
+    assert_eq!(response, GZIP_PONG);
+    handler.await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_h3_auto_gzip_does_not_retire_the_pooled_connection() {
+    let (client, server) = pair().await;
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dial = h3_dial(client, Arc::clone(&dials));
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            for malformed in [true, false] {
+                let (request, mut stream) = server.accept().await;
+                assert_eq!(request.headers()[http::header::ACCEPT_ENCODING], "gzip");
+                drain_request(&mut stream).await.unwrap();
+                let mut response = Response::builder()
+                    .version(Version::HTTP_3)
+                    .status(StatusCode::OK);
+                if malformed {
+                    response = response.header(http::header::CONTENT_ENCODING, "gzip");
+                }
+                stream
+                    .send_response(response.body(()).unwrap())
+                    .await
+                    .unwrap();
+                stream
+                    .send_data(if malformed {
+                        Bytes::from_static(b"not-gzip")
+                    } else {
+                        Bytes::from_static(b"healthy")
+                    })
+                    .await
+                    .unwrap();
+                stream.finish().await.unwrap();
+            }
+        }
+    });
+    let transport = xhttp_h3_transport(XhttpModeSelection::StreamOne, unlimited_xmux(), 4);
+
+    let mut malformed = transport
+        .open_stream_with_h3_dial(Arc::clone(&dial))
+        .await
+        .unwrap();
+    malformed.shutdown().await.unwrap();
+    let mut ignored = Vec::new();
+    let error = malformed
+        .read_to_end(&mut ignored)
+        .await
+        .expect_err("malformed gzip must reach the caller");
+    assert!(error.to_string().contains("gzip response decode failed"));
+    drop(malformed);
+
+    let mut healthy = transport.open_stream_with_h3_dial(dial).await.unwrap();
+    healthy.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    healthy.read_to_end(&mut response).await.unwrap();
+    assert_eq!(response, b"healthy");
+
+    handler.await.unwrap();
+    assert_eq!(dials.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn xhttp_h3_stream_up_uses_one_session_for_get_and_post() {
+    let (client, server) = pair().await;
+    let dials = Arc::new(AtomicUsize::new(0));
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (download_request, mut download) = server.accept().await;
+            assert_eq!(
+                download_request.headers()[http::header::ACCEPT_ENCODING],
+                "gzip"
+            );
+            let download_body = drain_request(&mut download)
+                .await
+                .expect("empty download request body");
+            download
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("download response headers");
+            download
+                .send_data(Bytes::from_static(b"pong"))
+                .await
+                .expect("download response DATA");
+            download.finish().await.expect("download response FIN");
+
+            let (upload_request, mut upload) = server.accept().await;
+            assert_eq!(
+                upload_request.headers()[http::header::ACCEPT_ENCODING],
+                "gzip"
+            );
+            let upload_body = drain_request(&mut upload).await.expect("stream-up body");
+            let upload_response = Response::builder()
+                .version(Version::HTTP_3)
+                .status(StatusCode::OK)
+                .header(http::header::CONTENT_ENCODING, "gzip")
+                .body(())
+                .unwrap();
+            upload
+                .send_response(upload_response)
+                .await
+                .expect("upload response headers");
+            upload
+                .send_data(Bytes::from_static(GZIP_PONG))
+                .await
+                .expect("compressed upload response body");
+            upload.finish().await.expect("upload response FIN");
+            (
+                download_request.method().clone(),
+                download_request.uri().path().to_owned(),
+                download_body,
+                upload_request.method().clone(),
+                upload_request.uri().path().to_owned(),
+                upload_body,
+            )
+        }
+    });
+    let transport = xhttp_h3_transport(XhttpModeSelection::StreamUp, unlimited_xmux(), 4);
+    let mut stream = transport
+        .open_stream_with_h3_dial(h3_dial(client, Arc::clone(&dials)))
+        .await
+        .expect("open H3 stream-up");
+
+    stream.write_all(b"ping").await.expect("write upload");
+    stream.shutdown().await.expect("finish upload");
+    let mut response_body = Vec::new();
+    stream
+        .read_to_end(&mut response_body)
+        .await
+        .expect("read download");
+
+    let (down_method, down_path, down_body, up_method, up_path, up_body) =
+        handler.await.expect("server handler");
+    assert_eq!(response_body, b"pong");
+    assert_eq!(down_method, Method::GET);
+    assert_eq!(up_method, Method::POST);
+    assert!(down_body.is_empty());
+    assert_eq!(up_body, b"ping");
+    assert_eq!(down_path, up_path);
+    assert_eq!(
+        dials.load(Ordering::Acquire),
+        2,
+        "the conservative H3 pool gives persistent GET and POST separate connections"
+    );
+}
+
+#[tokio::test]
+async fn xhttp_h3_packet_503_wakes_pending_downlink_with_the_same_error() {
+    let (client, server) = pair().await;
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let (download_request, mut download) = server.accept().await;
+            assert_eq!(download_request.method(), Method::GET);
+            drain_request(&mut download)
+                .await
+                .expect("empty packet downlink request");
+            download
+                .send_response(response(StatusCode::OK))
+                .await
+                .expect("pending downlink headers");
+
+            let (upload_request, mut upload) = server.accept().await;
+            assert_ne!(upload_request.method(), Method::GET);
+            let body = drain_request(&mut upload)
+                .await
+                .expect("packet upload body");
+            upload
+                .send_response(response(StatusCode::SERVICE_UNAVAILABLE))
+                .await
+                .expect("packet rejection headers");
+            let _ = upload.finish().await;
+            body
+        }
+    });
+    let transport = xhttp_h3_transport(XhttpModeSelection::PacketUp, unlimited_xmux(), 4);
+    let mut stream = transport
+        .open_stream_with_h3_dial(h3_dial(client, Arc::new(AtomicUsize::new(0))))
+        .await
+        .expect("open H3 packet-up");
+    stream.write_all(b"boom").await.expect("queue packet");
+
+    let mut byte = [0_u8; 1];
+    let read_error = timeout(DEADLINE, stream.read(&mut byte))
+        .await
+        .expect("blocked H3 downlink was not woken")
+        .expect_err("upload 503 must fail the logical stream");
+    let write_error = stream
+        .write_all(b"after-error")
+        .await
+        .expect_err("same shared failure must reach writes");
+    assert_eq!(handler.await.expect("server handler"), b"boom");
+    assert_eq!(read_error.to_string(), write_error.to_string());
+    assert_eq!(
+        read_error.to_string(),
+        "XHTTP HTTP/3 server returned status 503 Service Unavailable"
+    );
+}
+
+#[tokio::test]
+async fn xhttp_h3_pool_reuses_one_dial_for_sequential_streams() {
+    let (client, server) = pair().await;
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dial = h3_dial(client, Arc::clone(&dials));
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let first = serve_clean_exchange(&server).await;
+            let second = serve_clean_exchange(&server).await;
+            (first, second)
+        }
+    });
+    let transport = xhttp_h3_transport(XhttpModeSelection::StreamOne, unlimited_xmux(), 4);
+
+    for _ in 0..2 {
+        let mut stream = transport
+            .open_stream_with_h3_dial(Arc::clone(&dial))
+            .await
+            .expect("open pooled H3 stream");
+        stream.shutdown().await.expect("finish pooled request");
+        let mut sink = Vec::new();
+        stream
+            .read_to_end(&mut sink)
+            .await
+            .expect("pooled response");
+    }
+
+    let ((first_method, _, first_body), (second_method, _, second_body)) =
+        handler.await.expect("server handler");
+    assert_eq!((first_method, second_method), (Method::POST, Method::POST));
+    assert!(first_body.is_empty());
+    assert!(second_body.is_empty());
+    assert_eq!(dials.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn h3_pool_fans_out_at_peer_stream_limit_one_then_reuses_connections() {
+    let (client_tls, server_addr, server) = server_with_transport_options(None, Some(1)).await;
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dial = h3_network_dial(client_tls, server_addr, Arc::clone(&dials));
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let mut uploads = Vec::new();
+            for expected_body in [b"first".as_slice(), b"second".as_slice()] {
+                let first = server.accept().await;
+                let second = server.accept().await;
+                let ((download_request, mut download), (upload_request, mut upload)) =
+                    if first.0.method() == Method::GET {
+                        (first, second)
+                    } else {
+                        (second, first)
+                    };
+                assert_eq!(download_request.method(), Method::GET);
+                assert!(drain_request(&mut download).await.unwrap().is_empty());
+                download
+                    .send_response(response(StatusCode::OK))
+                    .await
+                    .expect("download response headers");
+
+                assert_eq!(upload_request.method(), Method::POST);
+                let body = drain_request(&mut upload).await.expect("upload body");
+                assert_eq!(body, expected_body);
+                uploads.push(body);
+                upload
+                    .send_response(response(StatusCode::OK))
+                    .await
+                    .expect("upload response headers");
+                upload.finish().await.expect("upload response finish");
+
+                download
+                    .send_data(Bytes::from_static(b"pong"))
+                    .await
+                    .expect("download response body");
+                download.finish().await.expect("download response finish");
+            }
+            uploads
+        }
+    });
+    let transport = xhttp_h3_transport(XhttpModeSelection::StreamUp, unlimited_xmux(), 4);
+
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        let mut stream = timeout(
+            DEADLINE,
+            transport.open_stream_with_h3_dial(Arc::clone(&dial)),
+        )
+        .await
+        .expect("peer MAX_STREAMS_BIDI=1 must not deadlock stream-up")
+        .expect("open H3 stream-up");
+        assert_eq!(
+            dials.load(Ordering::Acquire),
+            2,
+            "persistent download and upload need two connections, then reuse them"
+        );
+        stream.write_all(payload).await.expect("write upload");
+        stream.shutdown().await.expect("finish upload");
+        let mut response_body = Vec::new();
+        stream
+            .read_to_end(&mut response_body)
+            .await
+            .expect("read download response");
+        assert_eq!(response_body, b"pong");
+    }
+
+    assert_eq!(
+        handler.await.expect("server handler"),
+        vec![b"first".to_vec(), b"second".to_vec()]
+    );
+    assert_eq!(
+        dials.load(Ordering::Acquire),
+        2,
+        "released low-capacity connections must be reused without a third dial"
+    );
+}
+
+#[tokio::test]
+async fn xhttp_h3_xmux_fans_out_concurrent_logical_streams() {
+    let (client, server) = pair().await;
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dial = h3_dial(client, Arc::clone(&dials));
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let first = serve_clean_exchange(&server).await;
+            let second = serve_clean_exchange(&server).await;
+            (first, second)
+        }
+    });
+    let mut xmux = unlimited_xmux();
+    xmux.max_concurrency = XhttpRange::exact(1);
+    let transport = xhttp_h3_transport(XhttpModeSelection::StreamOne, xmux, 4);
+
+    let mut first = transport
+        .open_stream_with_h3_dial(Arc::clone(&dial))
+        .await
+        .expect("open first H3 logical stream");
+    let mut second = transport
+        .open_stream_with_h3_dial(dial)
+        .await
+        .expect("open second H3 logical stream");
+    first.shutdown().await.expect("finish first upload");
+    second.shutdown().await.expect("finish second upload");
+    let mut first_response = Vec::new();
+    let mut second_response = Vec::new();
+    first
+        .read_to_end(&mut first_response)
+        .await
+        .expect("first response");
+    second
+        .read_to_end(&mut second_response)
+        .await
+        .expect("second response");
+
+    handler.await.expect("server handler");
+    assert_eq!(dials.load(Ordering::Acquire), 2);
+    assert_eq!(transport.xmux_client_count().await, 2);
+}
+
+#[tokio::test]
+async fn xhttp_h3_idle_connection_is_retired_before_the_next_checkout() {
+    let (client, server) = pair().await;
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dial = h3_dial(client, Arc::clone(&dials));
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move {
+            serve_clean_exchange(&server).await;
+            serve_clean_exchange(&server).await;
+        }
+    });
+    let elapsed = Arc::new(AtomicU64::new(0));
+    let anchor = Instant::now();
+    let clock: XhttpClock = {
+        let elapsed = Arc::clone(&elapsed);
+        Arc::new(move || anchor + Duration::from_secs(elapsed.load(Ordering::Acquire)))
+    };
+    let transport = xhttp_h3_transport(XhttpModeSelection::StreamOne, unlimited_xmux(), 4)
+        .with_clock(clock)
+        .expect("inject clock")
+        .with_h3_idle_timeout(Duration::from_secs(3))
+        .expect("inject H3 idle timeout");
+
+    let mut first = transport
+        .open_stream_with_h3_dial(Arc::clone(&dial))
+        .await
+        .expect("first H3 stream");
+    first.shutdown().await.expect("first upload FIN");
+    let mut sink = Vec::new();
+    first.read_to_end(&mut sink).await.expect("first response");
+    drop(first);
+    elapsed.store(4, Ordering::Release);
+
+    let mut second = transport
+        .open_stream_with_h3_dial(dial)
+        .await
+        .expect("second H3 stream");
+    second.shutdown().await.expect("second upload FIN");
+    second
+        .read_to_end(&mut sink)
+        .await
+        .expect("second response");
+
+    handler.await.expect("server handler");
+    assert_eq!(dials.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn xhttp_h3_keepalive_defaults_only_for_zero_xmux_policy() {
+    let (config, endpoint) = xhttp_config(XhttpModeSelection::StreamOne, 4);
+    let transport = XhttpTransport::new(
+        config.clone(),
+        endpoint.clone(),
+        XhttpHttpVersion::Http3,
+        unlimited_xmux(),
+    )
+    .expect("default H3 transport");
+    assert_eq!(
+        transport.h3_quic_config().keep_alive_interval,
+        Some(Duration::from_secs(10))
+    );
+
+    for h_keep_alive_period_secs in [-1, 7] {
+        let mut xmux = unlimited_xmux();
+        xmux.h_keep_alive_period_secs = h_keep_alive_period_secs;
+        let transport = XhttpTransport::new(
+            config.clone(),
+            endpoint.clone(),
+            XhttpHttpVersion::Http3,
+            xmux,
+        )
+        .expect("explicit xmux keepalive policy");
+        assert_eq!(transport.h3_quic_config().keep_alive_interval, None);
+    }
+
+    let quic = H3QuicConfig {
+        keep_alive_interval: Some(Duration::from_secs(3)),
+        ..H3QuicConfig::default()
+    };
+    let transport = XhttpTransport::new_with_h3_quic(
+        config,
+        endpoint,
+        XhttpHttpVersion::Http3,
+        unlimited_xmux(),
+        quic,
+    )
+    .expect("explicit QUIC keepalive");
+    assert_eq!(
+        transport.h3_quic_config().keep_alive_interval,
+        Some(Duration::from_secs(3))
+    );
+}
+
+#[derive(Default)]
+struct RecordingProtector {
+    calls: AtomicUsize,
+}
+
+impl SocketProtector for RecordingProtector {
+    fn protect(&self, socket: SocketHandle) -> io::Result<()> {
+        assert!(socket.raw() >= 0);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A server-side UDP port redirect: each client source gets its own upstream
+/// socket, so the server sees a real QUIC path migration on every hop.
+struct HopRelay {
+    address: SocketAddr,
+    sources: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
+}
+
+impl HopRelay {
+    async fn start(server: SocketAddr) -> Self {
+        let front = Arc::new(
+            tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        );
+        let address = front.local_addr().unwrap();
+        let sources = Arc::new(AtomicUsize::new(0));
+        let seen = sources.clone();
+        let task = tokio::spawn(async move {
+            let mut paths: std::collections::HashMap<SocketAddr, Arc<tokio::net::UdpSocket>> =
+                std::collections::HashMap::new();
+            let mut buffer = [0; 65535];
+            loop {
+                let Ok((n, client)) = front.recv_from(&mut buffer).await else {
+                    return;
+                };
+                if let std::collections::hash_map::Entry::Vacant(path) = paths.entry(client) {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let upstream = Arc::new(
+                        tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                            .await
+                            .unwrap(),
+                    );
+                    upstream.connect(server).await.unwrap();
+                    let (source, output) = (upstream.clone(), front.clone());
+                    tokio::spawn(async move {
+                        let mut data = [0; 65535];
+                        while let Ok(n) = source.recv(&mut data).await {
+                            let _ = output.send_to(&data[..n], client).await;
+                        }
+                    });
+                    path.insert(upstream);
+                }
+                let _ = paths[&client].send(&buffer[..n]).await;
+            }
+        });
+        Self {
+            address,
+            sources,
+            task,
+        }
+    }
+}
+
+impl Drop for HopRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn xhttp_h3_hops_to_a_different_port_each_interval_on_one_connection() {
+    timeout(Duration::from_secs(40), async {
+        let (client_tls, server_addr, server) = server_with_options(None).await;
+        let first = HopRelay::start(server_addr).await;
+        let second = HopRelay::start(server_addr).await;
+        // Nothing listens on the nominal port: even the first Initial must use
+        // a hop port.
+        let nominal = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let protector = Arc::new(RecordingProtector::default());
+        let protector_dyn: Arc<dyn SocketProtector> = protector.clone();
+        let client = connect_h3(H3ConnectConfig {
+            remote_addr: nominal,
+            server_name: "localhost".to_owned(),
+            tls_config: client_tls,
+            socket_protector: Some(protector_dyn),
+            quic: H3QuicConfig {
+                udp_hop: H3UdpHopConfig {
+                    ports: vec![first.address.port(), second.address.port()],
+                    interval_min: Duration::from_secs(5),
+                    interval_max: Duration::from_secs(5),
+                    local: true,
+                    remote: true,
+                    ..H3UdpHopConfig::default()
+                },
+                ..H3QuicConfig::default()
+            },
+            realm: None,
+            network_changes: None,
+        })
+        .await
+        .expect("connect through a hop port");
+
+        for round in 0..3_u8 {
+            if round > 0 {
+                let before = client.local_addr().unwrap();
+                timeout(Duration::from_secs(8), async {
+                    while client.local_addr().unwrap() == before {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("the timer moves the carrier to a fresh socket");
+            }
+            let handler = tokio::spawn({
+                let server = server.clone();
+                async move { serve_clean_exchange(&server).await }
+            });
+            let payload = vec![round; 4096];
+            let mut body = client
+                .send_fixed(request(Method::POST, "/hop"), Bytes::from(payload.clone()))
+                .await
+                .expect("request survives the hop");
+            body.read_to_end(&mut Vec::new())
+                .await
+                .expect("response body");
+            assert_eq!(handler.await.unwrap().2, payload);
+            assert!(client.is_live());
+        }
+
+        // Every hop changed the port, so the relays alternated from a random
+        // first port: three carrier sockets, each protected before use, over
+        // one QUIC connection.
+        let mut sources = [
+            first.sources.load(Ordering::SeqCst),
+            second.sources.load(Ordering::SeqCst),
+        ];
+        sources.sort_unstable();
+        assert_eq!(sources, [1, 2]);
+        assert_eq!(protector.calls.load(Ordering::SeqCst), 3);
+    })
+    .await
+    .expect("bounded UDP hop scenario");
+}
+
+/// One request and response over `client`, served by `server`.
+async fn hop_exchange(client: &H3Client, server: &TestServer, round: u8) {
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move { serve_clean_exchange(&server).await }
+    });
+    let payload = vec![round; 4096];
+    let mut body = client
+        .send_fixed(request(Method::POST, "/hop"), Bytes::from(payload.clone()))
+        .await
+        .expect("request survives the hop");
+    body.read_to_end(&mut Vec::new())
+        .await
+        .expect("response body");
+    assert_eq!(handler.await.unwrap().2, payload);
+}
+
+/// Xray's `intervalLocal` alone: each interval takes a fresh local socket,
+/// still aimed at the server's own address, whatever the ports say.
+#[tokio::test]
+async fn xhttp_h3_local_hop_keeps_the_servers_address() {
+    timeout(Duration::from_secs(30), async {
+        let (client_tls, server_addr, server) = server_with_options(None).await;
+        let own = HopRelay::start(server_addr).await;
+        let other = HopRelay::start(server_addr).await;
+        let protector = Arc::new(RecordingProtector::default());
+        let protector_dyn: Arc<dyn SocketProtector> = protector.clone();
+        let client = connect_h3(H3ConnectConfig {
+            remote_addr: own.address,
+            server_name: "localhost".to_owned(),
+            tls_config: client_tls,
+            socket_protector: Some(protector_dyn),
+            quic: H3QuicConfig {
+                udp_hop: H3UdpHopConfig {
+                    ports: vec![other.address.port()],
+                    interval_min: Duration::from_secs(5),
+                    interval_max: Duration::from_secs(5),
+                    local: true,
+                    ..H3UdpHopConfig::default()
+                },
+                ..H3QuicConfig::default()
+            },
+            realm: None,
+            network_changes: None,
+        })
+        .await
+        .expect("connect to the server's address");
+        hop_exchange(&client, &server, 0).await;
+        let before = client.local_addr().unwrap();
+        timeout(Duration::from_secs(8), async {
+            while client.local_addr().unwrap() == before {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the timer moves the carrier to a fresh socket");
+        hop_exchange(&client, &server, 1).await;
+        assert!(client.is_live());
+        assert_eq!(own.sources.load(Ordering::SeqCst), 2);
+        assert_eq!(other.sources.load(Ordering::SeqCst), 0);
+        assert_eq!(protector.calls.load(Ordering::SeqCst), 2);
+    })
+    .await
+    .expect("bounded local hop scenario");
+}
+
+/// A change of the OS network: the connection takes a fresh protected
+/// socket towards the same server and its requests go on, with no mask and
+/// no hop configured. Without the signal it never moves.
+#[tokio::test]
+async fn xhttp_h3_takes_a_fresh_socket_when_the_network_changes() {
+    timeout(Duration::from_secs(30), async {
+        let (client_tls, server_addr, server) = server_with_options(None).await;
+        let front = HopRelay::start(server_addr).await;
+        let protector = Arc::new(RecordingProtector::default());
+        let protector_dyn: Arc<dyn SocketProtector> = protector.clone();
+        let changes = segue_transport::NetworkChanges::default();
+        assert_eq!(changes.notify(), 0, "nothing follows the changes yet");
+        let client = connect_h3(H3ConnectConfig {
+            remote_addr: front.address,
+            server_name: "localhost".to_owned(),
+            tls_config: client_tls,
+            socket_protector: Some(protector_dyn),
+            quic: H3QuicConfig::default(),
+            realm: None,
+            network_changes: Some(changes.clone()),
+        })
+        .await
+        .expect("connect to the server");
+        hop_exchange(&client, &server, 0).await;
+        let before = client.local_addr().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            client.local_addr().unwrap(),
+            before,
+            "no hop without a change"
+        );
+
+        assert_eq!(changes.notify(), 1);
+        timeout(Duration::from_secs(8), async {
+            while client.local_addr().unwrap() == before {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the change moves the carrier to a fresh socket");
+        hop_exchange(&client, &server, 1).await;
+        assert!(client.is_live());
+        assert_eq!(front.sources.load(Ordering::SeqCst), 2);
+        assert_eq!(protector.calls.load(Ordering::SeqCst), 2);
+
+        drop(client);
+        timeout(Duration::from_secs(5), async {
+            while changes.notify() != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a dropped connection stops following the changes");
+    })
+    .await
+    .expect("bounded network change scenario");
+}
+
+/// Xray's `perConnRemote` alone: the connection goes to a random one of the
+/// ports and stays there, on its first socket.
+#[tokio::test]
+async fn xhttp_h3_per_connection_remote_draws_once_and_never_hops() {
+    timeout(Duration::from_secs(30), async {
+        let (client_tls, server_addr, server) = server_with_options(None).await;
+        let first = HopRelay::start(server_addr).await;
+        let second = HopRelay::start(server_addr).await;
+        // Nothing listens on the nominal port.
+        let nominal = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let protector = Arc::new(RecordingProtector::default());
+        let protector_dyn: Arc<dyn SocketProtector> = protector.clone();
+        let client = connect_h3(H3ConnectConfig {
+            remote_addr: nominal,
+            server_name: "localhost".to_owned(),
+            tls_config: client_tls,
+            socket_protector: Some(protector_dyn),
+            quic: H3QuicConfig {
+                udp_hop: H3UdpHopConfig {
+                    ports: vec![first.address.port(), second.address.port()],
+                    interval_min: Duration::from_secs(5),
+                    interval_max: Duration::from_secs(5),
+                    remote_once: true,
+                    ..H3UdpHopConfig::default()
+                },
+                ..H3QuicConfig::default()
+            },
+            realm: None,
+            network_changes: None,
+        })
+        .await
+        .expect("connect through a drawn port");
+        let before = client.local_addr().unwrap();
+        hop_exchange(&client, &server, 0).await;
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        hop_exchange(&client, &server, 1).await;
+        assert_eq!(client.local_addr().unwrap(), before);
+        let mut sources = [
+            first.sources.load(Ordering::SeqCst),
+            second.sources.load(Ordering::SeqCst),
+        ];
+        sources.sort_unstable();
+        assert_eq!(sources, [0, 1]);
+        assert_eq!(protector.calls.load(Ordering::SeqCst), 1);
+    })
+    .await
+    .expect("bounded per-connection scenario");
+}
+
+#[tokio::test]
+async fn udp_socket_is_protected_before_quinn_takes_ownership() {
+    let protector = Arc::new(RecordingProtector::default());
+    let protector_dyn: Arc<dyn SocketProtector> = protector.clone();
+    let (client, _server) = pair_with_protector(Some(protector_dyn)).await;
+
+    assert!(client.is_live());
+    assert_eq!(protector.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn preprotected_tls_connector_protects_every_production_h3_candidate() {
+    let (client_tls, server_addr, server) = server_with_options(None).await;
+    let protector = Arc::new(RecordingProtector::default());
+    let protector_dyn: Arc<dyn SocketProtector> = protector.clone();
+    let dialer = TransportDialer::with_tls_connector(
+        TlsConnector::with_pinned_client_config(client_tls).with_socket_protector(protector_dyn),
+    );
+    let connector = ConnectorConfig::Tls(TlsClientConfig {
+        server_name: "localhost".to_owned(),
+        allow_insecure: false,
+        pinned_peer_cert_sha256: Vec::new(),
+        verify_peer_cert_by_name: Vec::new(),
+        alpn: vec!["http/1.1".to_owned()],
+        fingerprint: Some("fingerprint-is-ignored-by-h3".to_owned()),
+    });
+    let target = Target::new(
+        TargetAddr::Ip(server_addr.ip()),
+        server_addr.port(),
+        Network::Tcp,
+    );
+    let unused_socket =
+        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve unused UDP candidate");
+    let unused_addr = unused_socket.local_addr().expect("unused UDP address");
+    drop(unused_socket);
+    let happy_eyeballs = HappyEyeballsConfig {
+        prioritize_ipv6: false,
+        interleave: 1,
+        try_delay: Duration::from_millis(5),
+        max_concurrent: NonZeroUsize::new(2).expect("nonzero test concurrency"),
+    };
+    let layer = TransportLayer::Xhttp(xhttp_h3_transport(
+        XhttpModeSelection::StreamOne,
+        unlimited_xmux(),
+        4,
+    ));
+    let handler = tokio::spawn({
+        let server = server.clone();
+        async move { serve_clean_exchange(&server).await }
+    });
+
+    let mut stream = timeout(
+        DEADLINE,
+        dialer.connect_stream(
+            &connector,
+            &layer,
+            &target,
+            &[unused_addr, server_addr],
+            Some(&happy_eyeballs),
+        ),
+    )
+    .await
+    .expect("production H3 Happy Eyeballs deadline")
+    .expect("production H3 dial through preprotected connector");
+    stream.shutdown().await.expect("finish production upload");
+    let mut sink = Vec::new();
+    stream
+        .read_to_end(&mut sink)
+        .await
+        .expect("production H3 response");
+
+    handler.await.expect("server handler");
+    assert_eq!(
+        protector.calls.load(Ordering::SeqCst),
+        2,
+        "both the losing and winning UDP sockets must be protected"
+    );
+}
+
+#[tokio::test]
+async fn production_h3_rejects_tcp_and_reality_security_without_downgrade() {
+    let dialer = TransportDialer::system().expect("system dialer");
+    let target = Target::new(
+        TargetAddr::Ip(Ipv4Addr::LOCALHOST.into()),
+        443,
+        Network::Tcp,
+    );
+    let layer = TransportLayer::Xhttp(xhttp_h3_transport(
+        XhttpModeSelection::StreamOne,
+        unlimited_xmux(),
+        4,
+    ));
+    let reality = segue_transport::RealityClientConfig {
+        server_name: "example.com".to_owned(),
+        fingerprint: "chrome".to_owned(),
+        public_key: [0; 32],
+        short_id: Vec::new(),
+        spider_x: "/".to_owned(),
+        mldsa65_verify: None,
+    };
+
+    for (connector, expected) in [
+        (ConnectorConfig::Tcp, "TCP"),
+        (ConnectorConfig::Reality(reality), "REALITY"),
+    ] {
+        let result = dialer
+            .connect_stream(
+                &connector,
+                &layer,
+                &target,
+                &[SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9)],
+                None,
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("H3 must require stock TLS"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error for {expected}: {error}"
+        );
+    }
+}
+
+struct FailingProtector {
+    calls: AtomicUsize,
+}
+
+impl SocketProtector for FailingProtector {
+    fn protect(&self, _socket: SocketHandle) -> io::Result<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "deliberate protection failure",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn invalid_sni_precedes_socket_protection_and_protection_failure_stops_candidate_race() {
+    let (client_tls, server_addr, _server) = server_with_options(None).await;
+    let recording = Arc::new(RecordingProtector::default());
+    let error = connect_h3(H3ConnectConfig {
+        remote_addr: server_addr,
+        server_name: "invalid server name".to_owned(),
+        tls_config: Arc::clone(&client_tls),
+        socket_protector: Some(recording.clone()),
+        quic: H3QuicConfig::default(),
+        realm: None,
+        network_changes: None,
+    })
+    .await
+    .expect_err("invalid SNI must fail before UDP bind/protection");
+    assert!(matches!(
+        error,
+        H3Error::Transport(segue_transport::TransportError::InvalidTlsServerName(_))
+    ));
+    assert_eq!(recording.calls.load(Ordering::SeqCst), 0);
+
+    let failing = Arc::new(FailingProtector {
+        calls: AtomicUsize::new(0),
+    });
+    let policy = HappyEyeballsConfig {
+        prioritize_ipv6: false,
+        interleave: 1,
+        try_delay: Duration::from_millis(1),
+        max_concurrent: NonZeroUsize::new(2).expect("nonzero test concurrency"),
+    };
+    let error = segue_transport::stream::xhttp_h3_test_only::connect_h3_candidates(
+        H3ConnectConfig {
+            remote_addr: server_addr,
+            server_name: "localhost".to_owned(),
+            tls_config: client_tls,
+            socket_protector: Some(failing.clone()),
+            quic: H3QuicConfig::default(),
+            realm: None,
+            network_changes: None,
+        },
+        &[server_addr, server_addr],
+        Some(&policy),
+    )
+    .await
+    .expect_err("protection failure must be fatal to the whole candidate race");
+    assert!(matches!(
+        error,
+        H3Error::Transport(segue_transport::TransportError::SocketProtection(_))
+    ));
+    assert_eq!(
+        failing.calls.load(Ordering::SeqCst),
+        1,
+        "a protection failure must not try another candidate"
+    );
+}
+
+#[test]
+fn default_quic_diagnostics_expose_static_window_approximation() {
+    let config = H3QuicConfig::default();
+    let diagnostics = config
+        .diagnostics()
+        .expect("the supported default must remain usable");
+
+    assert_eq!(config.initial_stream_receive_window, 2 * 1024 * 1024);
+    assert_eq!(config.max_stream_receive_window, None);
+    assert_eq!(config.initial_connection_receive_window, 3 * 1024 * 1024);
+    assert_eq!(config.max_connection_receive_window, None);
+    assert_eq!(diagnostics.stream_receive_window, 2 * 1024 * 1024);
+    assert_eq!(diagnostics.connection_receive_window, 3 * 1024 * 1024);
+    // Downloads grow toward Xray's 6 MiB / 15 MiB on a standard host.
+    assert!(diagnostics.adaptive_receive_windows);
+}
+
+#[test]
+fn unsupported_quic_parity_modes_fail_closed() {
+    let mut config = H3QuicConfig {
+        version: H3QuicVersion::V2,
+        ..H3QuicConfig::default()
+    };
+    assert!(matches!(
+        config.diagnostics(),
+        Err(H3Error::UnsupportedQuicVersion {
+            requested: H3QuicVersion::V2
+        })
+    ));
+    let (xhttp, endpoint) = xhttp_config(XhttpModeSelection::StreamOne, 4);
+    assert!(XhttpTransport::new_with_h3_quic(
+        xhttp,
+        endpoint,
+        XhttpHttpVersion::Http3,
+        unlimited_xmux(),
+        config.clone(),
+    )
+    .is_err());
+
+    config.version = H3QuicVersion::V1;
+    config.max_stream_receive_window = Some(6 * 1024 * 1024);
+    assert!(config.diagnostics().is_ok());
+    config.max_stream_receive_window = Some(1024 * 1024);
+    assert!(matches!(
+        config.diagnostics(),
+        Err(H3Error::ReceiveWindowMaximumBelowInitial { .. })
+    ));
+
+    config.max_stream_receive_window = None;
+    for (requested, name) in [
+        (H3Congestion::BbrConservative, "xray-bbr-conservative"),
+        (H3Congestion::BbrAggressive, "xray-bbr-aggressive"),
+    ] {
+        config.congestion = requested;
+        assert_eq!(config.diagnostics().unwrap().congestion, name);
+    }
+    config.congestion = H3Congestion::ForceBrutal {
+        bytes_per_second: 0,
+    };
+    assert!(matches!(
+        config.diagnostics(),
+        Err(H3Error::UnsupportedCongestion { .. })
+    ));
+    config.congestion = H3Congestion::ForceBrutal {
+        bytes_per_second: 65_536,
+    };
+    assert_eq!(config.diagnostics().unwrap().congestion, "brutal");
+    // Xray's XHTTP dialer panics on plain `brutal`; it needs Hysteria's
+    // bandwidth exchange, so an XHTTP transport refuses it up front.
+    config.congestion = H3Congestion::Brutal {
+        up_bytes_per_second: 65_536,
+        bbr_profile: H3BbrProfile::Standard,
+    };
+    assert!(config.diagnostics().is_ok());
+    let (xhttp, endpoint) = xhttp_config(XhttpModeSelection::StreamOne, 4);
+    let Err(refused) = XhttpTransport::new_with_h3_quic(
+        xhttp,
+        endpoint,
+        XhttpHttpVersion::Http3,
+        unlimited_xmux(),
+        config.clone(),
+    ) else {
+        panic!("XHTTP H3 must refuse negotiated Brutal");
+    };
+    assert!(refused.to_string().contains("Hysteria"), "{refused}");
+
+    config.congestion = H3Congestion::BbrStandard;
+    config.udp_hop = H3UdpHopConfig {
+        ports: vec![443, 8443],
+        interval_min: Duration::from_secs(5),
+        interval_max: Duration::from_secs(10),
+        local: true,
+        remote: true,
+        ..H3UdpHopConfig::default()
+    };
+    assert!(config.diagnostics().unwrap().udp_hop);
+    config.udp_hop.interval_min = Duration::from_secs(4);
+    assert!(matches!(
+        config.diagnostics(),
+        Err(H3Error::InvalidUdpHop { port_count: 2, .. })
+    ));
+    config.udp_hop.interval_min = Duration::from_secs(5);
+    config.udp_hop.ports.push(0);
+    assert!(matches!(
+        config.diagnostics(),
+        Err(H3Error::InvalidUdpHop { port_count: 3, .. })
+    ));
+    // A local hop needs no ports, and its interval is held to the same bounds.
+    config.udp_hop = H3UdpHopConfig {
+        interval_min: Duration::from_secs(5),
+        interval_max: Duration::from_secs(5),
+        local: true,
+        ..H3UdpHopConfig::default()
+    };
+    assert!(config.diagnostics().unwrap().udp_hop);
+    config.udp_hop.interval_min = Duration::from_secs(4);
+    assert!(matches!(
+        config.diagnostics(),
+        Err(H3Error::InvalidUdpHop { port_count: 0, .. })
+    ));
+    // `perConnRemote` alone draws once and runs no timer.
+    config.udp_hop = H3UdpHopConfig {
+        ports: vec![443, 8443],
+        remote_once: true,
+        ..H3UdpHopConfig::default()
+    };
+    assert!(!config.diagnostics().unwrap().udp_hop);
+
+    config.udp_hop = H3UdpHopConfig::default();
+    config.debug = true;
+    assert!(matches!(
+        config.diagnostics(),
+        Err(H3Error::UnsupportedDebugLogging)
+    ));
+}
+
+#[tokio::test]
+async fn split_download_h3_drop_cancels_both_carriers_and_releases_both_pools() {
+    use segue_transport::stream::xhttp_transport_test_only::XhttpModeDial;
+    let (up_tls, up_addr, up_server) = server_with_options(None).await;
+    let (down_tls, down_addr, down_server) = server_with_options(None).await;
+    let up_count = Arc::new(AtomicUsize::new(0));
+    let down_count = Arc::new(AtomicUsize::new(0));
+    let up = xhttp_h3_transport(XhttpModeSelection::StreamUp, unlimited_xmux(), 4);
+    let down = xhttp_h3_transport(XhttpModeSelection::Auto, unlimited_xmux(), 4);
+    let up_dial = h3_network_dial(up_tls, up_addr, up_count.clone());
+    let down_dial = h3_network_dial(down_tls, down_addr, down_count.clone());
+    let mut stream = up
+        .open_split_stream_with_dials(
+            XhttpModeDial::Http3(up_dial.clone()),
+            &down,
+            XhttpModeDial::Http3(down_dial.clone()),
+        )
+        .await
+        .unwrap();
+    let (down_request, mut down_exchange) = down_server.accept().await;
+    let (up_request, mut up_exchange) = up_server.accept().await;
+    assert_eq!(down_request.uri().path(), up_request.uri().path());
+    down_exchange
+        .send_response(response(StatusCode::OK))
+        .await
+        .unwrap();
+    down_exchange
+        .send_data(Bytes::from_static(b"ready"))
+        .await
+        .unwrap();
+    let mut ready = [0; 5];
+    timeout(DEADLINE, stream.read_exact(&mut ready))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(stream);
+    assert_eq!(up.xmux_open_usages().await, vec![0]);
+    assert_eq!(down.xmux_open_usages().await, vec![0]);
+    let cancelled_up = timeout(DEADLINE, up_exchange.recv_data()).await.unwrap();
+    assert!(
+        cancelled_up.is_err(),
+        "upload must be reset, not replayed or left running"
+    );
+    let cancelled_down = timeout(DEADLINE, async {
+        loop {
+            if let Err(error) = down_exchange.send_data(Bytes::from_static(b"x")).await {
+                break error;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(cancelled_down, h3::error::StreamError::RemoteTerminate { code, .. } if code==Code::H3_REQUEST_CANCELLED)
+    );
+    let down_handler = tokio::spawn({
+        let server = down_server.clone();
+        async move { serve_clean_exchange(&server).await }
+    });
+    let up_handler = tokio::spawn({
+        let server = up_server.clone();
+        async move { serve_clean_exchange(&server).await }
+    });
+    let mut second = up
+        .open_split_stream_with_dials(
+            XhttpModeDial::Http3(up_dial),
+            &down,
+            XhttpModeDial::Http3(down_dial),
+        )
+        .await
+        .unwrap();
+    second.write_all(b"ping").await.unwrap();
+    second.shutdown().await.unwrap();
+    let mut body = Vec::new();
+    timeout(DEADLINE, second.read_to_end(&mut body))
+        .await
+        .unwrap()
+        .unwrap();
+    down_handler.await.unwrap();
+    up_handler.await.unwrap();
+    drop(second);
+    assert_eq!(
+        up_count.load(Ordering::Acquire),
+        1,
+        "upload connection remains reusable after cancelling only its request"
+    );
+    assert_eq!(
+        down_count.load(Ordering::Acquire),
+        1,
+        "download connection remains reusable after cancelling only its request"
+    );
+}

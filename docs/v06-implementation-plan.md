@@ -66,7 +66,7 @@ does not retag the published SDK or label its old binary as `0.6`.
    there is no fixed six-hour campaign.
 8. **The contributor test command had drifted from CI.** `--all-targets`
    overrides the fuzz binaries' `test = false` and starts unbounded libFuzzer
-   mains. Align `CONTRIBUTING.md` with CI by excluding `xray-rust-fuzz`; keep
+   mains. Align `CONTRIBUTING.md` with CI by excluding `segue-fuzz`; keep
    fuzzing in its separate bounded campaign.
 
 After the routing increment, implement VLESS non-`none` encryption, then
@@ -81,7 +81,7 @@ Implemented the first subset described in the
 [VLESS encryption design](vless-encryption-design.md): one NFS public key,
 `native`/`xorpub`/`random`, AES-256-GCM/ChaCha20-Poly1305, default padding,
 raw TCP without Vision, and TCP/UDP/XUDP framing. A separate
-`xray-vless-encryption` crate owns typed configuration, hybrid key exchange,
+`segue-vless-encryption` crate owns typed configuration, hybrid key exchange,
 and bounded async record state. `VlessUser.encryption` now uses the redacted
 `VlessEncryption` enum instead of retaining the raw string. C ABI remains 1.4.
 
@@ -197,8 +197,8 @@ and `SkipDNSResolve`. The oracle performs no network DNS queries. Run:
 
 ```sh
 bash scripts/check-routing-oracle.sh
-cargo test --locked -p xray-core-rs --lib outbound::routing
-cargo test --locked -p xray-core-rs --test runtime_data_path_tests ip_on_demand
+cargo test --locked -p segue-engine --lib outbound::routing
+cargo test --locked -p segue-engine --test runtime_data_path_tests ip_on_demand
 ```
 
 Additional Rust regressions cover address-limit edges, empty answers,
@@ -215,7 +215,7 @@ increment (retained as the first-increment evidence):
 
 | Check | Result |
 | --- | --- |
-| Rust 1.96 workspace tests, `--exclude xray-rust-fuzz --all-targets --locked` | 2,131 passed; 34 explicitly ignored; no failures |
+| Rust 1.96 workspace tests, `--exclude segue-fuzz --all-targets --locked` | 2,131 passed; 34 explicitly ignored; no failures |
 | Workspace Clippy, all targets/features, warnings denied | Passed |
 | Pinned Go routing oracle | All 23 shared cases passed |
 | SwiftPM tests with the current Rust library, local macOS arm64 XCFramework | 296 passed; Xcode 26.6; no failures |

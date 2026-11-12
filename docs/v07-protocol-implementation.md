@@ -15,7 +15,7 @@ discovery are available through ABI 1.5; release acceptance remains pending.
 
 ### Hysteria 2
 
-`xray-proxy::hysteria` now implements:
+`segue-proxy::hysteria` now implements:
 
 - TCP request and response encoding/decoding. Request bytes include the QUIC
   stream type `0x401`; the pinned Xray transport writes it separately from the
@@ -62,7 +62,7 @@ congestion control, Salamander and hopping are not implemented by this codec.
 
 ### WireGuard
 
-`xray-proxy::wireguard` now implements:
+`segue-proxy::wireguard` now implements:
 
 - Fixed-size decoded key material accepting 64-character hex, standard base64
   and URL-safe base64, with optional single `=` padding. Errors omit input;
@@ -109,8 +109,8 @@ conflicting duplicates, expiry, memory budgets, malformed keys and redaction.
 Reproduce from the repository root:
 
 ```sh
-cargo test --locked -p xray-proxy
-cargo clippy --locked -p xray-proxy --all-targets -- -D warnings -W clippy::perf -W clippy::suspicious
+cargo test --locked -p segue-proxy
+cargo clippy --locked -p segue-proxy --all-targets -- -D warnings -W clippy::perf -W clippy::suspicious
 XRAY_CORE_CHECKOUT=/path/to/pinned/Xray-core bash scripts/check-v07-protocol-oracle.sh
 CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_STRIP=none cargo +nightly-2026-05-22 fuzz run v07_protocols fuzz/corpus/v07_protocols -- -max_total_time=30 -max_len=65536 -timeout=10
 ```
@@ -118,7 +118,7 @@ CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_STRIP=none cargo +nightly-
 These are codec and policy comparisons. Live protocol connections and device
 acceptance remain separate evidence requirements.
 
-Observed locally on macOS arm64, 2026-09-08: all 90 `xray-proxy` tests passed
+Observed locally on macOS arm64, 2026-09-08: all 90 `segue-proxy` tests passed
 (18 new); the regenerated pinned Go fixture matched; proxy Clippy, formatting,
 the fixture-safety check and the hardening-script guard passed. The new ASan
 fuzz target completed 1,230,557 executions in 31 seconds with no crash. This is
@@ -151,7 +151,7 @@ Release criteria remain in the [roadmap](roadmap.md#phase-4-v07-hysteria-2-and-w
 
 ## Second implemented increment: live Hysteria transport
 
-`xray-transport::hysteria` exposes a single authenticated QUIC client and TCP/UDP
+`segue-transport::hysteria` exposes a single authenticated QUIC client and TCP/UDP
 flow leases. It reuses the existing TLS trust/SNI/verification policy and socket
 protector. Authentication is an HTTP/3 POST to `https://hysteria/auth`, with status
 233, bounded headers, credential redaction and Go-compatible boolean/rate parsing.
@@ -221,7 +221,7 @@ native-server, throughput, physical-device or release acceptance.
 Additional reproduction commands:
 
 ```sh
-cargo test --locked -p xray-transport
+cargo test --locked -p segue-transport
 XRAY_CORE_CHECKOUT=/path/to/pinned/Xray-core bash scripts/check-hysteria-interop.sh
 bash scripts/check-vendored-sources.sh
 ```
@@ -230,7 +230,7 @@ bash scripts/check-vendored-sources.sh
 ## Third implemented increment: Hysteria core runtime
 
 The [canonical JSON profile](../tests/fixtures/configs/hysteria2.json) is now
-accepted by `xray-config` and the executable config contract/tooling. Both
+accepted by `segue-config` and the executable config contract/tooling. Both
 `settings.version` and `streamSettings.hysteriaSettings.version` must be 2.
 The outbound has one `address`/nonzero `port`; authentication lives in the
 transport's `auth`. Authentication is bounded to 1..4096 bytes with no control
@@ -284,7 +284,7 @@ Swift/Kotlin profile import, publish mobile binaries or complete v0.7 acceptance
 
 ## Fourth implemented increment: WireGuard core runtime
 
-`xray-wireguard` connects the exact patched GotaTun engine to protected UDP and a
+`segue-wireguard` connects the exact patched GotaTun engine to protected UDP and a
 bounded smoltcp client interface. JSON and typed configuration now dispatch TCP
 and UDP through SOCKS, HTTP CONNECT, TUN and routed DNS, with accounting and host
 close. TCP and UDP share one device per configured outbound. See the

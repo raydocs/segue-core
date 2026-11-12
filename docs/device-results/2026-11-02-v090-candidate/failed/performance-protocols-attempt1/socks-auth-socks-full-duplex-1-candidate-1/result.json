@@ -9,7 +9,7 @@
   "concurrent_flows": 1,
   "connections": 1,
   "cpu_millis": 100,
-  "engine_binary": "<repo>/target/release-090/host/cargo/release/xray-rust",
+  "engine_binary": "<repo>/target/release-090/host/cargo/release/segue",
   "engine_sha256": "6e378c68d0326d631b44cab20a884128cec7e0918611018f3c6980de2cf4a77b",
   "final_footprint_kib": 2592,
   "idle_connections": 0,

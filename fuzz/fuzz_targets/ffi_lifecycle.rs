@@ -3,7 +3,7 @@
 use std::ffi::CString;
 
 use libfuzzer_sys::fuzz_target;
-use xray_ffi::{
+use segue_ffi::{
     xray_core_free, xray_core_load_config_json, xray_core_new, xray_core_probe_outbound_url,
     xray_core_replace_routing_policy_json, xray_core_routing_policy_snapshot_json, xray_core_start,
     xray_core_stop, xray_error_free, XrayCoreHandle, XrayError,

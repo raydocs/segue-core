@@ -1,0 +1,50 @@
+[package]
+name = "segue-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Runtime core coordinating inbounds, routing, transports, and TUN flows"
+
+[features]
+fuzzing = []
+
+[dependencies]
+aes.workspace = true
+aes-gcm.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+hkdf.workspace = true
+libc.workspace = true
+rand.workspace = true
+sha2.workspace = true
+smoltcp.workspace = true
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+segue-config = { path = "../segue-config" }
+segue-proxy = { path = "../segue-proxy" }
+segue-routing = { path = "../segue-routing" }
+segue-runtime = { path = "../segue-runtime" }
+segue-transport = { path = "../segue-transport" }
+segue-wireguard = { path = "../segue-wireguard" }
+segue-tun = { path = "../segue-tun" }
+segue-vless-encryption = { path = "../segue-vless-encryption" }
+zeroize.workspace = true
+
+[dev-dependencies]
+x25519-dalek.workspace = true
+base64.workspace = true
+quinn.workspace = true
+h2.workspace = true
+http.workspace = true
+loom.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls.workspace = true

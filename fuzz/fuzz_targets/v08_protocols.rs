@@ -1,7 +1,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use std::sync::Arc;
-use xray_proxy::{
+use segue_proxy::{
     mux,
     shadowsocks2022::{Method, UdpSession},
     trojan, vmess,

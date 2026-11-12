@@ -1,0 +1,2895 @@
+mod datagram;
+pub(crate) mod tproxy;
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use bytes::Bytes;
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{AbortHandle, Id as TaskId, JoinSet};
+use segue_config::{
+    CoreConfig, DomainStrategy, InboundSniffingConfig, RouteContext, SocksInboundSettings,
+};
+use segue_proxy::inbound::{
+    encode_socks5_udp_datagram, negotiate_socks5, parse_socks4_connect, parse_socks5_udp_datagram,
+    read_socks5_command, read_socks5_target, write_socks5_command_not_supported,
+    write_socks5_failure, write_socks5_success, write_socks5_success_with_bind,
+    HttpInboundAccounts, InboundUser, SocksCommand, SocksInboundAuth, SocksParseError,
+    SOCKS4_GRANTED, SOCKS4_REJECTED, SOCKS4_VERSION,
+};
+use segue_proxy::vless::{encode_xudp_keep_packet, encode_xudp_new_packet, UdpResponseReader};
+use segue_routing::{Target, TargetAddr};
+use segue_transport::{protect_udp_socket, TransportDialer};
+
+use crate::outbound::{
+    absorb_udp_datagrams, absorb_udp_datagrams_until, final_rules,
+    open_tcp_stream_with_resolvers_and_dialer, proxy_protocol, BlackholeOutbound, DnsOutbound,
+    DomainStrategyResolver, FreedomOutbound, InboundSource, TcpSessionOutbound, UdpSessionOutbound,
+};
+use crate::{
+    connection::{wait_for_connection_close, ConnectionLease},
+    dns::RuntimeDnsResolvers,
+    dns_outbound_runtime::{DnsOutboundRuntime, FakeIpTargetProvenance},
+    open_vless_udp_stream_with_resolver_and_dialer,
+    policy::{
+        accept_error_wants_backoff, effective_policy_for_level, AcceptBackoff, EffectivePolicy,
+        RelayTimeouts,
+    },
+    runtime_log::{monotonic_millis, LogThrottle},
+    udp_ingress::{sniff_udp_flow, UdpIngress},
+    ConnectionRegistry, OutboundRouter, RuntimeLogger, TcpOutbound, UdpOutbound, VlessTcpOutbound,
+    VlessUdpFraming,
+};
+
+// On Linux the download of a TCP relay leaves user space where it can.
+#[cfg(not(target_os = "linux"))]
+use crate::policy::copy_bidirectional_with_idle_timeout_and_traffic as relay_tcp;
+#[cfg(target_os = "linux")]
+use crate::policy::copy_bidirectional_with_splice as relay_tcp;
+
+const SOCKS_UDP_BUFFER_SIZE: usize = 65_536;
+const SOCKS_DNS_UDP_PATH_PAYLOAD_CAP: usize = 65_245;
+const SOCKS_UDP_FLOW_QUEUE: usize = 32;
+const SOCKS_UDP_MAX_FLOWS_PER_ASSOCIATION: usize = 128;
+const SOCKS_UDP_MAX_FLOWS_GLOBAL: usize = 1024;
+const SOCKS_UDP_MAX_PENDING_OPENS_GLOBAL: usize = 64;
+const SOCKS_UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SOCKS_UDP_BUDGET_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const SOCKS_VLESS_UDP_FLUSH_BATCH: usize = 16;
+const SOCKS_VLESS_UDP_FLUSH_INTERVAL: Duration = Duration::from_millis(2);
+const SOCKS_TCP_SNIFF_BUFFER_SIZE: usize = 8 * 1024;
+const SOCKS_TCP_SNIFF_TIMEOUT: Duration = Duration::from_millis(250);
+static SOCKS_UDP_GLOBAL_FLOWS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static SOCKS_UDP_GLOBAL_PENDING_OPENS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static SOCKS_UDP_BUDGET_EXHAUSTION_LOG: OnceLock<Arc<SocksUdpBudgetExhaustionLog>> =
+    OnceLock::new();
+
+type BoxedSocksDnsStreamFuture<'a> = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>>;
+
+fn serve_boxed_socks_dns_stream<'a>(
+    runtime: Arc<DnsOutboundRuntime>,
+    inbound: &'a mut TcpStream,
+    initial_payload: Bytes,
+    outbound: DnsOutbound,
+    original_target: Target,
+    inbound_idle_timeout: Duration,
+) -> BoxedSocksDnsStreamFuture<'a> {
+    // Keep the large DNS state machine out of every ordinary SOCKS TCP task.
+    // Dropping this boxed future still cancels the DNS flow synchronously.
+    Box::pin(async move {
+        runtime
+            .serve_tcp_stream(
+                inbound,
+                initial_payload,
+                &outbound,
+                &original_target,
+                inbound_idle_timeout,
+            )
+            .await
+    })
+}
+
+/// One throttle per distinct budget-exhaustion outcome, so a burst of one
+/// kind cannot silence reports of the others.
+struct SocksUdpBudgetExhaustionLog {
+    global_flow_evictions: LogThrottle,
+    global_flow_drops: LogThrottle,
+    pending_open_drops: LogThrottle,
+}
+
+impl SocksUdpBudgetExhaustionLog {
+    const fn new() -> Self {
+        Self {
+            global_flow_evictions: LogThrottle::new(SOCKS_UDP_BUDGET_LOG_INTERVAL),
+            global_flow_drops: LogThrottle::new(SOCKS_UDP_BUDGET_LOG_INTERVAL),
+            pending_open_drops: LogThrottle::new(SOCKS_UDP_BUDGET_LOG_INTERVAL),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SocksUdpFlowContext {
+    reply: UdpReply,
+    /// Where a SOCKS or transparent reply goes. A reverse session's client
+    /// is read through [`SocksUdpFlowContext::source`] instead.
+    client_addr: SocketAddr,
+    /// The address routing sees as the flow's local one: the association's
+    /// relay socket, as in Xray-core.
+    local_addr: Option<SocketAddr>,
+    /// The user the control connection logged in as, which Xray-core gives
+    /// routing for the association's flows too.
+    user: Option<InboundUser>,
+    inbound_tag: Option<String>,
+    config: Arc<CoreConfig>,
+    outbound_router: Arc<OutboundRouter>,
+    dns_resolvers: RuntimeDnsResolvers,
+    transport_dialer: Arc<TransportDialer>,
+    sniffing: Option<InboundSniffingConfig>,
+    runtime_logger: RuntimeLogger,
+    connection_registry: Arc<ConnectionRegistry>,
+}
+
+/// The shared relay keeps routing, DNS/FakeDNS and protocol framing identical.
+#[derive(Clone)]
+enum UdpReply {
+    Socks(Arc<UdpSocket>),
+    #[cfg(target_os = "linux")]
+    Transparent(Arc<UdpSocket>),
+    /// A session the portal of a VLESS reverse proxy opened, whose client
+    /// is the portal's when the portal named it.
+    Reverse {
+        session: crate::reverse::Session,
+        source: Option<SocketAddr>,
+    },
+}
+impl SocksUdpFlowContext {
+    async fn deliver(&self, source: &Target, payload: &[u8]) -> std::io::Result<()> {
+        match &self.reply {
+            UdpReply::Socks(socket) => {
+                let packet =
+                    encode_socks5_udp_datagram(source, payload).map_err(std::io::Error::other)?;
+                socket.send_to(&packet, self.client_addr).await.map(|_| ())
+            }
+            #[cfg(target_os = "linux")]
+            UdpReply::Transparent(socket) => {
+                socket.send_to(payload, self.client_addr).await.map(|_| ())
+            }
+            UdpReply::Reverse { session, .. } => session.send_datagram(source, payload).await,
+        }
+    }
+
+    /// The client routing sees as the flow's source.
+    fn source(&self) -> Option<SocketAddr> {
+        match &self.reply {
+            UdpReply::Reverse { source, .. } => *source,
+            _ => Some(self.client_addr),
+        }
+    }
+
+    /// The client, as access logs name it.
+    fn client_label(&self) -> String {
+        self.source()
+            .map_or_else(|| "unknown".to_owned(), |source| source.to_string())
+    }
+
+    fn is_reverse(&self) -> bool {
+        matches!(self.reply, UdpReply::Reverse { .. })
+    }
+
+    /// The XUDP global ID of the flow to `target`. Xray-core gives a reverse
+    /// session none, as it does every inbound but a few.
+    fn global_id(&self, target: &Target) -> [u8; 8] {
+        if self.is_reverse() {
+            return [0; 8];
+        }
+        socks_udp_flow_global_id(self.client_addr, target)
+    }
+}
+
+#[derive(Clone)]
+struct SocksUdpBudgets {
+    global_flows: Arc<Semaphore>,
+    pending_opens: Arc<Semaphore>,
+    exhaustion_log: Arc<SocksUdpBudgetExhaustionLog>,
+}
+
+impl Default for SocksUdpBudgets {
+    fn default() -> Self {
+        Self {
+            global_flows: Arc::clone(
+                SOCKS_UDP_GLOBAL_FLOWS
+                    .get_or_init(|| Arc::new(Semaphore::new(SOCKS_UDP_MAX_FLOWS_GLOBAL))),
+            ),
+            pending_opens: Arc::clone(
+                SOCKS_UDP_GLOBAL_PENDING_OPENS
+                    .get_or_init(|| Arc::new(Semaphore::new(SOCKS_UDP_MAX_PENDING_OPENS_GLOBAL))),
+            ),
+            exhaustion_log: Arc::clone(
+                SOCKS_UDP_BUDGET_EXHAUSTION_LOG
+                    .get_or_init(|| Arc::new(SocksUdpBudgetExhaustionLog::new())),
+            ),
+        }
+    }
+}
+
+struct SocksUdpFlowEntry {
+    sender: mpsc::Sender<Bytes>,
+    abort_handle: AbortHandle,
+    task_id: TaskId,
+    last_activity: u64,
+    /// Held for the flow's lifetime; reclaimed intact on eviction so the
+    /// budget transfers to the replacement flow without a trip through the
+    /// semaphore's free pool.
+    global_permit: OwnedSemaphorePermit,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "listener tasks receive shared runtime dependencies explicitly"
+)]
+pub async fn serve_socks_listener(
+    listener: TcpListener,
+    settings: Arc<SocksInboundSettings>,
+    inbound_tag: Option<String>,
+    config: Arc<CoreConfig>,
+    outbound_router: Arc<OutboundRouter>,
+    dns_resolvers: RuntimeDnsResolvers,
+    transport_dialer: Arc<TransportDialer>,
+    sniffing: Option<InboundSniffingConfig>,
+    policy: EffectivePolicy,
+    runtime_logger: RuntimeLogger,
+    connection_registry: Arc<ConnectionRegistry>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut connections = JoinSet::new();
+    let mut accept_backoff = AcceptBackoff::new();
+    let udp_budgets = SocksUdpBudgets::default();
+
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        if !accept_error_wants_backoff(error.kind()) {
+                            continue;
+                        }
+                        if !accept_backoff.is_backing_off() {
+                            // accept() errors carry only OS errno text (no peer
+                            // data), and the errno is the operator's signal to
+                            // raise `ulimit -n` — so this log skips <redacted>.
+                            runtime_logger.error(|| {
+                                format!("Debug socksAccept failed, backing off error={error}")
+                            });
+                        }
+                        let delay = accept_backoff.next_delay();
+                        tokio::select! {
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        continue;
+                    }
+                };
+                accept_backoff.reset();
+                let settings = Arc::clone(&settings);
+                let inbound_tag = inbound_tag.clone();
+                let config = Arc::clone(&config);
+                let outbound_router = Arc::clone(&outbound_router);
+                let dns_resolvers = dns_resolvers.clone();
+                let transport_dialer = Arc::clone(&transport_dialer);
+                let sniffing = sniffing.clone();
+                let runtime_logger = runtime_logger.clone();
+                let connection_shutdown = shutdown.clone();
+                let udp_budgets = udp_budgets.clone();
+                let connection_registry = Arc::clone(&connection_registry);
+                connections.spawn(async move {
+                    handle_socks_connection(
+                        stream,
+                        &settings,
+                        inbound_tag,
+                        config,
+                        outbound_router,
+                        dns_resolvers,
+                        transport_dialer,
+                        sniffing,
+                        policy,
+                        runtime_logger,
+                        connection_registry,
+                        connection_shutdown,
+                        udp_budgets,
+                    ).await;
+                });
+            }
+            joined = connections.join_next(), if !connections.is_empty() => {
+                let _ = joined;
+            }
+        }
+    }
+
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+}
+
+/// Pins a password-protected UDP association to one client socket.
+///
+/// RFC 1929 authenticates only the TCP control connection, and the relay
+/// socket is reachable by every local process. The association therefore
+/// accepts datagrams only from the endpoint the client declared in its
+/// UDP ASSOCIATE request. A request that leaves the port unset gives nothing
+/// to bind the login to, since local processes share the loopback IP, so it
+/// gets no lock and the association is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocksUdpClientLock {
+    client: SocketAddr,
+}
+
+impl SocksUdpClientLock {
+    fn for_request(declared: &Target, control_peer: Option<SocketAddr>) -> Option<Self> {
+        let client = match (&declared.addr, declared.port) {
+            (_, 0) => None,
+            (TargetAddr::Ip(ip), port) if !ip.is_unspecified() => Some(SocketAddr::new(*ip, port)),
+            (_, port) => control_peer.map(|peer| SocketAddr::new(peer.ip(), port)),
+        };
+        client.map(|client| Self { client })
+    }
+
+    fn admits(self, source: SocketAddr) -> bool {
+        self.client == source
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "connection tasks receive shared runtime dependencies explicitly"
+)]
+async fn handle_socks_connection(
+    mut inbound: TcpStream,
+    settings: &SocksInboundSettings,
+    inbound_tag: Option<String>,
+    config: Arc<CoreConfig>,
+    outbound_router: Arc<OutboundRouter>,
+    dns_resolvers: RuntimeDnsResolvers,
+    transport_dialer: Arc<TransportDialer>,
+    sniffing: Option<InboundSniffingConfig>,
+    policy: EffectivePolicy,
+    runtime_logger: RuntimeLogger,
+    connection_registry: Arc<ConnectionRegistry>,
+    shutdown: watch::Receiver<bool>,
+    udp_budgets: SocksUdpBudgets,
+) {
+    let auth = &settings.auth;
+    // Like Xray-core, the first byte selects SOCKS 5, SOCKS 4/4a or, for
+    // anything else, HTTP on the same port (`mixed` is only an alias).
+    let mut first = [0_u8; 1];
+    let Ok(Ok(1)) = tokio::time::timeout(policy.handshake, inbound.peek(&mut first)).await else {
+        return;
+    };
+    match first[0] {
+        5 => {}
+        SOCKS4_VERSION => {
+            handle_socks4_connection(
+                inbound,
+                auth,
+                inbound_tag,
+                config,
+                outbound_router,
+                dns_resolvers,
+                transport_dialer,
+                sniffing,
+                policy,
+                runtime_logger,
+                connection_registry,
+            )
+            .await;
+            return;
+        }
+        _ => {
+            handle_socks_http_connection(
+                inbound,
+                auth,
+                inbound_tag,
+                config,
+                outbound_router,
+                dns_resolvers,
+                transport_dialer,
+                sniffing,
+                policy,
+                runtime_logger,
+                connection_registry,
+            )
+            .await;
+            return;
+        }
+    }
+    // Xray-core gives the whole handshake one deadline.
+    let deadline = tokio::time::Instant::now() + policy.handshake;
+    let Some(user) = tokio::time::timeout_at(deadline, negotiate_socks5(&mut inbound, auth))
+        .await
+        .ok()
+        .and_then(Result::ok)
+    else {
+        return;
+    };
+
+    // Xray-core refuses a command it does not serve, and UDP while `"udp"`
+    // is false, before reading the address. A request it cannot read is
+    // closed without a reply.
+    let command = match tokio::time::timeout_at(deadline, read_socks5_command(&mut inbound)).await {
+        Ok(Ok(SocksCommand::UdpAssociate)) if !settings.udp => None,
+        Ok(Ok(command)) => Some(command),
+        Ok(Err(SocksParseError::UnsupportedCommand(_))) => None,
+        _ => return,
+    };
+    let Some(command) = command else {
+        let _ = write_socks5_command_not_supported(&mut inbound).await;
+        crate::http::drain_arrived(&inbound);
+        return;
+    };
+    let target =
+        match tokio::time::timeout_at(deadline, read_socks5_target(&mut inbound, command)).await {
+            Ok(Ok(target)) => target,
+            _ => {
+                crate::http::drain_arrived(&inbound);
+                return;
+            }
+        };
+
+    match command {
+        SocksCommand::Connect => {
+            handle_socks_connect::<true>(
+                inbound,
+                target,
+                user,
+                inbound_tag,
+                config,
+                outbound_router,
+                dns_resolvers,
+                transport_dialer,
+                sniffing,
+                policy,
+                runtime_logger,
+                connection_registry,
+            )
+            .await;
+        }
+        SocksCommand::UdpAssociate => {
+            let client_lock = if auth.requires_password() {
+                let Some(lock) = SocksUdpClientLock::for_request(&target, inbound.peer_addr().ok())
+                else {
+                    let _ = write_socks5_failure(&mut inbound).await;
+                    return;
+                };
+                Some(lock)
+            } else {
+                None
+            };
+            handle_socks_udp_associate(
+                inbound,
+                client_lock,
+                user,
+                inbound_tag,
+                config,
+                outbound_router,
+                dns_resolvers,
+                transport_dialer,
+                sniffing,
+                runtime_logger,
+                connection_registry,
+                shutdown,
+                udp_budgets,
+            )
+            .await;
+        }
+    }
+}
+
+/// SOCKS 4/4a `CONNECT`, which Xray-core refuses while the inbound requires
+/// a password. The grant goes out before dispatch, as in Xray.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "connection tasks receive shared runtime dependencies explicitly"
+)]
+async fn handle_socks4_connection(
+    mut inbound: TcpStream,
+    auth: &SocksInboundAuth,
+    inbound_tag: Option<String>,
+    config: Arc<CoreConfig>,
+    outbound_router: Arc<OutboundRouter>,
+    dns_resolvers: RuntimeDnsResolvers,
+    transport_dialer: Arc<TransportDialer>,
+    sniffing: Option<InboundSniffingConfig>,
+    policy: EffectivePolicy,
+    runtime_logger: RuntimeLogger,
+    connection_registry: Arc<ConnectionRegistry>,
+) {
+    let mut version = [0_u8; 1];
+    if inbound.read_exact(&mut version).await.is_err() {
+        return;
+    }
+    // The whole request is read even when it will be refused, so closing
+    // does not reset the connection over unread bytes and lose the reply.
+    let target =
+        match tokio::time::timeout(policy.handshake, parse_socks4_connect(&mut inbound)).await {
+            Ok(Ok(target)) if !auth.requires_password() => target,
+            _ => {
+                let _ = inbound.write_all(&SOCKS4_REJECTED).await;
+                return;
+            }
+        };
+    if inbound.write_all(&SOCKS4_GRANTED).await.is_err() {
+        return;
+    }
+    handle_socks_connect::<false>(
+        inbound,
+        target,
+        None,
+        inbound_tag,
+        config,
+        outbound_router,
+        dns_resolvers,
+        transport_dialer,
+        sniffing,
+        policy,
+        runtime_logger,
+        connection_registry,
+    )
+    .await;
+}
+
+/// HTTP on a SOCKS port. Xray's SOCKS inbound hands it to an HTTP server that
+/// requires the SOCKS accounts as Basic credentials.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "connection tasks receive shared runtime dependencies explicitly"
+)]
+async fn handle_socks_http_connection(
+    inbound: TcpStream,
+    auth: &SocksInboundAuth,
+    inbound_tag: Option<String>,
+    config: Arc<CoreConfig>,
+    outbound_router: Arc<OutboundRouter>,
+    dns_resolvers: RuntimeDnsResolvers,
+    transport_dialer: Arc<TransportDialer>,
+    sniffing: Option<InboundSniffingConfig>,
+    policy: EffectivePolicy,
+    runtime_logger: RuntimeLogger,
+    connection_registry: Arc<ConnectionRegistry>,
+) {
+    crate::http::serve_http_proxy_connection(
+        inbound,
+        &HttpInboundAccounts::from(auth),
+        inbound_tag,
+        config,
+        outbound_router,
+        dns_resolvers,
+        transport_dialer,
+        sniffing,
+        policy,
+        runtime_logger,
+        connection_registry,
+    )
+    .await;
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "connection tasks receive shared runtime dependencies explicitly"
+)]
+pub(crate) async fn handle_socks_connect<const SOCKS_REPLY: bool>(
+    mut inbound: TcpStream,
+    target: Target,
+    user: Option<InboundUser>,
+    inbound_tag: Option<String>,
+    config: Arc<CoreConfig>,
+    outbound_router: Arc<OutboundRouter>,
+    dns_resolvers: RuntimeDnsResolvers,
+    transport_dialer: Arc<TransportDialer>,
+    sniffing: Option<InboundSniffingConfig>,
+    policy: EffectivePolicy,
+    runtime_logger: RuntimeLogger,
+    connection_registry: Arc<ConnectionRegistry>,
+) {
+    let source = runtime_logger.is_enabled().then(|| {
+        inbound
+            .peer_addr()
+            .map_or_else(|_| "unknown".to_owned(), |addr| addr.to_string())
+    });
+    let sniffing_config = sniffing.as_ref();
+    let restored_target = dns_resolvers.outbound.restore_client_target(&target);
+    let provenance = restored_target.provenance;
+    let sniffed_routing = outbound_router.sniffed_routing();
+    let sniff_tcp = should_sniff_socks_tcp(sniffing_config, provenance, sniffed_routing.tcp());
+    let effective_target = restored_target.target;
+    let mut route_target = effective_target.clone();
+    let mut dial_target = effective_target;
+    let mut initial_payload = Bytes::new();
+    let mut sniffed_protocol = None;
+    let mut protocol = None;
+    let mut attributes = None;
+
+    if sniff_tcp {
+        if SOCKS_REPLY && write_socks5_success(&mut inbound).await.is_err() {
+            return;
+        }
+        if let Some(config) = sniffing_config {
+            let (payload, sniffed) = read_tcp_sniff_payload(
+                &mut inbound,
+                config,
+                &dial_target,
+                sniffed_routing.attributes,
+            )
+            .await;
+            initial_payload = payload;
+            attributes = sniffed.attributes;
+            if let Some(sniffed) = sniffed.sniffed {
+                protocol = Some(sniffed.protocol);
+                // A mapped fake IP keeps the domain the fake DNS gave it.
+                if let Some(sniffed) = sniffed
+                    .target
+                    .filter(|_| fake_ip_allows_content_sniffing(provenance))
+                {
+                    let sniffed = apply_fake_ip_sniffed_dial_precedence(provenance, sniffed);
+                    sniffed_protocol = Some(sniffed.protocol);
+                    route_target = sniffed.route_target;
+                    dial_target = sniffed.dial_target;
+                }
+            }
+        }
+    }
+    let protocol = crate::sniffing::routing_protocol(
+        protocol,
+        provenance == FakeIpTargetProvenance::Mapped,
+        sniffing_config,
+    );
+
+    let route = RouteContext {
+        inbound_tag: inbound_tag.as_deref(),
+        source: inbound.peer_addr().ok(),
+        local: inbound.local_addr().ok(),
+        user: user.as_ref().map(InboundUser::as_str),
+        protocol: protocol.map(crate::sniffing::SniffedProtocol::name),
+        attributes: attributes.as_ref(),
+    };
+    let selected = match outbound_router
+        .select_tcp_session_outbound_with_tag_and_resolver(
+            &route,
+            &route_target,
+            &dial_target,
+            true,
+            dns_resolvers.destination.as_ref(),
+        )
+        .await
+    {
+        Ok(outbound) => outbound,
+        Err(error) => {
+            if let Some(source) = source.as_deref() {
+                crate::debug_log::log_access_rejected(
+                    &runtime_logger,
+                    source,
+                    &route_target,
+                    error,
+                );
+            }
+            if SOCKS_REPLY && !sniff_tcp {
+                let _ = write_socks5_failure(&mut inbound).await;
+            }
+            return;
+        }
+    };
+    let connection = connection_registry.register(
+        inbound_tag.clone(),
+        selected.tag.clone(),
+        dial_target.clone(),
+    );
+    let mut connection_close = connection.close_receiver();
+    let connection_traffic = connection.traffic();
+
+    if runtime_logger.is_enabled() {
+        let selected_outbound = match &selected.outbound {
+            TcpSessionOutbound::Transport(outbound) => {
+                crate::debug_log::tcp_outbound_label(outbound)
+            }
+            TcpSessionOutbound::Dns(_) => "dns",
+            TcpSessionOutbound::Blackhole(_) => "blackhole",
+        };
+        crate::debug_log::log_route_decision(
+            &runtime_logger,
+            crate::debug_log::RouteDecisionLog {
+                inbound_tag: inbound_tag.as_deref(),
+                network: target.network,
+                original_target: &target,
+                sniffed_protocol,
+                route_target: &route_target,
+                dial_target: &dial_target,
+                selected_outbound,
+            },
+        );
+    }
+
+    let outbound = match selected.outbound {
+        TcpSessionOutbound::Transport(outbound) => outbound,
+        TcpSessionOutbound::Dns(outbound) => {
+            if let Some(source) = source.as_deref() {
+                crate::debug_log::log_access_accepted(&runtime_logger, source, &dial_target, "dns");
+            }
+            if SOCKS_REPLY && !sniff_tcp && write_socks5_success(&mut inbound).await.is_err() {
+                return;
+            }
+            connection.mark_active();
+            let served = tokio::select! {
+                result = serve_boxed_socks_dns_stream(
+                    dns_resolvers.outbound,
+                    &mut inbound,
+                    initial_payload,
+                    outbound,
+                    dial_target,
+                    policy.conn_idle,
+                ) => Some(result),
+                () = wait_for_connection_close(&mut connection_close) => None,
+            };
+            let _ = served;
+            connection.finish();
+            return;
+        }
+        TcpSessionOutbound::Blackhole(blackhole) => {
+            if let Some(source) = source.as_deref() {
+                crate::debug_log::log_access_accepted(
+                    &runtime_logger,
+                    source,
+                    &dial_target,
+                    "blackhole",
+                );
+            }
+            // Xray's SOCKS server acknowledges CONNECT before dispatching, so a
+            // blackholed client sees success followed by the response and close.
+            if SOCKS_REPLY && !sniff_tcp && write_socks5_success(&mut inbound).await.is_err() {
+                return;
+            }
+            tokio::select! {
+                () = blackhole.finish_stream(&mut inbound) => {}
+                () = wait_for_connection_close(&mut connection_close) => {}
+            }
+            connection.finish();
+            return;
+        }
+    };
+
+    let (open_timeout, relay_timeouts, relay_buffer_size) =
+        tcp_relay_policy(&config, &policy, &outbound);
+    let outbound_label = crate::debug_log::tcp_outbound_label(&outbound);
+    let client = outbound
+        .names_the_client()
+        .then(|| inbound.peer_addr().ok().map(InboundSource::tcp))
+        .flatten();
+    let opened = tokio::select! {
+        result = tokio::time::timeout(
+            open_timeout,
+            open_tcp_stream_with_resolvers_and_dialer(
+                &outbound,
+                &dial_target,
+                dns_resolvers.destination.as_ref(),
+                dns_resolvers.bootstrap.as_ref(),
+                transport_dialer.as_ref(),
+                client.as_ref(),
+            ),
+        ) => Some(result),
+        () = wait_for_connection_close(&mut connection_close) => None,
+    };
+    let mut outbound_stream = match opened {
+        None => return,
+        Some(result) => match result {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                if let Some(source) = source.as_deref() {
+                    crate::debug_log::log_access_rejected(
+                        &runtime_logger,
+                        source,
+                        &dial_target,
+                        error,
+                    );
+                }
+                if SOCKS_REPLY && !sniff_tcp {
+                    let _ = write_socks5_failure(&mut inbound).await;
+                }
+                return;
+            }
+            Err(_) => {
+                if let Some(source) = source.as_deref() {
+                    crate::debug_log::log_access_rejected(
+                        &runtime_logger,
+                        source,
+                        &dial_target,
+                        "outbound tcp open timed out",
+                    );
+                }
+                if SOCKS_REPLY && !sniff_tcp {
+                    let _ = write_socks5_failure(&mut inbound).await;
+                }
+                return;
+            }
+        },
+    };
+    if let Some(source) = source.as_deref() {
+        crate::debug_log::log_access_accepted(
+            &runtime_logger,
+            source,
+            &dial_target,
+            outbound_label,
+        );
+    }
+
+    if SOCKS_REPLY && !sniff_tcp && write_socks5_success(&mut inbound).await.is_err() {
+        return;
+    }
+    if !initial_payload.is_empty() {
+        if outbound_stream.write_all(&initial_payload).await.is_err() {
+            return;
+        }
+        connection_traffic.record_uplink(initial_payload.len() as u64);
+    }
+    connection.mark_active();
+
+    if matches!(outbound, TcpOutbound::Vmess(_)) {
+        if let Some(halves) = outbound_stream.take_parallel_halves() {
+            drop(outbound_stream);
+            let _ = Box::pin(crate::policy::copy_split_with_idle_timeout(
+                outbound_router.factory().parallel_vmess_budget(),
+                inbound.into_split(),
+                halves,
+                relay_timeouts,
+                relay_buffer_size,
+                connection_traffic,
+                wait_for_connection_close(&mut connection_close),
+            ))
+            .await;
+            connection.finish();
+            return;
+        }
+    }
+
+    let copied = tokio::select! {
+        result = relay_tcp(
+            &mut inbound,
+            &mut outbound_stream,
+            relay_timeouts,
+            relay_buffer_size,
+            connection_traffic.as_ref(),
+        ) => Some(result),
+        () = wait_for_connection_close(&mut connection_close) => None,
+    };
+    let _ = copied;
+    connection.finish();
+}
+
+/// The open timeout, idle timeout and relay buffer for a TCP outbound: its
+/// own level's handshake and buffer, and the shorter of its idle timeout and
+/// the inbound's, as Xray-core's two timers make it.
+pub(crate) fn tcp_relay_policy(
+    config: &CoreConfig,
+    policy: &EffectivePolicy,
+    outbound: &TcpOutbound,
+) -> (Duration, RelayTimeouts, usize) {
+    match outbound.primary() {
+        // Freedom's own timer runs at its level beside the inbound's, so the
+        // shorter timeout wins in each phase, as in Xray-core.
+        TcpOutbound::Freedom(freedom) => (
+            policy.handshake,
+            policy.relay_timeouts(effective_policy_for_level(config, Some(freedom.level()))),
+            policy.relay_buffer_size(),
+        ),
+        TcpOutbound::Vless(vless) => {
+            let outbound_policy = effective_policy_for_level(config, Some(vless.user().level));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Trojan(outbound) => {
+            let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Socks(outbound) => {
+            let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Http(outbound) => {
+            let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Vmess(outbound) => {
+            let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Shadowsocks2022(outbound) => {
+            let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Hysteria(_) | TcpOutbound::Wireguard(_) => {
+            let outbound_policy = effective_policy_for_level(config, Some(0));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Masque(_) => {
+            let outbound_policy = effective_policy_for_level(config, Some(0));
+            (
+                crate::outbound::masque::open_timeout(outbound_policy.handshake),
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Chained { .. } => unreachable!("primary outbound is never a chain wrapper"),
+    }
+}
+
+/// Reads a TCP flow's first bytes for sniffing, as Xray-core's dispatcher
+/// waits for them.
+pub(crate) async fn read_tcp_sniff_payload<S>(
+    inbound: &mut S,
+    config: &InboundSniffingConfig,
+    target: &Target,
+    record_attributes: bool,
+) -> (Bytes, crate::sniffing::TcpSniffed)
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + SOCKS_TCP_SNIFF_TIMEOUT;
+    let mut buffer = Vec::with_capacity(SOCKS_TCP_SNIFF_BUFFER_SIZE);
+
+    while buffer.len() < SOCKS_TCP_SNIFF_BUFFER_SIZE {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+
+        let mut chunk = vec![0; SOCKS_TCP_SNIFF_BUFFER_SIZE - buffer.len()];
+        let read = tokio::time::timeout(deadline - now, inbound.read(&mut chunk)).await;
+        let len = match read {
+            Ok(Ok(len)) if len > 0 => len,
+            _ => break,
+        };
+        buffer.extend_from_slice(&chunk[..len]);
+
+        if let crate::sniffing::TcpSniff::Done(sniffed) = crate::sniffing::sniff_tcp_initial_payload(
+            config,
+            target,
+            &buffer,
+            false,
+            record_attributes,
+        ) {
+            return (Bytes::copy_from_slice(&buffer), sniffed);
+        }
+    }
+
+    let sniffed = crate::sniffing::sniff_tcp_initial_payload(
+        config,
+        target,
+        &buffer,
+        true,
+        record_attributes,
+    )
+    .done();
+    (Bytes::copy_from_slice(&buffer), sniffed)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "connection tasks receive shared runtime dependencies explicitly"
+)]
+async fn handle_socks_udp_associate(
+    mut control: TcpStream,
+    client_lock: Option<SocksUdpClientLock>,
+    user: Option<InboundUser>,
+    inbound_tag: Option<String>,
+    config: Arc<CoreConfig>,
+    outbound_router: Arc<OutboundRouter>,
+    dns_resolvers: RuntimeDnsResolvers,
+    transport_dialer: Arc<TransportDialer>,
+    sniffing: Option<InboundSniffingConfig>,
+    runtime_logger: RuntimeLogger,
+    connection_registry: Arc<ConnectionRegistry>,
+    mut shutdown: watch::Receiver<bool>,
+    budgets: SocksUdpBudgets,
+) {
+    let bind_addr = match control.local_addr() {
+        Ok(SocketAddr::V6(_)) => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    };
+    let socket = match UdpSocket::bind(bind_addr).await {
+        Ok(socket) => Arc::new(socket),
+        Err(_) => {
+            let _ = write_socks5_failure(&mut control).await;
+            return;
+        }
+    };
+    let bind = match socket.local_addr() {
+        Ok(bind) => bind,
+        Err(_) => {
+            let _ = write_socks5_failure(&mut control).await;
+            return;
+        }
+    };
+    if write_socks5_success_with_bind(&mut control, bind)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let mut flows = HashMap::<(SocketAddr, Target), SocksUdpFlowEntry>::new();
+    let mut flow_tasks = JoinSet::new();
+    let mut activity_sequence = 0u64;
+    let mut buffer = vec![0; SOCKS_UDP_BUFFER_SIZE];
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            readable = control.readable() => {
+                if readable.is_err() {
+                    break;
+                }
+                let mut byte = [0; 1];
+                match control.try_read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => break,
+                }
+            }
+            joined = flow_tasks.join_next_with_id(), if !flow_tasks.is_empty() => {
+                match joined {
+                    Some(Ok((task_id, flow_key))) => {
+                        remove_socks_udp_flow_by_task_id(&mut flows, task_id, Some(&flow_key));
+                    }
+                    Some(Err(error)) => {
+                        remove_socks_udp_flow_by_task_id(&mut flows, error.id(), None);
+                    }
+                    None => {}
+                }
+            }
+            received = socket.recv_from(&mut buffer) => {
+                let Ok((len, client_addr)) = received else {
+                    break;
+                };
+                if client_lock.is_some_and(|lock| !lock.admits(client_addr)) {
+                    continue;
+                }
+                let Ok(datagram) = parse_socks5_udp_datagram(&buffer[..len]) else {
+                    continue;
+                };
+                // Xray-core drops a datagram without a payload.
+                if datagram.payload.is_empty() {
+                    continue;
+                }
+                let flow_key = (client_addr, datagram.target.clone());
+                activity_sequence = activity_sequence.wrapping_add(1);
+
+                let payload = match flows.get_mut(&flow_key) {
+                    Some(entry) => {
+                        entry.last_activity = activity_sequence;
+                        match entry.sender.try_send(datagram.payload) {
+                            Ok(()) => continue,
+                            Err(mpsc::error::TrySendError::Full(_)) => continue,
+                            Err(mpsc::error::TrySendError::Closed(payload)) => {
+                                if let Some(entry) = flows.remove(&flow_key) {
+                                    entry.abort_handle.abort();
+                                }
+                                payload
+                            }
+                        }
+                    }
+                    None => datagram.payload,
+                };
+
+                let Some(SocksUdpFlowPermits {
+                    global: global_permit,
+                    pending_open: pending_open_permit,
+                }) = admit_socks_udp_flow(&mut flows, &budgets, &runtime_logger)
+                else {
+                    continue;
+                };
+
+                let (sender, receiver) = mpsc::channel(SOCKS_UDP_FLOW_QUEUE);
+                if sender.try_send(payload).is_err() {
+                    continue;
+                }
+                let context = SocksUdpFlowContext {
+                    reply: UdpReply::Socks(Arc::clone(&socket)),
+                    client_addr,
+                    local_addr: Some(bind),
+                    user: user.clone(),
+                    inbound_tag: inbound_tag.clone(),
+                    config: Arc::clone(&config),
+                    outbound_router: Arc::clone(&outbound_router),
+                    dns_resolvers: dns_resolvers.clone(),
+                    transport_dialer: Arc::clone(&transport_dialer),
+                    sniffing: sniffing.clone(),
+                    runtime_logger: runtime_logger.clone(),
+                    connection_registry: Arc::clone(&connection_registry),
+                };
+                let target = datagram.target;
+                let completion_key = flow_key.clone();
+                let flow_shutdown = shutdown.clone();
+                let abort_handle = flow_tasks.spawn(async move {
+                    bridge_socks_udp_flow(
+                        target,
+                        context,
+                        receiver,
+                        flow_shutdown,
+                        pending_open_permit,
+                    )
+                    .await;
+                    completion_key
+                });
+                let task_id = abort_handle.id();
+                flows.insert(
+                    flow_key,
+                    SocksUdpFlowEntry {
+                        sender,
+                        abort_handle,
+                        task_id,
+                        last_activity: activity_sequence,
+                        global_permit,
+                    },
+                );
+            }
+        }
+    }
+
+    for (_, entry) in flows.drain() {
+        entry.abort_handle.abort();
+    }
+    flow_tasks.abort_all();
+    while flow_tasks.join_next().await.is_some() {}
+}
+
+/// Relays a UDP session the portal of a VLESS reverse proxy opened. A
+/// datagram goes to the address its frame names, else to the session's
+/// target; each destination is a flow of its own, routed and relayed as a
+/// SOCKS association's flows are, and the replies name their sources. The
+/// session ends when the portal ends it, or once every flow went idle.
+pub(crate) async fn relay_reverse_udp_session(
+    bridge: &crate::reverse::BridgeContext,
+    session: crate::reverse::Session,
+    target: Target,
+    source: Option<SocketAddr>,
+    local: Option<SocketAddr>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let context = SocksUdpFlowContext {
+        reply: UdpReply::Reverse {
+            session: session.clone(),
+            source,
+        },
+        // Only read through `source`, which keeps a missing client missing.
+        client_addr: source.unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+        local_addr: local,
+        user: bridge.user().map(InboundUser::from_email),
+        inbound_tag: Some(bridge.reverse.tag.clone()),
+        config: Arc::clone(&bridge.config),
+        outbound_router: Arc::clone(&bridge.router),
+        dns_resolvers: bridge.dns.clone(),
+        transport_dialer: Arc::clone(&bridge.dialer),
+        sniffing: bridge.reverse.sniffing.clone(),
+        runtime_logger: bridge.logger.clone(),
+        connection_registry: Arc::clone(&bridge.registry),
+    };
+    let budgets = SocksUdpBudgets::default();
+    let mut flows = HashMap::<(SocketAddr, Target), SocksUdpFlowEntry>::new();
+    let mut flow_tasks = JoinSet::new();
+    let mut activity_sequence = 0u64;
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            joined = flow_tasks.join_next_with_id(), if !flow_tasks.is_empty() => {
+                match joined {
+                    Some(Ok((task_id, flow_key))) => {
+                        remove_socks_udp_flow_by_task_id(&mut flows, task_id, Some(&flow_key));
+                    }
+                    Some(Err(error)) => {
+                        remove_socks_udp_flow_by_task_id(&mut flows, error.id(), None);
+                    }
+                    None => {}
+                }
+                if flow_tasks.is_empty() {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(SOCKS_UDP_FLOW_IDLE_TIMEOUT), if flow_tasks.is_empty() => break,
+            received = session.recv_datagram() => {
+                let Some((address, payload)) = received else {
+                    break;
+                };
+                let destination = address.unwrap_or_else(|| target.clone());
+                if payload.is_empty() || destination.port == 0 {
+                    continue;
+                }
+                let flow_key = (context.client_addr, destination);
+                activity_sequence = activity_sequence.wrapping_add(1);
+                let payload = match flows.get_mut(&flow_key) {
+                    Some(entry) => {
+                        entry.last_activity = activity_sequence;
+                        match entry.sender.try_send(payload) {
+                            Ok(()) => continue,
+                            Err(mpsc::error::TrySendError::Full(_)) => continue,
+                            Err(mpsc::error::TrySendError::Closed(payload)) => {
+                                if let Some(entry) = flows.remove(&flow_key) {
+                                    entry.abort_handle.abort();
+                                }
+                                payload
+                            }
+                        }
+                    }
+                    None => payload,
+                };
+                let Some(SocksUdpFlowPermits {
+                    global: global_permit,
+                    pending_open: pending_open_permit,
+                }) = admit_socks_udp_flow(&mut flows, &budgets, &context.runtime_logger)
+                else {
+                    continue;
+                };
+                let (sender, receiver) = mpsc::channel(SOCKS_UDP_FLOW_QUEUE);
+                if sender.try_send(payload).is_err() {
+                    continue;
+                }
+                let flow_context = context.clone();
+                let destination = flow_key.1.clone();
+                let completion_key = flow_key.clone();
+                let flow_shutdown = shutdown.clone();
+                let abort_handle = flow_tasks.spawn(async move {
+                    bridge_socks_udp_flow(
+                        destination,
+                        flow_context,
+                        receiver,
+                        flow_shutdown,
+                        pending_open_permit,
+                    )
+                    .await;
+                    completion_key
+                });
+                let task_id = abort_handle.id();
+                flows.insert(
+                    flow_key,
+                    SocksUdpFlowEntry {
+                        sender,
+                        abort_handle,
+                        task_id,
+                        last_activity: activity_sequence,
+                        global_permit,
+                    },
+                );
+            }
+        }
+    }
+
+    for (_, entry) in flows.drain() {
+        entry.abort_handle.abort();
+    }
+    flow_tasks.abort_all();
+    while flow_tasks.join_next().await.is_some() {}
+}
+
+struct SocksUdpFlowPermits {
+    global: OwnedSemaphorePermit,
+    pending_open: OwnedSemaphorePermit,
+}
+
+/// Admission control for one new SOCKS UDP flow: returns the budget permits
+/// the flow must hold, or `None` when the datagram has to be dropped.
+///
+/// On global-budget exhaustion the association reclaims its own
+/// least-recently-active flow's permit. That is the sing-box-style
+/// evict-oldest limited to what our permit ownership allows synchronously:
+/// evicting another association's flow releases its permit only after the
+/// owning task observes the abort, too late to admit this datagram. An
+/// association with nothing to evict drops the datagram (throttled log)
+/// until some flow elsewhere idles out.
+fn admit_socks_udp_flow(
+    flows: &mut HashMap<(SocketAddr, Target), SocksUdpFlowEntry>,
+    budgets: &SocksUdpBudgets,
+    runtime_logger: &RuntimeLogger,
+) -> Option<SocksUdpFlowPermits> {
+    let pending_open = match Arc::clone(&budgets.pending_opens).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            if runtime_logger.is_enabled() {
+                if let Some(drops) = budgets
+                    .exhaustion_log
+                    .pending_open_drops
+                    .register(monotonic_millis())
+                {
+                    runtime_logger.error(|| {
+                        format!(
+                            "socks udp pending-open budget exhausted \
+                             ({SOCKS_UDP_MAX_PENDING_OPENS_GLOBAL}): dropped a new flow's \
+                             datagram ({drops} drops since last report)"
+                        )
+                    });
+                }
+            }
+            return None;
+        }
+    };
+
+    let reclaimed = if flows.len() >= SOCKS_UDP_MAX_FLOWS_PER_ASSOCIATION {
+        evict_oldest_socks_udp_flow(flows)
+    } else {
+        None
+    };
+    let global = match reclaimed {
+        Some(permit) => permit,
+        None => match Arc::clone(&budgets.global_flows).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => match evict_oldest_socks_udp_flow(flows) {
+                Some(permit) => {
+                    if runtime_logger.is_enabled() {
+                        if let Some(evictions) = budgets
+                            .exhaustion_log
+                            .global_flow_evictions
+                            .register(monotonic_millis())
+                        {
+                            runtime_logger.debug(|| {
+                                format!(
+                                    "socks udp global flow budget exhausted \
+                                     ({SOCKS_UDP_MAX_FLOWS_GLOBAL}): evicted the association's \
+                                     oldest flow to admit a new one ({evictions} evictions \
+                                     since last report)"
+                                )
+                            });
+                        }
+                    }
+                    permit
+                }
+                None => {
+                    if runtime_logger.is_enabled() {
+                        if let Some(drops) = budgets
+                            .exhaustion_log
+                            .global_flow_drops
+                            .register(monotonic_millis())
+                        {
+                            runtime_logger.error(|| {
+                                format!(
+                                    "socks udp global flow budget exhausted \
+                                     ({SOCKS_UDP_MAX_FLOWS_GLOBAL}): dropped a new flow's \
+                                     datagram, association has nothing to evict ({drops} \
+                                     drops since last report)"
+                                )
+                            });
+                        }
+                    }
+                    return None;
+                }
+            },
+        },
+    };
+
+    Some(SocksUdpFlowPermits {
+        global,
+        pending_open,
+    })
+}
+
+fn evict_oldest_socks_udp_flow(
+    flows: &mut HashMap<(SocketAddr, Target), SocksUdpFlowEntry>,
+) -> Option<OwnedSemaphorePermit> {
+    let oldest_key = flows
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_activity)
+        .map(|(key, _)| key.clone())?;
+    let entry = flows.remove(&oldest_key)?;
+    entry.abort_handle.abort();
+    Some(entry.global_permit)
+}
+
+fn remove_socks_udp_flow_by_task_id(
+    flows: &mut HashMap<(SocketAddr, Target), SocksUdpFlowEntry>,
+    task_id: TaskId,
+    completed_key: Option<&(SocketAddr, Target)>,
+) {
+    if let Some(key) = completed_key {
+        if flows.get(key).is_some_and(|entry| entry.task_id == task_id) {
+            flows.remove(key);
+            return;
+        }
+    }
+
+    let matching_key = flows
+        .iter()
+        .find(|(_, entry)| entry.task_id == task_id)
+        .map(|(key, _)| key.clone());
+    if let Some(key) = matching_key {
+        flows.remove(&key);
+    }
+}
+
+async fn bridge_socks_udp_flow(
+    target: Target,
+    context: SocksUdpFlowContext,
+    mut from_client: mpsc::Receiver<Bytes>,
+    mut shutdown: watch::Receiver<bool>,
+    pending_open_permit: OwnedSemaphorePermit,
+) {
+    let Some(first_payload) = read_first_socks_udp_payload(&mut from_client, &mut shutdown).await
+    else {
+        return;
+    };
+    let restored_target = context
+        .dns_resolvers
+        .outbound
+        .restore_client_target(&target);
+    let provenance = restored_target.provenance;
+    let effective_target = restored_target.target;
+    let client_visible_target =
+        (provenance == FakeIpTargetProvenance::Mapped).then(|| target.clone());
+    let (sniffed_target, from_client) = sniff_socks_udp_target(
+        &context,
+        &effective_target,
+        provenance,
+        &first_payload,
+        from_client,
+        &mut shutdown,
+    )
+    .await;
+    let sniffed_protocol = sniffed_target.sniffed_protocol;
+    let route_target = sniffed_target.route_target;
+    let dial_target = sniffed_target.dial_target;
+    let route = RouteContext {
+        attributes: None,
+        inbound_tag: context.inbound_tag.as_deref(),
+        source: context.source(),
+        local: context.local_addr,
+        user: context.user.as_ref().map(InboundUser::as_str),
+        protocol: sniffed_target
+            .protocol
+            .map(crate::sniffing::SniffedProtocol::name),
+    };
+    let selected = match context
+        .outbound_router
+        .select_udp_session_outbound_with_tag_and_resolver(
+            &route,
+            &route_target,
+            &dial_target,
+            true,
+            context.dns_resolvers.destination.as_ref(),
+        )
+        .await
+    {
+        Ok(outbound) => outbound,
+        Err(error) => {
+            if context.runtime_logger.is_enabled() {
+                let source = context.client_label();
+                crate::debug_log::log_access_rejected(
+                    &context.runtime_logger,
+                    &source,
+                    &route_target,
+                    error,
+                );
+            }
+            return;
+        }
+    };
+
+    if context.runtime_logger.is_enabled() {
+        let selected_outbound =
+            selected
+                .tag
+                .as_deref()
+                .unwrap_or_else(|| match &selected.outbound {
+                    UdpSessionOutbound::Transport(outbound) => {
+                        crate::debug_log::udp_outbound_label(outbound)
+                    }
+                    UdpSessionOutbound::Dns(_) => "dns",
+                    UdpSessionOutbound::Blackhole(_) => "blackhole",
+                });
+        crate::debug_log::log_route_decision(
+            &context.runtime_logger,
+            crate::debug_log::RouteDecisionLog {
+                inbound_tag: context.inbound_tag.as_deref(),
+                network: target.network,
+                original_target: &target,
+                sniffed_protocol,
+                route_target: &route_target,
+                dial_target: &dial_target,
+                selected_outbound,
+            },
+        );
+    }
+
+    let connection = context.connection_registry.register(
+        context.inbound_tag.clone(),
+        selected.tag.clone(),
+        dial_target.clone(),
+    );
+    let connection_close = connection.close_receiver();
+
+    let outbound = match selected.outbound {
+        UdpSessionOutbound::Transport(outbound) => outbound,
+        UdpSessionOutbound::Dns(outbound) => {
+            if context.runtime_logger.is_enabled() {
+                let source = context.client_label();
+                crate::debug_log::log_access_accepted(
+                    &context.runtime_logger,
+                    &source,
+                    &dial_target,
+                    "dns",
+                );
+            }
+            drop(pending_open_permit);
+            bridge_socks_udp_dns_flow(
+                target,
+                dial_target,
+                outbound,
+                context,
+                from_client,
+                shutdown,
+                first_payload,
+                connection,
+                connection_close,
+            )
+            .await;
+            return;
+        }
+        UdpSessionOutbound::Blackhole(blackhole) => {
+            if context.runtime_logger.is_enabled() {
+                let source = context.client_label();
+                crate::debug_log::log_access_accepted(
+                    &context.runtime_logger,
+                    &source,
+                    &dial_target,
+                    "blackhole",
+                );
+            }
+            drop(pending_open_permit);
+            drop(first_payload);
+            absorb_socks_udp_blackhole_flow(
+                &target,
+                blackhole,
+                &context,
+                from_client,
+                shutdown,
+                connection,
+            )
+            .await;
+            return;
+        }
+    };
+
+    // A reverse flow a folded freedom fragment refuses drops its datagrams,
+    // as a refused freedom flow does.
+    if context.is_reverse()
+        && !matches!(
+            outbound
+                .reverse_refused(
+                    &dial_target,
+                    context.dns_resolvers.bootstrap.as_ref(),
+                    context.transport_dialer.as_ref(),
+                )
+                .await,
+            Ok(false)
+        )
+    {
+        drop(pending_open_permit);
+        drop(first_payload);
+        absorb_socks_udp_blackhole_flow(
+            &target,
+            BlackholeOutbound::new(&segue_config::BlackholeResponse::None),
+            &context,
+            from_client,
+            shutdown,
+            connection,
+        )
+        .await;
+        return;
+    }
+    match outbound {
+        UdpOutbound::Freedom(freedom) => {
+            let freedom = if context.is_reverse() {
+                freedom.for_reverse()
+            } else {
+                freedom
+            };
+            let domain_strategy = freedom.udp_domain_strategy(&target);
+            // Once Xray-core's freedom redirects, it stops attributing replies
+            // to their senders, so they come from the destination the client
+            // addressed.
+            let (dial_target, client_visible_target) = match freedom.redirect(&dial_target) {
+                Some(redirected) => (
+                    redirected,
+                    Some(client_visible_target.unwrap_or_else(|| target.clone())),
+                ),
+                None => (dial_target, client_visible_target),
+            };
+            if context.runtime_logger.is_enabled() {
+                let source = context.client_label();
+                crate::debug_log::log_access_accepted(
+                    &context.runtime_logger,
+                    &source,
+                    &dial_target,
+                    "freedom",
+                );
+            }
+            bridge_socks_udp_freedom_flow(
+                dial_target,
+                client_visible_target,
+                domain_strategy,
+                freedom,
+                context,
+                from_client,
+                shutdown,
+                first_payload,
+                pending_open_permit,
+                connection,
+                connection_close,
+            )
+            .await;
+        }
+        UdpOutbound::Vless(outbound) if !outbound.udp_uses_mux(&dial_target) => {
+            if context.runtime_logger.is_enabled() {
+                let source = context.client_label();
+                crate::debug_log::log_access_accepted(
+                    &context.runtime_logger,
+                    &source,
+                    &dial_target,
+                    "vless",
+                );
+            }
+            bridge_socks_udp_vless_flow(
+                dial_target,
+                client_visible_target,
+                outbound,
+                context,
+                from_client,
+                shutdown,
+                first_payload,
+                pending_open_permit,
+                connection,
+                connection_close,
+            )
+            .await;
+        }
+        // Trojan, SOCKS, VMess, Shadowsocks, Hysteria, WireGuard, and VLESS
+        // flows owned by its Mux pool share the datagram relay.
+        outbound => {
+            datagram::bridge(
+                dial_target,
+                client_visible_target,
+                outbound,
+                context,
+                from_client,
+                shutdown,
+                first_payload,
+                pending_open_permit,
+                connection,
+                connection_close,
+            )
+            .await
+        }
+    }
+}
+
+/// Absorbs a SOCKS UDP flow routed to a blackhole without opening a socket.
+///
+/// Xray dispatches the flow once. Its SOCKS inbound returns an `http` response
+/// as one datagram from the address the client sent to, and the blackhole then
+/// discards later datagrams until the flow is idle, so they are not routed
+/// again. The flow therefore stays registered as one connection.
+async fn absorb_socks_udp_blackhole_flow(
+    client_target: &Target,
+    blackhole: BlackholeOutbound,
+    context: &SocksUdpFlowContext,
+    mut from_client: UdpIngress,
+    mut shutdown: watch::Receiver<bool>,
+    connection: ConnectionLease,
+) {
+    let mut connection_close = connection.close_receiver();
+    connection.mark_active();
+    let response = blackhole.response_bytes();
+    if !response.is_empty() {
+        tokio::select! {
+            biased;
+            () = wait_for_connection_close(&mut connection_close) => {}
+            _ = context.deliver(client_target, &response) => {}
+        }
+    }
+    absorb_udp_datagrams(
+        &mut from_client,
+        &mut shutdown,
+        &mut connection_close,
+        SOCKS_UDP_FLOW_IDLE_TIMEOUT,
+    )
+    .await;
+    connection.finish();
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "SOCKS DNS UDP flow owns client/routed targets, shutdown, and connection state"
+)]
+async fn bridge_socks_udp_dns_flow(
+    client_target: Target,
+    routed_target: Target,
+    outbound: crate::DnsOutbound,
+    context: SocksUdpFlowContext,
+    mut from_client: UdpIngress,
+    mut shutdown: watch::Receiver<bool>,
+    first_payload: Bytes,
+    connection: ConnectionLease,
+    mut connection_close: watch::Receiver<bool>,
+) {
+    let mut pending_payload = Some(first_payload);
+    let traffic = connection.traffic();
+    connection.mark_active();
+    loop {
+        let payload = match pending_payload.take() {
+            Some(payload) => payload,
+            None => {
+                tokio::select! {
+                    biased;
+                    () = wait_for_connection_close(&mut connection_close) => break,
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ = tokio::time::sleep(SOCKS_UDP_FLOW_IDLE_TIMEOUT) => break,
+                    payload = from_client.recv() => {
+                        let Some(payload) = payload else {
+                            break;
+                        };
+                        payload
+                    }
+                }
+            }
+        };
+
+        let payload_len = payload.len();
+        let outcome = tokio::select! {
+            biased;
+            () = wait_for_connection_close(&mut connection_close) => break,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            outcome = context.dns_resolvers.outbound.execute_message(
+                &outbound,
+                &routed_target,
+                payload,
+                crate::dns_outbound_runtime::DnsClientTransport::Udp {
+                    path_payload_cap: SOCKS_DNS_UDP_PATH_PAYLOAD_CAP,
+                },
+            ) => outcome,
+        };
+        traffic.record_uplink(payload_len as u64);
+        let crate::dns_outbound_runtime::DnsMessageOutcome::Reply(response) = outcome else {
+            continue;
+        };
+        traffic.record_downlink(response.len() as u64);
+        let sent = tokio::select! {
+            biased;
+            () = wait_for_connection_close(&mut connection_close) => false,
+            changed = shutdown.changed() => {
+                changed.is_ok() && !*shutdown.borrow()
+            }
+            sent = context.deliver(&client_target, &response) => sent.is_ok(),
+        };
+        if !sent {
+            break;
+        }
+    }
+    connection.finish();
+}
+
+async fn read_first_socks_udp_payload(
+    from_client: &mut mpsc::Receiver<Bytes>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<Bytes> {
+    tokio::select! {
+        changed = shutdown.changed() => {
+            if changed.is_err() || *shutdown.borrow() {
+                None
+            } else {
+                from_client.recv().await
+            }
+        }
+        payload = from_client.recv() => payload,
+    }
+}
+
+struct SocksUdpSniffedTarget {
+    route_target: Target,
+    dial_target: Target,
+    sniffed_protocol: Option<segue_config::SniffingDestination>,
+    /// The protocol routing sees.
+    protocol: Option<crate::sniffing::SniffedProtocol>,
+}
+
+impl SocksUdpSniffedTarget {
+    fn original(target: &Target) -> Self {
+        Self {
+            route_target: target.clone(),
+            dial_target: target.clone(),
+            sniffed_protocol: None,
+            protocol: None,
+        }
+    }
+
+    fn from_sniffed(
+        target: &Target,
+        provenance: FakeIpTargetProvenance,
+        sniffed: Option<crate::sniffing::Sniffed>,
+    ) -> Self {
+        let protocol = sniffed.as_ref().map(|sniffed| sniffed.protocol);
+        let Some(sniffed) = sniffed
+            .and_then(|sniffed| sniffed.target)
+            .filter(|_| fake_ip_allows_content_sniffing(provenance))
+        else {
+            return Self {
+                protocol,
+                ..Self::original(target)
+            };
+        };
+        let sniffed = apply_fake_ip_sniffed_dial_precedence(provenance, sniffed);
+        let sniffed_protocol = Some(sniffed.protocol);
+        Self {
+            route_target: sniffed.route_target,
+            dial_target: sniffed.dial_target,
+            sniffed_protocol,
+            protocol,
+        }
+    }
+}
+
+pub(crate) fn fake_ip_allows_content_sniffing(provenance: FakeIpTargetProvenance) -> bool {
+    provenance != FakeIpTargetProvenance::Mapped
+}
+
+/// A mapped fake IP is sniffed only for what routing reads, when it asks.
+fn should_sniff_socks_tcp(
+    config: Option<&InboundSniffingConfig>,
+    provenance: FakeIpTargetProvenance,
+    routes_by_sniffing: bool,
+) -> bool {
+    (fake_ip_allows_content_sniffing(provenance) || routes_by_sniffing)
+        && crate::sniffing::should_sniff_tcp(config, routes_by_sniffing)
+}
+
+pub(crate) fn apply_fake_ip_sniffed_dial_precedence(
+    provenance: FakeIpTargetProvenance,
+    mut sniffed: crate::sniffing::SniffedTarget,
+) -> crate::sniffing::SniffedTarget {
+    if provenance == FakeIpTargetProvenance::InPoolUnmapped {
+        sniffed.dial_target = sniffed.route_target.clone();
+    }
+    sniffed
+}
+
+async fn sniff_socks_udp_target(
+    context: &SocksUdpFlowContext,
+    target: &Target,
+    provenance: FakeIpTargetProvenance,
+    first_payload: &[u8],
+    from_client: mpsc::Receiver<Bytes>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> (SocksUdpSniffedTarget, UdpIngress) {
+    let routes_by_protocol = context.outbound_router.sniffed_routing().protocol;
+    let config = context
+        .sniffing
+        .as_ref()
+        .filter(|_| fake_ip_allows_content_sniffing(provenance) || routes_by_protocol)
+        .filter(|config| crate::sniffing::should_sniff_udp(Some(config), routes_by_protocol));
+    let (sniffed, from_client) = match config {
+        Some(config) => sniff_udp_flow(config, target, first_payload, from_client, shutdown).await,
+        None => (None, from_client.into()),
+    };
+    let mut sniffed = SocksUdpSniffedTarget::from_sniffed(target, provenance, sniffed);
+    sniffed.protocol = crate::sniffing::routing_protocol(
+        sniffed.protocol,
+        provenance == FakeIpTargetProvenance::Mapped,
+        context.sniffing.as_ref(),
+    );
+    (sniffed, from_client)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "SOCKS Freedom UDP flow owns client/dial targets, shutdown, and connection state"
+)]
+async fn bridge_socks_udp_freedom_flow(
+    target: Target,
+    client_visible_target: Option<Target>,
+    domain_strategy: DomainStrategy,
+    freedom: FreedomOutbound,
+    context: SocksUdpFlowContext,
+    mut from_client: UdpIngress,
+    mut shutdown: watch::Receiver<bool>,
+    first_payload: Bytes,
+    pending_open_permit: OwnedSemaphorePermit,
+    connection: ConnectionLease,
+    mut connection_close: watch::Receiver<bool>,
+) {
+    let resolver =
+        DomainStrategyResolver::new(context.dns_resolvers.destination.as_ref(), domain_strategy);
+    let rules = freedom.final_rules();
+    let resolved = tokio::select! {
+        biased;
+        () = wait_for_connection_close(&mut connection_close) => return,
+        result = final_rules::resolve_udp_destination(&target, &resolver, rules) => result,
+    };
+    let Ok((target_addr, addresses)) = resolved else {
+        return;
+    };
+    if let Some(rule) = final_rules::blocking_rule(rules, segue_config::Network::Udp, addresses) {
+        // Xray-core holds the blocked flow, discarding its datagrams, so they
+        // are not dispatched again until the block delay passes.
+        let deadline = tokio::time::Instant::now() + final_rules::block_delay(rule);
+        drop(pending_open_permit);
+        drop(first_payload);
+        connection.mark_active();
+        absorb_udp_datagrams_until(
+            &mut from_client,
+            &mut shutdown,
+            &mut connection_close,
+            SOCKS_UDP_FLOW_IDLE_TIMEOUT,
+            Some(deadline),
+        )
+        .await;
+        connection.finish();
+        return;
+    }
+    let bind_addr = match target_addr {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let bound = tokio::select! {
+        biased;
+        () = wait_for_connection_close(&mut connection_close) => return,
+        result = UdpSocket::bind(bind_addr) => result,
+    };
+    let Ok(remote_socket) = bound else {
+        return;
+    };
+    // The socket takes freedom's socket options, as Xray-core's does.
+    let dialer = freedom.dialer(&context.transport_dialer);
+    if protect_udp_socket(&remote_socket, dialer.socket_protector()).is_err() {
+        return;
+    }
+    // Under `finalmask.udp`, every datagram of the flow, the PROXY header
+    // and the noises included, goes through the masks.
+    let masked = tokio::select! {
+        biased;
+        () = wait_for_connection_close(&mut connection_close) => return,
+        result = freedom.udp_socket(remote_socket, target_addr, dialer.socket_protector_arc()) => result,
+    };
+    let Ok(remote_socket) = masked else {
+        return;
+    };
+    connection.mark_active();
+    let traffic = connection.traffic();
+    if let Some(version) = freedom.proxy_protocol() {
+        // Xray-core writes the header as a datagram of its own.
+        let header = proxy_protocol::header(
+            version,
+            context.source().map(InboundSource::udp),
+            segue_routing::Network::Udp,
+            target_addr,
+        );
+        let sent = tokio::select! {
+            biased;
+            () = wait_for_connection_close(&mut connection_close) => return,
+            result = remote_socket.send_to(&header, target_addr) => result,
+        };
+        if sent.is_err() {
+            return;
+        }
+    }
+    // Xray-core's noise writer goes after the header, before the payload.
+    let noise_sent = tokio::select! {
+        biased;
+        () = wait_for_connection_close(&mut connection_close) => return,
+        result = freedom.send_udp_noises(&remote_socket, target_addr) => result,
+    };
+    let Ok(noise_len) = noise_sent else {
+        return;
+    };
+    traffic.record_uplink(noise_len);
+    let first_payload_len = first_payload.len();
+    let first_sent = tokio::select! {
+        biased;
+        () = wait_for_connection_close(&mut connection_close) => return,
+        result = remote_socket.send_to(&first_payload, target_addr) => result,
+    };
+    if first_sent.is_err() {
+        return;
+    }
+    traffic.record_uplink(first_payload_len as u64);
+    drop(pending_open_permit);
+    let mut buffer = vec![0; SOCKS_UDP_BUFFER_SIZE];
+
+    loop {
+        tokio::select! {
+            biased;
+            () = wait_for_connection_close(&mut connection_close) => break,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(SOCKS_UDP_FLOW_IDLE_TIMEOUT) => {
+                break;
+            }
+            payload = from_client.recv() => {
+                let Some(payload) = payload else {
+                    break;
+                };
+                let payload_len = payload.len();
+                if remote_socket.send_to(&payload, target_addr).await.is_err() {
+                    break;
+                }
+                traffic.record_uplink(payload_len as u64);
+            }
+            received = remote_socket.recv_from(&mut buffer) => {
+                let Ok((len, source)) = received else {
+                    break;
+                };
+                if final_rules::blocks(rules, segue_config::Network::Udp, source) {
+                    continue;
+                }
+                let source = client_visible_target.clone().unwrap_or_else(|| {
+                    Target::new(
+                        TargetAddr::Ip(source.ip()),
+                        source.port(),
+                        segue_routing::Network::Udp,
+                    )
+                });
+                traffic.record_downlink(len as u64);
+                if context
+                    .deliver(&source, &buffer[..len])
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+    connection.finish();
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "SOCKS UDP flow owns client/dial targets, outbound state, shutdown, and admission"
+)]
+async fn bridge_socks_udp_vless_flow(
+    target: Target,
+    client_visible_target: Option<Target>,
+    outbound: Box<VlessTcpOutbound>,
+    context: SocksUdpFlowContext,
+    mut from_client: UdpIngress,
+    mut shutdown: watch::Receiver<bool>,
+    first_payload: Bytes,
+    pending_open_permit: OwnedSemaphorePermit,
+    connection: ConnectionLease,
+    mut connection_close: watch::Receiver<bool>,
+) {
+    let open_timeout =
+        effective_policy_for_level(&context.config, Some(outbound.user().level)).handshake;
+    let opened = tokio::select! {
+        biased;
+        () = wait_for_connection_close(&mut connection_close) => return,
+        result = crate::outbound::datagram::within_handshake(
+            open_timeout,
+            open_vless_udp_stream_with_resolver_and_dialer(
+                &outbound,
+                &target,
+                context.dns_resolvers.bootstrap.as_ref(),
+                context.transport_dialer.as_ref(),
+            ),
+        ) => result,
+    };
+    let Ok((stream, framing)) = opened else {
+        return;
+    };
+    connection.mark_active();
+    let traffic = connection.traffic();
+
+    let (mut remote_reader, mut remote_writer) = tokio::io::split(stream);
+    let fallback_source = target.clone();
+    let mut sent_xudp_new = false;
+    let global_id = context.global_id(&target);
+    let record_write = |written: Option<usize>, len: usize| match written {
+        Some(written) => traffic.record_uplink(written as u64),
+        None => crate::outbound::datagram::log_oversize_udp_datagram(
+            &context.runtime_logger,
+            "socks",
+            len,
+            crate::tun::VLESS_UDP_MAX_PAYLOAD,
+        ),
+    };
+    let first_len = first_payload.len();
+    let first_write = tokio::select! {
+        biased;
+        () = wait_for_connection_close(&mut connection_close) => return,
+        result = write_socks_vless_udp_payload(
+            &mut remote_writer,
+            framing,
+            &target,
+            global_id,
+            &mut sent_xudp_new,
+            first_payload,
+            true,
+        ) => result,
+    };
+    let Ok(first_written) = first_write else {
+        return;
+    };
+    record_write(first_written, first_len);
+    drop(pending_open_permit);
+
+    let flush_deadline = tokio::time::sleep(SOCKS_VLESS_UDP_FLUSH_INTERVAL);
+    tokio::pin!(flush_deadline);
+    let mut pending_frames = 0usize;
+    // The read below loses to every other branch it is still waiting in;
+    // the bytes it took wait here for the next one.
+    let mut responses = UdpResponseReader::default();
+    loop {
+        tokio::select! {
+            biased;
+            () = wait_for_connection_close(&mut connection_close) => break,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(SOCKS_UDP_FLOW_IDLE_TIMEOUT) => {
+                break;
+            }
+            () = &mut flush_deadline, if pending_frames > 0 => {
+                if remote_writer.flush().await.is_err() {
+                    break;
+                }
+                pending_frames = 0;
+            }
+            payload = from_client.recv() => {
+                let Some(payload) = payload else {
+                    break;
+                };
+                let flush_now = pending_frames + 1 >= SOCKS_VLESS_UDP_FLUSH_BATCH;
+                let len = payload.len();
+                let Ok(written) = write_socks_vless_udp_payload(
+                    &mut remote_writer,
+                    framing,
+                    &target,
+                    global_id,
+                    &mut sent_xudp_new,
+                    payload,
+                    flush_now,
+                )
+                .await
+                else {
+                    break;
+                };
+                record_write(written, len);
+                if flush_now {
+                    pending_frames = 0;
+                } else {
+                    if pending_frames == 0 {
+                        flush_deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + SOCKS_VLESS_UDP_FLUSH_INTERVAL);
+                    }
+                    pending_frames += 1;
+                }
+            }
+            packet = read_socks_vless_udp_response(&mut responses, &mut remote_reader, framing, fallback_source.clone()) => {
+                let Ok((mut source, payload)) = packet else {
+                    break;
+                };
+                traffic.record_downlink(payload.len() as u64);
+                if let Some(client_visible_target) = client_visible_target.as_ref() {
+                    source = client_visible_target.clone();
+                }
+                if context
+                    .deliver(&source, &payload)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+    if pending_frames > 0 {
+        let _ = remote_writer.flush().await;
+    }
+    connection.finish();
+}
+
+async fn write_socks_vless_udp_payload<W>(
+    writer: &mut W,
+    framing: VlessUdpFraming,
+    target: &Target,
+    global_id: [u8; 8],
+    sent_xudp_new: &mut bool,
+    payload: Bytes,
+    flush: bool,
+) -> std::io::Result<Option<usize>>
+where
+    W: AsyncWrite + Unpin,
+{
+    // As on the TUN path, a datagram the VLESS stream cannot relay intact is
+    // dropped alone (`None`) instead of breaking or splitting the stream.
+    if payload.len() > crate::tun::VLESS_UDP_MAX_PAYLOAD {
+        if flush {
+            writer.flush().await?;
+        }
+        return Ok(None);
+    }
+    match framing {
+        VlessUdpFraming::LengthPrefixed => {
+            let len = u16::try_from(payload.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "vless udp payload exceeds u16 framing",
+                )
+            })?;
+            writer.write_all(&len.to_be_bytes()).await?;
+            writer.write_all(&payload).await?;
+        }
+        VlessUdpFraming::Xudp => {
+            let frame = if *sent_xudp_new {
+                encode_xudp_keep_packet(Some(target), &payload)
+            } else {
+                *sent_xudp_new = true;
+                encode_xudp_new_packet(target, &payload, global_id)
+            }
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            writer.write_all(&frame).await?;
+        }
+    }
+    if flush {
+        writer.flush().await?;
+    }
+    Ok(Some(payload.len()))
+}
+
+async fn read_socks_vless_udp_response<R>(
+    responses: &mut UdpResponseReader,
+    reader: &mut R,
+    framing: VlessUdpFraming,
+    fallback_source: Target,
+) -> std::io::Result<(Target, Bytes)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match framing {
+        VlessUdpFraming::LengthPrefixed => {
+            let payload = responses.read_udp_packet(reader).await?;
+            Ok((fallback_source, payload))
+        }
+        VlessUdpFraming::Xudp => {
+            let packet = responses.read_xudp_packet(reader).await?;
+            Ok((packet.source.unwrap_or(fallback_source), packet.payload))
+        }
+    }
+}
+
+fn socks_udp_flow_global_id(client_addr: SocketAddr, target: &Target) -> [u8; 8] {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in client_addr
+        .to_string()
+        .bytes()
+        .chain(format!("{target:?}").bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash.to_be_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::mem::size_of;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use bytes::Bytes;
+    use tokio::io::AsyncWrite;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+    use segue_config::{InboundSniffingConfig, SniffingDestination};
+    use segue_routing::{Network, Target, TargetAddr};
+
+    use super::{
+        admit_socks_udp_flow, apply_fake_ip_sniffed_dial_precedence, evict_oldest_socks_udp_flow,
+        should_sniff_socks_tcp, write_socks_vless_udp_payload, BoxedSocksDnsStreamFuture,
+        FakeIpTargetProvenance, SocksUdpBudgetExhaustionLog, SocksUdpBudgets, SocksUdpClientLock,
+        SocksUdpFlowEntry, SocksUdpSniffedTarget, VlessUdpFraming, SOCKS_UDP_FLOW_QUEUE,
+        SOCKS_UDP_MAX_FLOWS_PER_ASSOCIATION,
+    };
+    use crate::{RuntimeLogConfig, RuntimeLogger};
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.bytes.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn http_sniffing_config(route_only: bool) -> InboundSniffingConfig {
+        InboundSniffingConfig {
+            enabled: true,
+            dest_override: vec![SniffingDestination::Http],
+            metadata_only: false,
+            route_only,
+            ..Default::default()
+        }
+    }
+
+    fn sniffed_target(original: &Target, domain: &str) -> crate::sniffing::SniffedTarget {
+        let route_target = Target::new(
+            TargetAddr::Domain(domain.to_owned()),
+            original.port,
+            original.network,
+        );
+        crate::sniffing::SniffedTarget {
+            route_target: route_target.clone(),
+            dial_target: original.clone(),
+            protocol: SniffingDestination::Http,
+        }
+    }
+
+    #[test]
+    fn mapped_fake_ip_suppresses_socks_tcp_content_sniffing() {
+        assert!(!should_sniff_socks_tcp(
+            Some(&http_sniffing_config(false)),
+            FakeIpTargetProvenance::Mapped,
+            false,
+        ));
+        assert!(should_sniff_socks_tcp(
+            Some(&http_sniffing_config(false)),
+            FakeIpTargetProvenance::Outside,
+            false,
+        ));
+        // Routing by protocol sniffs a mapped fake IP for its protocol.
+        assert!(should_sniff_socks_tcp(
+            Some(&http_sniffing_config(false)),
+            FakeIpTargetProvenance::Mapped,
+            true,
+        ));
+    }
+
+    #[test]
+    fn socks_dns_stream_dispatch_future_stays_heap_erased() {
+        assert!(
+            size_of::<BoxedSocksDnsStreamFuture<'static>>() <= 2 * size_of::<usize>(),
+            "boxed DNS dispatch should occupy no more than a trait-object pointer"
+        );
+    }
+
+    #[test]
+    fn mapped_fake_ip_keeps_socks_udp_target_a_over_sniffed_target_b() {
+        let mapped = Target::new(
+            TargetAddr::Domain("mapped-a.example".to_owned()),
+            443,
+            Network::Udp,
+        );
+        let result = SocksUdpSniffedTarget::from_sniffed(
+            &mapped,
+            FakeIpTargetProvenance::Mapped,
+            Some(crate::sniffing::Sniffed {
+                protocol: crate::sniffing::SniffedProtocol::Quic,
+                target: Some(sniffed_target(&mapped, "sniffed-b.example")),
+            }),
+        );
+
+        assert_eq!(result.route_target, mapped);
+        assert_eq!(result.dial_target, mapped);
+        assert_eq!(result.sniffed_protocol, None);
+        // The protocol still reaches routing.
+        assert_eq!(
+            result.protocol,
+            Some(crate::sniffing::SniffedProtocol::Quic)
+        );
+    }
+
+    #[test]
+    fn in_pool_unmapped_route_only_uses_sniffed_domain_for_socks_dialing() {
+        let raw = Target::new(
+            TargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(198, 18, 1, 7))),
+            443,
+            Network::Tcp,
+        );
+        let tcp = apply_fake_ip_sniffed_dial_precedence(
+            FakeIpTargetProvenance::InPoolUnmapped,
+            sniffed_target(&raw, "sniffed.example"),
+        );
+        assert_eq!(tcp.dial_target, tcp.route_target);
+
+        let raw_udp = Target::new(raw.addr.clone(), raw.port, Network::Udp);
+        let udp = SocksUdpSniffedTarget::from_sniffed(
+            &raw_udp,
+            FakeIpTargetProvenance::InPoolUnmapped,
+            Some(crate::sniffing::Sniffed {
+                protocol: crate::sniffing::SniffedProtocol::Quic,
+                target: Some(sniffed_target(&raw_udp, "sniffed.example")),
+            }),
+        );
+        assert_eq!(udp.dial_target, udp.route_target);
+    }
+
+    #[test]
+    fn socks_udp_global_flow_budget_rejects_excess_flow() {
+        let budgets = SocksUdpBudgets {
+            global_flows: Arc::new(Semaphore::new(1)),
+            pending_opens: Arc::new(Semaphore::new(1)),
+            exhaustion_log: Arc::new(SocksUdpBudgetExhaustionLog::new()),
+        };
+        let _permit = Arc::clone(&budgets.global_flows)
+            .try_acquire_owned()
+            .expect("first flow should fit");
+
+        assert!(Arc::clone(&budgets.global_flows)
+            .try_acquire_owned()
+            .is_err());
+    }
+
+    #[test]
+    fn socks_udp_pending_open_budget_rejects_excess_open() {
+        let budgets = SocksUdpBudgets {
+            global_flows: Arc::new(Semaphore::new(1)),
+            pending_opens: Arc::new(Semaphore::new(1)),
+            exhaustion_log: Arc::new(SocksUdpBudgetExhaustionLog::new()),
+        };
+        let _permit = Arc::clone(&budgets.pending_opens)
+            .try_acquire_owned()
+            .expect("first pending open should fit");
+
+        assert!(Arc::clone(&budgets.pending_opens)
+            .try_acquire_owned()
+            .is_err());
+    }
+
+    #[test]
+    fn socks_udp_flow_queue_drops_instead_of_waiting_when_full() {
+        let (sender, _receiver) = mpsc::channel(1);
+        sender
+            .try_send(Bytes::from_static(b"first"))
+            .expect("first datagram should fit");
+
+        assert!(matches!(
+            sender.try_send(Bytes::from_static(b"second")),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn vless_udp_writer_can_batch_frames_without_per_frame_flush() {
+        let target = Target::new(
+            TargetAddr::Ip("192.0.2.1".parse().expect("test IP should parse")),
+            53,
+            Network::Udp,
+        );
+        let mut writer = RecordingWriter::default();
+        let mut sent_xudp_new = false;
+
+        write_socks_vless_udp_payload(
+            &mut writer,
+            VlessUdpFraming::LengthPrefixed,
+            &target,
+            [0; 8],
+            &mut sent_xudp_new,
+            Bytes::from_static(b"one"),
+            false,
+        )
+        .await
+        .expect("first frame should write");
+        write_socks_vless_udp_payload(
+            &mut writer,
+            VlessUdpFraming::LengthPrefixed,
+            &target,
+            [0; 8],
+            &mut sent_xudp_new,
+            Bytes::from_static(b"two"),
+            true,
+        )
+        .await
+        .expect("second frame should write and flush");
+
+        assert_eq!(writer.bytes, b"\0\x03one\0\x03two");
+        assert_eq!(writer.flushes, 1);
+    }
+
+    #[tokio::test]
+    async fn vless_udp_writer_drops_an_oversize_datagram_but_keeps_flushing() {
+        let target = Target::new(
+            TargetAddr::Ip("192.0.2.1".parse().expect("test IP should parse")),
+            53,
+            Network::Udp,
+        );
+        for framing in [VlessUdpFraming::LengthPrefixed, VlessUdpFraming::Xudp] {
+            let mut writer = RecordingWriter::default();
+            let mut sent_xudp_new = false;
+            let oversize = Bytes::from(vec![7; crate::tun::VLESS_UDP_MAX_PAYLOAD + 1]);
+            let written = write_socks_vless_udp_payload(
+                &mut writer,
+                framing,
+                &target,
+                [0; 8],
+                &mut sent_xudp_new,
+                oversize,
+                true,
+            )
+            .await
+            .expect("an oversize datagram is dropped, not an error");
+            assert_eq!(written, None);
+            assert!(writer.bytes.is_empty());
+            assert!(
+                !sent_xudp_new,
+                "the next datagram still opens the XUDP session"
+            );
+            assert_eq!(writer.flushes, 1);
+
+            let fits = Bytes::from(vec![7; crate::tun::VLESS_UDP_MAX_PAYLOAD]);
+            let written = write_socks_vless_udp_payload(
+                &mut writer,
+                framing,
+                &target,
+                [0; 8],
+                &mut sent_xudp_new,
+                fits,
+                false,
+            )
+            .await
+            .expect("an 8 KiB datagram fits");
+            assert_eq!(written, Some(crate::tun::VLESS_UDP_MAX_PAYLOAD));
+        }
+    }
+
+    fn admission_test_target() -> Target {
+        Target::new(
+            TargetAddr::Ip("192.0.2.1".parse().expect("test IP should parse")),
+            53,
+            Network::Udp,
+        )
+    }
+
+    fn admission_test_key(port: u16) -> (SocketAddr, Target) {
+        (
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            admission_test_target(),
+        )
+    }
+
+    fn insert_admission_test_flow(
+        flows: &mut HashMap<(SocketAddr, Target), SocksUdpFlowEntry>,
+        tasks: &mut JoinSet<(SocketAddr, Target)>,
+        global_flows: &Arc<Semaphore>,
+        port: u16,
+        last_activity: u64,
+    ) {
+        let global_permit = Arc::clone(global_flows)
+            .try_acquire_owned()
+            .expect("test flow should fit the global budget");
+        let (sender, _receiver) = mpsc::channel::<Bytes>(SOCKS_UDP_FLOW_QUEUE);
+        let abort_handle = tasks.spawn(std::future::pending::<(SocketAddr, Target)>());
+        let task_id = abort_handle.id();
+        flows.insert(
+            admission_test_key(port),
+            SocksUdpFlowEntry {
+                sender,
+                abort_handle,
+                task_id,
+                last_activity,
+                global_permit,
+            },
+        );
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        dir
+    }
+
+    #[tokio::test]
+    async fn socks_udp_admission_at_association_cap_evicts_to_admit() {
+        let budgets = SocksUdpBudgets {
+            global_flows: Arc::new(Semaphore::new(SOCKS_UDP_MAX_FLOWS_PER_ASSOCIATION)),
+            pending_opens: Arc::new(Semaphore::new(1)),
+            exhaustion_log: Arc::new(SocksUdpBudgetExhaustionLog::new()),
+        };
+        let mut tasks = JoinSet::new();
+        let mut flows = HashMap::new();
+        for index in 0..SOCKS_UDP_MAX_FLOWS_PER_ASSOCIATION {
+            insert_admission_test_flow(
+                &mut flows,
+                &mut tasks,
+                &budgets.global_flows,
+                2_000 + u16::try_from(index).expect("cap fits in u16"),
+                index as u64,
+            );
+        }
+        assert_eq!(budgets.global_flows.available_permits(), 0);
+
+        let permits = admit_socks_udp_flow(&mut flows, &budgets, &RuntimeLogger::disabled())
+            .expect("association at its cap should admit by evicting its oldest flow");
+
+        assert_eq!(flows.len(), SOCKS_UDP_MAX_FLOWS_PER_ASSOCIATION - 1);
+        assert!(!flows.contains_key(&admission_test_key(2_000)));
+        assert_eq!(budgets.global_flows.available_permits(), 0);
+        drop(permits);
+        assert_eq!(budgets.global_flows.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn socks_udp_admission_evicts_association_oldest_when_global_budget_exhausted() {
+        let budgets = SocksUdpBudgets {
+            global_flows: Arc::new(Semaphore::new(2)),
+            pending_opens: Arc::new(Semaphore::new(1)),
+            exhaustion_log: Arc::new(SocksUdpBudgetExhaustionLog::new()),
+        };
+        let mut tasks = JoinSet::new();
+        let mut flows = HashMap::new();
+        insert_admission_test_flow(&mut flows, &mut tasks, &budgets.global_flows, 2_001, 1);
+        insert_admission_test_flow(&mut flows, &mut tasks, &budgets.global_flows, 2_002, 2);
+        assert_eq!(budgets.global_flows.available_permits(), 0);
+
+        let permits = admit_socks_udp_flow(&mut flows, &budgets, &RuntimeLogger::disabled())
+            .expect(
+                "global exhaustion should be absorbed by evicting the association's oldest flow",
+            );
+
+        assert!(!flows.contains_key(&admission_test_key(2_001)));
+        assert!(flows.contains_key(&admission_test_key(2_002)));
+        assert_eq!(budgets.global_flows.available_permits(), 0);
+        drop(permits);
+    }
+
+    #[test]
+    fn socks_udp_admission_logs_drop_when_global_budget_exhausted_with_nothing_to_evict() {
+        let dir = unique_temp_dir("socks-udp-global-drop");
+        let logger = RuntimeLogger::new(RuntimeLogConfig::directory(&dir))
+            .expect("logger should open files");
+        let budgets = SocksUdpBudgets {
+            global_flows: Arc::new(Semaphore::new(1)),
+            pending_opens: Arc::new(Semaphore::new(1)),
+            exhaustion_log: Arc::new(SocksUdpBudgetExhaustionLog::new()),
+        };
+        let _held_by_other_association = Arc::clone(&budgets.global_flows)
+            .try_acquire_owned()
+            .expect("first permit should fit");
+        let mut flows = HashMap::new();
+
+        let admission = admit_socks_udp_flow(&mut flows, &budgets, &logger);
+
+        assert!(admission.is_none());
+        drop(logger);
+        let error_log =
+            std::fs::read_to_string(dir.join("xray-error.log")).expect("error log should exist");
+        assert!(error_log.contains("socks udp global flow budget exhausted"));
+        assert!(error_log.contains("nothing to evict"));
+    }
+
+    #[tokio::test]
+    async fn socks_udp_admission_logs_drop_when_pending_open_budget_exhausted() {
+        let dir = unique_temp_dir("socks-udp-pending-drop");
+        let logger = RuntimeLogger::new(RuntimeLogConfig::directory(&dir))
+            .expect("logger should open files");
+        let budgets = SocksUdpBudgets {
+            global_flows: Arc::new(Semaphore::new(2)),
+            pending_opens: Arc::new(Semaphore::new(1)),
+            exhaustion_log: Arc::new(SocksUdpBudgetExhaustionLog::new()),
+        };
+        let _pending_held_elsewhere = Arc::clone(&budgets.pending_opens)
+            .try_acquire_owned()
+            .expect("first pending open should fit");
+        let mut tasks = JoinSet::new();
+        let mut flows = HashMap::new();
+        insert_admission_test_flow(&mut flows, &mut tasks, &budgets.global_flows, 2_001, 1);
+
+        let admission = admit_socks_udp_flow(&mut flows, &budgets, &logger);
+
+        assert!(admission.is_none());
+        assert_eq!(flows.len(), 1, "pending exhaustion must not evict flows");
+        assert_eq!(budgets.global_flows.available_permits(), 1);
+        drop(logger);
+        let error_log =
+            std::fs::read_to_string(dir.join("xray-error.log")).expect("error log should exist");
+        assert!(error_log.contains("socks udp pending-open budget exhausted"));
+    }
+
+    #[tokio::test]
+    async fn socks_udp_eviction_returns_reclaimed_global_permit() {
+        let client_addr = SocketAddr::from(([127, 0, 0, 1], 1234));
+        let target = Target::new(
+            TargetAddr::Ip("192.0.2.1".parse().expect("test IP should parse")),
+            53,
+            Network::Udp,
+        );
+        let global_flows = Arc::new(Semaphore::new(1));
+        let global_permit = Arc::clone(&global_flows)
+            .try_acquire_owned()
+            .expect("flow permit should fit");
+        let (sender, _receiver) = mpsc::channel::<Bytes>(SOCKS_UDP_FLOW_QUEUE);
+        let mut tasks = JoinSet::new();
+        let abort_handle = tasks.spawn(std::future::pending::<(SocketAddr, Target)>());
+        let task_id = abort_handle.id();
+        let mut flows = HashMap::from([(
+            (client_addr, target),
+            SocksUdpFlowEntry {
+                sender,
+                abort_handle,
+                task_id,
+                last_activity: 1,
+                global_permit,
+            },
+        )]);
+
+        let reclaimed = evict_oldest_socks_udp_flow(&mut flows)
+            .expect("eviction should hand back the evicted flow's permit");
+
+        assert_eq!(global_flows.available_permits(), 0);
+        drop(reclaimed);
+        assert_eq!(global_flows.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn socks_udp_eviction_aborts_managed_flow_task() {
+        let client_addr = SocketAddr::from(([127, 0, 0, 1], 1234));
+        let target = Target::new(
+            TargetAddr::Ip("192.0.2.1".parse().expect("test IP should parse")),
+            53,
+            Network::Udp,
+        );
+        let key = (client_addr, target);
+        let budgets = SocksUdpBudgets {
+            global_flows: Arc::new(Semaphore::new(1)),
+            pending_opens: Arc::new(Semaphore::new(1)),
+            exhaustion_log: Arc::new(SocksUdpBudgetExhaustionLog::new()),
+        };
+        let global_permit = Arc::clone(&budgets.global_flows)
+            .try_acquire_owned()
+            .expect("flow permit should fit");
+        let (sender, _receiver) = mpsc::channel::<Bytes>(SOCKS_UDP_FLOW_QUEUE);
+        let mut tasks = JoinSet::new();
+        let abort_handle = tasks.spawn(std::future::pending::<(SocketAddr, Target)>());
+        let task_id = abort_handle.id();
+        let mut flows = HashMap::from([(
+            key,
+            SocksUdpFlowEntry {
+                sender,
+                abort_handle,
+                task_id,
+                last_activity: 1,
+                global_permit,
+            },
+        )]);
+
+        assert!(evict_oldest_socks_udp_flow(&mut flows).is_some());
+        let result = tasks
+            .join_next()
+            .await
+            .expect("aborted task should complete");
+
+        assert!(result.expect_err("task should be cancelled").is_cancelled());
+    }
+
+    #[test]
+    fn password_udp_lock_pins_only_a_declared_client() {
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 50_000));
+        let declared =
+            |ip: Ipv4Addr, port| Target::new(TargetAddr::Ip(IpAddr::V4(ip)), port, Network::Udp);
+        let client = SocketAddr::from((Ipv4Addr::LOCALHOST, 40_000));
+        let other = SocketAddr::from((Ipv4Addr::LOCALHOST, 40_001));
+
+        let exact =
+            SocksUdpClientLock::for_request(&declared(Ipv4Addr::LOCALHOST, 40_000), Some(peer))
+                .unwrap();
+        assert!(!exact.admits(other));
+        assert!(exact.admits(client));
+
+        let port_only =
+            SocksUdpClientLock::for_request(&declared(Ipv4Addr::UNSPECIFIED, 40_000), Some(peer))
+                .unwrap();
+        assert!(!port_only.admits(other));
+        assert!(port_only.admits(client));
+
+        assert_eq!(
+            SocksUdpClientLock::for_request(&declared(Ipv4Addr::UNSPECIFIED, 0), Some(peer)),
+            None
+        );
+        assert_eq!(
+            SocksUdpClientLock::for_request(&declared(Ipv4Addr::LOCALHOST, 0), Some(peer)),
+            None
+        );
+        assert_eq!(
+            SocksUdpClientLock::for_request(&declared(Ipv4Addr::UNSPECIFIED, 40_000), None),
+            None
+        );
+    }
+}

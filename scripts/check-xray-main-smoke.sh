@@ -42,7 +42,7 @@ export GOENV=off GOWORK=off GOTOOLCHAIN=local CGO_ENABLED=0
 export XRAY_CORE_CHECKOUT XRAY_CORE_EXPECTED_REVISION
 
 XRAY_XHTTP_INTEROP_CASES=h2-tls-stream-one \
-  cargo test --locked -p xray-core-rs \
+  cargo test --locked -p segue-engine \
     --test local_xray_interop_tests \
     rust_socks_client_reaches_echo_server_through_local_xray_vless_xhttp_selected_cases \
     -- --ignored --nocapture --test-threads=1

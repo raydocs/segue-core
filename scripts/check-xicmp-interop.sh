@@ -29,11 +29,11 @@ env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
 cmp "$WORKSPACE_ROOT/tests/fixtures/xicmp/vectors.json" "$TEST_ROOT/vectors.json"
 
 cd "$WORKSPACE_ROOT"
-cargo test --locked -p xray-transport --lib xicmp::
-cargo test --locked -p xray-transport --lib hysteria::carrier
-cargo test --locked -p xray-config --lib parser::xicmp
-cargo test --locked -p xray-config --test xicmp_tests
-cargo test --locked -p xray-core-rs --lib outbound::carrier::tests
+cargo test --locked -p segue-transport --lib xicmp::
+cargo test --locked -p segue-transport --lib hysteria::carrier
+cargo test --locked -p segue-config --lib parser::xicmp
+cargo test --locked -p segue-config --test xicmp_tests
+cargo test --locked -p segue-engine --lib outbound::carrier::tests
 
 # Xray-core's server reads echo requests on raw ICMP sockets, which only
 # Linux grants an unprivileged process through a capability.
@@ -48,8 +48,8 @@ test_binary() {
   cargo test --locked -p "$1" --test "$2" --no-run --message-format=json |
     python3 -c 'import json,sys; print(next(v["executable"] for v in map(json.loads,sys.stdin) if v.get("reason")=="compiler-artifact" and v.get("executable") and "test" in v["target"]["kind"]))'
 }
-readonly CORE_TESTS="$(test_binary xray-core-rs local_xray_interop_tests)"
-readonly HYSTERIA_TESTS="$(test_binary xray-transport hysteria_interop_tests)"
+readonly CORE_TESTS="$(test_binary segue-engine local_xray_interop_tests)"
+readonly HYSTERIA_TESTS="$(test_binary segue-transport hysteria_interop_tests)"
 
 # The client against Xray-core's own server: mKCP with datagram sockets to
 # the outbound's address and to two listed ones, with raw sockets, with

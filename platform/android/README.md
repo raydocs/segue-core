@@ -702,7 +702,7 @@ platform/android/gradlew -p platform/android \
 Run ABI/artifact contract tests from the workspace root:
 
 ```sh
-cargo test --locked -p xray-ffi --test mobile_artifacts_tests -- --nocapture
+cargo test --locked -p segue-ffi --test mobile_artifacts_tests -- --nocapture
 bash scripts/tests/check-mobile-toolchains.test.sh
 ```
 

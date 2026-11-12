@@ -1,0 +1,4 @@
+module XrayRust {
+  umbrella header "segue_ffi.h"
+  export *
+}

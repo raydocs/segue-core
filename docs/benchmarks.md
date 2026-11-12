@@ -57,7 +57,7 @@ two revisions in one target directory: Cargo's artifact hash for a workspace
 crate ignores the checkout's absolute path and freshness follows file mtimes,
 so a second checkout can silently reuse the first build's workspace crates.
 The 2026-10-27 "before" client was built that way and contains the
-migration's `xray-config` and `xray-utls`
+migration's `segue-config` and `segue-utls`
 ([erratum](benchmarks/results/2026-10-27-v26.10.21-migration/README.md#erratum-2026-10-29-the-before-client-is-a-mixed-build)).
 The script exports the exact commit to a fresh temporary directory, builds it
 with an empty target directory and a sanitized environment, and fails unless
@@ -72,7 +72,7 @@ cover-origin helper. Complete builds and tests before collecting measurements.
 python3 scripts/build-isolated-release.py --rev 3ca380e --name before --campaign /absolute/campaign
 python3 scripts/build-isolated-release.py --rev 53756fe --name after --campaign /absolute/campaign
 python3 scripts/build-isolated-release.py --rev 53756fe --name harness --campaign /absolute/campaign \
-  --package xray-cli --package xray-bench --binary xray-bench
+  --package segue-cli --package segue-bench --binary segue-bench
 ```
 
 To measure identical-binary variation, collect a separate A/A control with
@@ -328,7 +328,7 @@ and optional `dirty`, optional `harness_binary_path`, `harness_binary_sha256`,
 the end of the run; it is not an embedded build revision and can differ from
 the source used by an older binary. The SHA-256 fields identify the exact
 harness and measured engine executable files at run end. `invocation_args` is
-the canonical effective `xray-bench run` CLI argument vector rather than a
+the canonical effective `segue-bench run` CLI argument vector rather than a
 shell-quoted string, so those arguments can be replayed without guessing how
 paths were escaped; it does not capture environment variables or reconstruct
 the binaries' build source. A repeated-run summary is written only when every
@@ -346,44 +346,44 @@ transport, traffic, or XHTTP-mode cases are rejected instead of being merged.
 ## Run xray-rust Only
 
 ```sh
-cargo run -p xray-bench -- run --engine xray-rust --workload idle --duration-ms 1000
-cargo run -p xray-bench -- run --engine xray-rust --workload tcp-freedom --connections 1 --iterations 10 --payload-size 1024
-cargo run --release -p xray-bench -- run --engine xray-rust --workload tcp-bulk-throughput --connections 1 --iterations 2048 --payload-size 4194304 --run-timeout-ms 300000
+cargo run -p segue-bench -- run --engine xray-rust --workload idle --duration-ms 1000
+cargo run -p segue-bench -- run --engine xray-rust --workload tcp-freedom --connections 1 --iterations 10 --payload-size 1024
+cargo run --release -p segue-bench -- run --engine xray-rust --workload tcp-bulk-throughput --connections 1 --iterations 2048 --payload-size 4194304 --run-timeout-ms 300000
 scripts/fetch-geodata.sh --output-dir /private/tmp/bench-geodata
-cargo run --release -p xray-bench -- run --engine xray-rust --workload routed-tcp-freedom --geodata-dir /private/tmp/bench-geodata --connections 8 --iterations 100 --payload-size 1024 --run-timeout-ms 120000
-cargo run -p xray-bench -- run --engine xray-rust --workload many-idle-flows --connections 100 --duration-ms 1000
-cargo run -p xray-bench -- run --engine xray-rust --workload reconnect-burst --connections 16 --iterations 25
-cargo run -p xray-bench -- run --engine xray-rust --workload mixed-long-lived --connections 8 --iterations 20 --duration-ms 1000 --payload-size 512
-cargo run -p xray-bench -- run --engine xray-rust --workload udp-freedom --connections 1 --iterations 10 --payload-size 512
-cargo run -p xray-bench -- run --engine xray-rust --workload tun-udp-freedom --connections 1 --iterations 10 --payload-size 512
-cargo run -p xray-bench -- run --engine xray-rust --workload tun-fake-dns --connections 1 --iterations 1000
-cargo run -p xray-bench -- run --engine xray-rust --workload tun-fake-dns-tcp --connections 16 --iterations 1000
-cargo run -p xray-bench -- run --engine xray-rust --workload tun-dns-proxy --transport both --connections 32 --iterations 1000
-cargo run -p xray-bench -- run --engine xray-rust --workload tun-dns-proxy --transport udp --dns-upstream-transport tcp-routed --connections 32 --iterations 1000
-cargo run -p xray-bench -- run --engine xray-rust --workload tun-dns-proxy --transport both --dns-upstream-transport tcp-local --connections 32 --iterations 1000
-cargo run -p xray-bench -- run --engine xray-rust --workload tun-tcp-freedom --connections 1 --iterations 10 --payload-size 512
-cargo run -p xray-bench -- run --engine xray-rust --workload tun-tcp-stale-flows --connections 500 --iterations 1 --duration-ms 5000 --payload-size 512
-cargo run -p xray-bench -- run --engine xray-rust --workload tun-reality-blackhole --connections 500 --duration-ms 5000 --payload-size 512
-cargo run -p xray-bench -- run --engine xray-rust --workload udp-vless --connections 1 --iterations 10 --payload-size 512
-cargo run -p xray-bench -- run --engine xray-rust --workload udp-xudp --connections 1 --iterations 10 --payload-size 512
-cargo run -p xray-bench -- run --engine xray-rust --workload vision-xudp --connections 1 --iterations 10 --payload-size 512
-cargo run -p xray-bench -- run --engine xray-rust --workload reality-vision-xudp --xray-core-bin /path/to/xray-core --connections 1 --iterations 10 --payload-size 512
-cargo run --release -p xray-bench -- run --engine xray-rust --workload reality-vision-bulk-throughput --xray-core-dir Xray-core --connections 1 --iterations 256 --payload-size 4194304 --run-timeout-ms 120000
-cargo run --release -p xray-bench -- run --engine xray-rust --workload grpc-bulk-throughput --xray-core-dir Xray-core --connections 1 --iterations 256 --payload-size 4194304 --run-timeout-ms 120000
-cargo run --release -p xray-bench -- run --engine xray-rust --workload stream-transport --stream-transport xhttp-h2 --traffic full-duplex --xhttp-mode stream-up --xray-core-dir Xray-core --connections 1 --iterations 4096 --payload-size 65536 --run-timeout-ms 300000
-cargo run --release -p xray-bench -- run --engine xray-rust --workload stream-transport --stream-transport xhttp-h3 --traffic full-duplex --xhttp-mode stream-one --xray-core-dir Xray-core --connections 1 --iterations 4096 --payload-size 65536 --run-timeout-ms 300000
-cargo run -p xray-bench -- run --engine xray-rust --workload tcp-freedom --runs 5 --connections 8 --iterations 1000 --payload-size 4096
-cargo run --release -p xray-bench -- route-probe --iterations 100000 --rules 64 --outbounds 8
-cargo run --release -p xray-bench -- route-probe --iterations 100000 --rules 64 --outbounds 8 --dns-candidates 8
-cargo run --release -p xray-bench -- dns-policy-probe --iterations 10000 --servers 4 --matchers 4096
-cargo run --release -p xray-bench -- phase2-probe --iterations 10000 --members 64 --connections 64 --chain-depth 8
+cargo run --release -p segue-bench -- run --engine xray-rust --workload routed-tcp-freedom --geodata-dir /private/tmp/bench-geodata --connections 8 --iterations 100 --payload-size 1024 --run-timeout-ms 120000
+cargo run -p segue-bench -- run --engine xray-rust --workload many-idle-flows --connections 100 --duration-ms 1000
+cargo run -p segue-bench -- run --engine xray-rust --workload reconnect-burst --connections 16 --iterations 25
+cargo run -p segue-bench -- run --engine xray-rust --workload mixed-long-lived --connections 8 --iterations 20 --duration-ms 1000 --payload-size 512
+cargo run -p segue-bench -- run --engine xray-rust --workload udp-freedom --connections 1 --iterations 10 --payload-size 512
+cargo run -p segue-bench -- run --engine xray-rust --workload tun-udp-freedom --connections 1 --iterations 10 --payload-size 512
+cargo run -p segue-bench -- run --engine xray-rust --workload tun-fake-dns --connections 1 --iterations 1000
+cargo run -p segue-bench -- run --engine xray-rust --workload tun-fake-dns-tcp --connections 16 --iterations 1000
+cargo run -p segue-bench -- run --engine xray-rust --workload tun-dns-proxy --transport both --connections 32 --iterations 1000
+cargo run -p segue-bench -- run --engine xray-rust --workload tun-dns-proxy --transport udp --dns-upstream-transport tcp-routed --connections 32 --iterations 1000
+cargo run -p segue-bench -- run --engine xray-rust --workload tun-dns-proxy --transport both --dns-upstream-transport tcp-local --connections 32 --iterations 1000
+cargo run -p segue-bench -- run --engine xray-rust --workload tun-tcp-freedom --connections 1 --iterations 10 --payload-size 512
+cargo run -p segue-bench -- run --engine xray-rust --workload tun-tcp-stale-flows --connections 500 --iterations 1 --duration-ms 5000 --payload-size 512
+cargo run -p segue-bench -- run --engine xray-rust --workload tun-reality-blackhole --connections 500 --duration-ms 5000 --payload-size 512
+cargo run -p segue-bench -- run --engine xray-rust --workload udp-vless --connections 1 --iterations 10 --payload-size 512
+cargo run -p segue-bench -- run --engine xray-rust --workload udp-xudp --connections 1 --iterations 10 --payload-size 512
+cargo run -p segue-bench -- run --engine xray-rust --workload vision-xudp --connections 1 --iterations 10 --payload-size 512
+cargo run -p segue-bench -- run --engine xray-rust --workload reality-vision-xudp --xray-core-bin /path/to/xray-core --connections 1 --iterations 10 --payload-size 512
+cargo run --release -p segue-bench -- run --engine xray-rust --workload reality-vision-bulk-throughput --xray-core-dir Xray-core --connections 1 --iterations 256 --payload-size 4194304 --run-timeout-ms 120000
+cargo run --release -p segue-bench -- run --engine xray-rust --workload grpc-bulk-throughput --xray-core-dir Xray-core --connections 1 --iterations 256 --payload-size 4194304 --run-timeout-ms 120000
+cargo run --release -p segue-bench -- run --engine xray-rust --workload stream-transport --stream-transport xhttp-h2 --traffic full-duplex --xhttp-mode stream-up --xray-core-dir Xray-core --connections 1 --iterations 4096 --payload-size 65536 --run-timeout-ms 300000
+cargo run --release -p segue-bench -- run --engine xray-rust --workload stream-transport --stream-transport xhttp-h3 --traffic full-duplex --xhttp-mode stream-one --xray-core-dir Xray-core --connections 1 --iterations 4096 --payload-size 65536 --run-timeout-ms 300000
+cargo run -p segue-bench -- run --engine xray-rust --workload tcp-freedom --runs 5 --connections 8 --iterations 1000 --payload-size 4096
+cargo run --release -p segue-bench -- route-probe --iterations 100000 --rules 64 --outbounds 8
+cargo run --release -p segue-bench -- route-probe --iterations 100000 --rules 64 --outbounds 8 --dns-candidates 8
+cargo run --release -p segue-bench -- dns-policy-probe --iterations 10000 --servers 4 --matchers 4096
+cargo run --release -p segue-bench -- phase2-probe --iterations 10000 --members 64 --connections 64 --chain-depth 8
 scripts/run-v05-pre-device-benchmarks.sh target/benchmarks/v05-pre-device
 ```
 
-By default, the harness uses `target/debug/xray-rust` or builds it with:
+By default, the harness uses `target/debug/segue` or builds it with:
 
 ```sh
-cargo build -p xray-cli --bin xray-rust
+cargo build -p segue-cli --bin xray-rust
 ```
 
 Use `--xray-rust-bin <path>` to point at an already built binary.
@@ -615,19 +615,19 @@ below are a starting point, not a publication constant.
 
 ```sh
 export SING_BOX_BIN=/path/to/sing-box
-cargo build --release -p xray-cli --bin xray-rust
+cargo build --release -p segue-cli --bin xray-rust
 
 for transport in ws httpupgrade grpc xhttp-h1 xhttp-h2 xhttp-h3; do
   for traffic in upload download full-duplex; do
     for flows in 1 32; do
       xhttp_args=()
       case "$transport" in xhttp-*) xhttp_args=(--xhttp-mode stream-up) ;; esac
-      cargo run --release -p xray-bench -- compare \
+      cargo run --release -p segue-bench -- compare \
         --workload stream-transport --stream-transport "$transport" \
         --traffic "$traffic" "${xhttp_args[@]}" \
         --connections "$flows" --iterations 4096 --payload-size 65536 \
         --runs 5 --run-timeout-ms 300000 \
-        --xray-rust-bin target/release/xray-rust \
+        --xray-rust-bin target/release/segue \
         --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN"
     done
   done
@@ -640,12 +640,12 @@ flows):
 ```sh
 for transport in xhttp-h1 xhttp-h2 xhttp-h3; do
   for flows in 1 32; do
-    cargo run --release -p xray-bench -- compare \
+    cargo run --release -p segue-bench -- compare \
       --workload stream-transport --stream-transport "$transport" \
       --traffic packet-up --xhttp-mode packet-up \
       --connections "$flows" --iterations 4096 --payload-size 16384 \
       --runs 5 --run-timeout-ms 300000 \
-      --xray-rust-bin target/release/xray-rust --xray-core-dir Xray-core
+      --xray-rust-bin target/release/segue --xray-core-dir Xray-core
   done
 done
 ```
@@ -653,12 +653,12 @@ done
 A canonical targeted H3 `stream-one` release comparison is:
 
 ```sh
-cargo run --release -p xray-bench -- compare \
+cargo run --release -p segue-bench -- compare \
   --workload stream-transport --stream-transport xhttp-h3 \
   --traffic full-duplex --xhttp-mode stream-one \
   --connections 32 --iterations 4096 --payload-size 65536 \
   --runs 5 --run-timeout-ms 300000 \
-  --xray-rust-bin target/release/xray-rust --xray-core-dir Xray-core
+  --xray-rust-bin target/release/segue --xray-core-dir Xray-core
 ```
 
 `uplink_write_ops_per_second` counts payload-bearing `write_all` operations
@@ -718,8 +718,8 @@ runs against an older server. The traffic kinds are:
 Examples:
 
 ```sh
-cargo run -p xray-bench -- reality-matrix --xray-core-dir Xray-core
-cargo run -p xray-bench -- reality-matrix --xray-core-dir Xray-core --fingerprints chrome,hellochrome_120_pq --traffic startup-probe,tcp-connect,http-body,udp-xudp-echo --iterations 3 --body-bytes 1048576
+cargo run -p segue-bench -- reality-matrix --xray-core-dir Xray-core
+cargo run -p segue-bench -- reality-matrix --xray-core-dir Xray-core --fingerprints chrome,hellochrome_120_pq --traffic startup-probe,tcp-connect,http-body,udp-xudp-echo --iterations 3 --body-bytes 1048576
 ```
 
 Useful options:
@@ -753,8 +753,8 @@ host; `/path/to/sing-box` below is only a placeholder:
 
 ```sh
 export SING_BOX_BIN=/path/to/sing-box
-cargo run -p xray-bench -- run --engine sing-box --sing-box-bin "$SING_BOX_BIN" --workload idle --duration-ms 1000 --no-auto-build
-cargo run -p xray-bench -- run --engine sing-box --sing-box-bin "$SING_BOX_BIN" --workload many-idle-flows --connections 100 --duration-ms 1000 --no-auto-build
+cargo run -p segue-bench -- run --engine sing-box --sing-box-bin "$SING_BOX_BIN" --workload idle --duration-ms 1000 --no-auto-build
+cargo run -p segue-bench -- run --engine sing-box --sing-box-bin "$SING_BOX_BIN" --workload many-idle-flows --connections 100 --duration-ms 1000 --no-auto-build
 ```
 
 The sing-box slice supports the SOCKS/process-level workloads: `idle`, `tcp-freedom`, `tcp-bulk-throughput`, `many-idle-flows`, `reconnect-burst`, `mixed-long-lived`, `udp-freedom`, `reality-vision-xudp`, `reality-vision-bulk-throughput`, `grpc-bulk-throughput`, and the WS/HTTPUpgrade/gRPC cases of `stream-transport`. Stream-transport and REALITY workloads start an Xray-core server fixture and sample only the client engine process. XHTTP is compared only between xray-rust and Xray-core because sing-box does not implement that transport. The sing-box binary must include `with_utls`; the harness uses `with_gvisor,with_utls,badlinkname,tfogo_checklinkname0` when auto-building sing-box. TUN and fake VLESS/XUDP sing-box workloads are intentionally not part of this slice because they need a different topology than the rootless fd-backed harness.
@@ -803,27 +803,27 @@ compare all three engines:
 
 ```sh
 export SING_BOX_BIN=/path/to/sing-box
-cargo run -p xray-bench -- compare --workload tcp-freedom --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 1 --iterations 1000 --payload-size 1024
-cargo run --release -p xray-bench -- compare --workload tcp-bulk-throughput --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 1 --iterations 2048 --payload-size 4194304 --run-timeout-ms 300000
-cargo run -p xray-bench -- compare --workload many-idle-flows --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 100 --duration-ms 1000
-cargo run -p xray-bench -- compare --workload reconnect-burst --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 16 --iterations 25
-cargo run -p xray-bench -- compare --workload mixed-long-lived --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 8 --iterations 20 --duration-ms 1000 --payload-size 512
-cargo run -p xray-bench -- compare --workload udp-freedom --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 1 --iterations 1000 --payload-size 512
-cargo run --release -p xray-bench -- compare --workload grpc-bulk-throughput --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 1 --iterations 256 --payload-size 4194304 --run-timeout-ms 120000
+cargo run -p segue-bench -- compare --workload tcp-freedom --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 1 --iterations 1000 --payload-size 1024
+cargo run --release -p segue-bench -- compare --workload tcp-bulk-throughput --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 1 --iterations 2048 --payload-size 4194304 --run-timeout-ms 300000
+cargo run -p segue-bench -- compare --workload many-idle-flows --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 100 --duration-ms 1000
+cargo run -p segue-bench -- compare --workload reconnect-burst --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 16 --iterations 25
+cargo run -p segue-bench -- compare --workload mixed-long-lived --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 8 --iterations 20 --duration-ms 1000 --payload-size 512
+cargo run -p segue-bench -- compare --workload udp-freedom --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run --release -p segue-bench -- compare --workload grpc-bulk-throughput --xray-core-dir Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 1 --iterations 256 --payload-size 4194304 --run-timeout-ms 120000
 ```
 
 For the pinned RC4 comparator, run the two REALITY workloads without sing-box
 binary/source arguments and explicitly record the omission:
 
 ```sh
-cargo run -p xray-bench -- compare --skip-sing-box --workload reality-vision-xudp --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
-cargo run --release -p xray-bench -- compare --skip-sing-box --workload reality-vision-bulk-throughput --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 256 --payload-size 4194304 --run-timeout-ms 120000
+cargo run -p segue-bench -- compare --skip-sing-box --workload reality-vision-xudp --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run --release -p segue-bench -- compare --skip-sing-box --workload reality-vision-bulk-throughput --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 256 --payload-size 4194304 --run-timeout-ms 120000
 ```
 
 The reviewed RC4 gRPC omission is likewise a two-engine command:
 
 ```sh
-cargo run --release -p xray-bench -- compare --skip-sing-box \
+cargo run --release -p segue-bench -- compare --skip-sing-box \
   --workload stream-transport --stream-transport grpc \
   --traffic full-duplex --connections 32 --iterations 4096 \
   --payload-size 65536 --runs 5 --run-timeout-ms 300000 \
@@ -833,14 +833,14 @@ cargo run --release -p xray-bench -- compare --skip-sing-box \
 The TUN and fake VLESS/XUDP workloads remain comparable between `xray-rust` and Xray-core in this slice, except for `tun-fake-dns`, `tun-fake-dns-tcp`, and `tun-dns-proxy`. These workloads deliberately exercise the xray-rust local DNS extensions (`dns.fakeIp` and anchor proxying through `dns.servers`, respectively); run them with `run --engine xray-rust`, since `compare` rejects them until equivalent cross-engine configurations are defined. The compare command skips sing-box for the other TUN workloads because sing-box's CLI TUN path uses a real platform TUN topology, while the older VLESS/XUDP fake-server workloads use Xray JSON configs instead of sing-box outbound schema. `routed-tcp-freedom` is also xray-rust vs Xray-core only: sing-box ≥1.8 does not read Xray-format `.dat` geodata, and semantically equivalent `.srs` rule-sets cannot be guaranteed.
 
 ```sh
-cargo run -p xray-bench -- compare --workload tun-udp-freedom --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
-cargo run -p xray-bench -- compare --workload tun-tcp-freedom --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 100 --payload-size 512
-cargo run -p xray-bench -- compare --workload tun-tcp-stale-flows --xray-core-dir Xray-core --runs 5 --connections 500 --iterations 1 --duration-ms 5000 --payload-size 512
-cargo run -p xray-bench -- compare --workload tun-reality-blackhole --xray-core-dir Xray-core --runs 5 --connections 500 --duration-ms 5000 --payload-size 512
-cargo run -p xray-bench -- compare --workload udp-vless --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
-cargo run -p xray-bench -- compare --workload udp-xudp --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
-cargo run -p xray-bench -- compare --workload vision-xudp --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
-cargo run --release -p xray-bench -- compare --workload routed-tcp-freedom --xray-core-dir Xray-core --geodata-dir /private/tmp/bench-geodata --runs 5 --connections 8 --iterations 100 --payload-size 1024 --run-timeout-ms 120000
+cargo run -p segue-bench -- compare --workload tun-udp-freedom --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run -p segue-bench -- compare --workload tun-tcp-freedom --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 100 --payload-size 512
+cargo run -p segue-bench -- compare --workload tun-tcp-stale-flows --xray-core-dir Xray-core --runs 5 --connections 500 --iterations 1 --duration-ms 5000 --payload-size 512
+cargo run -p segue-bench -- compare --workload tun-reality-blackhole --xray-core-dir Xray-core --runs 5 --connections 500 --duration-ms 5000 --payload-size 512
+cargo run -p segue-bench -- compare --workload udp-vless --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run -p segue-bench -- compare --workload udp-xudp --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run -p segue-bench -- compare --workload vision-xudp --xray-core-dir Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run --release -p segue-bench -- compare --workload routed-tcp-freedom --xray-core-dir Xray-core --geodata-dir /private/tmp/bench-geodata --runs 5 --connections 8 --iterations 100 --payload-size 1024 --run-timeout-ms 120000
 ```
 
 The TUN workloads can also be run with xray-rust runtime profiles. The harness
@@ -849,30 +849,30 @@ the same TUN fd workload can be sampled under `default`, `low-memory`, or
 `throughput` queue/budget presets:
 
 ```bash
-cargo run -p xray-bench -- run --engine xray-rust --workload tun-udp-freedom --tun-profile low-memory --connections 1 --iterations 1000 --payload-size 512
-cargo run -p xray-bench -- run --engine xray-rust --workload tun-tcp-freedom --tun-profile throughput --connections 1 --iterations 100 --payload-size 1024
+cargo run -p segue-bench -- run --engine xray-rust --workload tun-udp-freedom --tun-profile low-memory --connections 1 --iterations 1000 --payload-size 512
+cargo run -p segue-bench -- run --engine xray-rust --workload tun-tcp-freedom --tun-profile throughput --connections 1 --iterations 100 --payload-size 1024
 ```
 
 From an isolated worktree under `.worktrees/`, pass the main checkout's Xray-core path:
 
 ```sh
 export SING_BOX_BIN=/path/to/sing-box
-cargo run -p xray-bench -- compare --workload tcp-freedom --xray-core-dir ../../Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 1 --iterations 1000 --payload-size 1024
-cargo run -p xray-bench -- compare --workload many-idle-flows --xray-core-dir ../../Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 100 --duration-ms 1000
-cargo run -p xray-bench -- compare --workload reconnect-burst --xray-core-dir ../../Xray-core --runs 5 --connections 16 --iterations 25
-cargo run -p xray-bench -- compare --workload mixed-long-lived --xray-core-dir ../../Xray-core --runs 5 --connections 8 --iterations 20 --duration-ms 1000 --payload-size 512
-cargo run -p xray-bench -- compare --workload udp-freedom --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
-cargo run -p xray-bench -- compare --skip-sing-box --workload reality-vision-xudp --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
-cargo run -p xray-bench -- compare --workload tun-udp-freedom --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
-cargo run -p xray-bench -- compare --workload tun-tcp-freedom --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 100 --payload-size 512
-cargo run -p xray-bench -- compare --workload tun-tcp-stale-flows --xray-core-dir ../../Xray-core --runs 5 --connections 500 --iterations 1 --duration-ms 5000 --payload-size 512
-cargo run -p xray-bench -- compare --workload tun-reality-blackhole --xray-core-dir ../../Xray-core --runs 5 --connections 500 --duration-ms 5000 --payload-size 512
-cargo run -p xray-bench -- compare --workload udp-vless --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
-cargo run -p xray-bench -- compare --workload udp-xudp --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
-cargo run -p xray-bench -- compare --workload vision-xudp --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run -p segue-bench -- compare --workload tcp-freedom --xray-core-dir ../../Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 1 --iterations 1000 --payload-size 1024
+cargo run -p segue-bench -- compare --workload many-idle-flows --xray-core-dir ../../Xray-core --sing-box-bin "$SING_BOX_BIN" --runs 5 --connections 100 --duration-ms 1000
+cargo run -p segue-bench -- compare --workload reconnect-burst --xray-core-dir ../../Xray-core --runs 5 --connections 16 --iterations 25
+cargo run -p segue-bench -- compare --workload mixed-long-lived --xray-core-dir ../../Xray-core --runs 5 --connections 8 --iterations 20 --duration-ms 1000 --payload-size 512
+cargo run -p segue-bench -- compare --workload udp-freedom --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run -p segue-bench -- compare --skip-sing-box --workload reality-vision-xudp --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run -p segue-bench -- compare --workload tun-udp-freedom --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run -p segue-bench -- compare --workload tun-tcp-freedom --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 100 --payload-size 512
+cargo run -p segue-bench -- compare --workload tun-tcp-stale-flows --xray-core-dir ../../Xray-core --runs 5 --connections 500 --iterations 1 --duration-ms 5000 --payload-size 512
+cargo run -p segue-bench -- compare --workload tun-reality-blackhole --xray-core-dir ../../Xray-core --runs 5 --connections 500 --duration-ms 5000 --payload-size 512
+cargo run -p segue-bench -- compare --workload udp-vless --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run -p segue-bench -- compare --workload udp-xudp --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
+cargo run -p segue-bench -- compare --workload vision-xudp --xray-core-dir ../../Xray-core --runs 5 --connections 1 --iterations 1000 --payload-size 512
 ```
 
-The compare command auto-builds `target/debug/xray-rust`, an Xray-core binary, and a sing-box binary under the run directory unless `--no-auto-build` is provided. Every guarded Xray-core auto-build recompiles the exact pinned checkout and replaces its revision-scoped output artifact; xray-rust and sing-box outputs may be reused within a benchmark group. Use `--xray-core-bin <path>` and `--sing-box-bin <path>` to benchmark existing binaries without rebuilding.
+The compare command auto-builds `target/debug/segue`, an Xray-core binary, and a sing-box binary under the run directory unless `--no-auto-build` is provided. Every guarded Xray-core auto-build recompiles the exact pinned checkout and replaces its revision-scoped output artifact; xray-rust and sing-box outputs may be reused within a benchmark group. Use `--xray-core-bin <path>` and `--sing-box-bin <path>` to benchmark existing binaries without rebuilding.
 
 ## Publishing Numbers and Charts
 
@@ -894,9 +894,9 @@ published group.
 
 ```sh
 export SING_BOX_BIN=/path/to/sing-box
-cargo build --release -p xray-cli --bin xray-rust
-cargo run --release -p xray-bench -- compare --workload tcp-bulk-throughput \
-  --xray-rust-bin target/release/xray-rust --xray-core-dir Xray-core \
+cargo build --release -p segue-cli --bin xray-rust
+cargo run --release -p segue-bench -- compare --workload tcp-bulk-throughput \
+  --xray-rust-bin target/release/segue --xray-core-dir Xray-core \
   --sing-box-bin "$SING_BOX_BIN" \
   --runs 5 --connections 1 --iterations 2048 --payload-size 4194304 --run-timeout-ms 300000
 ```
@@ -920,7 +920,7 @@ series.
 run groups. The current RC4 invocation records its exact comparator boundary:
 
 ```sh
-cargo run --release -p xray-bench -- chart \
+cargo run --release -p segue-bench -- chart \
   --group target/benchmarks/<run-id-1> --group target/benchmarks/<run-id-2> \
   --date 2026-08-29 \
   --hardware "<recorded RC4 hardware and OS>" \
@@ -970,37 +970,37 @@ identical across every invocation. The publication recipe is five runs, 16
 logical clients, and 1000 iterations:
 
 ```sh
-cargo build --release -p xray-cli --bin xray-rust
+cargo build --release -p segue-cli --bin xray-rust
 
-cargo run --release -p xray-bench -- run --engine xray-rust \
-  --xray-rust-bin target/release/xray-rust --workload tun-fake-dns \
+cargo run --release -p segue-bench -- run --engine xray-rust \
+  --xray-rust-bin target/release/segue --workload tun-fake-dns \
   --runs 5 --connections 16 --iterations 1000 --run-timeout-ms 120000
-cargo run --release -p xray-bench -- run --engine xray-rust \
-  --xray-rust-bin target/release/xray-rust --workload tun-fake-dns-tcp \
+cargo run --release -p segue-bench -- run --engine xray-rust \
+  --xray-rust-bin target/release/segue --workload tun-fake-dns-tcp \
   --runs 5 --connections 16 --iterations 1000 --run-timeout-ms 120000
 
-cargo run --release -p xray-bench -- run --engine xray-rust \
-  --xray-rust-bin target/release/xray-rust --workload tun-dns-proxy \
+cargo run --release -p segue-bench -- run --engine xray-rust \
+  --xray-rust-bin target/release/segue --workload tun-dns-proxy \
   --transport udp --dns-upstream-transport classic \
   --runs 5 --connections 16 --iterations 1000 --run-timeout-ms 120000
-cargo run --release -p xray-bench -- run --engine xray-rust \
-  --xray-rust-bin target/release/xray-rust --workload tun-dns-proxy \
+cargo run --release -p segue-bench -- run --engine xray-rust \
+  --xray-rust-bin target/release/segue --workload tun-dns-proxy \
   --transport tcp --dns-upstream-transport classic \
   --runs 5 --connections 16 --iterations 1000 --run-timeout-ms 120000
-cargo run --release -p xray-bench -- run --engine xray-rust \
-  --xray-rust-bin target/release/xray-rust --workload tun-dns-proxy \
+cargo run --release -p segue-bench -- run --engine xray-rust \
+  --xray-rust-bin target/release/segue --workload tun-dns-proxy \
   --transport udp --dns-upstream-transport tcp-routed \
   --runs 5 --connections 16 --iterations 1000 --run-timeout-ms 120000
-cargo run --release -p xray-bench -- run --engine xray-rust \
-  --xray-rust-bin target/release/xray-rust --workload tun-dns-proxy \
+cargo run --release -p segue-bench -- run --engine xray-rust \
+  --xray-rust-bin target/release/segue --workload tun-dns-proxy \
   --transport tcp --dns-upstream-transport tcp-routed \
   --runs 5 --connections 16 --iterations 1000 --run-timeout-ms 120000
-cargo run --release -p xray-bench -- run --engine xray-rust \
-  --xray-rust-bin target/release/xray-rust --workload tun-dns-proxy \
+cargo run --release -p segue-bench -- run --engine xray-rust \
+  --xray-rust-bin target/release/segue --workload tun-dns-proxy \
   --transport udp --dns-upstream-transport tcp-local \
   --runs 5 --connections 16 --iterations 1000 --run-timeout-ms 120000
-cargo run --release -p xray-bench -- run --engine xray-rust \
-  --xray-rust-bin target/release/xray-rust --workload tun-dns-proxy \
+cargo run --release -p segue-bench -- run --engine xray-rust \
+  --xray-rust-bin target/release/segue --workload tun-dns-proxy \
   --transport tcp --dns-upstream-transport tcp-local \
   --runs 5 --connections 16 --iterations 1000 --run-timeout-ms 120000
 ```
@@ -1019,7 +1019,7 @@ Pass each resulting `target/benchmarks/<run-id>` directory with a repeatable
 `--dns-group` flag. DNS inputs may be rendered on their own:
 
 ```sh
-cargo run --release -p xray-bench -- chart \
+cargo run --release -p segue-bench -- chart \
   --dns-group target/benchmarks/<fake-dns-udp-run-id> \
   --dns-group target/benchmarks/<fake-dns-tcp-run-id> \
   --dns-group target/benchmarks/<proxy-udp-classic-run-id> \
@@ -1247,7 +1247,7 @@ reply) and `peak_rss_kib` (matcher memory for the loaded geodata).
 
 **Measurement asymmetry:** the two engines send the SOCKS reply at different
 pipeline stages — xray-rust replies after rule evaluation, hosts resolution,
-and the local dial complete (`crates/xray-core-rs/src/socks.rs`, non-sniffing
+and the local dial complete (`crates/segue-engine/src/socks.rs`, non-sniffing
 path), while Xray-core replies during the SOCKS handshake before routing and
 dialing (`proxy/socks/protocol.go` → `writeSocks5Response`, dispatch
 afterwards). The chart therefore compares different spans of work and must

@@ -42,7 +42,7 @@ older servers accept that profile as imported. The other is on a WireGuard
 `remoteDNS` that no peer routes, since wg-quick also sends such DNS outside the
 tunnel. The FFI also constructs an unstarted core to validate typed runtime
 policy and cryptographic identities, including unusable/duplicate WireGuard peer
-keys. The lower-level `xray_config::profile_import` API alone performs config
+keys. The lower-level `segue_config::profile_import` API alone performs config
 parsing, not the latter runtime validation. Import does not verify a remote
 endpoint or certificate.
 
@@ -201,7 +201,7 @@ Swift tests invoke the current Rust library and load both results into a core;
 Kotlin has injected-boundary tests plus optional real host-JNI integration.
 
 ```sh
-cargo test --locked -p xray-config -p xray-ffi --tests
+cargo test --locked -p segue-config -p segue-ffi --tests
 swift test --disable-sandbox --package-path platform/apple \
   --filter 'XrayProfileImporterTests|XrayPacketTunnelPumpTests|XrayMobileDNSPreflightTests|XrayPacketTunnelProviderTests'
 platform/android/gradlew -p platform/android :xraymobile:testDebugUnitTest

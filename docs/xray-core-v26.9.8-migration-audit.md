@@ -59,9 +59,9 @@ rate. The process-wide `random` selection can currently choose one of the
 seven incompatible shapes. Other explicit aliases and randomized profiles
 also need a complete new-server matrix before support can be claimed.
 
-Local evidence: [fingerprint registry](../crates/xray-utls/src/lib.rs),
-[generated profiles](../crates/xray-transport/src/utls_profiles.rs), and
-[profile application](../crates/xray-transport/src/utls_shaping.rs).
+Local evidence: [fingerprint registry](../crates/segue-utls/src/lib.rs),
+[generated profiles](../crates/segue-transport/src/utls_profiles.rs), and
+[profile application](../crates/segue-transport/src/utls_shaping.rs).
 
 The same dependency update increases the target TLS-record buffer from 8 KiB
 to 17 KiB and fixes background probe connection leaks, truncated-record
@@ -95,7 +95,7 @@ supported socket-options field is `happyEyeballs`. This is a concrete
 configuration migration task, not just an oracle-version update. Define the
 canonical new spelling and explicit treatment of old SDK/config inputs while
 retaining cycle checks, transport restrictions and fail-closed behavior.
-See [the parser's field registry](../crates/xray-config/src/surface.rs).
+See [the parser's field registry](../crates/segue-config/src/surface.rs).
 
 The same upstream commit runs VLESS/Trojan transport-security validation after
 normalization and checks `vnext[0]` / `servers[0]`, closing the previous legacy

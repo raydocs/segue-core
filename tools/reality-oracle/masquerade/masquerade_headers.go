@@ -19,7 +19,7 @@
 // It emits the browser-masquerade header block Xray injects into every ws,
 // httpupgrade, XHTTP and REALITY-probe request, straight out of the reference
 // implementation (`common/utils.TryDefaultHeadersWith`). The Rust port in
-// `crates/xray-transport/src/stream/masquerade.rs` is asserted against the
+// `crates/segue-transport/src/stream/masquerade.rs` is asserted against the
 // committed fixtures rather than against a reading of `browser.go`, because
 // the literals that matter -- the GREASEd `Sec-CH-UA` brand list, the exact
 // non-canonical key casing, the User-Agent templates -- are easy to transcribe

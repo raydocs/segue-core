@@ -257,9 +257,9 @@ def main() -> None:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     module.verify_xray_core_checkout(checkout)
-    command("cargo", "build", "--locked", "--release", "-p", "xray-cli", "--bin", "xray-rust")
+    command("cargo", "build", "--locked", "--release", "-p", "segue-cli", "--bin", "xray-rust")
     target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
-    binary = (ROOT / target / "release/xray-rust").resolve()
+    binary = (ROOT / target / "release/segue").resolve()
     if candidate() != source:
         raise RuntimeError("candidate changed during build")
     values = {key: [] for key in ("process", "plainVless", "encryption", "directLatency", "routing", "memory")}

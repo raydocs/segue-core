@@ -1824,9 +1824,9 @@
   ],
   "schemaVersion": 1,
   "validation": {
-    "acceptance": "Exactly the linked xray-config parser with the same geodata search paths. Warnings do not invalidate an input.",
+    "acceptance": "Exactly the linked segue-config parser with the same geodata search paths. Warnings do not invalidate an input.",
     "command": [
-      "xray-rust",
+      "segue",
       "config",
       "check",
       "--config",
@@ -1846,7 +1846,7 @@
       "platform host policy",
       "network reachability"
     ],
-    "rustFunction": "xray_config::tooling::validate_xray_json",
+    "rustFunction": "segue_config::tooling::validate_xray_json",
     "scope": "parser"
   }
 }

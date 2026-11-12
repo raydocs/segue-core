@@ -128,9 +128,9 @@ class CarrierSuiteTests(unittest.TestCase):
 
     def test_preparer_takes_isolated_build_records_and_refuses_unclean_ones(self):
         record = {"commit": REVISION, "tree": TREE, "rustc": "rustc 1.96.0", "cargo": "cargo 1.96.0",
-                  "command": "cargo build --locked --release -p xray-cli", "incremental": False,
+                  "command": "cargo build --locked --release -p segue-cli", "incremental": False,
                   "rustflags": None, "path": "/x", "sha256": "c" * 64, "isolated_target": True,
-                  "lock_sha256": "d" * 64, "workspace_packages_compiled": ["crates/xray-cli"]}
+                  "lock_sha256": "d" * 64, "workspace_packages_compiled": ["crates/segue-cli"]}
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "candidate.json"
             path.write_text(json.dumps(record))

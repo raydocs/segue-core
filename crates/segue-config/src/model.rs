@@ -1,0 +1,3461 @@
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
+
+use std::fmt;
+
+use uuid::Uuid;
+use segue_routing::{
+    canonicalize_ip, domain_matcher::domain_matches_suffix, Cidr, DomainMatcherSetBuilder,
+    DomainMatcherSetError, DomainRegexError,
+};
+pub use segue_routing::{
+    DnsHostTarget, DnsIpFilter, DomainHostIndex, DomainMatcher, DomainMatcherSet, DomainNameMode,
+    IpMatcherSet, RegexMatcher,
+};
+use zeroize::Zeroize;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigModelError {
+    #[error("reality short id cannot exceed 8 bytes")]
+    RealityShortIdTooLong,
+    #[error("CIDR prefix length {prefix} exceeds max {max}")]
+    InvalidCidrPrefix { prefix: u8, max: u8 },
+    #[error("invalid domain regex `{pattern}`: {message}")]
+    InvalidDomainRegex { pattern: String, message: String },
+    #[error("invalid domain matcher set: {message}")]
+    InvalidDomainMatcherSet { message: String },
+    #[error("DNS qtype range start {start} exceeds end {end}")]
+    InvalidDnsQTypeRange { start: u16, end: u16 },
+    #[error("routing port range start {start} exceeds end {end}")]
+    InvalidRoutingPortRange { start: u16, end: u16 },
+}
+
+impl From<DomainRegexError> for ConfigModelError {
+    fn from(error: DomainRegexError) -> Self {
+        Self::InvalidDomainRegex {
+            pattern: error.pattern,
+            message: error.message,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreConfig {
+    pub inbounds: Vec<InboundConfig>,
+    pub outbounds: Vec<OutboundConfig>,
+    pub default_outbound_tag: Option<String>,
+    pub routing: RoutingConfig,
+    pub observatory: Option<ObservatoryConfig>,
+    pub dns: DnsConfig,
+    pub policy: PolicyConfig,
+}
+
+pub const DEFAULT_OBSERVATORY_PROBE_URL: &str = "https://www.google.com/generate_204";
+pub const DEFAULT_OBSERVATORY_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+pub const OBSERVATORY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Xray-compatible periodic URL probe configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservatoryConfig {
+    pub subject_selectors: Vec<String>,
+    pub probe_url: String,
+    pub probe_interval: Duration,
+    pub enable_concurrency: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutingConfig {
+    pub rules: Vec<RoutingRule>,
+    pub balancers: Vec<RoutingBalancer>,
+    pub domain_strategy: RoutingDomainStrategy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RoutingDomainStrategy {
+    #[default]
+    AsIs,
+    IpIfNonMatch,
+    IpOnDemand,
+}
+
+/// Xray-compatible outbound selector group from `routing.balancers`.
+///
+/// Each selector is a tag prefix. The runtime expands the prefixes against
+/// configured tagged outbounds once when it builds the immutable graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingBalancer {
+    pub tag: String,
+    pub selectors: Vec<String>,
+    pub strategy: RoutingBalancerStrategy,
+    pub fallback_tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RoutingBalancerStrategy {
+    #[default]
+    Random,
+    RoundRobin,
+    LeastPing,
+    LeastLoad(RoutingLeastLoadSettings),
+}
+
+/// Bounded subset of Xray's `leastLoad` strategy settings.
+///
+/// Floating-point JSON values are normalized to millionths so the parsed
+/// model remains deterministic and equality-safe across the FFI build matrix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutingLeastLoadSettings {
+    /// Number of best candidates to distribute new flows across. Zero uses
+    /// Xray's effective default of one.
+    pub expected: u8,
+    pub max_rtt: Option<Duration>,
+    pub tolerance_millionths: u32,
+    pub baselines: Vec<Duration>,
+    pub costs: Vec<RoutingLeastLoadCost>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingLeastLoadCost {
+    /// Literal substring matched against an outbound tag.
+    pub tag_substring: String,
+    /// Positive cost multiplier normalized to millionths.
+    pub value_millionths: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DnsConfig {
+    pub fake_ip: Option<DnsFakeIpConfig>,
+    pub servers: Vec<DnsServerConfig>,
+    /// `dns.hosts` entries, keyed by DNS-normalized `full:` names with the
+    /// remaining matchers scanned in config order.
+    pub hosts: DomainHostIndex<DnsHostTarget>,
+    /// Default synthetic inbound tag used by configured DNS clients.
+    ///
+    /// An empty value asks the runtime to supply Xray's generated internal
+    /// tag. UUID generation intentionally stays outside the config model.
+    pub tag: String,
+    pub query_strategy: DnsQueryStrategy,
+    /// `queryStrategy: "UseSystem"`, which leaves `query_strategy` at
+    /// [`DnsQueryStrategy::UseIp`] and narrows each lookup to the address
+    /// families the system has a route for, as Xray-core's `checkSystem` does.
+    pub check_system_routes: bool,
+    /// Disables the core-owned destination DNS cache. Bootstrap/system caches
+    /// remain platform-owned, matching Xray's `localhost` exception.
+    pub disable_cache: bool,
+    /// Returns expired positive answers while refreshing them in background.
+    pub serve_stale: bool,
+    /// Bounded positive-answer stale window in seconds.
+    pub serve_expired_ttl: u32,
+    pub disable_fallback: bool,
+    pub disable_fallback_if_match: bool,
+    /// Xray-core's `clientIp`: the address sent as the EDNS client subnet by
+    /// every server without its own.
+    pub client_ip: Option<IpAddr>,
+    /// Xray-core's `enableParallelQuery`: query every selected server at once.
+    pub enable_parallel_query: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DnsQueryStrategy {
+    #[default]
+    UseIp,
+    UseIpv4,
+    UseIpv6,
+}
+
+/// Transport used by one configured DNS server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum DnsServerTransport {
+    /// Classic DNS over UDP with the existing TCP retry on truncation.
+    #[default]
+    Classic,
+    /// DNS over TCP dispatched through Xray routing.
+    TcpRouted,
+    /// DNS over TCP dialed directly through the local network stack.
+    TcpLocal,
+    /// DNS over TLS dispatched through Xray routing.
+    TlsRouted,
+    /// DNS over HTTPS dispatched through Xray routing.
+    HttpsRouted,
+    /// DNS over HTTPS dialed directly through the local network stack.
+    HttpsLocal,
+    /// DNS over QUIC dialed directly through the local network stack.
+    QuicLocal,
+}
+
+pub const DEFAULT_DNS_SERVER_TIMEOUT_MS: u64 = 4_000;
+
+/// The policy key of a DNS server entry that sets none of the fields the key
+/// reads, as Xray-core's config builder writes it.
+pub const DEFAULT_DNS_POLICY_KEY: &str =
+    "client=none|skip=0|qs=|tag=|domains=[]|expected=[]|expect=[]|unexpected=[]|";
+pub const MAX_DNS_SERVE_EXPIRED_TTL_SECONDS: u32 = 24 * 60 * 60;
+/// Largest millisecond value safe across Xray-core's duration conversions.
+///
+/// Xray accepts larger `uint64` values, but its cached parallel-query context
+/// doubles the signed nanosecond duration. Rejecting values above this boundary
+/// avoids an overflow into an unintended deadline.
+pub const MAX_DNS_SERVER_TIMEOUT_MS: u64 = i64::MAX as u64 / 2 / 1_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsServerConfig {
+    Ip(SocketAddr),
+    Domain { domain: String, port: u16 },
+    Policy(Box<DnsNameServerConfig>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsNameServerConfig {
+    pub endpoint: DnsServerEndpoint,
+    pub transport: DnsServerTransport,
+    /// HTTP path and optional query for DoH transports.
+    pub https_path: Option<String>,
+    /// Compiled with [`compile_dns_domain_matchers`] semantics.
+    pub domains: DomainMatcherSet,
+    pub expected_ips: DnsIpFilter,
+    pub unexpected_ips: DnsIpFilter,
+    /// Per-client synthetic inbound tag; empty inherits `dns.tag`.
+    pub tag: String,
+    /// Raw Xray `timeoutMs`; zero selects [`DEFAULT_DNS_SERVER_TIMEOUT_MS`].
+    pub timeout_ms: u64,
+    pub skip_fallback: bool,
+    pub query_strategy: DnsQueryStrategy,
+    /// This server's `queryStrategy` is `UseSystem`; see
+    /// [`DnsConfig::check_system_routes`].
+    pub check_system_routes: bool,
+    pub final_query: bool,
+    /// This server's own `clientIp`, which replaces `dns.clientIp`.
+    pub client_ip: Option<IpAddr>,
+    /// The policy key Xray-core's config builder derives from this entry's
+    /// raw fields; see [`DnsServerConfig::policy_key`].
+    pub policy_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsServerEndpoint {
+    Ip(SocketAddr),
+    Domain { domain: String, port: u16 },
+}
+
+impl DnsServerConfig {
+    pub fn endpoint(&self) -> DnsServerEndpoint {
+        match self {
+            Self::Ip(addr) => DnsServerEndpoint::Ip(*addr),
+            Self::Domain { domain, port } => DnsServerEndpoint::Domain {
+                domain: domain.clone(),
+                port: *port,
+            },
+            Self::Policy(server) => server.endpoint.clone(),
+        }
+    }
+
+    /// Returns the effective transport, including classic shorthand servers.
+    pub fn transport(&self) -> DnsServerTransport {
+        match self {
+            Self::Policy(server) => server.transport,
+            Self::Ip(_) | Self::Domain { .. } => DnsServerTransport::Classic,
+        }
+    }
+
+    /// Returns the HTTP path and optional query used by a DoH server.
+    pub fn https_path(&self) -> Option<&str> {
+        match self {
+            Self::Policy(server) => server.https_path.as_deref(),
+            Self::Ip(_) | Self::Domain { .. } => None,
+        }
+    }
+
+    pub fn skip_fallback(&self) -> bool {
+        matches!(self, Self::Policy(server) if server.skip_fallback)
+    }
+
+    pub fn query_strategy(&self) -> DnsQueryStrategy {
+        match self {
+            Self::Policy(server) => server.query_strategy,
+            Self::Ip(_) | Self::Domain { .. } => DnsQueryStrategy::UseIp,
+        }
+    }
+
+    /// Whether this server's lookups are narrowed to the address families
+    /// the system has a route for (`queryStrategy: "UseSystem"`).
+    pub fn check_system_routes(&self) -> bool {
+        matches!(self, Self::Policy(server) if server.check_system_routes)
+    }
+
+    pub fn final_query(&self) -> bool {
+        matches!(self, Self::Policy(server) if server.final_query)
+    }
+
+    /// The key Xray-core v26.10.31's config builder gives this entry's
+    /// policy: its own `clientIp`, `skipFallback`, `queryStrategy` and `tag`,
+    /// and its domain and IP lists, as written. Adjacent servers with equal
+    /// keys race as one group under `enableParallelQuery`. A string entry has
+    /// the key of an object with none of those fields.
+    pub fn policy_key(&self) -> &str {
+        match self {
+            Self::Policy(server) => &server.policy_key,
+            Self::Ip(_) | Self::Domain { .. } => DEFAULT_DNS_POLICY_KEY,
+        }
+    }
+
+    /// This server's own `clientIp`; only object entries can carry one.
+    pub fn client_ip(&self) -> Option<IpAddr> {
+        match self {
+            Self::Policy(server) => server.client_ip,
+            Self::Ip(_) | Self::Domain { .. } => None,
+        }
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        match self {
+            Self::Policy(server) if server.timeout_ms != 0 => server.timeout_ms,
+            Self::Policy(_) | Self::Ip(_) | Self::Domain { .. } => DEFAULT_DNS_SERVER_TIMEOUT_MS,
+        }
+    }
+
+    /// Returns this client's configured tag after applying Xray inheritance.
+    ///
+    /// String shorthand servers and object servers with an omitted, `null`,
+    /// or empty tag inherit the effective global DNS tag supplied by the
+    /// caller. Runtime generation of an internal tag remains a core concern.
+    pub fn effective_tag<'a>(&'a self, global_tag: &'a str) -> &'a str {
+        match self {
+            Self::Policy(server) if !server.tag.is_empty() => &server.tag,
+            Self::Policy(_) | Self::Ip(_) | Self::Domain { .. } => global_tag,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsFakeIpConfig {
+    pub enabled: bool,
+    pub ipv4_pool: IpCidr,
+    pub pool_size: u32,
+    pub ttl: u32,
+}
+
+/// A routing rule. Each condition is `None` when the rule sets none and
+/// applies everywhere. As in Xray-core, a condition given with nothing it
+/// can match, such as `"port": 0`, `"network": "quic"` or a geosite
+/// selection with no domains, stays `Some` and matches nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingRule {
+    /// Inbound tags; empty applies to every inbound. Xray-core keeps an
+    /// empty tag, which no connection carries.
+    pub inbound_tags: Vec<String>,
+    /// Networks; a name Xray-core does not know matches no connection.
+    pub networks: Option<Vec<Network>>,
+    /// Destination ports; a reversed range matches no port.
+    pub port_ranges: Option<Vec<RoutingPortRange>>,
+    pub domain_matchers: Option<DomainMatcherSet>,
+    pub ip_matchers: Option<IpMatcherSet>,
+    /// Xray's `localOS`: the rule applies only on these operating systems,
+    /// named as Go's `runtime.GOOS` and compared case-insensitively. Empty
+    /// applies everywhere.
+    pub local_os: Vec<String>,
+    /// Conditions on where the connection comes from.
+    pub origin: RoutingOrigin,
+    /// Sniffed protocols, matched as prefixes of the protocol Xray-core's
+    /// sniffers name, such as `http1`, `tls`, `quic` or `bittorrent`. Empty
+    /// names are dropped, so a list of only empty names matches nothing.
+    pub protocols: Option<Vec<String>>,
+    /// `attrs`: patterns the flow's attributes of the same names must match.
+    pub attributes: Option<RoutingAttributes>,
+    pub target: RoutingRuleTarget,
+}
+
+/// What Xray-core's routing context tells a rule about where a connection
+/// comes from, besides its destination.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouteContext<'a> {
+    pub inbound_tag: Option<&'a str>,
+    /// The peer the connection came from: a SOCKS or HTTP client, or for TUN
+    /// the app.
+    pub source: Option<SocketAddr>,
+    /// The address the connection arrived on.
+    pub local: Option<SocketAddr>,
+    /// The authenticated user, which Xray-core names by email: for SOCKS and
+    /// HTTP, the username.
+    pub user: Option<&'a str>,
+    /// The protocol sniffing recognized, named as Xray-core's sniffers name
+    /// it.
+    pub protocol: Option<&'a str>,
+    /// What the flow carries for `attrs`, such as an HTTP request's headers.
+    pub attributes: Option<&'a ContentAttributes>,
+}
+
+impl<'a> RouteContext<'a> {
+    /// A context that knows only the inbound, as for the built-in DNS.
+    pub const fn inbound(inbound_tag: Option<&'a str>) -> Self {
+        Self {
+            inbound_tag,
+            source: None,
+            local: None,
+            user: None,
+            protocol: None,
+            attributes: None,
+        }
+    }
+}
+
+/// The attributes Xray-core keeps on a flow for routing's `attrs`. Its HTTP
+/// sniffer records a request's method and target as `:method` and `:path`,
+/// and each header under its lowercased name. Names are lowercased here, as
+/// Xray-core's matcher reads them, and a later value replaces an earlier one.
+///
+/// Headers can carry credentials, so `Debug` shows only the names.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ContentAttributes {
+    entries: Vec<(String, String)>,
+}
+
+impl ContentAttributes {
+    pub fn set(&mut self, name: &str, value: String) {
+        let name = go_lowercase(name);
+        match self.entries.iter_mut().find(|(known, _)| *known == name) {
+            Some((_, known)) => *known = value,
+            None => self.entries.push((name.into_owned(), value)),
+        }
+    }
+
+    /// The value under `name`, which must already be lowercase.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(known, _)| known == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl fmt::Debug for ContentAttributes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_set()
+            .entries(self.entries.iter().map(|(name, _)| name))
+            .finish()
+    }
+}
+
+/// A rule's `attrs`: for each attribute name, a pattern its value must match
+/// anywhere, case-sensitively, as Go's `regexp.MatchString` does. Names are
+/// lowercased, as in Xray-core, so names that differ only in case keep one
+/// pattern.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutingAttributes {
+    patterns: Vec<(String, RegexMatcher)>,
+}
+
+impl RoutingAttributes {
+    pub fn insert(&mut self, name: &str, pattern: RegexMatcher) {
+        let name = go_lowercase(name);
+        match self.patterns.iter_mut().find(|(known, _)| *known == name) {
+            Some((_, known)) => *known = pattern,
+            None => self.patterns.push((name.into_owned(), pattern)),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    /// Whether every named attribute is present and matches. As in
+    /// Xray-core, a flow without attributes matches no `attrs`.
+    pub fn matches(&self, attributes: Option<&ContentAttributes>) -> bool {
+        attributes.is_some_and(|attributes| {
+            self.patterns.iter().all(|(name, pattern)| {
+                attributes
+                    .get(name)
+                    .is_some_and(|value| pattern.is_match(value))
+            })
+        })
+    }
+}
+
+/// Go's `strings.ToLower`, which maps each character on its own: unlike
+/// Rust's `str::to_lowercase`, it lowercases `İ` to a plain `i` and `Σ`
+/// always to `σ`.
+pub fn go_lowercase(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.is_ascii() {
+        return if text.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            text.to_ascii_lowercase().into()
+        } else {
+            text.into()
+        };
+    }
+    text.chars()
+        .flat_map(|character| {
+            let mut lower = character.to_lowercase();
+            // Only `İ` lowercases to more than one character in Rust.
+            let first = lower.next().unwrap_or(character);
+            let rest = (character != 'İ').then_some(lower).into_iter().flatten();
+            std::iter::once(first).chain(rest)
+        })
+        .collect::<String>()
+        .into()
+}
+
+/// A routing rule's conditions on where a connection comes from: `sourceIP`
+/// (or `source`), `sourcePort`, `localIP`, `localPort` and `user`. Each is
+/// `None` when the rule sets none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutingOrigin {
+    pub source_ips: Option<IpMatcherSet>,
+    pub source_ports: Option<Vec<RoutingPortRange>>,
+    pub local_ips: Option<IpMatcherSet>,
+    pub local_ports: Option<Vec<RoutingPortRange>>,
+    pub users: Option<RoutingUsers>,
+}
+
+impl RoutingOrigin {
+    pub fn is_empty(&self) -> bool {
+        self.source_ips.is_none()
+            && self.source_ports.is_none()
+            && self.local_ips.is_none()
+            && self.local_ports.is_none()
+            && self.users.is_none()
+    }
+
+    /// `sourcePort`, `localPort` and `user`, which Xray-core checks before
+    /// the destination IP. As there, an unknown port reads as 0.
+    pub fn matches_ports_and_user(&self, route: &RouteContext<'_>) -> bool {
+        ports_contain(&self.source_ports, route.source)
+            && ports_contain(&self.local_ports, route.local)
+            && self
+                .users
+                .as_ref()
+                .is_none_or(|users| users.matches(route.user))
+    }
+
+    /// `sourceIP` and `localIP`, which Xray-core checks after the
+    /// destination IP. An unknown address matches no rule.
+    pub fn matches_ips(&self, route: &RouteContext<'_>) -> bool {
+        ips_contain(&self.source_ips, route.source) && ips_contain(&self.local_ips, route.local)
+    }
+}
+
+fn ports_contain(ranges: &Option<Vec<RoutingPortRange>>, address: Option<SocketAddr>) -> bool {
+    let port = address.map_or(0, |address| address.port());
+    ranges
+        .as_ref()
+        .is_none_or(|ranges| ranges.iter().any(|range| range.contains(port)))
+}
+
+fn ips_contain(matchers: &Option<IpMatcherSet>, address: Option<SocketAddr>) -> bool {
+    matchers
+        .as_ref()
+        .is_none_or(|matchers| address.is_some_and(|address| matchers.matches(address.ip())))
+}
+
+/// A rule's `user`: exact names and `regexp:` patterns, matched against the
+/// whole name as written. As in Xray-core, empty names are dropped, and no
+/// pattern matches a connection without a user.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutingUsers {
+    pub names: Vec<String>,
+    pub patterns: Vec<RegexMatcher>,
+}
+
+impl RoutingUsers {
+    pub fn matches(&self, user: Option<&str>) -> bool {
+        let Some(user) = user.filter(|user| !user.is_empty()) else {
+            return false;
+        };
+        self.names.iter().any(|name| name == user)
+            || self.patterns.iter().any(|pattern| pattern.is_match(user))
+    }
+}
+
+/// The running platform as Go's `runtime.GOOS` names it, which Xray's
+/// `localOS` compares against. Go builds for iOS, its simulators and Mac
+/// Catalyst report `ios`; Go has no tvOS, watchOS or visionOS value, so those
+/// Apple platforms report `ios` too.
+pub const LOCAL_OS: &str = if cfg!(target_os = "macos") {
+    "darwin"
+} else if cfg!(any(
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+)) {
+    "ios"
+} else {
+    std::env::consts::OS
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutingRuleTarget {
+    Outbound(String),
+    Balancer(String),
+}
+
+impl RoutingRuleTarget {
+    pub fn tag(&self) -> &str {
+        match self {
+            Self::Outbound(tag) | Self::Balancer(tag) => tag,
+        }
+    }
+}
+
+impl RoutingRule {
+    pub fn matches(
+        &self,
+        inbound_tag: Option<&str>,
+        target_domain: Option<&str>,
+        target_ip: Option<&IpAddr>,
+    ) -> bool {
+        self.matches_target(inbound_tag, target_domain, target_ip, None, None)
+    }
+
+    /// Matches a connection that only its inbound tag describes; see
+    /// [`Self::matches_route`].
+    pub fn matches_target(
+        &self,
+        inbound_tag: Option<&str>,
+        target_domain: Option<&str>,
+        target_ip: Option<&IpAddr>,
+        target_network: Option<Network>,
+        target_port: Option<u16>,
+    ) -> bool {
+        self.matches_route(
+            &RouteContext::inbound(inbound_tag),
+            target_domain,
+            target_ip,
+            target_network,
+            target_port,
+        )
+    }
+
+    /// Whether every condition holds, checked in Xray-core's order.
+    pub fn matches_route(
+        &self,
+        route: &RouteContext<'_>,
+        target_domain: Option<&str>,
+        target_ip: Option<&IpAddr>,
+        target_network: Option<Network>,
+        target_port: Option<u16>,
+    ) -> bool {
+        self.matches_local_os()
+            && self.matches_inbound(route.inbound_tag)
+            && self.matches_network(target_network)
+            && self.matches_protocol(route.protocol)
+            && self.matches_port(target_port)
+            && self.origin.matches_ports_and_user(route)
+            && self.matches_attributes(route.attributes)
+            && self.matches_ip(target_ip)
+            && self.origin.matches_ips(route)
+            && self.matches_domain(target_domain)
+    }
+
+    /// Whether `localOS` admits the running platform, fixed for the process
+    /// as in Xray.
+    pub fn matches_local_os(&self) -> bool {
+        self.matches_local_os_on(LOCAL_OS)
+    }
+
+    pub fn matches_local_os_on(&self, os: &str) -> bool {
+        self.local_os.is_empty()
+            || self
+                .local_os
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(os))
+    }
+
+    pub fn matches_inbound(&self, inbound_tag: Option<&str>) -> bool {
+        if self.inbound_tags.is_empty() {
+            return true;
+        }
+
+        // As in Xray-core, a connection without a tag matches no tag list.
+        let Some(inbound_tag) = inbound_tag.filter(|tag| !tag.is_empty()) else {
+            return false;
+        };
+
+        self.inbound_tags
+            .iter()
+            .any(|candidate| candidate == inbound_tag)
+    }
+
+    pub fn matches_network(&self, target_network: Option<Network>) -> bool {
+        let Some(networks) = &self.networks else {
+            return true;
+        };
+
+        target_network.is_some_and(|target| networks.contains(&target))
+    }
+
+    /// As in Xray-core, a flow without a sniffed protocol matches no
+    /// protocol rule.
+    pub fn matches_protocol(&self, protocol: Option<&str>) -> bool {
+        let Some(protocols) = &self.protocols else {
+            return true;
+        };
+        protocol
+            .filter(|protocol| !protocol.is_empty())
+            .is_some_and(|protocol| {
+                protocols
+                    .iter()
+                    .any(|prefix| protocol.starts_with(prefix.as_str()))
+            })
+    }
+
+    pub fn matches_attributes(&self, attributes: Option<&ContentAttributes>) -> bool {
+        self.attributes
+            .as_ref()
+            .is_none_or(|patterns| patterns.matches(attributes))
+    }
+
+    pub fn matches_port(&self, target_port: Option<u16>) -> bool {
+        let Some(port_ranges) = &self.port_ranges else {
+            return true;
+        };
+
+        target_port.is_some_and(|target| port_ranges.iter().any(|range| range.contains(target)))
+    }
+
+    pub fn matches_domain(&self, target_domain: Option<&str>) -> bool {
+        let Some(domain_matchers) = &self.domain_matchers else {
+            return true;
+        };
+
+        let Some(target_domain) = target_domain else {
+            return false;
+        };
+
+        domain_matchers.matches(target_domain)
+    }
+
+    pub fn matches_ip(&self, target_ip: Option<&IpAddr>) -> bool {
+        let Some(ip_matchers) = &self.ip_matchers else {
+            return true;
+        };
+
+        let Some(target_ip) = target_ip else {
+            return false;
+        };
+
+        ip_matchers.matches(*target_ip)
+    }
+
+    /// Whether the rule sets any condition. Xray-core refuses a rule with
+    /// none, which would otherwise take every connection.
+    pub fn has_condition(&self) -> bool {
+        !self.local_os.is_empty()
+            || !self.inbound_tags.is_empty()
+            || self.networks.is_some()
+            || self.port_ranges.is_some()
+            || self.domain_matchers.is_some()
+            || self.ip_matchers.is_some()
+            || !self.origin.is_empty()
+            || self.protocols.is_some()
+            || self.attributes.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RoutingPortRange {
+    start: u16,
+    end: u16,
+}
+
+impl RoutingPortRange {
+    pub fn new(start: u16, end: u16) -> Result<Self, ConfigModelError> {
+        if start > end {
+            return Err(ConfigModelError::InvalidRoutingPortRange { start, end });
+        }
+        Ok(Self { start, end })
+    }
+
+    pub const fn single(port: u16) -> Self {
+        Self {
+            start: port,
+            end: port,
+        }
+    }
+
+    pub const fn start(self) -> u16 {
+        self.start
+    }
+
+    pub const fn end(self) -> u16 {
+        self.end
+    }
+
+    pub fn contains(self, port: u16) -> bool {
+        (self.start..=self.end).contains(&port)
+    }
+}
+
+/// Compiles routing matchers ([`DomainNameMode::Routing`]).
+pub fn compile_domain_matchers(
+    matchers: &[DomainMatcher],
+) -> Result<DomainMatcherSet, ConfigModelError> {
+    DomainMatcherSet::compile(matchers, DomainNameMode::Routing).map_err(domain_matcher_set_error)
+}
+
+/// Compiles DNS matchers ([`DomainNameMode::Dns`]).
+pub fn compile_dns_domain_matchers(
+    matchers: &[DomainMatcher],
+) -> Result<DomainMatcherSet, ConfigModelError> {
+    DomainMatcherSet::compile(matchers, DomainNameMode::Dns).map_err(domain_matcher_set_error)
+}
+
+pub(crate) fn build_domain_matcher_set(
+    builder: DomainMatcherSetBuilder,
+) -> Result<DomainMatcherSet, ConfigModelError> {
+    builder.build().map_err(domain_matcher_set_error)
+}
+
+fn domain_matcher_set_error(error: DomainMatcherSetError) -> ConfigModelError {
+    ConfigModelError::InvalidDomainMatcherSet {
+        message: error.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpCidr(Cidr);
+
+impl IpCidr {
+    pub fn new(network: IpAddr, prefix: u8) -> Result<Self, ConfigModelError> {
+        Cidr::new(network, prefix)
+            .map(Self)
+            .map_err(|error| ConfigModelError::InvalidCidrPrefix {
+                prefix,
+                max: error.max_prefix,
+            })
+    }
+
+    pub const fn full(ip: IpAddr) -> Self {
+        Self(Cidr::host(ip))
+    }
+
+    pub const fn cidr(self) -> Cidr {
+        self.0
+    }
+
+    pub fn network(&self) -> IpAddr {
+        self.0.network()
+    }
+
+    pub fn prefix(&self) -> u8 {
+        self.0.prefix_len()
+    }
+
+    pub fn matches(&self, ip: &IpAddr) -> bool {
+        self.0.contains(*ip)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundConfig {
+    pub tag: Option<String>,
+    pub protocol: InboundProtocol,
+    pub listen: String,
+    pub port: u16,
+    /// Explicit consent to expose an unauthenticated SOCKS/HTTP listener
+    /// beyond loopback. Runtime code enforces this even for programmatically
+    /// constructed configurations.
+    pub allow_unauthenticated_lan: bool,
+    pub sniffing: Option<InboundSniffingConfig>,
+    pub user_level: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InboundSniffingConfig {
+    pub enabled: bool,
+    pub dest_override: Vec<SniffingDestination>,
+    pub metadata_only: bool,
+    pub route_only: bool,
+    /// Sniffed domains that never replace the destination, compiled with
+    /// routing semantics.
+    pub domains_excluded: DomainMatcherSet,
+    /// Destination IPs that a sniffed domain never replaces.
+    pub ips_excluded: IpMatcherSet,
+}
+
+impl InboundSniffingConfig {
+    /// Whether a sniffed `domain` leaves the destination alone, as Xray-core's
+    /// `shouldOverride` decides: the domain is in `domainsExcluded`, or the
+    /// destination is an IP, `destination_ip`, in `ipsExcluded`.
+    pub fn excludes(&self, destination_ip: Option<IpAddr>, domain: &str) -> bool {
+        self.domains_excluded.matches(domain)
+            || destination_ip.is_some_and(|ip| self.ips_excluded.matches(ip))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SniffingDestination {
+    Http,
+    Tls,
+    Quic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundProtocol {
+    Tproxy(TproxySettings),
+    Socks(SocksInboundSettings),
+    Http(HttpInboundSettings),
+    Tun,
+}
+
+/// HTTP inbound settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpInboundSettings {
+    /// The accounts `Proxy-Authorization: Basic` must name; none admits
+    /// every request.
+    pub accounts: segue_proxy::inbound::HttpInboundAccounts,
+}
+
+/// SOCKS5 inbound settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocksInboundSettings {
+    pub auth: segue_proxy::inbound::SocksInboundAuth,
+    /// Accept `UDP ASSOCIATE`. When false the request is refused with
+    /// `REP = 0x07`, as Xray-core does for `"udp": false`. The parser keeps an
+    /// absent `udp` enabled, unlike Xray-core, which reads it as false.
+    pub udp: bool,
+}
+
+impl Default for SocksInboundSettings {
+    /// No authentication, UDP enabled: what the parser builds when `settings`
+    /// or its `auth` and `udp` fields are absent.
+    fn default() -> Self {
+        Self {
+            auth: segue_proxy::inbound::SocksInboundAuth::NoAuth,
+            udp: true,
+        }
+    }
+}
+
+/// Linux transparent interception; the operator owns routing/firewall rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TproxySettings {
+    pub tcp: bool,
+    pub udp: bool,
+    pub mark: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundConfig {
+    pub tag: Option<String>,
+    pub mux: Option<MuxSettings>,
+    pub proxy_settings: Option<OutboundProxySettings>,
+    pub stream: StreamSettings,
+    pub settings: OutboundSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxSettings {
+    /// Children a parent carries at once. Zero up to 128 is normalized to
+    /// 128, see [`mux_tcp_concurrency`]; a negative value disables TCP
+    /// multiplexing.
+    pub concurrency: i16,
+    /// Zero shares the TCP pool; a negative value uses native UDP; a
+    /// positive one is a UDP pool's children per parent, taken as it is.
+    pub xudp_concurrency: i16,
+    pub udp443: MuxUdp443,
+}
+
+/// The TCP `concurrency` Xray-core's outbound handler runs a Mux pool with:
+/// since v26.11.9 every value from zero up to 128 becomes 128, a larger one
+/// stays, and a negative one turns TCP multiplexing off.
+pub fn mux_tcp_concurrency(concurrency: i16) -> i16 {
+    if (0..=128).contains(&concurrency) {
+        128
+    } else {
+        concurrency
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuxUdp443 {
+    Reject,
+    Allow,
+    Skip,
+}
+
+/// Freedom's own settings. Its domain strategy lives in
+/// [`SocketOptions::domain_strategy`], where Xray-core migrates it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FreedomOutboundSettings {
+    /// `redirect`, without the parts Xray-core ignores.
+    pub redirect: FreedomRedirect,
+    /// `userLevel`: the policy level of freedom's own idle timer.
+    pub user_level: u32,
+    /// `proxyProtocol`: the PROXY protocol header freedom writes before the
+    /// payload. Xray-core ignores every value but 1 and 2.
+    pub proxy_protocol: Option<ProxyProtocolVersion>,
+    /// `finalRules`, checked in order against each address freedom connects
+    /// or sends to. Empty when freedom itself dials through `dialerProxy`,
+    /// where Xray-core ignores them.
+    pub final_rules: Vec<FreedomFinalRule>,
+    /// `noises`: datagrams sent before the first of each UDP flow.
+    pub noises: Vec<FreedomNoise>,
+}
+
+/// One of freedom's `noises`, which Xray-core sends, in order, before the
+/// first datagram of a UDP flow, to the address the flow goes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreedomNoise {
+    pub packet: FreedomNoisePacket,
+    /// Milliseconds to wait after the datagram, drawn as Xray-core's
+    /// `RandBetween` draws: from the lower bound up to, but not including,
+    /// the upper, or the lower when they are at most one apart. `(0, 0)`
+    /// waits not at all.
+    pub delay_ms: (u32, u32),
+    pub apply_to: FreedomNoiseFamily,
+}
+
+/// What a noise datagram holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreedomNoisePacket {
+    Bytes(Vec<u8>),
+    /// Random bytes, their count drawn between the two bounds as the delay
+    /// is.
+    Random(u32, u32),
+}
+
+/// The destinations a noise datagram goes to, by address family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreedomNoiseFamily {
+    Ip,
+    Ipv4,
+    Ipv6,
+}
+
+/// The PROXY protocol version of freedom's `proxyProtocol`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyProtocolVersion {
+    V1,
+    V2,
+}
+
+/// One of freedom's `finalRules`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreedomFinalRule {
+    pub action: FreedomRuleAction,
+    /// The networks the rule applies to; `None` applies to every network.
+    /// Xray-core keeps a name it doesn't know as a network nothing travels
+    /// over, so a list of only such names applies to nothing.
+    pub networks: Option<Vec<Network>>,
+    /// The ports the rule applies to; `None` applies to every port. Xray-core
+    /// checks ports once the list has a range, so a list of only reversed
+    /// ranges applies to no port.
+    pub port_ranges: Option<Vec<RoutingPortRange>>,
+    /// The addresses the rule applies to; `None` applies to every address.
+    pub ip_matchers: Option<IpMatcherSet>,
+    /// How long a blocked connection is held before it closes, the rule's
+    /// `delay` (or the deprecated `blockDelay`). `None` is Xray-core's
+    /// default, 30 to 90 seconds. Only a block rule has one.
+    pub block_delay: Option<FreedomBlockDelay>,
+    /// The rule's `logLevel`. Only a block rule sets one; an allow rule keeps
+    /// the default.
+    pub log_level: FreedomRuleLogLevel,
+}
+
+/// What a matching final rule does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreedomRuleAction {
+    Allow,
+    Block,
+}
+
+/// The severity at which Xray-core logs the connections a block rule holds,
+/// its `finalRules.logLevel`. xray-rust writes no log line for a blocked
+/// connection, so the level is read and checked as Xray-core reads it and
+/// changes nothing else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FreedomRuleLogLevel {
+    /// `none`: the rule logs nothing.
+    None,
+    Debug,
+    /// An absent or empty `logLevel`, or `info`.
+    #[default]
+    Info,
+    Warning,
+    Error,
+}
+
+/// A whole number of seconds drawn uniformly from `min_secs..=max_secs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreedomBlockDelay {
+    pub min_secs: u32,
+    pub max_secs: u32,
+}
+
+impl FreedomFinalRule {
+    /// Whether the rule applies to `ip`:`port` over `network`, as Xray-core's
+    /// `FinalRule.Apply` decides.
+    pub fn applies(&self, network: Network, ip: IpAddr, port: u16) -> bool {
+        self.networks
+            .as_ref()
+            .is_none_or(|networks| networks.contains(&network))
+            && self
+                .port_ranges
+                .as_ref()
+                .is_none_or(|ranges| ranges.iter().any(|range| range.contains(port)))
+            && self
+                .ip_matchers
+                .as_ref()
+                .is_none_or(|matchers| matchers.matches(canonicalize_ip(ip)))
+    }
+}
+
+/// The rule that decides an address: the first that applies, as Xray-core's
+/// `matchFinalRule` picks it.
+pub fn deciding_final_rule(
+    rules: &[FreedomFinalRule],
+    network: Network,
+    ip: IpAddr,
+    port: u16,
+) -> Option<&FreedomFinalRule> {
+    rules.iter().find(|rule| rule.applies(network, ip, port))
+}
+
+/// Freedom's `redirect`: the destination address, port, or both that every
+/// connection is sent to instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FreedomRedirect {
+    /// Replaces the destination address. Xray-core keeps the destination for
+    /// an empty host, `0.0.0.0` and `::`, which parse to `None`.
+    pub address: Option<TargetAddr>,
+    /// Replaces the destination port; Xray-core keeps it for port 0.
+    pub port: Option<std::num::NonZeroU16>,
+}
+
+impl FreedomRedirect {
+    /// Whether the redirect changes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.address.is_none() && self.port.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundProxySettings {
+    pub tag: String,
+    pub transport_layer: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundProtocol {
+    Freedom,
+    Dns,
+    Vless,
+    Trojan,
+    Vmess,
+    Shadowsocks2022,
+    Hysteria,
+    Wireguard,
+    Blackhole,
+    Loopback,
+    Socks,
+    Http,
+    Masque,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundSettings {
+    Freedom(FreedomOutboundSettings),
+    Dns(DnsOutboundSettings),
+    Vless(VlessOutboundSettings),
+    Trojan(TrojanOutboundSettings),
+    Vmess(VmessOutboundSettings),
+    Shadowsocks2022(Shadowsocks2022OutboundSettings),
+    Hysteria(HysteriaOutboundSettings),
+    Wireguard(WireguardOutboundSettings),
+    Blackhole(BlackholeOutboundSettings),
+    Loopback(LoopbackOutboundSettings),
+    Socks(SocksOutboundSettings),
+    Http(HttpOutboundSettings),
+    Masque(MasqueOutboundSettings),
+}
+
+impl OutboundSettings {
+    pub fn protocol(&self) -> OutboundProtocol {
+        match self {
+            Self::Freedom(_) => OutboundProtocol::Freedom,
+            Self::Dns(_) => OutboundProtocol::Dns,
+            Self::Vless(_) => OutboundProtocol::Vless,
+            Self::Vmess(_) => OutboundProtocol::Vmess,
+            Self::Trojan(_) => OutboundProtocol::Trojan,
+            Self::Shadowsocks2022(_) => OutboundProtocol::Shadowsocks2022,
+            Self::Hysteria(_) => OutboundProtocol::Hysteria,
+            Self::Wireguard(_) => OutboundProtocol::Wireguard,
+            Self::Blackhole(_) => OutboundProtocol::Blackhole,
+            Self::Loopback(_) => OutboundProtocol::Loopback,
+            Self::Socks(_) => OutboundProtocol::Socks,
+            Self::Http(_) => OutboundProtocol::Http,
+            Self::Masque(_) => OutboundProtocol::Masque,
+        }
+    }
+}
+
+/// Xray `masque` outbound settings, as Xray-core v26.10.31's
+/// `MasqueClientConfig.Build` reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasqueOutboundSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    /// `remoteDNS`: literal servers asked through the tunnel. Empty takes
+    /// Xray's Cloudflare defaults when the client starts.
+    pub remote_dns: Vec<std::net::IpAddr>,
+}
+
+/// `masqueSettings`, as Xray-core v26.10.31's `MasqueConfig.Build` leaves
+/// them: the path's template variables replaced, `user` and `pass` turned
+/// into an Authorization header and the WARP defaults applied. Its `Debug`
+/// shows header names only: a value can be a credential.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MasqueSettings {
+    /// The request authority. Empty takes the TLS server name, with the
+    /// port unless it is 443.
+    pub host: String,
+    /// The CONNECT-IP request path, starting with `/`.
+    pub path: String,
+    /// Request header fields by name, sorted, Authorization included. The
+    /// values are wiped when dropped.
+    pub headers: Vec<(String, zeroize::Zeroizing<String>)>,
+    pub warp: Option<MasqueWarpSettings>,
+    /// Tunnel reuse, read as XHTTP's `xmux`; an all-zero object takes
+    /// MASQUE's defaults, one tunnel reused for 1800 to 3000 seconds.
+    pub xmux: XhttpXmuxSettings,
+}
+
+impl fmt::Debug for MasqueSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MasqueSettings")
+            .field("host", &self.host)
+            .field("path", &self.path)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
+            .field("warp", &self.warp)
+            .field("xmux", &self.xmux)
+            .finish()
+    }
+}
+
+/// `masqueSettings.warp`: Cloudflare WARP's MASQUE flavour.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MasqueWarpSettings {
+    /// The device key's ECDSA P-256 private scalar: 32 bytes.
+    pub private_key: zeroize::Zeroizing<Vec<u8>>,
+    /// The endpoint's public key, a DER SubjectPublicKeyInfo.
+    pub public_key: Vec<u8>,
+    /// The tunnel addresses with their prefix lengths, as written: at most
+    /// one per family.
+    pub addresses: Vec<(std::net::IpAddr, u8)>,
+}
+
+impl fmt::Debug for MasqueWarpSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MasqueWarpSettings")
+            .field("private_key", &"<redacted>")
+            .field("public_key", &self.public_key.len())
+            .field("addresses", &self.addresses)
+            .finish()
+    }
+}
+
+/// MASQUE's `xmux` defaults: one tunnel, reusable for 1800 to 3000 seconds.
+pub const MASQUE_DEFAULT_XMUX: XhttpXmuxSettings = XhttpXmuxSettings {
+    max_concurrency: XhttpRange { from: 0, to: 0 },
+    max_connections: XhttpRange { from: 1, to: 1 },
+    c_max_reuse_times: XhttpRange { from: 0, to: 0 },
+    h_max_request_times: XhttpRange { from: 0, to: 0 },
+    h_max_reusable_secs: XhttpRange {
+        from: 1_800,
+        to: 3_000,
+    },
+    h_keep_alive_period_secs: 0,
+};
+
+/// `xdriveSettings`, as Xray-core v26.10.31's `XDriveConfig.Build` leaves
+/// them: the service named, `"Google Drive"` read as `google-drive`, the `s3`
+/// block's `pathStyle` defaulted and an all-zero `xmux` replaced by XDRIVE's
+/// defaults. The tuning numbers stay as written: zero takes Xray-core's
+/// default when the transport starts. Its `Debug` shows how many secrets
+/// there are and how long the template is, never their text: both carry
+/// credentials.
+#[derive(Clone, PartialEq, Eq)]
+pub struct XdriveSettings {
+    pub service: XdriveService,
+    /// `remoteFolder`: the folder of `local`, the folder id of
+    /// `google-drive`, the key prefix of `s3`, `{folder}` in a `template`.
+    pub remote_folder: String,
+    /// `secrets`, in order, wiped when dropped.
+    pub secrets: Vec<zeroize::Zeroizing<String>>,
+    /// `segmentBytes`: zero is 512 KiB, more than 16 MiB is 16 MiB.
+    pub segment_bytes: u32,
+    /// `flushIntervalMs`: zero is 20 ms.
+    pub flush_interval_ms: u32,
+    /// `pollIntervalMs`: zero is 50 ms.
+    pub poll_interval_ms: u32,
+    /// `maxPollIntervalMs`: zero is 500 ms, never below the poll interval.
+    pub max_poll_interval_ms: u32,
+    /// `sessionTtlSeconds`: zero is 300 s.
+    pub session_ttl_seconds: u32,
+    /// `concurrency`: zero is 8, more than 64 is 64.
+    pub concurrency: u32,
+    /// `eagerWindowMs`: zero is 2 s.
+    pub eager_window_ms: u32,
+    /// `holeTimeoutMs`: zero is 30 s.
+    pub hole_timeout_ms: u32,
+    /// `template`, the JSON value as given, `None` when absent. Xray-core
+    /// reads it only when a connection dials.
+    pub template: Option<zeroize::Zeroizing<String>>,
+    pub s3: Option<XdriveS3Settings>,
+    /// Connection reuse, read as XHTTP's `xmux`; an all-zero object takes
+    /// [`xdrive_default_xmux`].
+    pub xmux: XhttpXmuxSettings,
+    /// `streamSettings.address` and `port`: where every connection to an
+    /// HTTP storage goes instead of the host its URL names, which still
+    /// names the TLS server and the `Host`; the port only when nonzero.
+    /// `None` without an address, whatever the port.
+    pub fronting: Option<(TargetAddr, u16)>,
+}
+
+impl fmt::Debug for XdriveSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XdriveSettings")
+            .field("service", &self.service)
+            .field("remote_folder", &self.remote_folder)
+            .field("secrets", &self.secrets.len())
+            .field("segment_bytes", &self.segment_bytes)
+            .field("flush_interval_ms", &self.flush_interval_ms)
+            .field("poll_interval_ms", &self.poll_interval_ms)
+            .field("max_poll_interval_ms", &self.max_poll_interval_ms)
+            .field("session_ttl_seconds", &self.session_ttl_seconds)
+            .field("concurrency", &self.concurrency)
+            .field("eager_window_ms", &self.eager_window_ms)
+            .field("hole_timeout_ms", &self.hole_timeout_ms)
+            .field(
+                "template",
+                &self.template.as_ref().map(|template| template.len()),
+            )
+            .field("s3", &self.s3)
+            .field("xmux", &self.xmux)
+            .field("fronting", &self.fronting)
+            .finish()
+    }
+}
+
+/// The storage an XDRIVE stream lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdriveService {
+    /// No `xdriveSettings` under `network: "xdrive"`: Xray-core then keeps
+    /// its registered default, whose empty service fails every dial.
+    Unset,
+    /// A folder both ends can reach.
+    Local,
+    /// Google Drive, with an OAuth refresh token.
+    GoogleDrive,
+    /// HTTP requests a JSON `template` describes.
+    Template,
+    /// An S3 bucket, signed with AWS Signature Version 4.
+    S3,
+}
+
+impl XdriveService {
+    /// The name Xray-core's config gives the service.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unset => "",
+            Self::Local => "local",
+            Self::GoogleDrive => "google-drive",
+            Self::Template => "template",
+            Self::S3 => "s3",
+        }
+    }
+}
+
+/// `xdriveSettings.s3`, checked as Xray-core's `ValidateS3Config` checks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdriveS3Settings {
+    /// An `http` or `https` URL, its path the prefix of every request.
+    pub endpoint: String,
+    /// The signing region; empty signs for `us-east-1`.
+    pub region: String,
+    pub bucket: String,
+    /// The bucket in the path rather than the host: `true` unless
+    /// `pathStyle` is false.
+    pub path_style: bool,
+}
+
+/// XDRIVE's `xmux` defaults: `connections` connections, reusable for 1800
+/// to 3000 seconds. Xray-core gives Google Drive four over HTTP/1.1 and
+/// HTTP/2, where one connection's window holds back long round trips, and
+/// every other case one.
+pub const fn xdrive_default_xmux(connections: i32) -> XhttpXmuxSettings {
+    XhttpXmuxSettings {
+        max_concurrency: XhttpRange { from: 0, to: 0 },
+        max_connections: XhttpRange {
+            from: connections,
+            to: connections,
+        },
+        c_max_reuse_times: XhttpRange { from: 0, to: 0 },
+        h_max_request_times: XhttpRange { from: 0, to: 0 },
+        h_max_reusable_secs: XhttpRange {
+            from: 1_800,
+            to: 3_000,
+        },
+        h_keep_alive_period_secs: 0,
+    }
+}
+
+/// Xray `loopback` outbound settings. The handler never dials: it routes the
+/// connection again, as if it came from an inbound tagged `inbound_tag`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoopbackOutboundSettings {
+    pub inbound_tag: String,
+}
+
+/// Xray `blackhole` outbound settings. The handler never dials: TCP sessions
+/// receive the optional response and are closed, and UDP datagrams are dropped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlackholeOutboundSettings {
+    pub response: BlackholeResponse,
+}
+
+/// Xray `settings.response.type`. Matching Xray, `none` is the default when
+/// `response` is absent; `http` writes Xray's fixed HTTP 403 reply first and
+/// `custom` writes the decoded `customResponseData` bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BlackholeResponse {
+    #[default]
+    None,
+    Http,
+    Custom(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireguardOutboundSettings {
+    pub secret_key: segue_proxy::wireguard::KeyMaterial,
+    pub peers: Vec<WireguardPeerSettings>,
+    pub addresses: Vec<std::net::IpAddr>,
+    pub mtu: u16,
+    /// Literal DNS servers contacted through the WireGuard tunnel.
+    pub remote_dns: Vec<std::net::IpAddr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireguardPeerSettings {
+    pub public_key: segue_proxy::wireguard::KeyMaterial,
+    pub preshared_key: Option<segue_proxy::wireguard::KeyMaterial>,
+    pub endpoint: TargetAddr,
+    pub port: u16,
+    pub allowed_ips: Vec<segue_proxy::wireguard::AllowedIp>,
+    pub keepalive: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HysteriaOutboundSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct HysteriaSettings {
+    pub auth: zeroize::Zeroizing<String>,
+    /// The single supported `finalmask.udp` mask, consumed by this carrier.
+    pub salamander_password: Option<zeroize::Zeroizing<String>>,
+    /// Salamander's `packetSize` when its upper bound is positive, which
+    /// selects Gecko in Xray: `1 <= from <= to <= 2048`.
+    pub gecko_packet_size: Option<FragmentRange>,
+}
+
+impl fmt::Debug for HysteriaSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HysteriaSettings")
+            .field("auth", &"<redacted>")
+            .field("salamander", &self.salamander_password.is_some())
+            .field("gecko_packet_size", &self.gecko_packet_size)
+            .finish()
+    }
+}
+
+/// `kcpSettings`, read as Xray-core v26.10.31's `KCPConfig.Build` reads it,
+/// with the stream's `finalmask.udp` masks that mKCP applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KcpSettings {
+    /// Bytes in a segment with its 18-byte header, at least 21.
+    pub mtu: u32,
+    /// Milliseconds between flushes, 10 to 1000.
+    pub tti: u32,
+    /// Megabytes a second the sender may keep in flight.
+    pub uplink_capacity: u32,
+    /// Megabytes a second the receiver advertises.
+    pub downlink_capacity: u32,
+    pub cwnd_multiplier: u32,
+    /// Bytes the sender buffers; at least `mtu`.
+    pub max_sending_window: u32,
+    /// The `finalmask.udp` masks in array order. The first applies first to
+    /// a datagram on its way out, the last is outermost on the wire.
+    pub masks: Vec<KcpMask>,
+}
+
+impl Default for KcpSettings {
+    /// Xray-core's defaults for an absent or null `kcpSettings`.
+    fn default() -> Self {
+        Self {
+            mtu: 1350,
+            tti: 50,
+            uplink_capacity: 5,
+            downlink_capacity: 20,
+            cwnd_multiplier: 1,
+            max_sending_window: 2 * 1024 * 1024,
+            masks: Vec::new(),
+        }
+    }
+}
+
+/// A `finalmask.udp` mask on an mKCP stream.
+#[derive(Clone, PartialEq, Eq)]
+pub enum KcpMask {
+    /// `mkcp-legacy` without header or value: an FNV-1a checksum and a
+    /// forward XOR, mKCP's original obfuscation.
+    Original,
+    /// `mkcp-legacy` with a value and no header: AES-128-GCM keyed by the
+    /// SHA-256 of the value, mKCP's old `seed`.
+    Aes128Gcm(zeroize::Zeroizing<String>),
+    /// `mkcp-legacy` with a header: bytes mKCP's old `header.type` put first.
+    Header(KcpHeader),
+    /// The stream's noise mask, read into `StreamSettings::udp_noise`, at
+    /// its place in the array.
+    Noise,
+    /// The stream's `header-custom` mask, read into
+    /// `StreamSettings::udp_header_custom`, at its place in the array.
+    HeaderCustom,
+    /// The stream's `sudoku` mask, read into `StreamSettings::udp_sudoku`,
+    /// at its place in the array.
+    Sudoku,
+    /// The stream's `salamander` mask, read into
+    /// `StreamSettings::udp_salamander`, at its place in the array.
+    Salamander,
+}
+
+impl fmt::Debug for KcpMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Original => f.write_str("Original"),
+            Self::Aes128Gcm(_) => f.write_str("Aes128Gcm(<redacted>)"),
+            Self::Header(header) => f.debug_tuple("Header").field(header).finish(),
+            Self::Noise => f.write_str("Noise"),
+            Self::HeaderCustom => f.write_str("HeaderCustom"),
+            Self::Sudoku => f.write_str("Sudoku"),
+            Self::Salamander => f.write_str("Salamander"),
+        }
+    }
+}
+
+/// An `mkcp-legacy` header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KcpHeader {
+    /// A DNS query for this domain: `value`, else `www.baidu.com`.
+    Dns(String),
+    Dtls,
+    Srtp,
+    Utp,
+    Wechat,
+    Wireguard,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DnsOutboundSettings {
+    /// Optional transport override; `None` preserves the original DNS flow.
+    pub rewrite_network: Option<Network>,
+    /// Optional address override; `None` preserves the original DNS target.
+    pub rewrite_address: Option<TargetAddr>,
+    /// Optional port override; zero preserves the original DNS target port.
+    pub rewrite_port: u16,
+    pub user_level: u32,
+    pub rules: Vec<DnsOutboundRule>,
+}
+
+impl DnsOutboundSettings {
+    /// Applies ordered Xray DNS outbound rules and then Xray's implicit policy.
+    pub fn action_for(&self, qtype: u16, domain: &str) -> DnsOutboundRuleAction {
+        let normalized_domain = normalize_dns_qname(domain);
+        self.rules
+            .iter()
+            .find(|rule| rule.matches_normalized(qtype, &normalized_domain))
+            .map_or_else(
+                || {
+                    if matches!(qtype, 1 | 28) {
+                        DnsOutboundRuleAction::Hijack
+                    } else {
+                        DnsOutboundRuleAction::Return
+                    }
+                },
+                |rule| rule.action,
+            )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsOutboundRule {
+    pub action: DnsOutboundRuleAction,
+    /// DNS response code used by `Return` and by non-address `Hijack` rules.
+    pub r_code: u16,
+    /// The query types the rule answers; empty answers every type.
+    pub qtype_ranges: Vec<DnsQTypeRange>,
+    /// Compiled with [`compile_dns_domain_matchers`] semantics. `None` sets
+    /// no condition; an empty set, from a geosite selection with no domain,
+    /// matches no name.
+    pub domain_matchers: Option<DomainMatcherSet>,
+}
+
+impl DnsOutboundRule {
+    pub fn matches(&self, qtype: u16, domain: &str) -> bool {
+        let normalized_domain = normalize_dns_qname(domain);
+        self.matches_normalized(qtype, &normalized_domain)
+    }
+
+    fn matches_normalized(&self, qtype: u16, normalized_domain: &str) -> bool {
+        (self.qtype_ranges.is_empty()
+            || self.qtype_ranges.iter().any(|range| range.contains(qtype)))
+            && self
+                .domain_matchers
+                .as_ref()
+                .is_none_or(|matchers| matchers.matches(normalized_domain))
+    }
+}
+
+fn normalize_dns_qname(domain: &str) -> String {
+    domain.trim_end_matches('.').to_ascii_lowercase()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DnsOutboundRuleAction {
+    Direct,
+    Drop,
+    Return,
+    Hijack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DnsQTypeRange {
+    start: u16,
+    end: u16,
+}
+
+impl DnsQTypeRange {
+    pub fn new(start: u16, end: u16) -> Result<Self, ConfigModelError> {
+        if start > end {
+            return Err(ConfigModelError::InvalidDnsQTypeRange { start, end });
+        }
+        Ok(Self { start, end })
+    }
+
+    pub const fn single(qtype: u16) -> Self {
+        Self {
+            start: qtype,
+            end: qtype,
+        }
+    }
+
+    pub const fn start(self) -> u16 {
+        self.start
+    }
+
+    pub const fn end(self) -> u16 {
+        self.end
+    }
+
+    pub fn contains(self, qtype: u16) -> bool {
+        (self.start..=self.end).contains(&qtype)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VmessOutboundSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    pub user_id: zeroize::Zeroizing<[u8; 16]>,
+    pub security: String,
+    pub options: segue_proxy::vmess::Options,
+    pub level: u32,
+}
+impl fmt::Debug for VmessOutboundSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VmessOutboundSettings")
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("user_id", &"<redacted>")
+            .field("security", &self.security)
+            .field("options", &self.options)
+            .field("level", &self.level)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrojanOutboundSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    pub password: zeroize::Zeroizing<String>,
+    pub level: u32,
+}
+
+impl fmt::Debug for TrojanOutboundSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrojanOutboundSettings")
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("password", &"<redacted>")
+            .field("level", &self.level)
+            .finish()
+    }
+}
+
+/// Xray `socks` outbound settings: one SOCKS5 server reached over the
+/// configured stream, with optional RFC 1929 credentials.
+///
+/// `Debug` is safe to log: [`SocksAccount`](segue_proxy::inbound::SocksAccount)
+/// redacts both credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocksOutboundSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    pub account: Option<segue_proxy::inbound::SocksAccount>,
+    pub level: u32,
+}
+
+/// Xray `http` outbound settings: one HTTP/1.1 proxy reached over the
+/// configured stream and asked for a `CONNECT` tunnel, with optional Basic
+/// credentials.
+///
+/// `Debug` is safe to log: [`HttpAccount`](segue_proxy::outbound::HttpAccount)
+/// redacts both credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpOutboundSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    pub account: Option<segue_proxy::outbound::HttpAccount>,
+    pub level: u32,
+    /// `headers`, set on each `CONNECT` after the credentials, by canonical
+    /// name; their values are redacted from `Debug`.
+    pub headers: Vec<(String, segue_proxy::outbound::HttpHeaderTemplate)>,
+}
+
+/// Settings of the `shadowsocks` outbound for both method families:
+/// Shadowsocks 2022 (`2022-blake3-*`) and the classic AEAD methods. The
+/// historical name is kept for API stability; `method` selects the family.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Shadowsocks2022OutboundSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    pub method: String,
+    pub password: zeroize::Zeroizing<String>,
+    pub level: u32,
+}
+
+impl fmt::Debug for Shadowsocks2022OutboundSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Shadowsocks2022OutboundSettings")
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("method", &self.method)
+            .field("password", &"<redacted>")
+            .field("level", &self.level)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VlessOutboundSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    pub users: Vec<VlessUser>,
+    /// `reverse`, which only the simplified form takes: the outbound is then
+    /// the bridge of Xray-core's VLESS reverse proxy.
+    pub reverse: Option<VlessReverseSettings>,
+}
+
+/// The bridge side of Xray-core v26.10.31's VLESS reverse proxy. The
+/// outbound keeps tunnels open to its server, and the server opens
+/// connections back through them, each routed as if an inbound tagged `tag`
+/// had accepted it. Those connections reach only what routing sends them to,
+/// and a freedom outbound refuses them unless its `finalRules` allow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VlessReverseSettings {
+    /// The inbound tag routing sees on the connections the server opens.
+    pub tag: String,
+    /// The outbound's `email`: the user routing sees on them.
+    pub email: String,
+    /// `sniffing`, as an inbound takes it: `None` unless enabled.
+    pub sniffing: Option<InboundSniffingConfig>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VlessUser {
+    pub id: Uuid,
+    pub encryption: crate::VlessEncryption,
+    pub flow: Option<String>,
+    pub level: u32,
+    /// `testseed`: Vision's padding parameters, Xray-core's
+    /// `[900, 500, 900, 256]` unless set.
+    pub vision_seed: [u32; 4],
+    /// `testpre`: how many carrier connections the outbound keeps opened
+    /// ahead of the requests that take them; zero opens none.
+    pub pre_connections: u32,
+}
+
+impl fmt::Debug for VlessUser {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VlessUser")
+            .field("id", &"<redacted>")
+            .field("encryption", &self.encryption)
+            .field("flow", &self.flow)
+            .field("level", &self.level)
+            .field("vision_seed", &self.vision_seed)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyConfig {
+    pub levels: BTreeMap<u32, PolicyLevelConfig>,
+    pub system: PolicySystemConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyLevelConfig {
+    pub handshake: Option<u32>,
+    pub conn_idle: Option<u32>,
+    pub uplink_only: Option<u32>,
+    pub downlink_only: Option<u32>,
+    pub stats_user_uplink: bool,
+    pub stats_user_downlink: bool,
+    pub buffer_size: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicySystemConfig {
+    pub stats_inbound_uplink: bool,
+    pub stats_inbound_downlink: bool,
+    pub stats_outbound_uplink: bool,
+    pub stats_outbound_downlink: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamSettings {
+    pub network: Network,
+    pub transport: StreamTransport,
+    pub security: StreamSecurity,
+    /// Normalized `streamSettings.finalmask.quicParams` values. `None`
+    /// preserves the distinction between an absent/null Go pointer and an
+    /// explicitly present (possibly default-valued) configuration.
+    pub quic_params: Option<QuicParamsSettings>,
+    /// One normalized FinalMask or legacy freedom `tlshello` transform.
+    pub tcp_fragment: Option<TcpFragmentSettings>,
+    /// The `header-custom` TCP mask: the handshake every TCP carrier sends
+    /// and checks before anything else.
+    pub tcp_header_custom: Option<HeaderCustomTcp>,
+    /// The `header-custom` UDP mask, at its place among the stream's UDP
+    /// masks.
+    pub udp_header_custom: Option<HeaderCustomUdp>,
+    /// The `sudoku` TCP mask, the outermost of the TCP masks.
+    pub tcp_sudoku: Option<SudokuMask>,
+    /// The `sudoku` UDP mask, at its place among mKCP's or a QUIC carrier's
+    /// masks.
+    pub udp_sudoku: Option<UdpSudoku>,
+    /// The `xmc` TCP mask, the outermost of the TCP masks, as `sudoku` is.
+    pub tcp_xmc: Option<XmcMask>,
+    /// The `xdns` UDP mask, the outermost of mKCP's or a QUIC carrier's
+    /// masks: it carries the datagrams in DNS queries.
+    pub udp_xdns: Option<XdnsMask>,
+    /// The `realm` UDP mask, the outermost of mKCP's or a QUIC carrier's
+    /// masks: the carrier's socket meets the server through a rendezvous and
+    /// a punched hole.
+    pub udp_realm: Option<RealmMask>,
+    /// The `xicmp` UDP mask, the outermost of mKCP's or a QUIC carrier's
+    /// masks: it carries the datagrams in ICMP echo messages.
+    pub udp_xicmp: Option<XicmpMask>,
+    pub udp_noise: Option<UdpNoiseSettings>,
+    /// The `salamander` UDP mask of mKCP, XHTTP over HTTP/3 or MASQUE over
+    /// HTTP/3, at its place among the other masks; Hysteria keeps its own in
+    /// [`HysteriaSettings`].
+    pub udp_salamander: Option<SalamanderMask>,
+    pub socket_options: Option<SocketOptions>,
+}
+
+/// A `salamander` UDP mask: every datagram behind a random salt and XORed
+/// with a key the password and salt derive.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SalamanderMask {
+    pub password: zeroize::Zeroizing<String>,
+    /// `packetSize` when its upper bound is positive, which selects Gecko:
+    /// `1 <= from <= to <= 2048`. Not on mKCP.
+    pub gecko_packet_size: Option<FragmentRange>,
+}
+
+impl fmt::Debug for SalamanderMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SalamanderMask")
+            .field("password", &"<redacted>")
+            .field("gecko_packet_size", &self.gecko_packet_size)
+            .finish()
+    }
+}
+
+/// Bounded FinalMask UDP prelude; ranges are inclusive and delays follow each packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpNoiseSettings {
+    pub items: Vec<UdpNoiseItem>,
+    pub reset_secs: FragmentRange,
+    pub before_salamander: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpNoiseItem {
+    pub packet: Vec<u8>,
+    pub random_length: FragmentRange,
+    pub random_bytes: FragmentRange,
+    pub delay_ms: FragmentRange,
+    /// The segments of an `exp` packet, built anew for every send; `packet`
+    /// is then empty and `random_length` zero.
+    pub segments: Vec<NoiseSegment>,
+}
+
+/// One segment of an `exp` noise packet, as Xray-core reads `<key arg>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoiseSegment {
+    /// `<b hex>`: these bytes.
+    Bytes(Vec<u8>),
+    /// `<r n>` or `<r from-to>`: that many random bytes.
+    Random(FragmentRange),
+    /// `<rc ...>`: that many random ASCII letters.
+    RandomLetters(FragmentRange),
+    /// `<rd ...>`: that many random decimal digits.
+    RandomDigits(FragmentRange),
+    /// `<t>`: the Unix time in seconds, four big-endian bytes.
+    Timestamp,
+    /// `<c>`: the connection's count of these segments, from one, four
+    /// big-endian bytes.
+    Counter,
+    /// `<n>`: eight random bytes.
+    Nonce,
+}
+
+impl NoiseSegment {
+    /// The most bytes this segment adds to a packet.
+    pub fn max_len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Random(size) | Self::RandomLetters(size) | Self::RandomDigits(size) => {
+                size.to as usize
+            }
+            Self::Timestamp | Self::Counter => 4,
+            Self::Nonce => 8,
+        }
+    }
+}
+
+/// The `header-custom` TCP mask, as Xray-core v26.10.31's `HeaderCustomTCP`
+/// reads it: sequences the client writes and the server answers with, in
+/// turns, before the connection carries anything else.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeaderCustomTcp {
+    pub clients: Vec<Vec<HeaderCustomItem>>,
+    pub servers: Vec<Vec<HeaderCustomItem>>,
+    /// What a server answers a client sequence that does not match; read
+    /// for parity, never sent by a client.
+    pub errors: Vec<Vec<HeaderCustomItem>>,
+}
+
+/// The `sudoku` mask, as Xray-core v26.10.31's `Sudoku` reads it: the
+/// camelCase fields, or their snake_case names when those are unset.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SudokuMask {
+    pub password: zeroize::Zeroizing<String>,
+    /// `ascii`: empty, `entropy` or `prefer_entropy`, or `ascii` or
+    /// `prefer_ascii`, as given.
+    pub ascii: String,
+    pub custom_table: String,
+    pub custom_tables: Vec<String>,
+    pub padding_min: u32,
+    pub padding_max: u32,
+}
+
+impl fmt::Debug for SudokuMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SudokuMask")
+            .field("password", &"<redacted>")
+            .field("ascii", &self.ascii)
+            .field("custom_table", &self.custom_table)
+            .field("custom_tables", &self.custom_tables)
+            .field("padding_min", &self.padding_min)
+            .field("padding_max", &self.padding_max)
+            .finish()
+    }
+}
+
+/// The `sudoku` UDP mask and its place among a QUIC carrier's other masks;
+/// mKCP keeps its own order in `KcpSettings::masks`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UdpSudoku {
+    pub mask: SudokuMask,
+    /// Listed before Salamander, which then obfuscates it.
+    pub before_salamander: bool,
+    /// Listed before noise, whose packets then pass through it.
+    pub before_noise: bool,
+    /// Listed before `header-custom`, whose prefixes it then encodes.
+    pub before_header_custom: bool,
+}
+
+/// The `xdns` mask, as Xray-core v26.10.31's `XDNS.Build` reads it: one
+/// domain per name, with the defaults filled in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XdnsMask {
+    pub domains: Vec<XdnsDomain>,
+    pub resolvers: Vec<XdnsResolver>,
+    /// Polls sent after each packet and each poll, 0 to 3.
+    pub extra_poll: u8,
+}
+
+/// One domain the client tunnels under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdnsDomain {
+    pub name: String,
+    /// The longest query name: 255 when the config gives 0.
+    pub len_limit: i32,
+    /// The longest label carrying data: 63 when the config gives 0.
+    pub label_limit: i32,
+    /// The record types the client asks for, each A (1), CNAME (5), TXT
+    /// (16) or AAAA (28); empty asks for TXT.
+    pub types: Vec<u16>,
+    /// The UDP size the client's OPT record advertises, 0 for none.
+    pub edns0: u16,
+}
+
+/// A resolver the client sends its queries to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdnsResolver {
+    pub protocol: XdnsProtocol,
+    pub address: std::net::SocketAddr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdnsProtocol {
+    Udp,
+    Tcp,
+}
+
+/// The `xicmp` mask, as Xray-core v26.10.31's `Xicmp.Build` reads it: the
+/// carrier's datagrams ride in ICMP echo requests to the server and come
+/// back in its echo replies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XicmpMask {
+    /// Unprivileged datagram ICMP sockets, rather than raw ones.
+    pub dgram: bool,
+    /// The server addresses to send to, one drawn for each packet; the
+    /// outbound's address when empty.
+    pub ips: Vec<std::net::IpAddr>,
+}
+
+/// The `realm` mask, as Xray-core v26.10.31's `Realm.Build` reads it: the
+/// client finds its public addresses with STUN, asks a rendezvous to
+/// introduce it to the server registered under `id`, punches a hole to the
+/// addresses the server reported, and sends the carrier's datagrams to the
+/// one that answered.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RealmMask {
+    /// `realm://` reaches the rendezvous over HTTPS, `realm+http://` over
+    /// HTTP.
+    pub scheme: RealmScheme,
+    /// The rendezvous host as `url.Hostname` reads it, without brackets.
+    pub host: String,
+    /// The port as the URL spells it, which Go keeps for the `Host` header;
+    /// `443` or `80` when it names none.
+    pub port_text: String,
+    /// The port's value.
+    pub port: u16,
+    /// The URL's user information, unescaped: the rendezvous's bearer token.
+    pub token: zeroize::Zeroizing<String>,
+    /// The URL's path without its leading slash, unescaped.
+    pub id: String,
+    pub stun_servers: Vec<RealmStunServer>,
+    /// `tlsConfig`, for an HTTPS rendezvous.
+    pub tls: Option<TlsSettings>,
+    pub ip_mode: RealmIpMode,
+    /// `portMapping`, which xray-rust reads but does not act on yet.
+    pub port_mapping: Option<RealmPortMapping>,
+}
+
+impl fmt::Debug for RealmMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RealmMask")
+            .field("scheme", &self.scheme)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("token", &"<redacted>")
+            .field("id", &self.id)
+            .field("stun_servers", &self.stun_servers)
+            .field("tls", &self.tls.is_some())
+            .field("ip_mode", &self.ip_mode)
+            .field("port_mapping", &self.port_mapping)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealmScheme {
+    Https,
+    Http,
+}
+
+/// One `stunServers` entry, split as `net.SplitHostPort` splits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealmStunServer {
+    pub host: String,
+    /// The port as written: Xray-core tells servers apart by it.
+    pub port_text: String,
+    pub port: u16,
+}
+
+/// Which address families the client discovers and punches. Xray-core
+/// reads `dual`, `v4` and `v6`, case-insensitively, and any other value as
+/// `dual`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RealmIpMode {
+    #[default]
+    Dual,
+    V4,
+    V6,
+}
+
+/// `portMapping`: a UDP mapping on the local gateway through UPnP or
+/// NAT-PMP, renewed every half lifetime. Seconds; zero takes Xray-core's
+/// defaults of 10 seconds and 10 minutes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RealmPortMapping {
+    pub enabled: bool,
+    pub timeout: i64,
+    pub lifetime: i64,
+}
+
+/// The `xmc` mask, as Xray-core v26.10.31's `XMC.Build` reads it: a
+/// Minecraft login as one of the profiles, keyed by the password.
+#[derive(Clone, PartialEq, Eq)]
+pub struct XmcMask {
+    /// The handshake's server address; empty sends the server's IP address.
+    pub hostname: String,
+    pub password: zeroize::Zeroizing<String>,
+    pub profiles: Vec<XmcProfile>,
+}
+
+impl fmt::Debug for XmcMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XmcMask")
+            .field("hostname", &self.hostname)
+            .field("password", &"<redacted>")
+            .field("profiles", &self.profiles)
+            .finish()
+    }
+}
+
+/// A signed Minecraft profile the `xmc` client logs in as, which its server
+/// must hold too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmcProfile {
+    pub username: String,
+    pub uuid: [u8; 16],
+    pub textures_value: String,
+    pub textures_signature: String,
+}
+
+/// The `header-custom` UDP mask, as Xray-core v26.10.31's `HeaderCustomUDP`
+/// reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeaderCustomUdp {
+    /// `standalone`: exchange the client's and server's items separately
+    /// before the first datagram and the first write after five seconds.
+    /// Otherwise (`prefix`) every datagram carries the items in front.
+    pub standalone: bool,
+    pub client: Vec<HeaderCustomItem>,
+    pub server: Vec<HeaderCustomItem>,
+    /// Listed before Salamander, which then obfuscates it.
+    pub before_salamander: bool,
+    /// Listed before noise, whose packets then pass through it.
+    pub before_noise: bool,
+}
+
+/// One `header-custom` item: random bytes, fixed bytes, a captured variable
+/// or a transform, or nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderCustomItem {
+    /// TCP only: milliseconds to wait before the item when the upper bound
+    /// is positive. Go's `Int32Range`, so it may be negative.
+    pub delay: (i32, i32),
+    /// Random bytes to send, and the inclusive range of their values.
+    pub rand: i32,
+    pub rand_range: (i32, i32),
+    pub packet: Vec<u8>,
+    /// Saves what the item sends or receives under this name.
+    pub capture: String,
+    /// Sends, or expects, the bytes saved under this name.
+    pub reuse: String,
+    pub transform: Option<HeaderCustomExpr>,
+}
+
+/// A `header-custom` transform: an operation over its arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderCustomExpr {
+    pub op: String,
+    pub args: Vec<HeaderCustomArg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderCustomArg {
+    Bytes(Vec<u8>),
+    U64(u64),
+    Reuse(String),
+    Metadata(String),
+    Transform(HeaderCustomExpr),
+}
+
+/// Bounded TCP fragmentation: the first ClientHello's record, or selected
+/// writes cut into raw pieces. Ranges are inclusive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpFragmentSettings {
+    pub packets: FragmentPackets,
+    pub lengths: Vec<FragmentRange>,
+    pub delays_ms: Vec<FragmentRange>,
+    pub max_split: FragmentRange,
+    /// The `finalRules` of the dedicated freedom fragment outbound a
+    /// `dialerProxy` named, when the parser folded that freedom into this
+    /// outbound; `None` for any other fragment mask. A connection from a VLESS
+    /// reverse proxy still meets them, as it meets that freedom in Xray-core.
+    pub folded_final_rules: Option<Vec<FreedomFinalRule>>,
+}
+
+/// The writes a fragment mask cuts, as Xray's `packets` selects them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentPackets {
+    /// `tlshello`: the first write's complete TLS handshake record, sent as
+    /// smaller records with the same handshake bytes.
+    TlsHello,
+    /// Empty or absent: every write, cut into raw pieces.
+    AllWrites,
+    /// `"from-to"` or one number: the writes so numbered, counting from one,
+    /// cut into raw pieces; `from` is at least one and `to` at least `from`.
+    Writes { from: u32, to: u32 },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FragmentRange {
+    pub from: u32,
+    pub to: u32,
+}
+
+/// Xray's final QUIC parameters after config-build normalization.
+///
+/// Bandwidths are stored in bytes per second, matching the protobuf/runtime
+/// representation rather than the bits-per-second JSON spelling.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuicParamsSettings {
+    pub congestion: QuicCongestion,
+    pub bbr_profile: QuicBbrProfile,
+    pub brutal_up_bytes_per_sec: u64,
+    pub brutal_down_bytes_per_sec: u64,
+    pub udp_hop: QuicUdpHopSettings,
+    pub init_stream_receive_window: u64,
+    pub max_stream_receive_window: u64,
+    pub init_connection_receive_window: u64,
+    pub max_connection_receive_window: u64,
+    pub max_idle_timeout_secs: i64,
+    pub keep_alive_period_secs: i64,
+    pub disable_path_mtu_discovery: bool,
+    pub max_incoming_streams: i64,
+    /// `disableChromeParrot`: Xray-core shapes the Hysteria, XHTTP H3 and
+    /// XDRIVE H3 handshakes like Chrome's (quic-go's `ChromeParrot`) unless
+    /// this is true. MASQUE never does.
+    pub disable_chrome_parrot: bool,
+    /// quic-go's `Transport.DisableGSO`.
+    pub disable_gso: bool,
+    /// Only Xray-core's QUIC servers consult it, so it changes nothing here.
+    pub disable_stateless_reset: bool,
+    /// Brutal keeps its exact rate instead of compensating for loss.
+    pub brutal_disable_loss_compensation: bool,
+    /// Retained for fail-closed runtime handling. Unlike Xray's config build,
+    /// parsing this flag does not mutate process-global environment variables.
+    pub debug: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QuicCongestion {
+    /// Xray leaves an empty congestion name for the QUIC runtime to resolve.
+    #[default]
+    Default,
+    Brutal,
+    Reno,
+    Bbr,
+    ForceBrutal,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QuicBbrProfile {
+    Conservative,
+    /// Xray normalizes an absent/empty profile to `standard`.
+    #[default]
+    Standard,
+    Aggressive,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuicUdpHopSettings {
+    /// Expanded in configured order; duplicates are intentionally preserved.
+    pub ports: Vec<u16>,
+    pub interval: QuicIntervalRange,
+    /// Xray's `intervalLocal`: a new local socket at every interval.
+    pub local: bool,
+    /// Xray's `intervalRemote`: a new remote address at every interval.
+    pub remote: bool,
+    /// Xray's `perConnRemote`: a random remote address once per connection.
+    pub remote_once: bool,
+    /// Xray's `remoteIPs`: a new remote address takes a random IP in one of
+    /// these; empty keeps the server's IP.
+    pub remote_ips: Vec<IpCidr>,
+}
+
+/// An ordered Xray `Int32Range` used for the UDP-hop interval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuicIntervalRange {
+    pub from: i32,
+    pub to: i32,
+}
+
+/// The stream transport `streamSettings.network` selected, with its own
+/// settings block already parsed.
+///
+/// Hysteria uses `Network::Udp`. Other variants retain `Network::Tcp` for
+/// compatibility; XHTTP selects its TCP or QUIC carrier at runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamTransport {
+    /// `tcp` / `raw`: nothing layered on top.
+    Raw,
+    Hysteria(HysteriaSettings),
+    WebSocket(WebSocketSettings),
+    HttpUpgrade(HttpUpgradeSettings),
+    Grpc(GrpcSettings),
+    /// `xhttp` / the legacy `splithttp` spelling.
+    Xhttp(Box<XhttpSettings>),
+    /// `kcp` / `mkcp`.
+    Kcp(KcpSettings),
+    /// `masque`, for the `masque` outbound only.
+    Masque(Box<MasqueSettings>),
+    /// `xdrive`, for VLESS only: the stream rides files in a storage both
+    /// ends reach.
+    Xdrive(Box<XdriveSettings>),
+}
+
+/// An ordered XHTTP integer range. Xray accepts either a JSON integer or a
+/// string such as `"100-1000"`; a single value has identical bounds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct XhttpRange {
+    pub from: i32,
+    pub to: i32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum XhttpMode {
+    #[default]
+    Auto,
+    PacketUp,
+    StreamUp,
+    StreamOne,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum XhttpPaddingPlacement {
+    Cookie,
+    Header,
+    Query,
+    #[default]
+    QueryInHeader,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum XhttpPaddingMethod {
+    #[default]
+    RepeatX,
+    Tokenish,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum XhttpPlacement {
+    #[default]
+    Path,
+    Cookie,
+    Header,
+    Query,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum XhttpUplinkDataPlacement {
+    #[default]
+    Auto,
+    Body,
+    Cookie,
+    Header,
+}
+
+/// The client-side XHTTP connection-reuse policy. The runtime may initially
+/// use direct per-connection reuse, but retaining and validating this surface
+/// prevents real Xray profiles from being silently reinterpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XhttpXmuxSettings {
+    pub max_concurrency: XhttpRange,
+    pub max_connections: XhttpRange,
+    pub c_max_reuse_times: XhttpRange,
+    pub h_max_request_times: XhttpRange,
+    pub h_max_reusable_secs: XhttpRange,
+    pub h_keep_alive_period_secs: i64,
+}
+
+impl Default for XhttpXmuxSettings {
+    fn default() -> Self {
+        Self {
+            max_concurrency: XhttpRange::default(),
+            max_connections: XhttpRange { from: 3, to: 3 },
+            c_max_reuse_times: XhttpRange::default(),
+            h_max_request_times: XhttpRange { from: 600, to: 900 },
+            h_max_reusable_secs: XhttpRange {
+                from: 1_800,
+                to: 3_000,
+            },
+            h_keep_alive_period_secs: 0,
+        }
+    }
+}
+
+/// Config-build-normalized `xhttpSettings` / `splithttpSettings` from Xray
+/// v26.7.28. Zero ranges remain zero here where Xray's `Build` leaves them;
+/// the transport must apply its mode/placement-dependent `GetNormalized*`
+/// defaults when it creates a connection.
+///
+/// [`Default`] represents an explicit empty settings object after
+/// `SplitHTTPConfig.Build`. The parser separately preserves the zero XMUX
+/// produced when both settings pointers are absent or null.
+///
+/// `extra` is intentionally absent from the normalized model: the parser
+/// applies Xray's one-level replacement rule and stores only the effective
+/// settings here. `downloadSettings` contains one independently validated stack;
+/// recursive download configurations are rejected by the parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XhttpSettings {
+    pub download: Option<Box<XhttpDownloadSettings>>,
+    /// Rust-specific H2 receive credit per stream, in bytes. None uses 4 MiB.
+    /// Does not change H1/H3 or the 16 MiB H2 connection window.
+    pub h2_stream_receive_window: Option<u32>,
+    pub host: Option<String>,
+    /// The configured path, before XHTTP adds a leading/trailing slash and
+    /// separates its query string for individual requests.
+    pub path: String,
+    pub mode: XhttpMode,
+    pub headers: Vec<(String, String)>,
+    pub x_padding_bytes: XhttpRange,
+    pub x_padding_obfs_mode: bool,
+    pub x_padding_key: String,
+    pub x_padding_header: String,
+    pub x_padding_placement: XhttpPaddingPlacement,
+    pub x_padding_method: XhttpPaddingMethod,
+    pub uplink_http_method: String,
+    pub session_placement: XhttpPlacement,
+    pub session_key: String,
+    /// Empty selects Xray's UUID v4 fallback. Non-empty values retain the
+    /// configured alias/custom table for transport-side expansion.
+    pub session_id_table: String,
+    pub session_id_length: XhttpRange,
+    pub seq_placement: XhttpPlacement,
+    pub seq_key: String,
+    pub uplink_data_placement: XhttpUplinkDataPlacement,
+    pub uplink_data_key: String,
+    pub uplink_chunk_size: XhttpRange,
+    pub no_grpc_header: bool,
+    pub no_sse_header: bool,
+    pub sc_max_each_post_bytes: XhttpRange,
+    pub sc_min_posts_interval_ms: XhttpRange,
+    pub sc_max_buffered_posts: i64,
+    pub sc_stream_up_server_secs: XhttpRange,
+    pub server_max_header_bytes: i32,
+    pub xmux: XhttpXmuxSettings,
+}
+
+impl Default for XhttpSettings {
+    fn default() -> Self {
+        Self {
+            download: None,
+            h2_stream_receive_window: None,
+            host: None,
+            path: String::new(),
+            mode: XhttpMode::Auto,
+            headers: Vec::new(),
+            x_padding_bytes: XhttpRange::default(),
+            x_padding_obfs_mode: false,
+            x_padding_key: "x_padding".to_owned(),
+            x_padding_header: "X-Padding".to_owned(),
+            x_padding_placement: XhttpPaddingPlacement::QueryInHeader,
+            x_padding_method: XhttpPaddingMethod::RepeatX,
+            uplink_http_method: "POST".to_owned(),
+            session_placement: XhttpPlacement::Path,
+            session_key: String::new(),
+            session_id_table: String::new(),
+            session_id_length: XhttpRange::default(),
+            seq_placement: XhttpPlacement::Path,
+            seq_key: String::new(),
+            uplink_data_placement: XhttpUplinkDataPlacement::Auto,
+            uplink_data_key: "X-Data".to_owned(),
+            uplink_chunk_size: XhttpRange::default(),
+            no_grpc_header: false,
+            no_sse_header: false,
+            sc_max_each_post_bytes: XhttpRange::default(),
+            sc_min_posts_interval_ms: XhttpRange::default(),
+            sc_max_buffered_posts: 0,
+            sc_stream_up_server_secs: XhttpRange::default(),
+            server_max_header_bytes: 0,
+            xmux: XhttpXmuxSettings::default(),
+        }
+    }
+}
+
+/// One independently addressed XHTTP download carrier. Never recursively nested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XhttpDownloadSettings {
+    pub address: TargetAddr,
+    pub port: u16,
+    pub stream: StreamSettings,
+}
+
+/// `grpcSettings`. Key spellings are Xray's, inconsistencies included: five of
+/// the eight are snake_case upstream (`idle_timeout`, `health_check_timeout`,
+/// `permit_without_stream`, `initial_windows_size`, `user_agent`) while
+/// `serviceName` and `multiMode` are not, and regularising either group here
+/// would accept a config xray-core ignores (`Xray-core/infra/conf/
+/// grpc.go:8-17`).
+///
+/// The three numbers are `int32` there and clamp a negative to zero rather
+/// than failing, so an unsigned field holds every value that survives
+/// `GRPCConfig.Build`. `authority` and `user_agent` are `Option` because Xray
+/// cannot tell an absent key from an empty string either: both leave the Go
+/// field `""`, which is what selects the authority fallback chain and the
+/// Chrome user agent (`transport/internet/grpc/dial.go:159-166,193-205`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrpcSettings {
+    pub service_name: String,
+    pub multi_mode: bool,
+    pub authority: Option<String>,
+    pub user_agent: Option<String>,
+    pub idle_timeout_secs: u32,
+    pub health_check_timeout_secs: u32,
+    pub permit_without_stream: bool,
+    pub initial_windows_size: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebSocketSettings {
+    /// Normalized: always begins with `/`, and `?ed=N` has been stripped with
+    /// the remaining query re-encoded the way Go's `url.Values.Encode` does.
+    pub path: String,
+    /// `Host` header. Falls back to the TLS server name, then the destination
+    /// address. Never carries a port.
+    pub host: Option<String>,
+    /// Extra headers, MIME-canonicalized. Xray feeds them to Go's `header.Add`,
+    /// which title-cases the key, so `accept` reaches the wire as `Accept` —
+    /// unlike `HttpUpgradeSettings::headers`, which keeps the literal casing.
+    /// Order here is not meaningful; the serializer sorts them.
+    pub headers: Vec<(String, String)>,
+    /// From `?ed=N`. Zero means early data is off.
+    pub early_data_bytes: u32,
+    /// Seconds between client pings. Zero means no keepalive.
+    pub heartbeat_period_secs: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HttpUpgradeSettings {
+    pub path: String,
+    pub host: Option<String>,
+    /// Extra headers with their literal casing preserved: Xray assigns these
+    /// into the header map directly rather than through `header.Add`, on
+    /// purpose, so that a config can send names like `Sec-WebSocket-Key`
+    /// exactly as written.
+    pub headers: Vec<(String, String)>,
+    /// From `?ed=N`. For HTTPUpgrade this carries no payload — any positive
+    /// value is retained only for config compatibility; the client still
+    /// waits for the 101 to avoid stranding coalesced bytes in Xray's inbound
+    /// buffered reader.
+    pub early_data_bytes: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SocketOptions {
+    pub happy_eyeballs: Option<HappyEyeballsSettings>,
+    /// `sockopt.domainStrategy`, after freedom's deprecated `domainStrategy`
+    /// and an outbound `targetStrategy` were migrated into it as Xray-core
+    /// does. Freedom and WireGuard read it.
+    pub domain_strategy: DomainStrategy,
+    /// `addressPortStrategy`: an SRV or TXT lookup that replaces a domain
+    /// server's address or port before it is dialed.
+    pub address_port_strategy: AddressPortStrategy,
+    /// `mark`, the Linux and Android `SO_MARK`; zero sets nothing.
+    pub mark: i32,
+    /// `tcpFastOpen` as Xray-core stores it: zero when absent or null, 256
+    /// for `true`, -1 for `false`, otherwise the number truncated and clamped
+    /// to `i32`.
+    pub tcp_fast_open: i32,
+    /// `tproxy`, which on an outbound sets Linux `IP_TRANSPARENT`.
+    pub tproxy: TproxyMode,
+    /// `tcpKeepAliveIdle` and `tcpKeepAliveInterval` in seconds. Zero keeps
+    /// Xray-core's 45-second default, a negative value turns keepalive off.
+    pub tcp_keep_alive_idle: i32,
+    pub tcp_keep_alive_interval: i32,
+    /// `tcpCongestion`, the Linux congestion control algorithm; empty sets
+    /// nothing.
+    pub tcp_congestion: String,
+    /// `tcpWindowClamp`, `tcpMaxSeg` and `tcpUserTimeout` (milliseconds),
+    /// set on Linux when positive.
+    pub tcp_window_clamp: i32,
+    pub tcp_max_seg: i32,
+    pub tcp_user_timeout: i32,
+    /// `interface`, the device every socket is bound to; empty binds none.
+    pub interface: String,
+    /// `tcpMptcp`: Multipath TCP on Linux, falling back to TCP.
+    pub tcp_mptcp: bool,
+    /// `penetrate`: an XHTTP `downloadSettings` takes these options instead
+    /// of its own.
+    pub penetrate: bool,
+    /// `customSockopt`, applied in order after the options above.
+    pub custom: Vec<CustomSocketOption>,
+}
+
+/// Xray-core's `AddressPortStrategy`: which records of a domain server's
+/// name the system resolver is asked for, and what of the first usable one
+/// replaces the server's address and port.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AddressPortStrategy {
+    #[default]
+    None,
+    SrvPortOnly,
+    SrvAddressOnly,
+    SrvPortAndAddress,
+    TxtPortOnly,
+    TxtAddressOnly,
+    TxtPortAndAddress,
+}
+
+/// The records an [`AddressPortStrategy`] looks up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressPortRecords {
+    Srv,
+    Txt,
+}
+
+impl AddressPortStrategy {
+    /// The records looked up, or `None` for no lookup.
+    pub fn records(self) -> Option<AddressPortRecords> {
+        match self {
+            Self::None => None,
+            Self::SrvPortOnly | Self::SrvAddressOnly | Self::SrvPortAndAddress => {
+                Some(AddressPortRecords::Srv)
+            }
+            Self::TxtPortOnly | Self::TxtAddressOnly | Self::TxtPortAndAddress => {
+                Some(AddressPortRecords::Txt)
+            }
+        }
+    }
+
+    /// Whether the record's port replaces the server's.
+    pub fn replaces_port(self) -> bool {
+        matches!(
+            self,
+            Self::SrvPortOnly
+                | Self::SrvPortAndAddress
+                | Self::TxtPortOnly
+                | Self::TxtPortAndAddress
+        )
+    }
+
+    /// Whether the record's address replaces the server's.
+    pub fn replaces_address(self) -> bool {
+        matches!(
+            self,
+            Self::SrvAddressOnly
+                | Self::SrvPortAndAddress
+                | Self::TxtAddressOnly
+                | Self::TxtPortAndAddress
+        )
+    }
+}
+
+/// Xray-core's `SocketConfig_TProxyMode`. Any other `tproxy` text is off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TproxyMode {
+    #[default]
+    Off,
+    Tproxy,
+    Redirect,
+}
+
+/// One `sockopt.customSockopt` entry, kept as the text Xray-core keeps and
+/// reads only when a socket is set up.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CustomSocketOption {
+    /// The `runtime.GOOS` the entry applies to; empty applies everywhere.
+    pub system: String,
+    /// A prefix of `tcp4`, `tcp6`, `udp4` or `udp6`; empty matches all.
+    pub network: String,
+    pub level: String,
+    pub opt: String,
+    pub value: String,
+    /// `int` or `str`; anything else fails when the option is applied.
+    pub kind: String,
+}
+
+/// Xray-core's `internet.DomainStrategy`: whether a dial resolves a domain
+/// itself, which address families it asks for first and next, and whether a
+/// failed lookup ends the dial.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DomainStrategy {
+    #[default]
+    AsIs,
+    UseIp,
+    UseIpv4,
+    UseIpv6,
+    UseIpv4v6,
+    UseIpv6v4,
+    ForceIp,
+    ForceIpv4,
+    ForceIpv6,
+    ForceIpv4v6,
+    ForceIpv6v4,
+}
+
+/// The address families one lookup asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamilies {
+    Both,
+    Ipv4,
+    Ipv6,
+}
+
+impl DomainStrategy {
+    /// Parses the names Xray-core accepts, ignoring case; `""` is `AsIs`.
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "" | "asis" => Self::AsIs,
+            "useip" => Self::UseIp,
+            "useipv4" => Self::UseIpv4,
+            "useipv6" => Self::UseIpv6,
+            "useipv4v6" => Self::UseIpv4v6,
+            "useipv6v4" => Self::UseIpv6v4,
+            "forceip" => Self::ForceIp,
+            "forceipv4" => Self::ForceIpv4,
+            "forceipv6" => Self::ForceIpv6,
+            "forceipv4v6" => Self::ForceIpv4v6,
+            "forceipv6v4" => Self::ForceIpv6v4,
+            _ => return None,
+        })
+    }
+
+    /// Whether a dial resolves a domain itself rather than leaving it as is.
+    pub fn has_strategy(self) -> bool {
+        self != Self::AsIs
+    }
+
+    /// Whether a failed lookup fails the dial instead of falling back to an
+    /// ordinary lookup of both families.
+    pub fn force_ip(self) -> bool {
+        matches!(
+            self,
+            Self::ForceIp
+                | Self::ForceIpv4
+                | Self::ForceIpv6
+                | Self::ForceIpv4v6
+                | Self::ForceIpv6v4
+        )
+    }
+
+    /// The families of the first lookup.
+    pub fn preferred(self) -> AddressFamilies {
+        match self {
+            Self::AsIs | Self::UseIp | Self::ForceIp => AddressFamilies::Both,
+            Self::UseIpv4 | Self::UseIpv4v6 | Self::ForceIpv4 | Self::ForceIpv4v6 => {
+                AddressFamilies::Ipv4
+            }
+            Self::UseIpv6 | Self::UseIpv6v4 | Self::ForceIpv6 | Self::ForceIpv6v4 => {
+                AddressFamilies::Ipv6
+            }
+        }
+    }
+
+    /// The family asked for when the first lookup fails or finds nothing.
+    pub fn fallback(self) -> Option<AddressFamilies> {
+        match self {
+            Self::UseIpv4v6 | Self::ForceIpv4v6 => Some(AddressFamilies::Ipv6),
+            Self::UseIpv6v4 | Self::ForceIpv6v4 => Some(AddressFamilies::Ipv4),
+            _ => None,
+        }
+    }
+
+    /// Xray-core's `GetDynamicStrategy`: a freedom UDP flow whose original
+    /// destination was an IP address prefers that address's family when the
+    /// strategy names none.
+    pub fn for_original_ip(self, original: std::net::IpAddr) -> Self {
+        match (self, original) {
+            (Self::UseIp, std::net::IpAddr::V4(_)) => Self::UseIpv4v6,
+            (Self::UseIp, std::net::IpAddr::V6(_)) => Self::UseIpv6v4,
+            (Self::ForceIp, std::net::IpAddr::V4(_)) => Self::ForceIpv4v6,
+            (Self::ForceIp, std::net::IpAddr::V6(_)) => Self::ForceIpv6v4,
+            (strategy, _) => strategy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HappyEyeballsSettings {
+    pub prioritize_ipv6: bool,
+    pub interleave: u32,
+    pub try_delay_ms: u64,
+    pub max_concurrent_try: u32,
+}
+
+impl Default for HappyEyeballsSettings {
+    fn default() -> Self {
+        Self {
+            prioritize_ipv6: false,
+            interleave: 1,
+            try_delay_ms: 0,
+            max_concurrent_try: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Network {
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamSecurity {
+    None,
+    Tls(TlsSettings),
+    Reality(RealitySettings),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsSettings {
+    pub server_name: Option<String>,
+    /// Normalized uTLS fingerprint. A parsed config always populates it: an
+    /// absent `tlsSettings.fingerprint` means `chrome`, and `unsafe` means no
+    /// shaping. `None` reaches here only from call sites that build the model
+    /// directly, where it also means no shaping.
+    pub fingerprint: Option<String>,
+    /// SHA-256 fingerprints of complete DER-encoded peer certificates from
+    /// Xray's comma-separated `pinnedPeerCertSha256` setting.
+    pub pinned_peer_cert_sha256: Vec<[u8; 32]>,
+    /// Alternative certificate verification names parsed from Xray's
+    /// comma-separated `verifyPeerCertByName` setting. Any one matching DNS
+    /// or IP SAN is sufficient; this list is independent of the TLS SNI.
+    pub verify_peer_cert_by_name: Vec<String>,
+    /// Programmatic-only escape hatch retained for local test fixtures. The
+    /// canonical Xray JSON parser rejects `allowInsecure: true`.
+    pub allow_insecure: bool,
+    /// `tlsSettings.alpn`, verbatim.
+    pub alpn: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealitySettings {
+    pub server_name: String,
+    pub fingerprint: String,
+    pub public_key: [u8; 32],
+    pub short_id: RealityShortId,
+    pub spider_x: String,
+    pub mldsa65_verify: Option<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RealityShortId {
+    bytes: [u8; 8],
+    len: u8,
+}
+
+impl fmt::Debug for RealityShortId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl Drop for RealityShortId {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        self.len.zeroize();
+    }
+}
+
+impl RealityShortId {
+    pub fn try_from_slice(bytes: &[u8]) -> Result<Self, ConfigModelError> {
+        if bytes.len() > 8 {
+            return Err(ConfigModelError::RealityShortIdTooLong);
+        }
+
+        let mut short_id = Self {
+            bytes: [0; 8],
+            len: bytes.len() as u8,
+        };
+        short_id.bytes[..bytes.len()].copy_from_slice(bytes);
+        Ok(short_id)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetAddr {
+    Ip(std::net::IpAddr),
+    Domain(String),
+}
+
+impl TargetAddr {
+    /// Whether Xray-core exempts this server address from its outbound
+    /// transport-security requirement.
+    ///
+    /// Since v26.10.31 an IP address is exempt only when Go's
+    /// `IsPrivate() || IsLoopback() || IsLinkLocalUnicast()` holds
+    /// (`requiresTransportSecurity` in `infra/conf/xray.go`); the reserved,
+    /// shared (100.64.0.0/10), benchmarking, documentation, multicast and
+    /// unspecified ranges of the older `geoip:private` set no longer are.
+    /// `net.IP.To4` makes an IPv4-mapped IPv6 address count as IPv4. Xray
+    /// normalizes one trailing domain dot and domain case before applying the
+    /// domain rules.
+    pub fn is_xray_plaintext_server_exempt(&self) -> bool {
+        match self {
+            Self::Ip(ip) => match canonicalize_ip(*ip) {
+                IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+                IpAddr::V6(ip) => {
+                    ip.is_unique_local() || ip.is_loopback() || ip.is_unicast_link_local()
+                }
+            },
+            Self::Domain(domain) => xray_plaintext_server_domain_matches(domain),
+        }
+    }
+}
+
+fn xray_plaintext_server_domain_matches(domain: &str) -> bool {
+    let normalized = domain.to_lowercase();
+    let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
+    const PRIVATE_SUFFIXES: [&str; 9] = [
+        "lan",
+        "localdomain",
+        "example",
+        "invalid",
+        "localhost",
+        "test",
+        "local",
+        "home.arpa",
+        "internal",
+    ];
+
+    PRIVATE_SUFFIXES
+        .iter()
+        .any(|suffix| domain_matches_suffix(normalized, suffix))
+        || xray_dotless_domain_matches(normalized)
+}
+
+fn xray_dotless_domain_matches(domain: &str) -> bool {
+    let bytes = domain.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 || !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    if bytes.len() == 1 {
+        return true;
+    }
+
+    bytes[1..bytes.len() - 1]
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::*;
+    use segue_routing::PRIVATE_NETWORKS;
+
+    #[derive(Clone, Copy)]
+    enum Matcher {
+        Cidr(Cidr, bool),
+        Private(bool),
+    }
+
+    fn cidr(a: u8, b: u8, c: u8, d: u8, prefix: u8) -> Matcher {
+        Matcher::Cidr(
+            Cidr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), prefix).unwrap(),
+            false,
+        )
+    }
+
+    fn private() -> Matcher {
+        Matcher::Private(false)
+    }
+
+    fn not(matcher: Matcher) -> Matcher {
+        match matcher {
+            Matcher::Cidr(cidr, inverted) => Matcher::Cidr(cidr, !inverted),
+            Matcher::Private(inverted) => Matcher::Private(!inverted),
+        }
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    fn v6(segments: [u16; 8]) -> IpAddr {
+        IpAddr::V6(Ipv6Addr::from(segments))
+    }
+
+    fn mapped(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V6(Ipv4Addr::new(a, b, c, d).to_ipv6_mapped())
+    }
+
+    fn set(matchers: Vec<Matcher>) -> IpMatcherSet {
+        let mut builder = IpMatcherSet::builder();
+        for matcher in matchers {
+            match matcher {
+                Matcher::Cidr(cidr, inverted) => builder.insert_cidr(cidr, inverted),
+                Matcher::Private(inverted) => builder.insert_private_networks(inverted),
+            }
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn ip_matcher_set_positive_match_wins_over_failing_inverse() {
+        // Positive matches even though the inverse clause fails (10.0.0.1 is inside the
+        // negated 10.0.0.0/8) — and regardless of matcher ordering.
+        let matchers = set(vec![not(cidr(10, 0, 0, 0, 8)), cidr(10, 0, 0, 0, 16)]);
+        assert!(matchers.matches(v4(10, 0, 0, 1)));
+
+        let matchers = set(vec![cidr(10, 0, 0, 0, 16), not(cidr(10, 0, 0, 0, 8))]);
+        assert!(matchers.matches(v4(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn ip_matcher_set_only_inverses_with_one_failing_is_false() {
+        let matchers = set(vec![
+            not(cidr(10, 0, 0, 0, 8)),
+            not(cidr(192, 168, 0, 0, 16)),
+            not(cidr(172, 16, 0, 0, 12)),
+        ]);
+        assert!(!matchers.matches(v4(192, 168, 1, 1)));
+        assert!(!matchers.matches(v4(10, 1, 2, 3)));
+        assert!(!matchers.matches(v4(172, 20, 0, 1)));
+    }
+
+    #[test]
+    fn ip_matcher_set_only_inverses_all_passing_is_true() {
+        let matchers = set(vec![
+            not(cidr(10, 0, 0, 0, 8)),
+            not(cidr(192, 168, 0, 0, 16)),
+        ]);
+        assert!(matchers.matches(v4(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn ip_matcher_set_with_no_matchers_is_empty_and_matches_nothing() {
+        let matchers = set(Vec::new());
+        assert!(matchers.is_empty());
+        assert_eq!(matchers.range_count(), 0);
+        assert!(!matchers.matches(v4(8, 8, 8, 8)));
+        assert_eq!(matchers, IpMatcherSet::default());
+        assert!(!set(vec![cidr(10, 0, 0, 0, 8)]).is_empty());
+        assert!(!set(vec![not(cidr(10, 0, 0, 0, 8))]).is_empty());
+    }
+
+    #[test]
+    fn ip_matcher_set_positive_miss_and_failing_inverse_is_false() {
+        let matchers = set(vec![cidr(203, 0, 113, 0, 24), not(cidr(10, 0, 0, 0, 8))]);
+        assert!(!matchers.matches(v4(10, 42, 0, 1)));
+        // Positive miss but inverse clause holds.
+        assert!(matchers.matches(v4(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn ip_matcher_set_flattens_nested_not() {
+        let matchers = set(vec![not(not(cidr(10, 0, 0, 0, 8)))]);
+        assert!(matchers.matches(v4(10, 1, 1, 1)));
+        assert!(!matchers.matches(v4(8, 8, 8, 8)));
+        assert_eq!(matchers, set(vec![cidr(10, 0, 0, 0, 8)]));
+
+        let matchers = set(vec![
+            not(not(cidr(10, 0, 0, 0, 8))),
+            not(cidr(192, 168, 0, 0, 16)),
+        ]);
+        assert!(matchers.matches(v4(8, 8, 8, 8)));
+        assert!(matchers.matches(v4(10, 1, 1, 1)));
+        assert!(!matchers.matches(v4(192, 168, 1, 1)));
+        assert!(set(vec![not(not(cidr(10, 0, 0, 0, 8)))]).matches(v4(10, 1, 1, 1)));
+        assert!(!set(vec![not(not(cidr(10, 0, 0, 0, 8)))]).matches(v4(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn ip_matcher_set_canonicalizes_v4_mapped_targets_and_networks() {
+        let matchers = set(vec![cidr(203, 0, 113, 0, 24)]);
+        assert!(matchers.matches(mapped(203, 0, 113, 7)));
+        assert!(!matchers.matches(mapped(203, 0, 114, 7)));
+        assert!(set(vec![cidr(203, 0, 113, 0, 24)]).matches(mapped(203, 0, 113, 7)));
+
+        let mapped_network = Matcher::Cidr(
+            IpCidr::new(mapped(203, 0, 113, 0), 24)
+                .expect("v4 prefix")
+                .cidr(),
+            false,
+        );
+        assert_eq!(
+            set(vec![mapped_network]),
+            set(vec![cidr(203, 0, 113, 0, 24)])
+        );
+        assert!(set(vec![mapped_network]).matches(v4(203, 0, 113, 7)));
+        assert!(IpCidr::new(mapped(203, 0, 113, 0), 33).is_err());
+
+        let inverse = set(vec![not(cidr(10, 0, 0, 0, 8))]);
+        assert!(!inverse.matches(mapped(10, 1, 1, 1)));
+        assert!(inverse.matches(mapped(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn ip_matcher_set_inverse_of_foreign_family_matches_nothing() {
+        let matchers = set(vec![not(cidr(10, 0, 0, 0, 8))]);
+        assert!(matchers.matches(v4(8, 8, 8, 8)));
+        assert!(!matchers.matches(v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1])));
+        assert!(!matchers.matches(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(
+            !set(vec![not(cidr(10, 0, 0, 0, 8))]).matches(v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]))
+        );
+
+        let fc00 = Matcher::Cidr(
+            Cidr::new(v6([0xfc00, 0, 0, 0, 0, 0, 0, 0]), 7).expect("v6 prefix"),
+            false,
+        );
+        let matchers = set(vec![not(cidr(10, 0, 0, 0, 8)), not(fc00)]);
+        assert!(matchers.matches(v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1])));
+        assert!(!matchers.matches(v6([0xfd00, 0, 0, 0, 0, 0, 0, 1])));
+        assert!(matchers.matches(v4(8, 8, 8, 8)));
+        assert!(!matchers.matches(v4(10, 0, 0, 1)));
+
+        let matchers = set(vec![not(fc00), cidr(203, 0, 113, 0, 24)]);
+        assert!(matchers.matches(v4(203, 0, 113, 7)));
+        assert!(!matchers.matches(v4(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn ip_matcher_set_prefix_zero_covers_the_whole_family() {
+        let matchers = set(vec![cidr(0, 0, 0, 0, 0)]);
+        assert_eq!(matchers.range_count(), 1);
+        assert!(matchers.matches(v4(0, 0, 0, 0)));
+        assert!(matchers.matches(v4(255, 255, 255, 255)));
+        assert!(matchers.matches(mapped(8, 8, 8, 8)));
+        assert!(!matchers.matches(v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1])));
+
+        let matchers = set(vec![not(cidr(0, 0, 0, 0, 0))]);
+        assert!(!matchers.matches(v4(8, 8, 8, 8)));
+        assert!(!matchers.matches(v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1])));
+    }
+
+    #[test]
+    fn ip_matcher_set_merges_adjacent_and_overlapping_ranges() {
+        let matchers = set(vec![
+            cidr(10, 0, 0, 128, 25),
+            cidr(10, 0, 0, 0, 25),
+            cidr(10, 0, 1, 0, 24),
+            cidr(10, 0, 0, 0, 26),
+        ]);
+        assert_eq!(matchers.range_count(), 1);
+        assert!(matchers.matches(v4(10, 0, 0, 0)));
+        assert!(matchers.matches(v4(10, 0, 1, 255)));
+        assert!(!matchers.matches(v4(10, 0, 2, 0)));
+        assert_eq!(matchers, set(vec![cidr(10, 0, 0, 0, 23)]));
+
+        let inverse = set(vec![not(cidr(10, 0, 0, 0, 24)), not(cidr(10, 0, 1, 0, 24))]);
+        assert_eq!(inverse.range_count(), 1);
+        assert!(!inverse.matches(v4(10, 0, 0, 255)));
+        assert!(!inverse.matches(v4(10, 0, 1, 0)));
+        assert!(inverse.matches(v4(10, 0, 2, 0)));
+
+        let both = set(vec![cidr(10, 0, 0, 0, 24), not(cidr(10, 0, 1, 0, 24))]);
+        assert_eq!(both.range_count(), 2);
+    }
+
+    #[test]
+    fn ip_matcher_set_private_and_its_inverse() {
+        let private_set = set(vec![private()]);
+        assert_eq!(private_set.range_count(), PRIVATE_NETWORKS.len());
+        assert!(private_set.matches(v4(10, 1, 2, 3)));
+        assert!(private_set.matches(mapped(192, 168, 1, 1)));
+        assert!(private_set.matches(v6([0xfe80, 0, 0, 0, 0, 0, 0, 1])));
+        assert!(!private_set.matches(v4(8, 8, 8, 8)));
+
+        let public = set(vec![not(private())]);
+        assert_eq!(public.range_count(), PRIVATE_NETWORKS.len());
+        assert!(public.matches(v4(8, 8, 8, 8)));
+        assert!(public.matches(v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1])));
+        assert!(!public.matches(v4(10, 0, 0, 1)));
+        assert!(!public.matches(mapped(192, 168, 1, 1)));
+        assert!(!public.matches(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!public.matches(v6([0xfe80, 0, 0, 0, 0, 0, 0, 1])));
+        assert!(set(vec![not(private())]).matches(v4(8, 8, 8, 8)));
+        assert!(!set(vec![not(private())]).matches(v4(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn private_matcher_uses_shared_private_networks() {
+        assert!(set(vec![private()]).matches(v4(10, 1, 2, 3)));
+        assert!(set(vec![private()]).matches(v4(100, 64, 0, 1)));
+        assert!(set(vec![private()]).matches(v4(127, 0, 0, 1)));
+        assert!(set(vec![private()]).matches(v4(169, 254, 1, 1)));
+        assert!(set(vec![private()]).matches(v4(172, 31, 255, 255)));
+        assert!(set(vec![private()]).matches(v4(192, 168, 0, 1)));
+        assert!(set(vec![private()]).matches(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(
+            set(vec![private()]).matches(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)))
+        );
+        assert!(
+            set(vec![private()]).matches(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)))
+        );
+        assert!(!set(vec![private()]).matches(v4(8, 8, 8, 8)));
+        assert!(!set(vec![private()]).matches(v4(172, 32, 0, 1)));
+        assert!(!set(vec![private()])
+            .matches(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))));
+    }
+
+    #[test]
+    fn invalid_domain_regex_maps_to_the_config_error() {
+        let error = ConfigModelError::from(RegexMatcher::new("(").unwrap_err());
+        assert!(matches!(
+            &error,
+            ConfigModelError::InvalidDomainRegex { pattern, message }
+                if pattern == "(" && !message.is_empty()
+        ));
+        assert!(error.to_string().starts_with("invalid domain regex `(`: "));
+    }
+
+    fn parity_matchers() -> Vec<DomainMatcher> {
+        let regex = |pattern: &str| DomainMatcher::Regex(RegexMatcher::new(pattern).unwrap());
+        vec![
+            DomainMatcher::Full("example.com".to_owned()),
+            DomainMatcher::Full("Exact.TEST".to_owned()),
+            DomainMatcher::Full("dotted.test.".to_owned()),
+            DomainMatcher::Full("bücher.example".to_owned()),
+            DomainMatcher::Full("single".to_owned()),
+            DomainMatcher::Full("".to_owned()),
+            DomainMatcher::Suffix("suffix.example".to_owned()),
+            DomainMatcher::Suffix("Mixed.Case.Example".to_owned()),
+            DomainMatcher::Suffix("trailing.example.".to_owned()),
+            DomainMatcher::Suffix(".leading.example".to_owned()),
+            DomainMatcher::Suffix("tld".to_owned()),
+            DomainMatcher::Suffix("".to_owned()),
+            DomainMatcher::Suffix("münchen.example".to_owned()),
+            DomainMatcher::Suffix("a..b.example".to_owned()),
+            DomainMatcher::Keyword("track".to_owned()),
+            DomainMatcher::Keyword("ADS".to_owned()),
+            DomainMatcher::Keyword(".metrics.".to_owned()),
+            DomainMatcher::Keyword("straße".to_owned()),
+            DomainMatcher::Keyword("zz-only-tail".to_owned()),
+            DomainMatcher::Keyword("k".to_owned()),
+            regex("^[^.]*intranet[^.]*$"),
+            regex("^[^.]*[^.]*$"),
+            regex(r"^api\.[a-z0-9-]+\.svc$"),
+            regex(r"(^|\.)regex\.example\.?$"),
+            regex(r"^cdn[0-9]+\.static\.example$"),
+            regex(r"^[a-z]{2}\.[a-z]{2}$"),
+            regex(r"\.onion$"),
+            regex(r"^(www\.)?shop\.example$"),
+            regex(r"caf\u{e9}"),
+            regex(r"^x{3,}$"),
+        ]
+    }
+
+    fn parity_probes() -> Vec<String> {
+        let mut probes = vec![
+            "",
+            ".",
+            "..",
+            "example.com",
+            "EXAMPLE.COM",
+            "example.com.",
+            "www.example.com",
+            "notexample.com",
+            "exact.test",
+            "EXACT.TEST",
+            "exact.test.",
+            "notexact.test",
+            "dotted.test",
+            "dotted.test.",
+            "sub.dotted.test.",
+            "bücher.example",
+            "BÜCHER.example",
+            "single",
+            "single.",
+            "a.single",
+            "suffix.example",
+            "SUB.SUFFIX.EXAMPLE",
+            "notsuffix.example",
+            "suffix.example.evil",
+            "suffix.example.",
+            "mixed.case.example",
+            "deep.MIXED.CASE.EXAMPLE",
+            "trailing.example",
+            "trailing.example.",
+            "a.trailing.example.",
+            "leading.example",
+            ".leading.example",
+            "x..leading.example",
+            "www.leading.example",
+            "tld",
+            "a.tld",
+            "tld.example",
+            "atld",
+            "münchen.example",
+            "MÜNCHEN.example",
+            "www.münchen.example",
+            "a..b.example",
+            "x.a..b.example",
+            "a.b.example",
+            "tracker.test",
+            "TRACKING.test",
+            "ads.example",
+            "ADS",
+            "roads.example",
+            "roadside.example",
+            "a.metrics.b",
+            "metrics.b",
+            "a.metrics",
+            "straße.example",
+            "STRASSE.example",
+            "strasse.example",
+            "zz-only-tail",
+            "zz-only-tai",
+            "k",
+            "K",
+            "no-such-letter",
+            "intranet",
+            "MyIntranetBox",
+            "intranet.corp",
+            "nodots",
+            "api.svc-1.svc",
+            "API.SVC-1.SVC",
+            "api.svc-1.svc.",
+            "regex.example",
+            "regex.example.",
+            "a.regex.example",
+            "aregex.example",
+            "cdn12.static.example",
+            "cdn.static.example",
+            "ab.cd",
+            "ab.cde",
+            "hidden.onion",
+            "onion",
+            "shop.example",
+            "www.shop.example",
+            "m.shop.example",
+            "café.example",
+            "CAFÉ.example",
+            "xxx",
+            "xx",
+            "xxxx.",
+            "XXX",
+            "🙂.example",
+            "😀",
+            "a.b.c.d.e.f.g.h",
+            "trailing.dots...",
+            "...",
+            "mix.Of.EVERYTHING.example.com.",
+            "com",
+            "example",
+            "-",
+            "_dmarc.example.com",
+            "xn--bcher-kva.example",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        probes.push("y".repeat(300));
+        probes.push("very-long-label-".repeat(4));
+        probes
+    }
+
+    fn dns_reference_matches(matcher: &DomainMatcher, domain: &str) -> bool {
+        let trimmed = |pattern: &str| pattern.trim_end_matches('.').to_owned();
+        match matcher {
+            DomainMatcher::Full(expected) => DomainMatcher::Full(trimmed(expected)),
+            DomainMatcher::Suffix(suffix) => DomainMatcher::Suffix(trimmed(suffix)),
+            other => other.clone(),
+        }
+        .matches(domain.trim_end_matches('.'))
+    }
+
+    #[test]
+    fn compiled_routing_set_matches_the_linear_reference_on_every_probe() {
+        let matchers = parity_matchers();
+        let set = compile_domain_matchers(&matchers).unwrap();
+        assert_eq!(set.matcher_count(), matchers.len());
+        let probes = parity_probes();
+        assert!(probes.len() >= 100);
+        let mut hits = 0;
+        for domain in &probes {
+            let expected = matchers.iter().any(|matcher| matcher.matches(domain));
+            assert_eq!(set.matches(domain), expected, "domain={domain:?}");
+            hits += usize::from(expected);
+        }
+        assert!(hits > 30 && hits < probes.len() - 20, "hits={hits}");
+    }
+
+    #[test]
+    fn compiled_dns_set_matches_the_transport_reference_on_normalized_names() {
+        let matchers = parity_matchers();
+        let set = compile_dns_domain_matchers(&matchers).unwrap();
+        for domain in parity_probes() {
+            let domain = domain.trim_end_matches('.');
+            let expected = matchers
+                .iter()
+                .any(|matcher| dns_reference_matches(matcher, domain));
+            assert_eq!(set.matches(domain), expected, "domain={domain:?}");
+        }
+    }
+
+    #[test]
+    fn routing_and_dns_compilation_differ_only_in_trailing_dot_patterns() {
+        let matchers = [
+            DomainMatcher::Full("dotted.test.".to_owned()),
+            DomainMatcher::Suffix("trailing.example.".to_owned()),
+        ];
+        let routing = compile_domain_matchers(&matchers).unwrap();
+        let dns = compile_dns_domain_matchers(&matchers).unwrap();
+
+        assert!(routing.matches("dotted.test."));
+        assert!(!routing.matches("dotted.test"));
+        assert!(routing.matches("a.trailing.example."));
+        assert!(!routing.matches("a.trailing.example"));
+
+        assert!(dns.matches("dotted.test"));
+        assert!(!dns.matches("dotted.test."));
+        assert!(dns.matches("a.trailing.example"));
+        assert!(!dns.matches("a.trailing.example."));
+    }
+}

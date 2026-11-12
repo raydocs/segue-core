@@ -34,5 +34,5 @@ for corpus in freedom mux filter; do
     "$TEST_ROOT/xray" "tests/fixtures/$corpus/config-verdicts.json"
 done
 
-cargo test --locked -p xray-config --test freedom_settings_tests --test mux_tests \
+cargo test --locked -p segue-config --test freedom_settings_tests --test mux_tests \
   --test finalmask_filter_tests config_verdicts_match_xray_core

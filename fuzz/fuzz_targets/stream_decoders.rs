@@ -11,13 +11,13 @@ use std::task::{Context, Poll};
 use libfuzzer_sys::fuzz_target;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::runtime::Builder;
-use xray_proxy::shadowsocks::{ClientStream, Method};
-use xray_proxy::vless::{VisionStream, VisionStreamIo, VlessResponseStream};
-use xray_routing::{Network, Target, TargetAddr};
-use xray_transport::stream::grpc_test_only::{
+use segue_proxy::shadowsocks::{ClientStream, Method};
+use segue_proxy::vless::{VisionStream, VisionStreamIo, VlessResponseStream};
+use segue_routing::{Network, Target, TargetAddr};
+use segue_transport::stream::grpc_test_only::{
     encode_hunk, HunkDecoder, HunkMode, MAX_HUNK_PAYLOAD_LEN,
 };
-use xray_transport::stream::{FrameDecoder, FrameEvent};
+use segue_transport::stream::{FrameDecoder, FrameEvent};
 
 // Matches the seed corpus; the fuzzer can still reach other ids.
 const VISION_USER_ID: [u8; 16] = [0x11; 16];
@@ -197,7 +197,7 @@ fuzz_target!(|data: &[u8]| {
     let (sizes, wire) = split_input(data);
     grpc_hunks(sizes, wire);
     websocket_frames(sizes, wire);
-    if let Some(hello) = xray_transport::extract_server_hello_for_fuzzing(wire) {
+    if let Some(hello) = segue_transport::extract_server_hello_for_fuzzing(wire) {
         assert_eq!(hello.first(), Some(&0x02));
     }
     let runtime = Builder::new_current_thread()

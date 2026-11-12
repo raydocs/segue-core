@@ -115,7 +115,7 @@ The loopback tests do not establish NAT interoperability. Do not restore
 first-sender learning to address that limitation without a replacement for the
 isolation this policy provides.
 
-Existing Rust [runtime tests](../crates/xray-core-rs/tests/runtime_data_path_tests.rs)
+Existing Rust [runtime tests](../crates/segue-engine/tests/runtime_data_path_tests.rs)
 cover `socks_password_udp_association_refuses_undeclared_client_endpoint` and
 `socks_password_udp_association_ignores_other_local_senders`, including a foreign
 sender arriving first. Preserve those tests if this policy changes. Accepting
@@ -144,7 +144,7 @@ login. `CONNECT` succeeds on each of these inbounds; `"udp": true` relays.
 xray-rust now gives the explicit `false` case the same reply, creates no relay
 socket, dials nothing and closes the control connection, for noauth and
 password inbounds; `CONNECT` is unchanged. The
-[runtime tests](../crates/xray-core-rs/tests/runtime_data_path_tests/socks_inbound_udp.rs)
+[runtime tests](../crates/segue-engine/tests/runtime_data_path_tests/socks_inbound_udp.rs)
 `socks_udp_false_refuses_udp_associate_without_relay_or_dial`,
 `socks_password_udp_false_refuses_udp_associate_after_login` and
 `socks_udp_true_or_absent_keeps_relaying` cover this with a counting socket
@@ -173,16 +173,16 @@ see the [accepted link subset and capability guard](socks-profile-import.md).
 
 [check-socks-interop.sh](../scripts/check-socks-interop.sh) runs a real pinned
 Xray-core SOCKS server against the Rust client. Its
-[runtime test](../crates/xray-core-rs/tests/socks_runtime_tests.rs) covers both
+[runtime test](../crates/segue-engine/tests/socks_runtime_tests.rs) covers both
 settings shapes, password/noauth, wrong/missing credentials, IPv4/IPv6 and remote
 domain destinations, 64 KiB payloads, socket protection, and connection inventory.
 The TCP matrix runs over both plain TCP and TLS, using an IPv4 carrier resolved
 through the injected bootstrap resolver and a real IPv6 proxy listener on `::1`.
-Separate [client tests](../crates/xray-proxy/tests/socks_client_tests.rs) cover
+Separate [client tests](../crates/segue-proxy/tests/socks_client_tests.rs) cover
 IPv6 address encoding, malformed/truncated replies, and preserving tunnel data
 after the reply.
 
-The [integration tests](../crates/xray-core-rs/tests/socks_runtime/integration.rs)
+The [integration tests](../crates/segue-engine/tests/socks_runtime/integration.rs)
 add these independently exercised cases:
 
 - TCP TLS rejects both an untrusted certificate and a trusted certificate with
@@ -1514,7 +1514,7 @@ The zero draws remain the reference: each spec order shuffled with seed 0 is
 the order of its raw oracle fixture, for all ten profiles, and the byte
 comparisons with those fixtures write every GREASE value as `0x0a0a` and,
 for the shuffling profiles, compare the extensions in a canonical order
-(`crates/xray-transport/tests/support/client_hello_draws.rs`). Unit tests in
+(`crates/segue-transport/tests/support/client_hello_draws.rs`). Unit tests in
 `utls_shaping.rs` hold the GREASE seeds to `getBoringGREASEValue` and show
 that GREASE, padding and pre_shared_key stay in place while every other
 extension reaches every other place; `utls_tls_shaping_tests` shows two

@@ -2,10 +2,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use std::ptr;
-use xray_config::profile_import::{
+use segue_config::profile_import::{
     import_profile, import_request, is_import_advisory, ProfileFormat, MAX_RESULT_BYTES,
 };
-use xray_ffi::{xray_error_free, xray_profile_import_json, XrayStatus};
+use segue_ffi::{xray_error_free, xray_profile_import_json, XrayStatus};
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(data) {
@@ -23,7 +23,7 @@ fuzz_target!(|data: &[u8]| {
         .into_iter()
         .flatten()
         {
-            let config = xray_config::parse_xray_json(&profile.config_json).unwrap();
+            let config = segue_config::parse_xray_json(&profile.config_json).unwrap();
             assert!(config.diagnostics.iter().all(is_import_advisory));
             assert!(profile.to_json().unwrap().len() <= MAX_RESULT_BYTES);
         }

@@ -13,7 +13,7 @@ gate and publishes the GitHub prerelease itself.
 
 1. **Release commit.** Bump the workspace version, date the changelog section,
    regenerate the configuration contract
-   (`cargo run -p xray-config --example config_contract > docs/config-contract.json`)
+   (`cargo run -p segue-config --example config_contract > docs/config-contract.json`)
    and merge. That commit is the candidate; every later step binds to its
    revision and tree.
 2. **Candidate CI.** Dispatch **CI** on a branch whose head is the candidate

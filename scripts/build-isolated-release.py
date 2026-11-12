@@ -6,7 +6,7 @@ artifact hash for a workspace crate does not include the checkout's absolute
 path, and freshness is decided by file mtimes. A second checkout whose files
 look older than the first build's artifacts silently reuses those artifacts.
 That is how the 2026-10-27 migration campaign's "before" client got the
-migration's `xray-config` and `xray-utls`.
+migration's `segue-config` and `segue-utls`.
 
 This script exports the exact commit into a fresh temporary directory outside
 the repository, builds it with an empty target directory and a sanitized
@@ -73,7 +73,7 @@ def compiled_workspace_packages(messages, source):
         if source not in manifest.parents:
             foreign.add(str(manifest))
             continue
-        # Workspace members and vendored path crates, e.g. `crates/xray-config`.
+        # Workspace members and vendored path crates, e.g. `crates/segue-config`.
         package = str(manifest.parent.relative_to(source))
         (fresh if message.get('fresh') else compiled).add(package)
     if foreign:
@@ -92,11 +92,11 @@ def main():
     parser.add_argument('--campaign', type=Path, required=True,
                         help='writes bin/NAME and build/NAME.json here; refuses to overwrite')
     parser.add_argument('--package', action='append', default=None,
-                        help='cargo package to build (repeatable; default xray-cli)')
+                        help='cargo package to build (repeatable; default segue-cli)')
     parser.add_argument('--binary', default='xray-rust', help='binary to freeze from target/release')
     parser.add_argument('--keep', action='store_true', help='keep the temporary export and target directory')
     a = parser.parse_args()
-    packages = a.package or ['xray-cli']
+    packages = a.package or ['segue-cli']
 
     commit = git('rev-parse', '--verify', a.rev + '^{commit}').decode().strip()
     tree = git('rev-parse', commit + '^{tree}').decode().strip()

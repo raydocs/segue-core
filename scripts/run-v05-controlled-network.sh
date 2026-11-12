@@ -73,7 +73,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$WORKSPACE_ROOT"
-cargo build --locked --release -p xray-bench -p xray-cli
+cargo build --locked --release -p segue-bench -p segue-cli
 env \
   -u GOFLAGS \
   -u GOEXPERIMENT \
@@ -89,8 +89,8 @@ if [[ "$TARGET_ARGUMENT" = /* ]]; then
 else
   readonly TARGET_DIR="$WORKSPACE_ROOT/$TARGET_ARGUMENT"
 fi
-readonly BENCH_BINARY="$TARGET_DIR/release/xray-bench"
-readonly XRAY_RUST_BINARY="$TARGET_DIR/release/xray-rust"
+readonly BENCH_BINARY="$TARGET_DIR/release/segue-bench"
+readonly XRAY_RUST_BINARY="$TARGET_DIR/release/segue"
 
 initial_qdisc="$(tc qdisc show dev lo)"
 if ! grep -Eq '^qdisc noqueue ' <<<"$initial_qdisc"; then

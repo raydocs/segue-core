@@ -4,7 +4,7 @@ and on the candidate, in one run, and write the "release-comparison" artifact.
 
 Both clients and the driver are builds made by build-isolated-release.py in
 one campaign directory: bin/baseline (the v0.9.0 tag), bin/candidate and
-bin/harness (the candidate's xray-bench), each with its build/NAME.json.
+bin/harness (the candidate's segue-bench), each with its build/NAME.json.
 
 Each repeat starts a fresh pinned Xray-core server with fresh keys, the
 device fixture's twelve legacy-regression cases, and runs both builds on one

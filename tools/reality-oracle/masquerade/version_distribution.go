@@ -23,7 +23,7 @@
 // CPU-seeded `math/rand`, so it can never reproduce a particular machine's
 // version. Matching this distribution is the whole of what it owes Xray, and
 // this fixture is what
-// `crates/xray-transport/tests/stream_http_headers_tests.rs` asserts against.
+// `crates/segue-transport/tests/stream_http_headers_tests.rs` asserts against.
 //
 // # Why this file transcribes browser.go instead of calling it
 //

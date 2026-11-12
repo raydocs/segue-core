@@ -113,7 +113,7 @@ class EvidenceAllowlists(unittest.TestCase):
         self.assertEqual(self.scan(outside),
                          {(path, "jfrog-identity-token") for path in outside})
 
-        source = "crates/xray-ffi/include/xray_ffi.h"
+        source = "crates/segue-ffi/include/segue_ffi.h"
         digest = json.loads(reviewed[paths[0]])["nativeSourceDigests"][source]
         other = "e79a0029cc782ff8166c708f8c911ef39de33563b71a30df2cd2ff1d63d799ab"
         changed = {path: content.replace(digest, other) for path, content in reviewed.items()}
@@ -216,7 +216,7 @@ class EvidenceAllowlists(unittest.TestCase):
                 if member.name.endswith("/manifest.json"):
                     manifest = json.loads(data)
                     binaries = {name: digest for name, digest in manifest.get("file_hashes", {}).items()
-                                if Path(name).name in ("xray-rust", "xray-bench", "xray-core")}
+                                if Path(name).name in ("xray-rust", "segue-bench", "xray-core")}
                     if binaries:
                         reviewed[archive_path + "!" + member.name] = json.dumps(binaries)
         self.assertGreaterEqual(len(reviewed), 15)

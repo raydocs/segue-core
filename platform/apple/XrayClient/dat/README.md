@@ -22,6 +22,6 @@ SHA-256 digests, and only then replaces the destination files. The upstream
 the runtime and the Xcode sample targets.
 
 Version, provenance, attribution, and license details are recorded in the
-repository's [`THIRD_PARTY_NOTICES.md`](../../../../THIRD_PARTY_NOTICES.md).
+repository's [`THIRD_PARTY_NOTICES.md`](../../../../licenses/THIRD_PARTY_NOTICES.md).
 Retain those notices when redistributing an application that bundles the
 data.

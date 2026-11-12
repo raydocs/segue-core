@@ -13,10 +13,10 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOLCHAIN/aarch64-linux-andro
 export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
 export AR_aarch64_linux_android="$TOOLCHAIN/llvm-ar"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS='-Dwarnings -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384'
-cargo build --locked --offline --release --package xray-ffi --target aarch64-linux-android
+cargo build --locked --offline --release --package segue-ffi --target aarch64-linux-android
 mkdir -p "$CAMPAIGN/native/include" "$CAMPAIGN/native/jniLibs/arm64-v8a"
-cp crates/xray-ffi/include/xray_ffi.h "$CAMPAIGN/native/include/"
-cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libxray_ffi.so" "$CAMPAIGN/native/jniLibs/arm64-v8a/"
-"$TOOLCHAIN/llvm-readelf" -lW "$CAMPAIGN/native/jniLibs/arm64-v8a/libxray_ffi.so"
-shasum -a 256 "$CAMPAIGN/native/jniLibs/arm64-v8a/libxray_ffi.so" "$CAMPAIGN/native/include/xray_ffi.h"
+cp crates/segue-ffi/include/segue_ffi.h "$CAMPAIGN/native/include/"
+cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libsegue_ffi.so" "$CAMPAIGN/native/jniLibs/arm64-v8a/"
+"$TOOLCHAIN/llvm-readelf" -lW "$CAMPAIGN/native/jniLibs/arm64-v8a/libsegue_ffi.so"
+shasum -a 256 "$CAMPAIGN/native/jniLibs/arm64-v8a/libsegue_ffi.so" "$CAMPAIGN/native/include/segue_ffi.h"
 test -z "$(git status --porcelain)"

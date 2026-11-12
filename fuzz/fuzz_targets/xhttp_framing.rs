@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::Builder;
-use xray_transport::stream::xhttp_h1_test_only::PendingResponse;
+use segue_transport::stream::xhttp_h1_test_only::PendingResponse;
 
 const FUZZ_HEAD_LIMIT: usize = 16 * 1024;
 

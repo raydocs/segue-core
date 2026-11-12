@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use tokio::runtime::Builder;
-use xray_proxy::vless::{
+use segue_proxy::vless::{
     encode_udp_packet, encode_xudp_keep_packet, read_udp_packet, read_xudp_packet,
     unpad_vision_block,
 };

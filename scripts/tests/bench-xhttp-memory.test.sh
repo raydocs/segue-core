@@ -103,17 +103,17 @@ import sys
 
 commands = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
 common = [
-    "run", "--locked", "--release", "-p", "xray-bench", "--", "compare",
+    "run", "--locked", "--release", "-p", "segue-bench", "--", "compare",
     "--workload", "stream-transport",
     "--xhttp-profile", "legacy-extra-h1-packet-up",
     "--sample-interval-ms", "100",
     "--settle-ms", "5000",
     "--runs", "5",
     "--out-dir", "target/benchmarks/xhttp-memory",
-    "--xray-rust-bin", "target/release/xray-rust",
+    "--xray-rust-bin", "target/release/segue",
     "--xray-core-dir", "Xray-core",
 ]
-expected = [["build", "--locked", "--release", "-p", "xray-cli", "--bin", "xray-rust"]]
+expected = [["build", "--locked", "--release", "-p", "segue-cli", "--bin", "xray-rust"]]
 for flows in (1, 16, 32):
     expected.append(common + [
         "--xhttp-max-post-bytes", "500000",
@@ -166,7 +166,7 @@ import sys
 log_path, output, rust_bin, core_bin, core_dir = sys.argv[1:]
 commands = [json.loads(line) for line in pathlib.Path(log_path).read_text().splitlines()]
 common = [
-    "run", "--locked", "--release", "-p", "xray-bench", "--", "compare",
+    "run", "--locked", "--release", "-p", "segue-bench", "--", "compare",
     "--workload", "stream-transport",
     "--xhttp-profile", "legacy-extra-h1-packet-up",
     "--sample-interval-ms", "101",
@@ -239,17 +239,17 @@ import sys
 log_path, output, core_dir = sys.argv[1:]
 commands = [json.loads(line) for line in pathlib.Path(log_path).read_text().splitlines()]
 common = [
-    "run", "--locked", "--release", "-p", "xray-bench", "--", "compare",
+    "run", "--locked", "--release", "-p", "segue-bench", "--", "compare",
     "--workload", "stream-transport",
     "--xhttp-profile", "legacy-extra-h1-packet-up",
     "--sample-interval-ms", "101",
     "--settle-ms", "1",
     "--runs", "5",
     "--out-dir", output,
-    "--xray-rust-bin", "target/release/xray-rust",
+    "--xray-rust-bin", "target/release/segue",
     "--xray-core-dir", core_dir,
 ]
-expected = [["build", "--locked", "--release", "-p", "xray-cli", "--bin", "xray-rust"]]
+expected = [["build", "--locked", "--release", "-p", "segue-cli", "--bin", "xray-rust"]]
 for flows in (1, 16, 32):
     expected.append(common + [
         "--xhttp-max-post-bytes", "500000",

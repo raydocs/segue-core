@@ -48,12 +48,12 @@ same_as_fixture wal-vectors.json
 same_as_fixture http-vectors.json
 
 cd "$WORKSPACE_ROOT"
-cargo test --locked -p xray-proxy --lib go_url
-cargo test --locked -p xray-transport --lib xdrive::
-cargo test --locked -p xray-config --lib parser::xdrive
-cargo test --locked -p xray-config --test xdrive_tests
-cargo test --locked -p xray-core-rs --lib outbound::xdrive
-cargo test --locked -p xray-core-rs --test core_lifecycle_tests xdrive
+cargo test --locked -p segue-proxy --lib go_url
+cargo test --locked -p segue-transport --lib xdrive::
+cargo test --locked -p segue-config --lib parser::xdrive
+cargo test --locked -p segue-config --test xdrive_tests
+cargo test --locked -p segue-engine --lib outbound::xdrive
+cargo test --locked -p segue-engine --test core_lifecycle_tests xdrive
 
 # Every recorded verdict of the config corpus, rechecked with `xray run -test`.
 env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
@@ -81,5 +81,5 @@ env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
 XRAY_VLESS_FULL_BINARY="$TEST_ROOT/xray" XRAY_CORE_CHECKOUT="$CHECKOUT" \
   XDRIVE_STANDIN_BINARY="$TEST_ROOT/xdrive-standin" \
   XDRIVE_DRIVE_SERVER="$TEST_ROOT/xdrive-drive-server" \
-  cargo test --locked -p xray-core-rs --test local_xray_interop_tests xdrive:: \
+  cargo test --locked -p segue-engine --test local_xray_interop_tests xdrive:: \
     -- --ignored --nocapture --test-threads=1

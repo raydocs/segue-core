@@ -75,9 +75,9 @@ XRAY_WIREGUARD_BINARY="$TEST_ROOT/xray" "$BUILD_TARGET/debug/examples/xray_adapt
 
 cd "$WORKSPACE_ROOT"
 XRAY_WIREGUARD_BINARY="$TEST_ROOT/xray" \
-  cargo +1.96.0 test --locked -p xray-wireguard --lib \
+  cargo +1.96.0 test --locked -p segue-wireguard --lib \
   --test lifecycle --test interop --test multi_peer_tests \
   -- --include-ignored --nocapture
 XRAY_WIREGUARD_BINARY="$TEST_ROOT/xray" \
-  cargo +1.96.0 test --locked -p xray-core-rs --lib --test wireguard_runtime_tests \
+  cargo +1.96.0 test --locked -p segue-engine --lib --test wireguard_runtime_tests \
   --test runtime_data_path_tests wireguard_runtime_ -- --ignored --nocapture

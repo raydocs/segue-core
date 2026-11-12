@@ -26,7 +26,7 @@ env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
 cmp "$WORKSPACE_ROOT/tests/fixtures/v08/protocol-primitives.json" "$TEST_ROOT/protocol-primitives.json"
 
 cd "$WORKSPACE_ROOT"
-cargo test --locked -p xray-proxy --test trojan_wire_tests
-cargo test --locked -p xray-proxy --lib shadowsocks
-cargo test --locked -p xray-proxy --lib vmess
-cargo test --locked -p xray-proxy --lib mux
+cargo test --locked -p segue-proxy --test trojan_wire_tests
+cargo test --locked -p segue-proxy --lib shadowsocks
+cargo test --locked -p segue-proxy --lib vmess
+cargo test --locked -p segue-proxy --lib mux

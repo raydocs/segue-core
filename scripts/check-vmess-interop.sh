@@ -20,4 +20,4 @@ PY
 env -u GOFLAGS -u GOEXPERIMENT GOENV=off GOWORK=off CGO_ENABLED=0 \
   go -C "$CHECKOUT" build -mod=readonly -o "$TEST_ROOT/xray" ./main
 cd "$WORKSPACE_ROOT"
-XRAY_CLIENT_PROTOCOL_BINARY="$TEST_ROOT/xray" cargo test --locked -p xray-core-rs --test vmess_runtime_tests --test runtime_data_path_tests vmess_runtime_ -- --ignored --nocapture
+XRAY_CLIENT_PROTOCOL_BINARY="$TEST_ROOT/xray" cargo test --locked -p segue-engine --test vmess_runtime_tests --test runtime_data_path_tests vmess_runtime_ -- --ignored --nocapture

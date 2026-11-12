@@ -6,15 +6,15 @@ behavior run in hermetic Rust integration tests.
 
 ```mermaid
 flowchart LR
-    Host["CLI / Swift / Kotlin"] --> Config["xray-config"]
-    Host --> FFI["xray-ffi"]
-    FFI --> Core["xray-core-rs"]
+    Host["CLI / Swift / Kotlin"] --> Config["segue-config"]
+    Host --> FFI["segue-ffi"]
+    FFI --> Core["segue-engine"]
     Config --> Core
     Proxy["SOCKS5 / HTTP CONNECT"] --> Core
     Tun["TUN packet API or fd"] --> Core
-    Core --> Routing["xray-routing"]
-    Core --> ProxyWire["xray-proxy"]
-    Core --> Transport["xray-transport"]
+    Core --> Routing["segue-routing"]
+    Core --> ProxyWire["segue-proxy"]
+    Core --> Transport["segue-transport"]
     Transport --> Network["TCP / TLS / REALITY"]
 ```
 
@@ -22,17 +22,17 @@ flowchart LR
 
 | Crate | Responsibility |
 | --- | --- |
-| `xray-config` | Parses the supported Xray JSON subset, diagnostics, geodata lookup, and resource budgets |
-| `xray-routing` | Platform-neutral target/session types and router contracts |
-| `xray-proxy` | SOCKS/HTTP parsing plus VLESS, Vision, UDP, and XUDP wire framing |
-| `xray-utls` | uTLS fingerprint names and normalization, shared by plain TLS and REALITY |
-| `xray-transport` | DNS, socket protection, TCP, TLS, REALITY handshake, and shaped ClientHello support |
-| `xray-tun` | Bounded packet queues, counters, and diagnostic events |
-| `xray-runtime` | Cooperative shutdown primitive |
-| `xray-core-rs` | Lifecycle, listeners, routing, outbound selection, policy, TUN TCP/UDP/ICMP runtime |
-| `xray-ffi` | Stable C ABI and embedded Tokio runtime |
-| `xray-cli` | `xray-rust run -config …` executable |
-| `xray-bench` | Local workload and comparison harness |
+| `segue-config` | Parses the supported Xray JSON subset, diagnostics, geodata lookup, and resource budgets |
+| `segue-routing` | Platform-neutral target/session types and router contracts |
+| `segue-proxy` | SOCKS/HTTP parsing plus VLESS, Vision, UDP, and XUDP wire framing |
+| `segue-utls` | uTLS fingerprint names and normalization, shared by plain TLS and REALITY |
+| `segue-transport` | DNS, socket protection, TCP, TLS, REALITY handshake, and shaped ClientHello support |
+| `segue-tun` | Bounded packet queues, counters, and diagnostic events |
+| `segue-runtime` | Cooperative shutdown primitive |
+| `segue-engine` | Lifecycle, listeners, routing, outbound selection, policy, TUN TCP/UDP/ICMP runtime |
+| `segue-ffi` | Stable C ABI and embedded Tokio runtime |
+| `segue-cli` | `xray-rust run -config …` executable |
+| `segue-bench` | Local workload and comparison harness |
 
 ## Configuration path
 
@@ -118,9 +118,9 @@ all losing attempts in place.
 ### TUN
 
 The host either pushes and polls raw IP packets through the C ABI or registers a
-platform TUN file descriptor. `xray-core-rs` drives the userspace TCP/UDP path,
+platform TUN file descriptor. `segue-engine` drives the userspace TCP/UDP path,
 applies sniffing and routing, and emits response packets through bounded
-`xray-tun` queues. Android uses raw-IP fd framing; Darwin's optional direct path
+`segue-tun` queues. Android uses raw-IP fd framing; Darwin's optional direct path
 uses the four-byte utun address-family header.
 
 The packet-pump and fd-backed modes are alternatives for the same `TunEndpoint`.
@@ -139,18 +139,18 @@ the flow ([TUN MTU](ffi.md#tun-mtu)).
 ### DNS
 
 DNS is split at the wire-transport boundary instead of being owned by TUN.
-`xray-transport` builds and validates DNS messages, retains ordered A/AAAA
+`segue-transport` builds and validates DNS messages, retains ordered A/AAAA
 candidates with authoritative or remaining TTL metadata, handles CNAME
 resolution, server failover, UDP truncation with same-server TCP retry, and the
 bounded resolver cache. Object name-server policies select matching domains
 before ordered fallback, with Xray-compatible skip/disable/final behavior; a
 CNAME-only continuation stays on the answering name server. Domain rules are
-compiled once by the config parser into `xray_routing::DomainMatcherSet`, the
+compiled once by the config parser into `segue_routing::DomainMatcherSet`, the
 same index used by routing rules and DNS outbound rules: exact names and
 label-boundary suffixes use hash sets probed per label, keywords one
 Aho-Corasick automaton, and regexes a `Vec<Regex>` matched with `any` (a
 `RegexSet` is deliberately avoided: its size limit applies to the whole set).
-Static `dns.hosts` compile into `xray_routing::DomainHostIndex`, a hash map of
+Static `dns.hosts` compile into `segue_routing::DomainHostIndex`, a hash map of
 DNS-normalized `full:` names that wins over the remaining matchers scanned in
 config order; the core converts it once and shares it with every configured
 resolver. The compiled policy set is shared by all routed resolver contexts
@@ -183,7 +183,7 @@ addresses and selecting `StaticOnly`. Long-running Rust embeddings can instead
 install a native asynchronous platform backend through
 `Core::with_platform_dns_resolver`; the dependency remains separate from
 managed destination servers and survives the runtime resolver rebuild.
-`xray-core-rs` supplies a transport-aware query service. Classic DNS,
+`segue-engine` supplies a transport-aware query service. Classic DNS,
 `tcp://`, and certificate-verified `tls://` exchanges open through the normal
 outbound router; `tcp+local://`
 resolves only through the bootstrap role and opens a protected direct TCP
@@ -390,9 +390,9 @@ load/start/stop/set/free operations. See [the C ABI contract](ffi.md).
 
 ## Platform boundary
 
-- Apple builds `xray-ffi` as static-library XCFramework slices and exposes
+- Apple builds `segue-ffi` as static-library XCFramework slices and exposes
   Swift wrappers plus `NEPacketTunnelProvider` reference code.
-- Android builds `libxray_ffi.so`, links a small C++ JNI bridge, and exposes a
+- Android builds `libsegue_ffi.so`, links a small C++ JNI bridge, and exposes a
   Kotlin wrapper plus `VpnService`.
 - Outbound socket protection is injected before config load so Android can call
   `VpnService.protect(fd)` for every launched TCP/UDP candidate before that
