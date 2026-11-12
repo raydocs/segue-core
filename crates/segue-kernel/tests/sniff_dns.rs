@@ -122,6 +122,7 @@ async fn start_kernel(fake: Arc<Fake>, pool: Option<Arc<FakeIpPool>>) -> SocketA
             timeout: SNIFF_TIMEOUT,
             max_bytes: 16 * 1024,
         }),
+        udp: None,
     };
     tokio::spawn(serve(l, Arc::new(kernel)));
     addr

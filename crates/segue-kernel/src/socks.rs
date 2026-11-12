@@ -1,4 +1,5 @@
-//! Local SOCKS5 entry point (CONNECT only, no authentication, loopback only).
+//! Local SOCKS5 entry point (CONNECT and UDP ASSOCIATE, no authentication,
+//! loopback only). UDP lives in `crate::udp`.
 //!
 //! Domain targets: the success reply is sent only after the outbound dial
 //! succeeds, so a failed proxy route reaches the application as a SOCKS
@@ -26,6 +27,7 @@ use crate::dial::{Dialer, Stream};
 use crate::fakeip::FakeIpPool;
 use crate::rules::{Action, RuleSet};
 use crate::sniff::{sniff, Sniff};
+use crate::udp::{associate, Udp};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -37,6 +39,9 @@ pub const REP_HOST_UNREACHABLE: u8 = 0x04;
 pub const REP_CMD_UNSUPPORTED: u8 = 0x07;
 pub const REP_ATYP_UNSUPPORTED: u8 = 0x08;
 
+const CMD_CONNECT: u8 = 1;
+const CMD_UDP_ASSOCIATE: u8 = 3;
+
 pub struct Kernel {
     pub rules: RuleSet,
     pub dialer: Arc<dyn Dialer>,
@@ -45,6 +50,8 @@ pub struct Kernel {
     pub fake_ip: Option<Arc<FakeIpPool>>,
     /// None turns sniffing off: bare IPs are routed by IP rules only.
     pub sniff: Option<SniffSettings>,
+    /// None: UDP ASSOCIATE is answered "command not supported".
+    pub udp: Option<Arc<Udp>>,
 }
 
 impl Kernel {
@@ -55,6 +62,7 @@ impl Kernel {
             dialer,
             fake_ip: None,
             sniff: None,
+            udp: None,
         }
     }
 }
@@ -103,7 +111,7 @@ async fn handle(mut conn: TcpStream, kernel: &Kernel) -> Result<(), Fail> {
     let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_request(&mut conn))
         .await
         .map_err(|_| Fail::Io(std::io::ErrorKind::TimedOut.into()))?;
-    let (addr, port) = match request {
+    let (cmd, addr, port) = match request {
         Ok(target) => target,
         Err(Fail::Reply(code)) => {
             reply(&mut conn, code).await?;
@@ -111,6 +119,16 @@ async fn handle(mut conn: TcpStream, kernel: &Kernel) -> Result<(), Fail> {
         }
         Err(e) => return Err(e),
     };
+    if cmd == CMD_UDP_ASSOCIATE {
+        let Some(udp) = kernel.udp.as_ref() else {
+            reply(&mut conn, REP_CMD_UNSUPPORTED).await?;
+            return Ok(());
+        };
+        // DST.ADDR/PORT name where the client will send from; only the port
+        // is used (the address must be the TCP peer's anyway).
+        associate(conn, kernel, udp, port).await?;
+        return Ok(());
+    }
     if let TargetAddr::Ip(ip) = addr {
         if let Some(pool) = kernel.fake_ip.as_ref().filter(|p| p.contains(ip)) {
             // A fake address is never dialled as an IP.
@@ -275,7 +293,7 @@ fn reset(conn: TcpStream) -> Result<(), Fail> {
     Ok(())
 }
 
-async fn read_request(conn: &mut TcpStream) -> Result<(TargetAddr, u16), Fail> {
+async fn read_request(conn: &mut TcpStream) -> Result<(u8, TargetAddr, u16), Fail> {
     let mut head = [0u8; 2];
     conn.read_exact(&mut head).await?;
     if head[0] != 5 {
@@ -320,10 +338,10 @@ async fn read_request(conn: &mut TcpStream) -> Result<(TargetAddr, u16), Fail> {
         _ => return Err(Fail::Reply(REP_ATYP_UNSUPPORTED)),
     };
     let port = conn.read_u16().await?;
-    if req[1] != 1 {
+    if req[1] != CMD_CONNECT && req[1] != CMD_UDP_ASSOCIATE {
         return Err(Fail::Reply(REP_CMD_UNSUPPORTED));
     }
-    Ok((addr, port))
+    Ok((req[1], addr, port))
 }
 
 async fn reply(conn: &mut TcpStream, code: u8) -> std::io::Result<()> {

@@ -21,6 +21,9 @@
 //! Each outbound is parsed by the engine's own config parser, so anything the
 //! engine accepts as an outbound (REALITY, Hysteria 2, ...) works here.
 //!
+//! `"udp": { "refuse": ["home"], "refuse_quic": ["proxy"], "idle_timeout_secs": 60 }`
+//! turns on SOCKS5 UDP ASSOCIATE; outbounds in `refuse` never carry UDP.
+//!
 //! `sniff` absent: bare-IP CONNECTs are routed by IP rules only. `dns`
 //! absent: no DNS listener and no fake-IP range.
 
@@ -35,6 +38,7 @@ use serde_json::Value;
 use crate::dns::DnsSettings;
 use crate::rules::{Action, Cidr, CidrTable, RuleSet, RuleSpec};
 use crate::socks::SniffSettings;
+use crate::udp::UdpSettings;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +53,40 @@ struct RawConfig {
     sniff: Option<RawSniff>,
     #[serde(default)]
     dns: Option<RawDns>,
+    #[serde(default)]
+    udp: Option<RawUdp>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUdp {
+    /// Outbounds that never carry UDP (the Home / AI exit, §1.2.3).
+    #[serde(default)]
+    refuse: Vec<String>,
+    /// Outbounds that refuse UDP/443 (QUIC over a Reality carrier, §4.3).
+    #[serde(default)]
+    refuse_quic: Vec<String>,
+    #[serde(default = "default_udp_idle")]
+    idle_timeout_secs: u64,
+    #[serde(default = "default_udp_flows")]
+    max_flows: usize,
+    #[serde(default = "default_udp_queue")]
+    queue: usize,
+    #[serde(default = "default_udp_assoc")]
+    max_associations: usize,
+}
+
+fn default_udp_idle() -> u64 {
+    60
+}
+fn default_udp_flows() -> usize {
+    128
+}
+fn default_udp_queue() -> usize {
+    32
+}
+fn default_udp_assoc() -> usize {
+    64
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,6 +159,8 @@ pub struct KernelConfig {
     pub rules: RuleSet,
     pub sniff: Option<SniffSettings>,
     pub dns: Option<DnsConfig>,
+    /// None: UDP ASSOCIATE is refused as unsupported.
+    pub udp: Option<UdpSettings>,
 }
 
 impl KernelConfig {
@@ -172,14 +212,42 @@ impl KernelConfig {
             .dns
             .map(|d| dns_config(d, &raw.outbounds, base))
             .transpose()?;
+        let udp = raw.udp.map(|u| udp_config(u, &raw.outbounds)).transpose()?;
         Ok(Self {
             listen: raw.listen,
             outbounds: raw.outbounds,
             rules,
             sniff,
             dns,
+            udp,
         })
     }
+}
+
+fn udp_config(u: RawUdp, outbounds: &BTreeMap<String, Value>) -> Result<UdpSettings, String> {
+    for tag in u.refuse.iter().chain(&u.refuse_quic) {
+        if !outbounds.contains_key(tag) {
+            return Err(format!("udp refers to unknown outbound {tag:?}"));
+        }
+    }
+    if u.idle_timeout_secs == 0
+        || !(1..=4096).contains(&u.max_flows)
+        || !(1..=1024).contains(&u.queue)
+        || !(1..=4096).contains(&u.max_associations)
+    {
+        return Err(
+            "udp: idle_timeout_secs > 0, max_flows 1..=4096, queue 1..=1024, max_associations 1..=4096"
+                .into(),
+        );
+    }
+    Ok(UdpSettings {
+        refuse: u.refuse.into_iter().collect(),
+        refuse_quic: u.refuse_quic.into_iter().collect(),
+        idle_timeout: Duration::from_secs(u.idle_timeout_secs),
+        max_flows: u.max_flows,
+        queue: u.queue,
+        max_associations: u.max_associations,
+    })
 }
 
 fn dns_config(
