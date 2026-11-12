@@ -15,6 +15,7 @@ use segue_kernel::dns::{
     RCODE_OK, RCODE_SERVFAIL, TYPE_A, TYPE_AAAA,
 };
 use segue_kernel::fakeip::FakeIpPool;
+use segue_kernel::policy::{Policy, PolicyStore};
 use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
 use segue_kernel::sniff::client_hello_for_test;
 use segue_kernel::socks::{serve, Kernel, SniffSettings, REP_NOT_ALLOWED, REP_OK};
@@ -115,7 +116,7 @@ async fn start_kernel(fake: Arc<Fake>, pool: Option<Arc<FakeIpPool>>) -> SocketA
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let kernel = Kernel {
-        rules: rules(),
+        policy: PolicyStore::inline(Policy::inline(rules(), CidrTable::default())),
         dialer: fake,
         fake_ip: pool,
         sniff: Some(SniffSettings {
@@ -454,17 +455,18 @@ fn pool() -> Arc<FakeIpPool> {
 }
 
 async fn smart_dns(domestic: Vec<SocketAddr>, pool: Arc<FakeIpPool>) -> Arc<SmartDns> {
+    let chnroute = CidrTable::new(&[
+        Cidr::parse("1.0.0.0/8").unwrap(),
+        Cidr::parse("36.0.0.0/8").unwrap(),
+    ]);
     let settings = DnsSettings {
         domestic,
-        chnroute: CidrTable::new(&[
-            Cidr::parse("1.0.0.0/8").unwrap(),
-            Cidr::parse("36.0.0.0/8").unwrap(),
-        ]),
         foreign: proxy("proxy"),
         query_timeout: Duration::from_millis(500),
         cache_size: 128,
     };
-    Arc::new(SmartDns::new(rules(), pool, settings))
+    let policy = PolicyStore::inline(Policy::inline(rules(), chnroute));
+    Arc::new(SmartDns::new(policy, pool, settings))
 }
 
 async fn ask(dns: &Arc<SmartDns>, id: u16, name: &str, qtype: u16) -> (u8, Vec<IpAddr>) {

@@ -7,10 +7,12 @@
 //! [`killswitch`] holds the posture and per-flow verdicts (KILLSWITCH.md).
 
 pub mod config;
+pub mod control;
 pub mod dial;
 pub mod dns;
 pub mod fakeip;
 pub mod killswitch;
+pub mod policy;
 pub mod rules;
 pub mod session;
 pub mod sniff;

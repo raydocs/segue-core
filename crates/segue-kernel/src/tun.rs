@@ -1812,7 +1812,8 @@ impl TunRouter for RefuseAll {
 }
 
 /// The kernel's routing for TUN flows: the same decisions the SOCKS front
-/// end makes. Fake-IP destinations are dialled by their name (a stale fake
+/// end makes, read from the kernel's current policy bundle
+/// ([`crate::policy::PolicyStore`]; no valid bundle refuses everything). Fake-IP destinations are dialled by their name (a stale fake
 /// address is refused, never dialled as an IP); with sniffing on, bare IPs
 /// are routed by the sniffed name per D8 (`socks::stricter`); UDP uses the
 /// SOCKS UDP refusals (home exit, QUIC on refused tags); DNS on port 53 is
@@ -1838,10 +1839,15 @@ impl TunRouter for TunKernel {
         if self.hijack_dns && key.dst.port() == DNS_PORT {
             return TcpRoute::Dns;
         }
+        let policy = self.kernel.policy.current();
+        if policy.refuse_all {
+            // No valid policy bundle: fail closed, fake-IP included (§5.4).
+            return TcpRoute::Refuse;
+        }
         if let Some(fake) = self.fake(key) {
             return fake.map_or(TcpRoute::Refuse, TcpRoute::Dial);
         }
-        let rules = &self.kernel.rules;
+        let rules = &policy.rules;
         if let Some(s) = self.kernel.sniff {
             // An IP reject cannot be overridden by a name: refuse the SYN.
             if let Some((_, Action::Reject)) = rules.lookup(&TargetAddr::Ip(key.dst.ip())) {
@@ -1853,7 +1859,12 @@ impl TunRouter for TunKernel {
     }
 
     fn sniffed(&self, key: &FlowKey, domain: Option<&str>) -> Option<Dial> {
-        let rules = &self.kernel.rules;
+        // The policy current now: a bundle installed during the sniff applies.
+        let policy = self.kernel.policy.current();
+        if policy.refuse_all {
+            return None;
+        }
+        let rules = &policy.rules;
         let ip = key.dst.ip();
         let by_ip = rules.lookup(&TargetAddr::Ip(ip));
         let by_domain = domain.and_then(|d| rules.lookup(&TargetAddr::Domain(d.to_owned())));

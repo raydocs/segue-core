@@ -250,13 +250,17 @@ pub(crate) fn route(
     addr: &TargetAddr,
     port: u16,
 ) -> Option<(Option<String>, TargetAddr)> {
+    let policy = kernel.policy.current();
+    if policy.refuse_all {
+        return None;
+    }
     let (action, target) = match addr {
         TargetAddr::Ip(ip) if kernel.fake_ip.as_ref().is_some_and(|p| p.contains(*ip)) => {
             // A fake address is never dialled as an IP.
             let entry = kernel.fake_ip.as_ref()?.lookup(*ip)?;
             (entry.action, TargetAddr::Domain(entry.domain))
         }
-        _ => (kernel.rules.decide(addr).clone(), addr.clone()),
+        _ => (policy.rules.decide(addr).clone(), addr.clone()),
     };
     match action {
         Action::Reject => None,

@@ -2188,8 +2188,10 @@ name = "segue-kernel"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "rand 0.8.6",
+ "ring",
  "segue-config",
  "segue-engine",
  "segue-routing",
