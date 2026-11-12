@@ -179,9 +179,36 @@ sleep 3
 r=$(fetch "http://localhost:$HP/1m.bin" "$OUT/a3.bin")
 [ "$(sha "$OUT/a3.bin" 2>/dev/null)" = "$(sha "$OUT/www/1m.bin")" ] && ok "AI works after recovery ($r)" || bad "AI after recovery ($r)"
 
-# 6. Home UDP refused (and session routes never carry UDP)
-u=$(python3 -I "$HERE/udp_probe.py" $KP localhost $UP)
-[ "$u" != REPLY ] && [ ! -s "$OUT/udp.log" ] && ok "Home UDP refused ($u, echo got nothing)" || bad "Home UDP leaked ($u)"
+# 6. Home UDP refused (and session routes never carry UDP).
+# home_udp <probe> <echo port>: 0 only when the echo answers directly, the
+# probe ran cleanly (rc 0) through an accepted ASSOCIATE, got no reply, and
+# the echo saw nothing from the kernel. Sets HU to a description.
+udp_seen() { wc -l < "$OUT/udp.log" | tr -d ' '; }
+home_udp() {
+  local d u rc n0
+  d=$(python3 -I "$1" direct 127.0.0.1 "$2"); rc=$?
+  [ $rc = 0 ] && [ "$d" = REPLY ] || { HU="UDP echo not reachable directly (rc=$rc '$d')"; return 1; }
+  n0=$(udp_seen)
+  u=$(python3 -I "$1" $KP localhost "$2"); rc=$?
+  sleep 0.3
+  [ $rc = 0 ] || { HU="probe failed (rc=$rc '$u')"; return 1; }
+  [ "$u" = NO_REPLY ] || { HU="probe result '$u', want NO_REPLY"; return 1; }
+  [ "$(udp_seen)" = "$n0" ] || { HU="echo got $(( $(udp_seen) - n0 )) datagram(s) via the kernel"; return 1; }
+  HU="ASSOCIATE accepted, datagram dropped, echo reachable directly and got nothing via the kernel"
+}
+home_udp "$HERE/udp_probe.py" $UP && ok "Home UDP refused ($HU)" || bad "Home UDP: $HU"
+# The check itself must fail when the probe breaks or the echo is down.
+# Probe that controls fine directly, then prints a refusal-looking result
+# but exits nonzero through the kernel.
+cat > "$OUT/broken_probe.py" <<P
+import subprocess, sys
+if sys.argv[1] == "direct":
+    sys.exit(subprocess.call([sys.executable, "-I", "$HERE/udp_probe.py"] + sys.argv[1:]))
+print("NO_REPLY"); sys.exit(3)
+P
+home_udp "$OUT/broken_probe.py" $UP && bad "self-test: probe exiting 3 counted as refusal" || ok "self-test: broken probe fails the check ($HU)"
+for pid in $(lsof -nP -tiUDP:9998 2>/dev/null); do kill "$pid"; done
+home_udp "$HERE/udp_probe.py" 9998 && bad "self-test: echo down counted as refusal" || ok "self-test: echo down fails the check ($HU)"
 
 # 7. Rejected (default rule) never connects: ::1 matches no rule, and the
 # canary listens there.
