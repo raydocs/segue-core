@@ -364,6 +364,12 @@ expected_rust="$(cat <<'EXPECTED'
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Keep build outputs on the root disk
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          mkdir -p target
+          sudo mount --bind /opt/segue-target target
+          df -h / target
       - name: Check repository scripts
         run: |
           for script in scripts/*.sh scripts/tests/*.sh; do

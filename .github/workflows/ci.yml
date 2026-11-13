@@ -278,6 +278,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Instabox runs the workspace on a 20 GiB /data disk, which a full
+      # workspace test build fills. The root disk has the room, so build there.
+      - name: Keep build outputs on the root disk
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          mkdir -p target
+          sudo mount --bind /opt/segue-target target
+          df -h / target
+
       - name: Check repository scripts
         run: |
           for script in scripts/*.sh scripts/tests/*.sh; do
@@ -367,6 +376,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Instabox runs the workspace on a 20 GiB /data disk, which a full
+      # workspace test build fills. The root disk has the room, so build there.
+      - name: Keep build outputs on the root disk
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          mkdir -p target
+          sudo mount --bind /opt/segue-target target
+          df -h / target
 
       # The pinned Xray-core v26.11.9 source requires Go 1.27.
       # Use one exact toolchain for all oracle and interoperability checks.
@@ -834,6 +852,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Instabox runs the workspace on a 20 GiB /data disk, which a full
+      # workspace test build fills. The root disk has the room, so build there.
+      - name: Keep build outputs on the root disk
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          mkdir -p target
+          sudo mount --bind /opt/segue-target target
+          df -h / target
 
       - name: Select JDK 17
         run: |
