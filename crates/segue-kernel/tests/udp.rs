@@ -509,7 +509,9 @@ async fn quic_to_bare_ip_is_dropped_on_any_port() {
             n += 1;
         }
     }
-    c.send(&packet(&ip("8.8.8.8"), 443, b"\x40short")).await.unwrap();
+    c.send(&packet(&ip("8.8.8.8"), 443, b"\x40short"))
+        .await
+        .unwrap();
     n += 1;
     assert_eq!(recv(&c, QUIET).await, None);
     assert!(env.fake.calls().is_empty(), "{:?}", env.fake.calls());
@@ -567,7 +569,10 @@ async fn plain_flow_drops_each_quic_datagram() {
     assert_eq!(recv(&c, QUIET).await, None);
     c.send(&packet(&dst, 8443, b"\x12\x34again")).await.unwrap();
     assert!(recv(&c, WAIT).await.is_some());
-    assert_eq!(env.fake.calls(), vec![(Some("proxy".into()), "8.8.8.8:8443".into())]);
+    assert_eq!(
+        env.fake.calls(),
+        vec![(Some("proxy".into()), "8.8.8.8:8443".into())]
+    );
     assert_eq!(env.udp.as_ref().unwrap().dropped(), 4);
     assert_eq!(env.fake.sent.lock().unwrap().len(), 2);
 }
