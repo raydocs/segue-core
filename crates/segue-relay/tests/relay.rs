@@ -1177,3 +1177,65 @@ async fn revocation_resets_live_sessions() {
         .unwrap()
         .unwrap();
 }
+
+/// Review r6 (server.rs task ownership): cancelling `serve` (dropping or
+/// aborting its future, as a hot restart or an embedder does) must take its
+/// tasks with it. A live session's site socket and a carrier still in its
+/// first-frame wait are closed at once; before, the driver and the
+/// per-accept tasks ran on detached, holding both open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_serve_stops_its_tasks() {
+    let e = env("127.0.0.1:1", false, "198.51.100.0/24");
+    // A site that holds its connection and reports when it is closed.
+    let site = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let site_port = site.local_addr().unwrap().port();
+    let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = site.accept().await {
+            let tx = closed_tx.clone();
+            tokio::spawn(async move {
+                let mut b = [0u8; 1024];
+                while let Ok(n) = s.read(&mut b).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let _ = tx.send(());
+            });
+        }
+    });
+    let (ra, _stop, h) = start(&e).await;
+    let params = OpenParams {
+        ticket: e.signer.sign(&claims(5, vec![ExitClass::Overseas])),
+        kind: Kind::Tcp,
+        target: Target::Domain("echo.test".into(), site_port),
+        exit_class: 0,
+        anchor_node_id: 1,
+        instance_hint: 0,
+    };
+    let pool = Pool::new(8 << 20);
+    let s = ClientSession::new(Default::default(), &pool, params, Instant::now()).unwrap();
+    let connector: Connector = Arc::new(move || {
+        Box::pin(async move { Ok(Box::new(TcpStream::connect(ra).await?) as BoxCarrier) })
+    });
+    let (mut app, far) = tokio::io::duplex(64 << 10);
+    let client = tokio::spawn(run_client(s, far, connector));
+    app.write_all(b"hello").await.unwrap();
+    // A carrier that never sends its first frame.
+    let mut idle = TcpStream::connect(ra).await.unwrap();
+    // Wait for the site connection to be up, then cancel serve.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(closed_rx.try_recv().is_err(), "site closed early");
+    h.abort();
+    let _ = h.await;
+    tokio::time::timeout(Duration::from_secs(3), closed_rx.recv())
+        .await
+        .expect("site socket outlived the cancelled serve");
+    let mut b = [0u8; 16];
+    let r = tokio::time::timeout(Duration::from_secs(3), idle.read(&mut b)).await;
+    assert!(
+        matches!(r, Ok(Ok(0)) | Ok(Err(_))),
+        "first-frame task outlived the cancelled serve: {r:?}"
+    );
+    client.abort();
+}
