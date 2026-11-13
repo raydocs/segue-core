@@ -88,7 +88,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use segue_routing::TargetAddr;
-use segue_session::pool::Pool as SessionPool;
+use segue_session::pool::{Pool as SessionPool, Tier};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{self, State};
@@ -178,8 +178,8 @@ impl BufferPool {
     }
 
     /// Take between `min` and `want` blocks while staying at or under `limit`
-    /// (and within the shared pool, if any).
-    fn take(&self, want: usize, min: usize, limit: usize) -> usize {
+    /// (and within `tier` of the shared pool, if any).
+    fn take(&self, want: usize, min: usize, limit: usize, tier: Tier) -> usize {
         let mut used = self.used.load(Ordering::Relaxed);
         let n = loop {
             let n = want.min(limit.saturating_sub(used));
@@ -199,7 +199,7 @@ impl BufferPool {
         let Some(shared) = &self.shared else {
             return n;
         };
-        let got = shared.take_blocks(n, min.max(1), shared.blocks());
+        let got = shared.take_blocks(n, min.max(1), shared.limit(tier));
         if got < n {
             self.used.fetch_sub(n - got, Ordering::AcqRel);
         }
@@ -219,7 +219,7 @@ impl BufferPool {
     /// Exactly `blocks` blocks, only while the pool stays under high water
     /// (admission and ring growth).
     pub fn charge(self: &Arc<Self>, blocks: usize) -> Option<Charge> {
-        let n = self.take(blocks, blocks, self.high_water);
+        let n = self.take(blocks, blocks, self.high_water, Tier::Elastic);
         (n > 0).then(|| Charge {
             pool: self.clone(),
             blocks: n,
@@ -228,7 +228,7 @@ impl BufferPool {
 
     /// 1..=`want` blocks for bytes in flight, using the whole pool.
     pub fn chunk(self: &Arc<Self>, want: usize) -> Option<Charge> {
-        let n = self.take(want.max(1), 1, self.blocks);
+        let n = self.take(want.max(1), 1, self.blocks, Tier::Relay);
         (n > 0).then(|| Charge {
             pool: self.clone(),
             blocks: n,
@@ -292,7 +292,11 @@ impl Charge {
             return true;
         }
         let extra = blocks - self.blocks;
-        if self.pool.take(extra, extra, self.pool.high_water) == 0 {
+        if self
+            .pool
+            .take(extra, extra, self.pool.high_water, Tier::Elastic)
+            == 0
+        {
             return false;
         }
         self.blocks = blocks;
@@ -304,11 +308,6 @@ impl Charge {
             self.pool.give(self.blocks - blocks);
             self.blocks = blocks;
         }
-    }
-
-    fn absorb(&mut self, mut other: Charge) {
-        self.blocks += other.blocks;
-        other.blocks = 0;
     }
 }
 
@@ -329,26 +328,21 @@ impl std::fmt::Debug for Charge {
 /// Bytes in flight between the stack and a relay task, with their charge.
 struct Chunk {
     data: Bytes,
-    charge: Charge,
+    /// Returned when the chunk is dropped.
+    _charge: Charge,
 }
 
 impl Chunk {
     fn new(data: Bytes, charge: Charge) -> Self {
         debug_assert!(data.len() <= charge.bytes());
-        Self { data, charge }
+        Self {
+            data,
+            _charge: charge,
+        }
     }
 
     fn advance(&mut self, n: usize) {
         let _ = self.data.split_to(n);
-    }
-
-    fn concat(self, next: Chunk) -> Chunk {
-        let mut v = Vec::with_capacity(self.data.len() + next.data.len());
-        v.extend_from_slice(&self.data);
-        v.extend_from_slice(&next.data);
-        let mut charge = self.charge;
-        charge.absorb(next.charge);
-        Chunk::new(Bytes::from(v), charge)
     }
 }
 
@@ -1668,6 +1662,67 @@ impl Netstack {
         Ok(n)
     }
 
+    /// Copy the first `buf.len()` bytes the application sent without
+    /// taking them off the receive ring (they leave it with
+    /// [`tcp_consume`](Self::tcp_consume) once delivered upstream, r6 R5).
+    pub fn tcp_peek(&mut self, id: FlowId, buf: &mut [u8]) -> Result<usize, FlowGone> {
+        let (rx, tx) = self.tcp_buffers(id)?;
+        let queued = self.socket(id)?.recv_queue();
+        let moved = self.entry(id)?.rx_moved;
+        if rx > 0 && rx < self.max_rx() && (queued * 2 >= rx || moved >= rx) {
+            // The window was mostly used, or turned over: offer more.
+            if self.resize(id, (rx * 2).min(self.max_rx()), tx) {
+                self.entry(id)?.rx_moved = 0;
+            }
+        }
+        self.socket(id)?.peek_slice(buf).map_err(|_| FlowGone::Gone)
+    }
+
+    /// Drop `n` delivered bytes from the front of the receive ring.
+    pub fn tcp_consume(&mut self, id: FlowId, n: usize) -> Result<usize, FlowGone> {
+        let sock = self.socket(id)?;
+        let mut done = 0;
+        while done < n && sock.recv_queue() > 0 {
+            let want = n - done;
+            match sock.recv(|b| {
+                let k = b.len().min(want);
+                (k, k)
+            }) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => done += k,
+            }
+        }
+        if done > 0 {
+            let now = self.now;
+            let e = self.entry(id)?;
+            e.last_activity = now;
+            e.rx_moved += done;
+        }
+        Ok(done)
+    }
+
+    /// Free transmit ring space for bytes towards the application, growing
+    /// the ring (doubling, under high water) when it is half full; a
+    /// released ring gets its reserved block back.
+    pub fn tcp_tx_room(&mut self, id: FlowId) -> Result<usize, FlowGone> {
+        self.ensure_rx(id);
+        let (rx, tx) = self.tcp_buffers(id)?;
+        let sock = self.socket(id)?;
+        if !sock.may_send() {
+            return Ok(0);
+        }
+        let queue = sock.send_queue();
+        if (tx == 0 || queue * 2 >= tx) && tx < self.max_tx() {
+            let want = (tx * 2).clamp(BLOCK, self.max_tx());
+            if !self.resize(id, rx, want) && tx == 0 {
+                // The reservation always covers one block each way.
+                self.resize(id, rx, BLOCK);
+            }
+        }
+        let tx = self.tcp_buffers(id)?.1;
+        Ok(tx.saturating_sub(self.socket(id)?.send_queue()))
+    }
+
     /// The application half-closed (FIN received) and everything it sent has
     /// been read.
     pub fn tcp_peer_finished(&mut self, id: FlowId) -> Result<bool, FlowGone> {
@@ -2028,7 +2083,40 @@ enum Up {
     Abort,
 }
 
+/// What a flow's relay task and the stack loop share besides the chunk
+/// channels (r6 R5). Upload bytes stay in the flow's receive ring until the
+/// relay wrote them upstream: the relay asks for a chunk (`want`), gets a
+/// copy of the ring's head, reports what it wrote (`written`, dequeued by
+/// the stack), and drops a chunk the site would block on (keeping one byte
+/// for a waiting write). Download chunks are only made into transmit ring
+/// room the stack published (`room`), so the stack takes them at once.
+/// Relay chunks are therefore never held while waiting for the network or
+/// the application, and the pool's relay region always comes back: a full
+/// pool still moves every flow.
+#[derive(Default)]
+struct Link {
+    state: std::sync::Mutex<LinkState>,
+    /// Ring room was published.
+    room_ready: Notify,
+}
+
+#[derive(Default)]
+struct LinkState {
+    written: usize,
+    /// (at least, at most) bytes wanted from the ring head.
+    want: Option<(usize, usize)>,
+    room: usize,
+    room_wanted: bool,
+}
+
+impl Link {
+    fn state(&self) -> std::sync::MutexGuard<'_, LinkState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 struct Pipe {
+    link: Arc<Link>,
     down: Option<mpsc::Sender<Chunk>>,
     up: mpsc::Receiver<Up>,
     pending: Option<Chunk>,
@@ -2214,11 +2302,13 @@ impl TunStack {
                                 let _ = stack.tcp_abort(id);
                                 continue;
                             };
-                            let (down_tx, down_rx) = mpsc::channel(RELAY_CHUNKS);
+                            let (down_tx, down_rx) = mpsc::channel(1);
                             let (up_tx, up_rx) = mpsc::channel(RELAY_CHUNKS);
+                            let link = Arc::new(Link::default());
                             pipes.insert(
                                 id,
                                 Pipe {
+                                    link: link.clone(),
                                     down: Some(down_tx),
                                     up: up_rx,
                                     pending: None,
@@ -2226,7 +2316,7 @@ impl TunStack {
                                     closed: false,
                                 },
                             );
-                            tokio::spawn(relay(ctx.clone(), plan, key, down_rx, up_tx));
+                            tokio::spawn(relay(ctx.clone(), plan, key, link, down_rx, up_tx));
                         }
                         Event::TcpClosed { id, .. } => {
                             pipes.remove(&id);
@@ -2474,8 +2564,22 @@ fn policy(
 fn pump(stack: &mut Netstack, pool: &Arc<BufferPool>, id: FlowId, pipe: &mut Pipe) -> (bool, bool) {
     let mut progressed = false;
     let mut starved = false;
-    // Application → upstream.
-    while let Some(tx) = &pipe.down {
+    // Taken before the up channel is drained: chunks the relay sent before
+    // asking for room are counted below.
+    let room_wanted = std::mem::take(&mut pipe.link.state().room_wanted);
+    // Application → upstream: bytes leave the receive ring once written.
+    // Under the link lock throughout, so a request is never answered from
+    // a ring head that still holds bytes reported written.
+    let link = pipe.link.clone();
+    let mut l = link.state();
+    let written = std::mem::take(&mut l.written);
+    if written > 0 {
+        if stack.tcp_consume(id, written).is_err() {
+            return (progressed, starved);
+        }
+        progressed = true;
+    }
+    if let Some(tx) = &pipe.down {
         let queued = match stack.tcp_recv_queue(id) {
             Ok(q) => q,
             Err(_) => return (progressed, starved),
@@ -2489,30 +2593,42 @@ fn pump(stack: &mut Netstack, pool: &Arc<BufferPool>, id: FlowId, pipe: &mut Pip
             pipe.closed = true;
             return (true, starved);
         }
+        let finished = stack.tcp_peer_finished(id).unwrap_or(true);
         if queued == 0 {
-            if stack.tcp_peer_finished(id).unwrap_or(true) {
+            if finished {
                 pipe.down = None;
                 progressed = true;
             }
-            break;
+        } else if let Some((min, max)) = l.want {
+            // Sent under the lock, so a relay that withdraws its request
+            // never finds a late chunk.
+            if queued >= min || finished {
+                let n = queued.min(max);
+                match pool.chunk(blocks_for(n)) {
+                    None => starved = true,
+                    Some(charge) => {
+                        let mut buf = vec![0u8; n.min(charge.bytes())];
+                        let k = match stack.tcp_peek(id, &mut buf) {
+                            Ok(k) => k,
+                            Err(_) => return (progressed, starved),
+                        };
+                        buf.truncate(k);
+                        if k < min && !finished {
+                            // The pool is short of what the relay needs
+                            // at once: retry when blocks return.
+                            starved = true;
+                        } else if k > 0 && tx.try_send(Chunk::new(Bytes::from(buf), charge)).is_ok()
+                        {
+                            l.want = None;
+                            progressed = true;
+                        }
+                    }
+                }
+            }
         }
-        let Ok(permit) = tx.try_reserve() else { break };
-        let Some(charge) = pool.chunk(blocks_for(queued.min(CHUNK))) else {
-            starved = true;
-            break;
-        };
-        let mut buf = vec![0u8; queued.min(charge.bytes())];
-        let n = match stack.tcp_read(id, &mut buf) {
-            Ok(n) => n,
-            Err(_) => return (progressed, starved),
-        };
-        if n == 0 {
-            break;
-        }
-        buf.truncate(n);
-        permit.send(Chunk::new(Bytes::from(buf), charge));
-        progressed = true;
     }
+    drop(l);
+
     // Upstream → application.
     loop {
         if pipe.closed {
@@ -2556,6 +2672,23 @@ fn pump(stack: &mut Netstack, pool: &Arc<BufferPool>, id: FlowId, pipe: &mut Pip
             Err(mpsc::error::TryRecvError::Empty) => break,
         }
     }
+    if room_wanted {
+        let room = if pipe.closed || pipe.pending.is_some() {
+            0
+        } else {
+            stack.tcp_tx_room(id).unwrap_or(0)
+        };
+        let mut l = pipe.link.state();
+        if room > 0 {
+            l.room += room;
+            drop(l);
+            pipe.link.room_ready.notify_one();
+        } else {
+            // Asked again on the next round (the application acks, the
+            // pending chunk drains).
+            l.room_wanted = true;
+        }
+    }
     (progressed, starved)
 }
 
@@ -2565,6 +2698,100 @@ async fn send_up(ctx: &Ctx, up: &mpsc::Sender<Up>, msg: Up) -> bool {
     ok
 }
 
+/// Ask the stack for the head of the flow's receive ring: at least `min`
+/// bytes (fewer only once the application finished), at most `max`.
+/// `None`: the application finished and everything was delivered.
+async fn request(
+    ctx: &Ctx,
+    link: &Link,
+    down: &mut mpsc::Receiver<Chunk>,
+    min: usize,
+    max: usize,
+) -> Option<Chunk> {
+    link.state().want = Some((min.max(1), max));
+    ctx.notify.notify_one();
+    down.recv().await
+}
+
+/// Withdraw a request, dropping a chunk that answered it meanwhile (the
+/// stack sends under the same lock).
+fn withdraw(link: &Link, down: &mut mpsc::Receiver<Chunk>) {
+    let mut l = link.state();
+    l.want = None;
+    while down.try_recv().is_ok() {}
+}
+
+/// `n` bytes of the ring head reached the site.
+fn wrote(ctx: &Ctx, link: &Link, n: usize) {
+    if n > 0 {
+        link.state().written += n;
+        ctx.notify.notify_one();
+    }
+}
+
+/// Wait for up to `want` bytes of transmit ring room (`None`: the stack
+/// dropped the flow).
+async fn wait_room(ctx: &Ctx, link: &Link, up: &mpsc::Sender<Up>, want: usize) -> Option<usize> {
+    loop {
+        let ready = link.room_ready.notified();
+        tokio::pin!(ready);
+        ready.as_mut().enable();
+        {
+            let mut l = link.state();
+            if l.room > 0 {
+                let k = l.room.min(want);
+                l.room -= k;
+                return Some(k);
+            }
+            l.room_wanted = true;
+        }
+        ctx.notify.notify_one();
+        tokio::select! {
+            _ = &mut ready => {}
+            _ = up.closed() => return None,
+        }
+    }
+}
+
+/// Return room a chunk did not use.
+fn give_room(link: &Link, n: usize) {
+    if n > 0 {
+        link.state().room += n;
+    }
+}
+
+/// `data` towards the application, in chunks that fit published ring room.
+async fn send_to_app(ctx: &Ctx, link: &Link, up: &mpsc::Sender<Up>, mut data: &[u8]) -> bool {
+    while !data.is_empty() {
+        let Some(room) = wait_room(ctx, link, up, data.len().min(CHUNK)).await else {
+            return false;
+        };
+        let charge = tokio::select! {
+            c = ctx.pool.chunk_wait(blocks_for(room)) => c,
+            _ = up.closed() => return false,
+        };
+        let n = room.min(charge.bytes());
+        give_room(link, room - n);
+        let chunk = Chunk::new(Bytes::copy_from_slice(&data[..n]), charge);
+        data = &data[n..];
+        if !send_up(ctx, up, Up::Data(chunk)).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Write what `w` takes right now (`None`: it would block).
+fn try_write<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, buf: &[u8]) -> Option<io::Result<usize>> {
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
+    match Pin::new(w).poll_write(&mut cx, buf) {
+        Poll::Ready(r) => Some(r),
+        Poll::Pending => None,
+    }
+}
+
 /// Per-flow task: decide (sniff), dial, then relay both directions with
 /// half-close. A refusal or failed dial resets the flow; nothing is retried
 /// direct (§5.4).
@@ -2572,45 +2799,40 @@ async fn relay(
     ctx: Arc<Ctx>,
     plan: TcpPlan,
     key: FlowKey,
+    link: Arc<Link>,
     mut down: mpsc::Receiver<Chunk>,
     up: mpsc::Sender<Up>,
 ) {
-    let mut first: Option<Chunk> = None;
-    let mut eof = false;
     let dial = match plan {
-        TcpPlan::Dns => return dns_tcp(&ctx, down, up).await,
+        TcpPlan::Dns => return dns_tcp(&ctx, &link, down, up).await,
         TcpPlan::Dial(d) => d,
         TcpPlan::Sniff(s) => {
             let mut domain = None;
             let deadline = tokio::time::sleep(s.timeout);
             tokio::pin!(deadline);
+            let mut min = 1;
             loop {
-                tokio::select! {
-                    c = down.recv() => match c {
-                        Some(c) => {
-                            ctx.notify.notify_one();
-                            first = Some(match first.take() {
-                                None => c,
-                                Some(f) => f.concat(c),
-                            });
-                        }
-                        None => {
-                            eof = true;
-                            break;
-                        }
-                    },
+                // Each chunk is the ring head so far: nothing to keep
+                // between rounds.
+                let c = tokio::select! {
+                    c = request(&ctx, &link, &mut down, min, s.max_bytes) => c,
                     _ = &mut deadline => break,
-                }
-                let buf = &first.as_ref().expect("just set").data;
-                match sniff(buf) {
+                };
+                let Some(c) = c else { break };
+                match sniff(&c.data) {
                     Sniff::Domain(d) => {
                         domain = Some(d);
                         break;
                     }
-                    Sniff::NeedMore if buf.len() < s.max_bytes => {}
+                    // Shorter than asked: the application finished (or
+                    // the pool is short); sniff no further.
+                    Sniff::NeedMore if c.data.len() < s.max_bytes && c.data.len() >= min => {
+                        min = c.data.len() + 1;
+                    }
                     _ => break,
                 }
             }
+            withdraw(&link, &mut down);
             match ctx.router.sniffed(&key, domain.as_deref()) {
                 Some(d) => d,
                 None => {
@@ -2643,14 +2865,22 @@ async fn relay(
             let msg = match res {
                 Ok(0) => Up::Fin,
                 Ok(_) => {
+                    // Only into ring room the stack published, so the
+                    // chunk is taken at once (r6 R5).
+                    let Some(room) = wait_room(&ctx, &link, &up, CHUNK).await else {
+                        return;
+                    };
                     let charge = tokio::select! {
-                        c = ctx.pool.chunk_wait(CHUNK / BLOCK) => c,
+                        c = ctx.pool.chunk_wait(blocks_for(room)) => c,
                         _ = up.closed() => return,
                     };
-                    let mut buf = vec![0u8; charge.bytes()];
+                    let size = room.min(charge.bytes());
+                    give_room(&link, room - size);
+                    let mut buf = vec![0u8; size];
                     buf[0] = one[0];
                     match read_ready(&mut r, &mut buf[1..]).await {
                         Ok(n) => {
+                            give_room(&link, size - 1 - n);
                             buf.truncate(1 + n);
                             Up::Data(Chunk::new(Bytes::from(buf), charge))
                         }
@@ -2666,19 +2896,33 @@ async fn relay(
         }
     };
     let to_site = async {
-        if let Some(c) = first.take() {
-            if w.write_all(&c.data).await.is_err() {
-                send_up(&ctx, &abort, Up::Abort).await;
-                return;
+        // Bytes leave the ring only once written; a chunk the site would
+        // block on is dropped but for one byte, whose write is awaited.
+        while let Some(c) = request(&ctx, &link, &mut down, 1, CHUNK).await {
+            let mut off = 0;
+            let mut blocked = false;
+            while off < c.data.len() {
+                match try_write(&mut w, &c.data[off..]) {
+                    Some(Ok(n)) if n > 0 => off += n,
+                    Some(_) => {
+                        send_up(&ctx, &abort, Up::Abort).await;
+                        return;
+                    }
+                    None => {
+                        blocked = true;
+                        break;
+                    }
+                }
             }
-        }
-        if !eof {
-            while let Some(c) = down.recv().await {
-                ctx.notify.notify_one();
-                if w.write_all(&c.data).await.is_err() {
+            let next = blocked.then(|| c.data[off]);
+            drop(c);
+            wrote(&ctx, &link, off);
+            if let Some(b) = next {
+                if w.write_all(&[b]).await.is_err() {
                     send_up(&ctx, &abort, Up::Abort).await;
                     return;
                 }
+                wrote(&ctx, &link, 1);
             }
         }
         let _ = w.shutdown().await;
@@ -2705,62 +2949,64 @@ async fn read_ready<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// DNS over TCP to the hijacked resolver: length-prefixed messages answered
-/// by the [`SmartDns`] one at a time.
-async fn dns_tcp(ctx: &Ctx, mut down: mpsc::Receiver<Chunk>, up: mpsc::Sender<Up>) {
+/// by the [`SmartDns`] one at a time. Queries are read from the ring head
+/// and copied out (charged like a ring) before they are answered, so no
+/// relay chunk waits for the resolver.
+async fn dns_tcp(ctx: &Ctx, link: &Link, mut down: mpsc::Receiver<Chunk>, up: mpsc::Sender<Up>) {
     const IDLE: Duration = Duration::from_secs(10);
     let Some(dns) = ctx.dns.clone() else {
         send_up(ctx, &up, Up::Abort).await;
         return;
     };
-    let mut acc: Option<Chunk> = None;
-    let mut eof = false;
+    let mut min = 2;
     loop {
-        // Answer every complete message buffered so far.
-        while let Some(buf) = acc.as_mut() {
-            let data = &buf.data;
-            if data.len() < 2 {
+        let c = match tokio::time::timeout(IDLE, request(ctx, link, &mut down, min, 2 + 65_535))
+            .await
+        {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(_) => {
+                withdraw(link, &mut down);
                 break;
             }
-            let len = u16::from_be_bytes([data[0], data[1]]) as usize;
-            if data.len() < 2 + len {
+        };
+        let data = &c.data;
+        if data.len() < 2 {
+            if data.len() < min {
+                // The application finished mid-message.
                 break;
             }
-            let query = data.slice(2..2 + len);
-            buf.advance(2 + len);
-            if buf.data.is_empty() {
-                acc = None;
-            }
-            let Some(answer) = dns.handle(&query).await else {
-                continue;
-            };
-            let Ok(n) = u16::try_from(answer.len()) else {
-                continue;
-            };
-            let charge = ctx.pool.chunk_wait(blocks_for(answer.len() + 2)).await;
-            let mut framed = Vec::with_capacity(answer.len() + 2);
-            framed.extend_from_slice(&n.to_be_bytes());
-            framed.extend_from_slice(&answer);
-            if !send_up(ctx, &up, Up::Data(Chunk::new(Bytes::from(framed), charge))).await {
-                return;
-            }
+            min = 2;
+            continue;
         }
-        if eof {
-            break;
-        }
-        match tokio::time::timeout(IDLE, down.recv()).await {
-            Ok(Some(c)) => {
-                ctx.notify.notify_one();
-                acc = Some(match acc.take() {
-                    None => c,
-                    Some(a) => a.concat(c),
-                });
-                if acc.as_ref().is_some_and(|a| a.data.len() > 2 + 65_535) {
-                    send_up(ctx, &up, Up::Abort).await;
-                    return;
-                }
+        let len = u16::from_be_bytes([data[0], data[1]]) as usize;
+        if data.len() < 2 + len {
+            if data.len() < min {
+                break;
             }
-            Ok(None) => eof = true,
-            Err(_) => break,
+            min = 2 + len;
+            continue;
+        }
+        min = 2;
+        let Some(_held) = ctx.pool.charge(blocks_for(len).max(1)) else {
+            // No room to hold the query: refuse the flow.
+            send_up(ctx, &up, Up::Abort).await;
+            return;
+        };
+        let query = data[2..2 + len].to_vec();
+        drop(c);
+        wrote(ctx, link, 2 + len);
+        let Some(answer) = dns.handle(&query).await else {
+            continue;
+        };
+        drop(query);
+        let Ok(n) = u16::try_from(answer.len()) else {
+            continue;
+        };
+        if !send_to_app(ctx, link, &up, &n.to_be_bytes()).await
+            || !send_to_app(ctx, link, &up, &answer).await
+        {
+            return;
         }
     }
     send_up(ctx, &up, Up::Fin).await;
@@ -2862,7 +3108,7 @@ mod tests {
             tag: None,
             target: TargetAddr::Ip(key.dst.ip()),
         });
-        let task = relay(ctx, plan, key, down_rx, up_tx);
+        let task = relay(ctx, plan, key, Arc::new(Link::default()), down_rx, up_tx);
         // Socket (storage is pooled), table entries (key → entry, id → key,
         // pipes), the relay task and its two channel headers.
         // Channel headers and the tokio task header.
@@ -2870,7 +3116,9 @@ mod tests {
         let tables = 2 * (size_of::<FlowKey>() + size_of::<TcpEntry>())
             + size_of::<FlowKey>()
             + size_of::<FlowId>()
-            + size_of::<Pipe>();
+            + size_of::<Pipe>()
+            + size_of::<Link>()
+            + 16;
         let total =
             size_of::<tcp::Socket<'static>>() + tables + std::mem::size_of_val(&task) + channels;
         println!(

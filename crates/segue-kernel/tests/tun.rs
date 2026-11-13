@@ -216,6 +216,8 @@ struct Seg {
     seq: u32,
     ack_no: u32,
     mss: Option<u16>,
+    /// Advertised receive window (no scaling: test SYNs offer none).
+    window: u16,
     payload: Vec<u8>,
 }
 
@@ -244,6 +246,7 @@ fn seg(pkt: &[u8]) -> Seg {
         seq: t.seq_number().0 as u32,
         ack_no: t.ack_number().0 as u32,
         mss: repr.max_seg_size,
+        window: t.window_len(),
         payload: t.payload().to_vec(),
     }
 }
@@ -1986,4 +1989,270 @@ async fn tun_second_quic_connection_on_same_tuple_is_classified() {
         );
         assert_eq!(e.dialer.udp_dials.lock().unwrap().len(), 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// r6 R5: a TUN flow through a real segue session keeps moving bytes both
+// ways while every elastic block of the shared pool is held elsewhere.
+
+/// Engine stand-in: every carrier is a duplex pipe into one in-process
+/// relay.
+struct RelayEngine {
+    accept: mpsc::Sender<segue_session::driver::BoxCarrier>,
+}
+
+#[async_trait]
+impl Dialer for RelayEngine {
+    async fn dial(
+        &self,
+        _tag: Option<&str>,
+        _addr: &TargetAddr,
+        _port: u16,
+    ) -> Result<segue_kernel::dial::Stream, DialError> {
+        let (client, relay) = tokio::io::duplex(64 << 10);
+        self.accept
+            .send(Box::new(relay))
+            .await
+            .map_err(|_| DialError("relay gone".into()))?;
+        Ok(Box::new(client))
+    }
+}
+
+fn pattern_byte(i: u64, salt: u8) -> u8 {
+    ((i % 251) as u8) ^ salt
+}
+
+/// The application side of one TCP flow, by hand: sends `up` bytes and
+/// takes the download until the site's FIN, acknowledging everything,
+/// retransmitting from the last ACK when nothing moves. The FIN goes out
+/// once `site_got` shows the whole upload reached the site (a relay that
+/// closes a session with data still buffered is a separate bug, not what
+/// this exercises). Returns the download.
+async fn raw_transfer(
+    h: &mut Harness,
+    src: SocketAddr,
+    dst: SocketAddr,
+    up: usize,
+    site_got: &std::sync::atomic::AtomicUsize,
+) -> Vec<u8> {
+    const SEG: usize = 1000;
+    h.send(tcp(src, dst, SYN, 1000, 0, b"")).await;
+    let synack = h.next_meaningful().await;
+    assert!(synack.syn && synack.ack, "no SYN-ACK");
+    let iss = 1001u32;
+    let mut their_next = synack.seq.wrapping_add(1);
+    h.send(tcp(src, dst, ACK, iss, their_next, b"")).await;
+    let body: Vec<u8> = (0..up as u64).map(|i| pattern_byte(i, 0x5a)).collect();
+    let (mut sent, mut acked) = (0usize, 0usize);
+    let mut fin_sent = false;
+    let mut down = Vec::new();
+    let mut their_fin = false;
+    let mut window = synack.window as usize;
+    while !(their_fin && fin_sent && acked > up) {
+        while sent < up && sent < acked + window {
+            let n = SEG.min(up - sent).min(acked + window - sent);
+            let seq = iss.wrapping_add(sent as u32);
+            h.send(tcp(src, dst, ACK, seq, their_next, &body[sent..sent + n]))
+                .await;
+            sent += n;
+        }
+        if sent == up
+            && acked == up
+            && !fin_sent
+            && site_got.load(std::sync::atomic::Ordering::SeqCst) >= up
+        {
+            let seq = iss.wrapping_add(up as u32);
+            h.send(tcp(src, dst, FIN, seq, their_next, b"")).await;
+            fin_sent = true;
+            sent += 1;
+        }
+        let wait = if acked == up && !fin_sent { 5 } else { 300 };
+        let pkt = tokio::time::timeout(Duration::from_millis(wait), h.from_stack.recv()).await;
+        let Ok(Some(pkt)) = pkt else {
+            if acked == up && !fin_sent {
+                continue;
+            }
+            // Nothing moved: resend from the last ACK.
+            sent = acked.min(up);
+            fin_sent = false;
+            h.send(tcp(
+                src,
+                dst,
+                ACK,
+                iss.wrapping_add(sent as u32),
+                their_next,
+                b"",
+            ))
+            .await;
+            continue;
+        };
+        let s = seg(&pkt);
+        assert!(!s.rst, "flow reset after {} down / {acked} up", down.len());
+        if s.ack {
+            let a = s.ack_no.wrapping_sub(iss) as usize;
+            if a >= acked && a <= sent {
+                acked = a;
+                window = s.window as usize;
+            }
+        }
+        let mut reply = false;
+        if !s.payload.is_empty() {
+            if s.seq == their_next {
+                down.extend_from_slice(&s.payload);
+                their_next = their_next.wrapping_add(s.payload.len() as u32);
+            }
+            reply = true;
+        }
+        if s.fin && s.seq.wrapping_add(s.payload.len() as u32) == their_next && !their_fin {
+            their_fin = true;
+            their_next = their_next.wrapping_add(1);
+            reply = true;
+        }
+        if reply {
+            let seq = iss.wrapping_add(sent.min(up + usize::from(fin_sent)) as u32);
+            h.send(tcp(src, dst, ACK, seq, their_next, b"")).await;
+        }
+    }
+    down
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tun_session_flow_moves_both_ways_with_the_elastic_pool_spent() {
+    use segue_kernel::session::{Exit, KernelDialer, SegueRoute};
+    use segue_session::codec::{Kind, Target};
+    use segue_session::driver::{run_relay, BoxCarrier, SiteConnector};
+    use segue_session::pool::{Grant, Pool, Tier};
+    use segue_session::relay::{AllowAll, RelayTable};
+    const UP: usize = 192 << 10;
+    const DOWN: u64 = 192 << 10;
+
+    let pool = Pool::new(1 << 20);
+    // The site: sends DOWN pattern bytes then FIN, reads and checks the
+    // upload, reports how much arrived.
+    let (got_tx, mut got_rx) = mpsc::unbounded_channel::<usize>();
+    let site_got = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = site_got.clone();
+    let (connected_tx, mut connected_rx) = mpsc::unbounded_channel::<()>();
+    let site: SiteConnector = Arc::new(move |_t: Target, _k: Kind| {
+        let got_tx = got_tx.clone();
+        let connected_tx = connected_tx.clone();
+        let seen = seen.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(64 << 10);
+            let (mut r, mut w) = tokio::io::split(b);
+            tokio::spawn(async move {
+                let mut i = 0u64;
+                while i < DOWN {
+                    let chunk: Vec<u8> = (i..(i + 4096).min(DOWN))
+                        .map(|x| pattern_byte(x, 0))
+                        .collect();
+                    if w.write_all(&chunk).await.is_err() {
+                        return;
+                    }
+                    i += chunk.len() as u64;
+                }
+                let _ = w.shutdown().await;
+            });
+            tokio::spawn(async move {
+                let mut at = 0u64;
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match r.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            for &x in &buf[..n] {
+                                assert_eq!(x, pattern_byte(at, 0x5a), "upload byte {at}");
+                                at += 1;
+                            }
+                            seen.store(at as usize, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                }
+                let _ = got_tx.send(at as usize);
+            });
+            let _ = connected_tx.send(());
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let (accept_tx, accept_rx) = mpsc::channel(16);
+    let table = RelayTable::new(
+        segue_session::Config::default(),
+        Pool::new(8 << 20),
+        Box::new(AllowAll),
+        9,
+    );
+    tokio::spawn(run_relay(table, accept_rx, site, None));
+    let dialer = KernelDialer::new(
+        Arc::new(RelayEngine { accept: accept_tx }),
+        vec![Exit {
+            name: "la".into(),
+            carrier: "relay".into(),
+            relay: "127.0.0.1:7443".parse().unwrap(),
+            node_id: 1,
+        }],
+        [(
+            "p1".to_string(),
+            SegueRoute {
+                ticket: b"ticket".to_vec(),
+                exit_class: 0,
+            },
+        )]
+        .into(),
+        Default::default(),
+    )
+    .with_pool(pool.clone());
+    let mut tun = TunStack::new(Arc::new(rules_proxy_default()), Arc::new(dialer));
+    tun.config.shared_pool = Some(pool.clone());
+    let mut h = Harness::run(tun);
+
+    // Hold every elastic block from the moment the flow's session is
+    // admitted to the end of the transfer: what windows, replay buffers and
+    // rings of other flows would hold. Whatever the flow frees is taken
+    // again within a few milliseconds.
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hog = tokio::spawn({
+        let (pool, done) = (pool.clone(), done.clone());
+        async move {
+            connected_rx.recv().await.expect("site connected");
+            let mut hog = Vec::new();
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                while let Some(g) = Grant::fixed(&pool, BLOCK) {
+                    hog.push(g);
+                }
+                assert!(pool.used_blocks() >= pool.limit(Tier::Elastic));
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            hog
+        }
+    });
+    let started = Instant::now();
+    let down = tokio::time::timeout(
+        Duration::from_secs(60),
+        raw_transfer(&mut h, CLIENT4, SITE4, UP, &site_got),
+    )
+    .await
+    .expect("TUN flow stalled with the pool spent");
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let hog = hog.await.unwrap();
+    println!(
+        "{} KiB each way in {:?} with {} blocks hogged",
+        UP >> 10,
+        started.elapsed(),
+        hog.len()
+    );
+    assert!(
+        hog.len() > 100,
+        "the pool was never spent ({} blocks)",
+        hog.len()
+    );
+    assert_eq!(down.len() as u64, DOWN);
+    for (i, &x) in down.iter().enumerate() {
+        assert_eq!(x, pattern_byte(i as u64, 0), "download byte {i}");
+    }
+    let up = tokio::time::timeout(Duration::from_secs(10), got_rx.recv())
+        .await
+        .expect("site never saw the upload end")
+        .unwrap();
+    assert_eq!(up, UP);
+    drop(hog);
 }
