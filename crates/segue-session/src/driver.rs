@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::client::{ClientSession, CloseReason, State, Tx};
 use crate::codec::{code, ty, CtrlHello, Frame, FrameDecoder, Kind, SessionId, Target};
-use crate::pool::{Grant as PoolGrant, Pool, Tier, FRAME_MAX};
+use crate::pool::{Grant as PoolGrant, Pool, Ticket, Tier, FRAME_MAX};
 use crate::relay::{Grant, RelayEvent, RelayTable};
 use crate::ProtoError;
 
@@ -159,29 +159,33 @@ fn charged(data: Vec<u8>, mut c: Charge) -> Out {
 
 /// Room for one carrier frame of `min..=want` bytes: elastic blocks while
 /// there are any, else the transport region, one frame per `slot` at a
-/// time. `None`: wait for blocks.
+/// time and in arrival order (`ticket` is the caller's place in line, kept
+/// across attempts while it waits; r7 #1). `None`: wait for blocks.
 fn take_charge(
     pool: &Arc<Pool>,
     slot: &Arc<AtomicBool>,
+    ticket: &mut Option<Ticket>,
     min: usize,
     want: usize,
 ) -> Option<Charge> {
     if let Some(g) = PoolGrant::between(pool, min, want, Tier::Elastic) {
+        *ticket = None;
         return Some(Charge {
             _slot: None,
             grant: g,
         });
     }
     if slot.swap(true, Ordering::AcqRel) {
+        // This session already holds its frame there: it must not hold up
+        // the line meanwhile.
+        *ticket = None;
         return None;
     }
     let held = Slot(slot.clone());
-    let g = PoolGrant::between(
-        pool,
-        min,
-        want.min(min.max(TRANSPORT_FRAME)),
-        Tier::Transport,
-    )?;
+    let t = ticket.get_or_insert_with(|| pool.ticket());
+    // The ticket stays with the caller until the frame is built (a frame
+    // that needs a larger charge keeps its place in line).
+    let g = PoolGrant::transport(pool, min, want.min(min.max(TRANSPORT_FRAME)), t)?;
     Some(Charge {
         _slot: Some(held),
         grant: g,
@@ -238,6 +242,7 @@ async fn read_charged<R: AsyncRead + Unpin>(
 ) {
     let mut r = tokio::io::BufReader::with_capacity(SMALL_READ, r);
     let slot = Arc::new(AtomicBool::new(false));
+    let mut ticket = None;
     loop {
         let mut hdr = [0u8; 10];
         if r.read_exact(&mut hdr[..3]).await.is_err() {
@@ -259,18 +264,11 @@ async fn read_charged<R: AsyncRead + Unpin>(
         // DATA keeps the payload's allocation; anything else is decoded
         // into a copy while the payload is still held.
         let cover = if ty == ty::DATA { len } else { 2 * len };
-        let charge = if cover == 0 {
-            None
-        } else {
-            Some(
-                pool.wait_for(|| take_charge(&pool, &slot, cover, cover))
-                    .await,
-            )
-        };
-        let mut payload = vec![0u8; len];
-        if r.read_exact(&mut payload).await.is_err() {
+        let Some((payload, charge)) =
+            read_body(&mut r, &pool, &slot, &mut ticket, len, cover).await
+        else {
             break;
-        }
+        };
         match Frame::decode_owned(ty, flags, payload) {
             Ok(Some(f)) => {
                 if tx.send(CarrierEv::Frame(cid, Ok(f), charge)).await.is_err() {
@@ -285,6 +283,85 @@ async fn read_charged<R: AsyncRead + Unpin>(
         }
     }
     let _ = tx.send(CarrierEv::Closed(cid)).await;
+}
+
+/// Read a frame body of `len` bytes whose memory (with what decoding it
+/// needs, `cover`) is charged before it is held: elastic blocks when there
+/// are any, else the whole frame from the transport region (in line, see
+/// [`take_charge`]), and only once its first byte has arrived, so a
+/// carrier that delivers a header and stalls holds nothing there. A frame
+/// charged to the transport region must then arrive within the pool's
+/// hold; a carrier that does not deliver it in time is closed (the peer
+/// replays on the next one; r7 #1). Whole frames only: a reader never
+/// holds part of a frame while waiting for more blocks, so readers cannot
+/// wait on each other. `None`: the carrier ended or timed out.
+async fn read_body<R: AsyncRead + Unpin>(
+    r: &mut tokio::io::BufReader<R>,
+    pool: &Arc<Pool>,
+    slot: &Arc<AtomicBool>,
+    ticket: &mut Option<Ticket>,
+    len: usize,
+    cover: usize,
+) -> Option<(Vec<u8>, Option<Charge>)> {
+    use tokio::io::AsyncBufReadExt;
+    if len == 0 {
+        return Some((Vec::new(), None));
+    }
+    let mut charge = PoolGrant::between(pool, cover, cover, Tier::Elastic).map(|g| Charge {
+        _slot: None,
+        grant: g,
+    });
+    if charge.is_none() {
+        // Nothing is charged while the body has not started.
+        if r.fill_buf().await.ok()?.is_empty() {
+            return None;
+        }
+        charge = Some(wait_charge(pool, slot, ticket, cover).await);
+        *ticket = None;
+    }
+    let mut payload = vec![0u8; len];
+    let transport = charge
+        .as_ref()
+        .is_some_and(|c| c.grant.tier() == Tier::Transport);
+    let read = r.read_exact(&mut payload);
+    let ok = if transport {
+        matches!(
+            tokio::time::timeout(pool.transport_hold(), read).await,
+            Ok(Ok(_))
+        )
+    } else {
+        read.await.is_ok()
+    };
+    ok.then_some((payload, charge))
+}
+
+/// [`take_charge`] of `cover` bytes, waiting for blocks: listening before
+/// the second try (nothing given in between is missed), and for its turn
+/// when in line for the transport region.
+async fn wait_charge(
+    pool: &Arc<Pool>,
+    slot: &Arc<AtomicBool>,
+    ticket: &mut Option<Ticket>,
+    cover: usize,
+) -> Charge {
+    loop {
+        if let Some(c) = take_charge(pool, slot, ticket, cover, cover) {
+            return c;
+        }
+        let freed = pool.armed();
+        if let Some(c) = take_charge(pool, slot, ticket, cover, cover) {
+            return c;
+        }
+        match ticket.as_ref() {
+            Some(t) => {
+                tokio::select! {
+                    _ = t.ready() => {}
+                    _ = freed.wait() => {}
+                }
+            }
+            None => freed.wait().await,
+        }
+    }
 }
 
 /// Relay side: no pool, a [`FrameDecoder`] over adaptive reads.
@@ -564,6 +641,10 @@ where
     let mut app_shut = false;
     let pool = s.pool().clone();
     let tx_slot = Arc::new(AtomicBool::new(false));
+    let mut tx_ticket: Option<Ticket> = None;
+    // The carrier whose queued frame holds the transport slot, and until
+    // when it may (r7 #1).
+    let mut tx_hold: Option<(u64, tokio::time::Instant)> = None;
     let mut abuf = ReadBuffer::new(Some(pool.clone()));
     // A queued message the pool could not cover is waiting for blocks.
     let mut pool_blocked;
@@ -590,6 +671,7 @@ where
         }
         tasks.prune();
         pool_blocked = false;
+        let mut freed = None;
         // Carrier output, generated only while the writer has room and
         // there is something to send. Each queued frame is charged to the
         // pool before it is built (elastic blocks, else the session's one
@@ -599,14 +681,32 @@ where
             if let Some(io) = carriers.get(&cid) {
                 let mut min = 1;
                 while io.tx.capacity() > 0 && s.has_transmit(cid, t) {
-                    let Some(c) = take_charge(&pool, &tx_slot, min, FRAME_MAX) else {
+                    let c = match take_charge(&pool, &tx_slot, &mut tx_ticket, min, FRAME_MAX) {
+                        Some(c) => Some(c),
+                        None => {
+                            // Listen before the second try, so blocks or a
+                            // turn in line given in between wake the loop.
+                            freed = Some(pool.armed());
+                            take_charge(&pool, &tx_slot, &mut tx_ticket, min, FRAME_MAX)
+                        }
+                    };
+                    let Some(c) = c else {
                         pool_blocked = true;
                         break;
                     };
+                    freed = None;
+                    let transport = c.grant.tier() == Tier::Transport;
                     let mut v = Vec::new();
                     match s.poll_transmit_into(cid, t, &mut v, c.grant.bytes()) {
                         Tx::Wrote => {
+                            if transport {
+                                tx_hold = Some((
+                                    cid,
+                                    tokio::time::Instant::now() + pool.transport_hold(),
+                                ));
+                            }
                             let _ = io.tx.try_send(charged(v, c));
+                            tx_ticket = None;
                             min = 1;
                         }
                         Tx::Idle => break,
@@ -614,6 +714,14 @@ where
                     }
                 }
             }
+        }
+        if !pool_blocked {
+            // Not waiting for blocks: leave the line for the transport
+            // region.
+            tx_ticket = None;
+        }
+        if !tx_slot.load(Ordering::Acquire) {
+            tx_hold = None;
         }
         // Received bytes go from the receive buffer straight to the app,
         // with no buffer in between: when the app would block, one byte is
@@ -664,6 +772,7 @@ where
         let backoff = connect_backoff.filter(|_| !connecting);
         let abuf_idle = abuf.idle_at();
         let drain = tasks.next_deadline();
+        let hold_at = tx_hold.map(|(_, d)| d);
         tokio::select! {
             ev = ev_rx.recv() => {
                 let t = now();
@@ -761,11 +870,27 @@ where
                 }
             }
             _ = writable.notified() => {}
-            // The short timeout covers blocks freed between the failed
-            // charge and this wait.
+            // Armed before the last failed charge, so nothing given back
+            // since is missed; the timeout is a backstop.
             _ = async {
+                let freed = freed.take();
                 tokio::select! {
-                    _ = pool.freed() => {}
+                    _ = async {
+                        let freed = async {
+                            match freed {
+                                Some(f) => f.wait().await,
+                                None => pool.freed().await,
+                            }
+                        };
+                        match &tx_ticket {
+                            // First in line: also woken for its turn.
+                            Some(t) => tokio::select! {
+                                _ = t.ready() => {}
+                                _ = freed => {}
+                            },
+                            None => freed.await,
+                        }
+                    } => {}
                     _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
                 }
             }, if pool_blocked => {}
@@ -775,6 +900,21 @@ where
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
             _ = tokio::time::sleep_until(backoff.unwrap_or_else(tokio::time::Instant::now)), if backoff.is_some() => {}
             _ = tokio::time::sleep_until(drain.unwrap_or_else(tokio::time::Instant::now)), if drain.is_some() => {}
+            // A frame held the transport region past the hold: its carrier
+            // stopped moving. Give the carrier up (the frame's blocks go
+            // back with its writer); the session resumes on a new one and
+            // replays what was not acknowledged (r7 #1).
+            _ = tokio::time::sleep_until(hold_at.unwrap_or_else(tokio::time::Instant::now)), if hold_at.is_some() => {
+                if let Some((cid, _)) = tx_hold.take() {
+                    if tx_slot.load(Ordering::Acquire) {
+                        s.on_carrier_closed(cid, now());
+                        if let Some(io) = carriers.remove(&cid) {
+                            io.reader.abort();
+                            io.writer.abort();
+                        }
+                    }
+                }
+            }
         }
     }
     if let Some(h) = dial.take() {

@@ -1008,3 +1008,204 @@ async fn idle_sessions_hold_only_their_floors_before_and_after_a_burst() {
     }
     relay.abort();
 }
+
+/// A carrier between the client end `a` and the relay end `b`: both ways
+/// until `freeze` is set; then the downlink delivers the header of a
+/// `len`-byte DATA frame and `body` bytes of it, never the rest (a carrier
+/// that stalls mid-frame), while the uplink keeps moving.
+async fn freezable(
+    a: DuplexStream,
+    b: DuplexStream,
+    freeze: Arc<std::sync::atomic::AtomicBool>,
+    len: u16,
+    body: usize,
+) {
+    let (mut ar, mut aw) = tokio::io::split(a);
+    let (mut br, mut bw) = tokio::io::split(b);
+    let up = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        while let Ok(n) = ar.read(&mut buf).await {
+            if n == 0 || bw.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+    let mut buf = vec![0u8; 4096];
+    loop {
+        if freeze.load(Ordering::SeqCst) {
+            // DATA, no flags, two-byte varint length.
+            let len = len | 0x4000;
+            let hdr = [0x10, 0, (len >> 8) as u8, len as u8];
+            let _ = aw.write_all(&hdr).await;
+            let _ = aw.write_all(&vec![0u8; body]).await;
+            let _ = up.await;
+            return;
+        }
+        tokio::select! {
+            r = br.read(&mut buf) => match r {
+                Ok(0) | Err(_) => break,
+                Ok(n) => { if aw.write_all(&buf[..n]).await.is_err() { break; } }
+            },
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn carriers_that_stopped_moving_cannot_starve_a_healthy_session() {
+    // r7 #1: with the elastic part spent, every frame is charged to the
+    // transport region. Idle open sessions whose carriers then deliver a
+    // frame header and stall each held a frame's charge there waiting for
+    // the body (no data in flight, so no stall timer fires), for ever, and
+    // the region being cumulative they ate the relay region too, so a
+    // session with a working carrier could not read a single ACK. Now the
+    // region is disjoint, a body is charged only once it starts arriving,
+    // a frame may hold the region only for the pool's hold time (the
+    // carrier is then given up; the session resumes on a new one), and the
+    // first in line has its frame reserved.
+    use segue_session::pool::{Grant, BLOCK};
+    const STUCK: usize = 32;
+    const PARTIAL: usize = 3;
+    const PARTIAL_BODY: usize = 8000;
+    const UP: usize = 64 << 10;
+    let cfg = Config::default();
+    let pool = Pool::new(8 << 20);
+    pool.set_transport_hold(Duration::from_millis(300));
+    let table = RelayTable::new(cfg.clone(), Pool::new(8 << 20), Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(64);
+    // Bytes the sites got: the healthy session's, and everyone's.
+    let healthy_got = Arc::new(AtomicUsize::new(0));
+    let all_got = Arc::new(AtomicUsize::new(0));
+    let sink: SiteConnector = {
+        let (healthy_got, all_got) = (healthy_got.clone(), all_got.clone());
+        Arc::new(move |t, _k| {
+            let mine = matches!(&t, Target::Domain(d, _) if d == "healthy.example");
+            let (healthy_got, all_got) = (healthy_got.clone(), all_got.clone());
+            Box::pin(async move {
+                let (a, mut b) = tokio::io::duplex(64 << 10);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 << 10];
+                    while let Ok(n) = b.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        all_got.fetch_add(n, Ordering::SeqCst);
+                        if mine {
+                            healthy_got.fetch_add(n, Ordering::SeqCst);
+                        }
+                    }
+                });
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    let relay = tokio::spawn(run_relay(table, accept_rx, sink, None));
+    // Every carrier goes to the relay through a pump that stops moving
+    // bytes once `freeze` is set (healthy ones never freeze); carriers
+    // dialled after that are frozen from the start.
+    let freeze = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dials = Arc::new(AtomicUsize::new(0));
+    let conn = |freeze: Arc<std::sync::atomic::AtomicBool>, len: u16, body: usize| -> Connector {
+        let accept_tx = accept_tx.clone();
+        let dials = dials.clone();
+        Arc::new(move || {
+            let accept_tx = accept_tx.clone();
+            let freeze = freeze.clone();
+            dials.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let (a, mid) = tokio::io::duplex(1024);
+                let (to_relay, b) = tokio::io::duplex(64 << 10);
+                tokio::spawn(freezable(mid, to_relay, freeze, len, body));
+                accept_tx
+                    .send(Box::new(b))
+                    .await
+                    .map_err(|_| std::io::Error::other("gone"))?;
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    let healthy_conn = conn(Arc::new(std::sync::atomic::AtomicBool::new(false)), 0, 0);
+    // Most stall right after the header of a one-block frame (enough of
+    // them to charge every draining block before); a few after part of a
+    // large body.
+    let stuck_conn = conn(freeze.clone(), 4000, 0);
+    let partial_conn = conn(freeze.clone(), 16_000, PARTIAL_BODY);
+    let mut hp = params();
+    hp.target = Target::Domain("healthy.example".into(), 443);
+    let hs = ClientSession::new(cfg.clone(), &pool, hp, Instant::now()).unwrap();
+    let (mut happ, hfar) = tokio::io::duplex(64 << 10);
+    let healthy = tokio::spawn(run_client(hs, hfar, healthy_conn));
+    let mut stuck_apps = Vec::new();
+    let mut stuck = Vec::new();
+    for i in 0..STUCK + PARTIAL {
+        let s = ClientSession::new(cfg.clone(), &pool, params(), Instant::now()).unwrap();
+        let (app, far) = tokio::io::duplex(64 << 10);
+        let c = if i < STUCK { &stuck_conn } else { &partial_conn };
+        stuck.push(tokio::spawn(run_client(s, far, c.clone())));
+        stuck_apps.push(app);
+    }
+    // Everyone opens and delivers a first request.
+    happ.write_all(b"hello").await.unwrap();
+    for a in &mut stuck_apps {
+        a.write_all(b"hello").await.unwrap();
+    }
+    assert!(
+        settle(Duration::from_secs(10), || all_got.load(Ordering::SeqCst)
+            == 5 * (STUCK + PARTIAL + 1))
+        .await,
+        "sessions never opened"
+    );
+    let dialled = dials.load(Ordering::SeqCst);
+    // Let the ACKs settle, spend the elastic part, then stall the stuck
+    // sessions' downlinks mid-frame.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut hog = Vec::new();
+    while let Some(g) = Grant::fixed(&pool, BLOCK) {
+        hog.push(g);
+    }
+    freeze.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A header alone holds nothing; a started body holds its frame, for
+    // the hold at most.
+    let held = pool.transport_used_blocks();
+    assert!(
+        held <= PARTIAL * 16_000usize.div_ceil(BLOCK),
+        "stalled carriers hold {held} transport blocks"
+    );
+    // Written from a task: a starved session would never take it all.
+    let up = pattern(UP, 5);
+    let writer = tokio::spawn(async move {
+        let _ = happ.write_all(&up).await;
+        happ
+    });
+    let t0 = Instant::now();
+    let ok = settle(Duration::from_secs(20), || {
+        healthy_got.load(Ordering::SeqCst) == 5 + UP
+    })
+    .await;
+    println!("healthy upload done in {:?}", t0.elapsed());
+    assert!(
+        ok,
+        "healthy session starved: {} of {UP} bytes delivered (transport region {}/{} blocks, {} waiting)",
+        healthy_got.load(Ordering::SeqCst) - 5,
+        pool.transport_used_blocks(),
+        pool.transport_blocks(),
+        pool.queued()
+    );
+    // Carriers holding transport blocks past the hold were given up.
+    assert!(
+        settle(Duration::from_secs(5), || dials.load(Ordering::SeqCst)
+            >= dialled + PARTIAL)
+        .await,
+        "stuck carriers were never given up"
+    );
+    drop(hog);
+    drop(writer.await);
+    for h in stuck {
+        h.abort();
+    }
+    healthy.abort();
+    relay.abort();
+}
