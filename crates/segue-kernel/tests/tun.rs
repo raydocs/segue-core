@@ -3252,3 +3252,389 @@ async fn tun_and_session_flows_over_a_loopback_tcp_carrier_with_pool_and_rss() {
     relay.abort();
     acceptor.abort();
 }
+
+/// Process CPU time (user + system) and voluntary context switches (each
+/// one a thread going to sleep: a proxy for wakeups).
+fn process_cpu() -> (Duration, i64) {
+    // SAFETY: valid out pointer.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    assert_eq!(r, 0);
+    let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+    (tv(ru.ru_utime) + tv(ru.ru_stime), ru.ru_nvcsw as i64)
+}
+
+fn sha(b: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(b).into()
+}
+
+/// r10 closing checklist item 4: everything at once over real loopback
+/// TCP. Slow carriers (a throttling TCP proxy, 10 KB/s each way) carry
+/// slow sessions on the client's shared 1 MiB pool, whose elastic part is
+/// kept spent (full pool contention: the slow sessions send through the
+/// transport region and wait on credit with ACKs due, r10 N4), while a
+/// healthy TUN flow goes both ways through `KernelDialer` over a direct
+/// loopback TCP carrier. Checks: every byte intact (SHA-256 of each
+/// stream), reconnects bounded (slow dials and healthy carriers), CPU
+/// and voluntary context switches per wall second bounded (no spinning
+/// while blocked on credit), host RSS growth bounded. Before the N4 fix
+/// the run took ~85% of a core here; now ~15%.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_tcp_carriers_full_pool_and_a_healthy_tun_flow_over_loopback() {
+    use segue_kernel::session::{Exit, KernelDialer, SegueRoute};
+    use segue_session::client::{ClientSession, CloseReason, OpenParams};
+    use segue_session::codec::{Kind, Target};
+    use segue_session::driver::{run_client, run_relay, BoxCarrier, Connector, SiteConnector};
+    use segue_session::pool::{Grant, Pool, Tier};
+    use segue_session::relay::{AllowAll, RelayTable};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    const UP: usize = 192 << 10;
+    const DOWN: u64 = 192 << 10;
+    const SLOW: usize = 6;
+    const SLOW_UP: usize = 8 << 10;
+    const SLOW_DOWN: usize = 48 << 10;
+    const SLOW_CHUNK: usize = 1000;
+    const SLOW_EVERY: Duration = Duration::from_millis(100);
+    const MIB: f64 = (1 << 20) as f64;
+
+    let pool = Pool::new(1 << 20);
+    let site_got = Arc::new(AtomicUsize::new(0));
+    let (up_tx, mut up_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (connected_tx, mut connected_rx) = mpsc::unbounded_channel::<()>();
+    let slow_up: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>> = Default::default();
+    let site: SiteConnector = {
+        let (seen, slow_up) = (site_got.clone(), slow_up.clone());
+        Arc::new(move |t: Target, _k: Kind| {
+            let (up_tx, connected_tx) = (up_tx.clone(), connected_tx.clone());
+            let (seen, slow_up) = (seen.clone(), slow_up.clone());
+            Box::pin(async move {
+                let (a, b) = tokio::io::duplex(64 << 10);
+                let (mut r, mut w) = tokio::io::split(b);
+                if let Target::Domain(name, _) = t {
+                    // Slow sessions: a large download in full frames; the
+                    // upload kept for its hash.
+                    tokio::spawn(async move {
+                        let down: Vec<u8> =
+                            (0..SLOW_DOWN as u64).map(|x| pattern_byte(x, 3)).collect();
+                        let _ = w.write_all(&down).await;
+                        let _ = w.shutdown().await;
+                        std::future::pending::<()>().await;
+                        drop(w);
+                    });
+                    tokio::spawn(async move {
+                        let mut got = Vec::new();
+                        let _ = r.read_to_end(&mut got).await;
+                        slow_up.lock().unwrap().insert(name, got);
+                        std::future::pending::<()>().await;
+                        drop(r);
+                    });
+                    return Ok(Box::new(a) as BoxCarrier);
+                }
+                tokio::spawn(async move {
+                    let mut i = 0u64;
+                    while i < DOWN {
+                        let chunk: Vec<u8> = (i..(i + 4096).min(DOWN))
+                            .map(|x| pattern_byte(x, 0))
+                            .collect();
+                        if w.write_all(&chunk).await.is_err() {
+                            return;
+                        }
+                        i += chunk.len() as u64;
+                    }
+                    let _ = w.shutdown().await;
+                });
+                tokio::spawn(async move {
+                    let mut got = Vec::new();
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match r.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                got.extend_from_slice(&buf[..n]);
+                                seen.store(got.len(), Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    let _ = up_tx.send(got);
+                });
+                let _ = connected_tx.send(());
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+
+    // The relay behind a real loopback listener.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(64);
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let acceptor = tokio::spawn({
+        let accepted = accepted.clone();
+        async move {
+            while let Ok((s, _)) = listener.accept().await {
+                let _ = s.set_nodelay(true);
+                accepted.fetch_add(1, Ordering::SeqCst);
+                if accept_tx.send(Box::new(s)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    let table = RelayTable::new(
+        segue_session::Config::default(),
+        Pool::new(8 << 20),
+        Box::new(AllowAll),
+        9,
+    );
+    let relay = tokio::spawn(run_relay(table, accept_rx, site, None));
+
+    // Slow carriers: a TCP proxy in front of the relay that moves at most
+    // SLOW_CHUNK bytes per SLOW_EVERY each way, over small socket buffers.
+    let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow_addr = slow_listener.local_addr().unwrap();
+    async fn throttle(
+        mut from: tokio::net::tcp::OwnedReadHalf,
+        mut to: tokio::net::tcp::OwnedWriteHalf,
+    ) {
+        let mut buf = vec![0u8; SLOW_CHUNK];
+        let mut tick = tokio::time::interval(SLOW_EVERY);
+        loop {
+            tick.tick().await;
+            match from.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if to.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = to.shutdown().await;
+    }
+    let proxy = tokio::spawn(async move {
+        while let Ok((c, _)) = slow_listener.accept().await {
+            let Ok(u) = tokio::net::TcpStream::connect(relay_addr).await else {
+                continue;
+            };
+            let _ = (c.set_nodelay(true), u.set_nodelay(true));
+            let (cr, cw) = c.into_split();
+            let (ur, uw) = u.into_split();
+            tokio::spawn(throttle(cr, uw));
+            tokio::spawn(throttle(ur, cw));
+        }
+    });
+    let slow_dials = Arc::new(AtomicUsize::new(0));
+    let slow_connector: Connector = {
+        let dials = slow_dials.clone();
+        Arc::new(move || {
+            dials.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let s = tokio::net::TcpSocket::new_v4()?;
+                s.set_recv_buffer_size(4096)?;
+                s.set_send_buffer_size(4096)?;
+                let s = s.connect(slow_addr).await?;
+                let _ = s.set_nodelay(true);
+                Ok(Box::new(s) as BoxCarrier)
+            })
+        })
+    };
+
+    // Sample the host's RSS for the whole run.
+    let done = Arc::new(AtomicBool::new(false));
+    let rss_base = host_rss_kib().expect("ps reports no RSS");
+    let rss_peak = Arc::new(AtomicU64::new(rss_base));
+    let sampler = std::thread::spawn({
+        let (done, rss_peak) = (done.clone(), rss_peak.clone());
+        move || {
+            while !done.load(Ordering::SeqCst) {
+                if let Some(k) = host_rss_kib() {
+                    rss_peak.fetch_max(k, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    });
+
+    let mut slow = Vec::new();
+    for i in 0..SLOW {
+        let params = OpenParams {
+            ticket: b"ticket".to_vec(),
+            kind: Kind::Tcp,
+            target: Target::Domain(format!("slow{i}.example"), 443),
+            exit_class: 0,
+            anchor_node_id: 1,
+            instance_hint: 9,
+        };
+        let s = ClientSession::new(Default::default(), &pool, params, std::time::Instant::now())
+            .expect("slow session admitted");
+        let (mut app, far) = tokio::io::duplex(64 << 10);
+        let client = tokio::spawn(run_client(s, far, slow_connector.clone()));
+        slow.push(tokio::spawn(async move {
+            let (mut r, mut w) = tokio::io::split(&mut app);
+            let up: Vec<u8> = (0..SLOW_UP as u64)
+                .map(|x| pattern_byte(x, i as u8 + 1))
+                .collect();
+            let ((), down) = tokio::join!(
+                async {
+                    let _ = w.write_all(&up).await;
+                    let _ = w.shutdown().await;
+                },
+                async {
+                    let mut down = Vec::new();
+                    let _ = r.read_to_end(&mut down).await;
+                    down
+                }
+            );
+            (client.await.unwrap(), down)
+        }));
+    }
+
+    // The healthy flow: TUN → KernelDialer → a direct loopback carrier.
+    let dialer = KernelDialer::new(
+        Arc::new(LoopbackEngine { relay: relay_addr }),
+        vec![Exit {
+            name: "la".into(),
+            carrier: "relay".into(),
+            relay: relay_addr,
+            node_id: 1,
+        }],
+        [(
+            "p1".to_string(),
+            SegueRoute {
+                ticket: b"ticket".to_vec(),
+                exit_class: 0,
+            },
+        )]
+        .into(),
+        Default::default(),
+    )
+    .with_pool(pool.clone());
+    let mut tun = TunStack::new(Arc::new(rules_proxy_default()), Arc::new(dialer));
+    tun.config.shared_pool = Some(pool.clone());
+    let mut h = Harness::run(tun);
+
+    // Keep the elastic part spent once the healthy flow is admitted.
+    let watch = tokio::spawn({
+        let (pool, done) = (pool.clone(), done.clone());
+        async move {
+            connected_rx.recv().await.expect("healthy site connected");
+            let mut hog = Vec::new();
+            let (mut peak, mut peak_transport) = (0, 0);
+            while !done.load(Ordering::SeqCst) {
+                while let Some(g) = Grant::fixed(&pool, BLOCK) {
+                    hog.push(g);
+                }
+                peak = peak.max(pool.used_blocks() + pool.transport_used_blocks());
+                peak_transport = peak_transport.max(pool.transport_used_blocks());
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            (hog.len(), peak, peak_transport)
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (cpu0, csw0) = process_cpu();
+    let started = Instant::now();
+    let down = tokio::time::timeout(
+        Duration::from_secs(60),
+        raw_transfer(&mut h, CLIENT4, SITE4, UP, &site_got),
+    )
+    .await
+    .expect("healthy TUN flow stalled behind the slow carriers");
+    let healthy = started.elapsed();
+    let slow_running = slow.iter().filter(|j| !j.is_finished()).count();
+    let want_down: Vec<u8> = (0..DOWN).map(|x| pattern_byte(x, 0)).collect();
+    assert_eq!(down.len() as u64, DOWN);
+    assert!(sha(&down) == sha(&want_down), "TUN download corrupted");
+    let up = tokio::time::timeout(Duration::from_secs(10), up_rx.recv())
+        .await
+        .expect("site never saw the upload end")
+        .unwrap();
+    let want_up: Vec<u8> = (0..UP as u64).map(|x| pattern_byte(x, 0x5a)).collect();
+    assert_eq!(up.len(), UP);
+    assert!(sha(&up) == sha(&want_up), "TUN upload corrupted");
+    // The slow sessions finish too, with the pool still spent.
+    let want_slow_down: Vec<u8> = (0..SLOW_DOWN as u64).map(|x| pattern_byte(x, 3)).collect();
+    for (i, j) in slow.into_iter().enumerate() {
+        let (reason, d) = tokio::time::timeout(Duration::from_secs(120), j)
+            .await
+            .expect("slow session never finished")
+            .unwrap();
+        assert_eq!(reason, CloseReason::Clean, "slow session {i}");
+        assert!(
+            sha(&d) == sha(&want_slow_down),
+            "slow session {i} download corrupted"
+        );
+    }
+    let wall = started.elapsed();
+    let (cpu1, csw1) = process_cpu();
+    done.store(true, Ordering::SeqCst);
+    let (hogged, peak, peak_transport) = watch.await.unwrap();
+    sampler.join().unwrap();
+    {
+        let got = slow_up.lock().unwrap();
+        for i in 0..SLOW {
+            let want: Vec<u8> = (0..SLOW_UP as u64)
+                .map(|x| pattern_byte(x, i as u8 + 1))
+                .collect();
+            let g = got
+                .get(&format!("slow{i}.example"))
+                .expect("slow upload missing");
+            assert!(sha(g) == sha(&want), "slow session {i} upload corrupted");
+        }
+    }
+    let cpu = cpu1 - cpu0;
+    let csw = csw1 - csw0;
+    let cpu_share = cpu.as_secs_f64() / wall.as_secs_f64();
+    let csw_rate = csw as f64 / wall.as_secs_f64();
+    let dials = slow_dials.load(Ordering::SeqCst);
+    // Direct carriers: the healthy flow's and the control stream, plus
+    // the slow sessions' proxied ones (the proxy dials the relay too).
+    let direct = accepted.load(Ordering::SeqCst) - dials;
+    let rss_peak = rss_peak.load(Ordering::SeqCst);
+    let grew_mib = (rss_peak - rss_base) as f64 * 1024.0 / MIB;
+    println!(
+        "loopback: healthy {} KiB each way in {healthy:?} ({slow_running} of {SLOW} slow still running), all in {wall:?}; \
+         pool {} blocks, {hogged} hogged, peak {peak} ({} elastic), transport peak {peak_transport}/{}; \
+         slow dials {dials}, direct carriers {direct}; CPU {cpu:?} ({:.0}% of one core), {csw} voluntary switches ({csw_rate:.0}/s); \
+         RSS {:.1} -> {:.1} MiB (+{grew_mib:.1})",
+        UP >> 10,
+        pool.blocks(),
+        pool.limit(Tier::Elastic),
+        pool.transport_blocks(),
+        cpu_share * 100.0,
+        rss_base as f64 * 1024.0 / MIB,
+        rss_peak as f64 * 1024.0 / MIB,
+    );
+    assert!(hogged > 100, "the pool was never spent ({hogged} blocks)");
+    assert!(
+        slow_running > 0,
+        "the slow sessions ended before the healthy flow: no contention"
+    );
+    assert!(
+        peak <= pool.blocks(),
+        "peak {peak} of {} blocks",
+        pool.blocks()
+    );
+    assert!(peak_transport <= pool.transport_blocks());
+    assert!(dials <= 2 * SLOW, "{dials} dials for {SLOW} slow sessions");
+    assert!(
+        direct <= 3,
+        "{direct} direct carriers: the healthy flow redialled"
+    );
+    // Mostly waiting on 10 KB/s carriers: a session spinning on a
+    // deadline it cannot serve burns a core on its own.
+    assert!(
+        cpu_share < 0.5,
+        "CPU {:.0}% of a core over {wall:?}",
+        cpu_share * 100.0
+    );
+    // A tight loop of timers that fire at once never sleeps, so it shows
+    // as CPU, not as switches; this bounds the other kind (a timer that
+    // wakes the thread every millisecond or so).
+    assert!(csw_rate < 20_000.0, "{csw_rate:.0} wakeups/s");
+    assert!(grew_mib < 128.0, "RSS grew {grew_mib:.1} MiB");
+    relay.abort();
+    acceptor.abort();
+    proxy.abort();
+}

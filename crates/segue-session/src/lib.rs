@@ -81,6 +81,39 @@ pub struct Timing {
     pub site_flush_max: Duration,
 }
 
+/// The shortest client stall bound (`t_stall`) a relay serves keepalives
+/// for: an announced bound below it is taken as this floor, so a peer
+/// cannot make the relay send ACKs in a loop. A client configured below
+/// it is refused by [`Timing::validate_client`] (r10 N3), so the floor
+/// only ever applies to a misbehaving peer.
+pub const MIN_CLIENT_STALL: Duration = Duration::from_millis(100);
+
+/// A client timing the protocol cannot honour.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TimingError {
+    #[error("t_stall {0:?} is below the {MIN_CLIENT_STALL:?} a relay serves keepalives for")]
+    StallTooShort(Duration),
+    #[error("t_stall {0:?} does not fit the wire field")]
+    StallTooLong(Duration),
+}
+
+impl Timing {
+    /// Check a client configuration (r10 N3): `t_stall` is sent to the
+    /// relay (`t_stall_ms`), which keeps a session alive at half of it but
+    /// never below [`MIN_CLIENT_STALL`]. A shorter client bound would take
+    /// live carriers for stalled ones, so it is refused here rather than
+    /// floored silently on the relay.
+    pub fn validate_client(&self) -> Result<(), TimingError> {
+        if self.t_stall < MIN_CLIENT_STALL {
+            return Err(TimingError::StallTooShort(self.t_stall));
+        }
+        if self.t_stall.as_millis() > u128::from(codec::STALL_MS_MAX) {
+            return Err(TimingError::StallTooLong(self.t_stall));
+        }
+        Ok(())
+    }
+}
+
 impl Default for Timing {
     fn default() -> Self {
         Self {

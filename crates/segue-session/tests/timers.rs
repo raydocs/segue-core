@@ -550,3 +550,128 @@ fn relay_keepalive_follows_the_shorter_stall_bound() {
         "a client cannot make the relay send ACKs in a loop"
     );
 }
+
+/// r10 N3: a client `t_stall` below what a relay serves keepalives for
+/// is a configuration error, not something the relay floors silently.
+#[test]
+fn client_stall_below_the_relay_floor_is_refused() {
+    use segue_session::{TimingError, MIN_CLIENT_STALL};
+    let mut t = Config::default().timing;
+    assert_eq!(t.validate_client(), Ok(()));
+    t.t_stall = MIN_CLIENT_STALL;
+    assert_eq!(t.validate_client(), Ok(()));
+    t.t_stall = MIN_CLIENT_STALL - Duration::from_millis(1);
+    assert_eq!(
+        t.validate_client(),
+        Err(TimingError::StallTooShort(t.t_stall))
+    );
+    t.t_stall = Duration::ZERO;
+    assert!(t.validate_client().is_err());
+    t.t_stall = Duration::MAX;
+    assert_eq!(
+        t.validate_client(),
+        Err(TimingError::StallTooLong(t.t_stall))
+    );
+}
+
+/// r10 N5: OPENED proves the path, so OPEN attempts lost before it no
+/// longer count; RESUMED does not reset the count.
+#[test]
+fn opened_resets_the_recovery_budget_and_resumed_does_not() {
+    use segue_session::codec::{Opened, Resumed};
+    let t0 = Instant::now();
+    let mut c = client(t0);
+    c.attach(1, t0);
+    let _ = c.poll_transmit(1, t0);
+    c.on_carrier_closed(1, t0);
+    assert_eq!(c.fruitless_carriers(), 1, "an unanswered OPEN counts");
+    let t = t0 + Duration::from_secs(5);
+    assert!(c.wants_attach(t));
+    c.attach(2, t);
+    while c.poll_transmit(2, t).is_some() {}
+    c.on_frame(
+        2,
+        Frame::Opened(Opened {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            recv_offset: 0,
+            max_offset: 1 << 16,
+            window_cap: 1 << 16,
+            ack_bytes: 0,
+        }),
+        t,
+    )
+    .unwrap();
+    assert_eq!(c.fruitless_carriers(), 0, "OPENED resets the budget");
+    // Lost with a frame expected: counts again; RESUMED keeps it.
+    c.on_carrier_stuck(2, t);
+    assert_eq!(c.fruitless_carriers(), 1);
+    let t = t + Duration::from_secs(5);
+    c.attach(3, t);
+    while c.poll_transmit(3, t).is_some() {}
+    c.on_frame(
+        3,
+        Frame::Resumed(Resumed {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            recv_offset: 0,
+            max_offset: 1 << 16,
+        }),
+        t,
+    )
+    .unwrap();
+    assert_eq!(c.fruitless_carriers(), 1, "RESUMED is not progress");
+}
+
+/// r10 N6: health and the recovery budget are separate. A carrier that
+/// moved data and then stalls is a failure for health (before, it
+/// reported nothing), though it does not count against the budget; and
+/// while data keeps moving, `Up` is reported again every
+/// `HEALTH_REFRESH`, so the exit sees recent proof.
+#[test]
+fn a_stall_after_success_reports_failed_and_progress_refreshes_up() {
+    use segue_session::client::{Health, HEALTH_REFRESH};
+    use segue_session::codec::Opened;
+    let t0 = Instant::now();
+    let mut c = client(t0);
+    c.attach(1, t0);
+    while c.poll_transmit(1, t0).is_some() {}
+    c.on_frame(
+        1,
+        Frame::Opened(Opened {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            recv_offset: 0,
+            max_offset: 1 << 20,
+            window_cap: 1 << 20,
+            ack_bytes: 0,
+        }),
+        t0,
+    )
+    .unwrap();
+    assert_eq!(c.take_health(), Some(Health::Up));
+    let data = |off: u64| Frame::Data {
+        offset: off,
+        data: vec![1; 100],
+        pad: 0,
+    };
+    // Data within the refresh interval: no new report.
+    let t = t0 + Duration::from_millis(100);
+    c.on_frame(1, data(0), t).unwrap();
+    assert_eq!(c.take_health(), None);
+    // After it: Up again.
+    let t = t0 + HEALTH_REFRESH;
+    c.on_frame(1, data(100), t).unwrap();
+    assert_eq!(c.take_health(), Some(Health::Up), "no refreshed proof");
+    // Upload, never acknowledged, nothing received: a stall.
+    assert_eq!(c.write(b"hello"), 5);
+    while c.poll_transmit(1, t).is_some() {}
+    let t = t + Config::default().timing.t_stall + Duration::from_millis(1);
+    c.handle_timeout(t);
+    assert_eq!(
+        c.take_health(),
+        Some(Health::Failed),
+        "a stall after earlier success went unreported"
+    );
+    assert_eq!(c.fruitless_carriers(), 0, "budget counted a carrier that moved data");
+}

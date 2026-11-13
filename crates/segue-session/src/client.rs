@@ -17,7 +17,8 @@ use std::time::Instant;
 use rand::RngCore;
 
 use crate::codec::{
-    code, Frame, Kind, Open, Reject, Resume, Secret, SessionId, Target, MAX_PAYLOAD, VERSION,
+    code, Frame, Kind, Open, Reject, Resume, Secret, SessionId, Target, MAX_PAYLOAD, STALL_MS_MAX,
+    VERSION,
 };
 use crate::flow::{RecvHalf, SendHalf};
 use crate::park::{ParkDecision, ParkTracker};
@@ -110,18 +111,25 @@ pub const MAX_FRUITLESS: u32 = 8;
 pub const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 pub const RECONNECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// While data keeps moving, [`Health::Up`] is reported again at most
+/// this often: the caller's evidence of recent success (r10 N6).
+pub const HEALTH_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Session-level health, for the caller's exit health (r9 F5): the
 /// carrier dial succeeding says nothing about whether sessions work over
 /// it, so these are reported from the protocol itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Health {
     /// A valid answer that proves the path: OPENED, or new data moved end
-    /// to end (received DATA, or an ACK of new bytes). A bare RESUMED does
-    /// not count: a path that answers RESUME and then stalls is not up.
+    /// to end (received DATA, or an ACK of new bytes), repeated every
+    /// [`HEALTH_REFRESH`] while data keeps moving. A bare RESUMED does not
+    /// count: a path that answers RESUME and then stalls is not up.
     Up,
-    /// A carrier was given up with something expected on it and nothing
-    /// moved (stall, STALL hint, hold timeout, unanswered attach, closed
-    /// mid-frame): the session is backing off to redial.
+    /// A carrier was given up with something expected on it (stall, STALL
+    /// hint, hold timeout, unanswered attach, closed mid-frame), whether
+    /// or not data moved on it earlier: the session is redialling. Only
+    /// a carrier on which nothing moved counts against the recovery
+    /// budget (r10 N6: budget and health are separate).
     Failed,
     /// The session gave up ([`LOCAL_GIVE_UP`]).
     GaveUp,
@@ -183,6 +191,8 @@ pub struct ClientSession {
     rx_partial: bool,
     /// Latest health report not yet taken (see [`Health`]).
     health: Option<Health>,
+    /// When [`Health::Up`] was last reported (see [`HEALTH_REFRESH`]).
+    up_reported: Option<Instant>,
     /// When the current carrier's attach was answered.
     confirmed_at: Option<Instant>,
     /// When a frame last went out, and a keepalive ACK is owed (see
@@ -260,6 +270,7 @@ impl ClientSession {
             fruitless: 0,
             rx_partial: false,
             health: None,
+            up_reported: None,
             confirmed_at: None,
             last_sent: now,
             ka_due: false,
@@ -397,9 +408,16 @@ impl ClientSession {
     }
 
     /// This side's stall bound, told to the relay so its keepalive comes
-    /// often enough for it (r9).
+    /// often enough for it (r9). In the wire range ([`STALL_MS_MAX`]); a
+    /// validated configuration ([`crate::Timing::validate_client`]) is
+    /// never below [`crate::MIN_CLIENT_STALL`], so the relay serves it as
+    /// announced.
     fn stall_ms(&self) -> u64 {
-        self.cfg.timing.t_stall.as_millis().min(u64::MAX as u128) as u64
+        self.cfg
+            .timing
+            .t_stall
+            .as_millis()
+            .clamp(1, u128::from(STALL_MS_MAX)) as u64
     }
 
     fn open_header_len(&self) -> usize {
@@ -503,15 +521,12 @@ impl ClientSession {
     /// by the callers that know the carrier owed us something (a stall
     /// timer, a STALL hint, a hold timeout, an unanswered attach); besides
     /// that, anything of ours outstanding, or a frame that was arriving
-    /// and never completed, counts. Only end-to-end progress (new data
-    /// received, or new bytes acknowledged) resets the count; an answered
-    /// RESUME does not.
+    /// and never completed (its header or its body), counts. End-to-end
+    /// progress (new data received, or new bytes acknowledged) resets the
+    /// count, and so does the session's one OPENED; an answered RESUME
+    /// does not.
     fn carrier_lost(&mut self, now: Instant, expected: bool) {
         if self.is_closed() || self.carrier.is_none() {
-            return;
-        }
-        if self.progressed {
-            self.fruitless = 0;
             return;
         }
         // Anything outstanding, sent or not: bytes that arrived after the
@@ -521,14 +536,30 @@ impl ClientSession {
         // anything counts too: otherwise a path that accepts RESUME and
         // drops the carrier at once is redialled in a tight loop. A carrier
         // that served an idle session for longer and then closed does not.
-        let brief = self
-            .confirmed_at
-            .is_some_and(|c| now < c + self.cfg.timing.t_live);
-        if !(expected || !self.confirmed || brief || self.send.pending() || self.rx_partial) {
+        let brief = !self.progressed
+            && self
+                .confirmed_at
+                .is_some_and(|c| now < c + self.cfg.timing.t_live);
+        let failed =
+            expected || !self.confirmed || brief || self.send.pending() || self.rx_partial;
+        if failed && (expected || !self.progressed) {
+            // Health: this carrier failed. A stall, a hold timeout or an
+            // unanswered attach is a failure even if data moved on it
+            // before (r10 N6); a carrier that moved data and was then
+            // closed or left for a network change proves nothing either
+            // way (the next one shows).
+            self.health = Some(Health::Failed);
+            self.up_reported = None;
+        }
+        if self.progressed {
+            // Budget: a carrier that moved data resets it.
+            self.fruitless = 0;
+            return;
+        }
+        if !failed {
             return;
         }
         self.fruitless += 1;
-        self.health = Some(Health::Failed);
         if self.fruitless >= MAX_FRUITLESS {
             self.close(CloseReason::Reset(LOCAL_GIVE_UP));
             return;
@@ -632,6 +663,14 @@ impl ClientSession {
                 self.send.on_ack(o.recv_offset, o.max_offset)?;
                 self.instance_id = o.instance_id;
                 self.established(now);
+                // OPENED proves the path (the relay reached the site), so
+                // OPEN retries lost before it no longer count (r10 N5).
+                // It is not progress: the carrier that brought it still
+                // counts if it is then lost with something expected, and
+                // OPENED comes once per session, so it cannot reset the
+                // budget in a loop (RESUMED never resets it).
+                self.fruitless = 0;
+                self.up_reported = Some(now);
                 self.health = Some(Health::Up);
             }
             Frame::Resumed(r) => {
@@ -652,11 +691,16 @@ impl ClientSession {
                 // acknowledged are progress.
                 self.established(now);
                 if self.send.acked() > acked {
-                    self.made_progress();
+                    self.made_progress(now);
                 }
             }
             Frame::Reject(rj) => {
-                if rj.attach_gen != self.gen {
+                // REJECT(version) carries generation 0 whatever we sent: a
+                // peer of another wire version cannot read the rest of our
+                // OPEN / RESUME (r10 N3). On the current carrier it answers
+                // our latest frame, so it ends the session at once rather
+                // than leaving a RESUME to time out and redial.
+                if rj.attach_gen != self.gen && rj.code != code::VERSION {
                     return Ok(());
                 }
                 match rj.code {
@@ -686,7 +730,7 @@ impl ClientSession {
             Frame::Pad(_) | Frame::Dgram { .. } => {}
             Frame::Data { offset, data, .. } if self.confirmed => {
                 if self.recv.on_data(offset, &data, now)? > 0 {
-                    self.made_progress();
+                    self.made_progress(now);
                 }
             }
             Frame::Ack {
@@ -694,7 +738,7 @@ impl ClientSession {
                 max_offset,
             } if self.confirmed => {
                 if self.send.on_ack(recv_offset, max_offset)? {
-                    self.made_progress();
+                    self.made_progress(now);
                 }
             }
             Frame::Fin { offset } if self.confirmed => self.recv.on_fin(offset, now)?,
@@ -704,10 +748,15 @@ impl ClientSession {
     }
 
     /// New data moved end to end on the current carrier.
-    fn made_progress(&mut self) {
+    fn made_progress(&mut self, now: Instant) {
         if !self.progressed {
             self.progressed = true;
             self.fruitless = 0;
+        }
+        // Proof of the path, refreshed while data keeps moving so the
+        // caller can tell recent success from old (r10 N6).
+        if self.up_reported.is_none_or(|t| now >= t + HEALTH_REFRESH) {
+            self.up_reported = Some(now);
             self.health = Some(Health::Up);
         }
     }
@@ -872,9 +921,11 @@ impl ClientSession {
     }
 
     /// [`poll_timeout`](Self::poll_timeout) for a driver that knows
-    /// whether the current carrier's writer has room (r9 F3): the delayed
-    /// ACK deadline is served only by sending, so it is left out while
-    /// the writer is full (the driver wakes when the writer drains).
+    /// whether it can send on the current carrier now: room in the
+    /// writer queue and pool credit for a frame (r9 F3, r10 N4). The
+    /// delayed ACK deadline is served only by sending, so it is left out
+    /// while sending is blocked (the driver wakes when the writer drains
+    /// or credit is released).
     pub fn poll_timeout_writable(&self, writable: bool) -> Option<Instant> {
         if self.is_closed() {
             return None;

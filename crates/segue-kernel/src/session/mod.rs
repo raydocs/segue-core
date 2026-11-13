@@ -132,23 +132,58 @@ impl ExitChoice {
 struct Health {
     ks: KillSwitch,
     last_fail: Option<Instant>,
-    /// A session on this exit failed (its carrier stalled, held a frame
-    /// too long, or went unanswered; or it gave up) and no session has
-    /// had a valid answer since (r9 F5). A carrier connect alone does
+    /// The exit was judged down on session evidence (r9 F5) and no
+    /// session has had a valid answer since. A carrier connect alone does
     /// not clear it: the outer tunnel can come up while session frames
     /// are black-holed. Cleared by [`SessionHealth::Up`] (OPENED, or data
     /// moving end to end).
     unproven: bool,
-    /// Live sessions on this exit whose last report was a failure: they
-    /// are backing off to redial. While any is, strict flows are refused
-    /// at once (however long ago the last failure was).
-    failing: usize,
+    /// Every live session on this exit, by reporter id: its own health,
+    /// apart from its recovery budget (r10 N6).
+    sessions: HashMap<u64, SessionMark>,
 }
 
+/// One session's latest health on its exit.
+#[derive(Clone, Copy, Debug, Default)]
+struct SessionMark {
+    /// Its last report was a failure: it is redialling.
+    failing: bool,
+    /// When it last proved the path (OPENED, or data moving end to end).
+    ok_at: Option<Instant>,
+}
+
+/// A session's proof of the path counts this long for its exit (it is
+/// refreshed every [`segue_session::client::HEALTH_REFRESH`] while data
+/// moves): another session's failure within it does not take the exit
+/// down (r10 N6).
+pub const PROOF_FRESH: Duration = Duration::from_secs(5);
+
 impl Health {
+    fn new() -> Self {
+        Self {
+            ks: KillSwitch::new(),
+            last_fail: None,
+            unproven: false,
+            sessions: HashMap::new(),
+        }
+    }
+
     fn recently_failed(&self) -> bool {
         self.last_fail
             .is_some_and(|t| t.elapsed() < STRICT_RETRY_AFTER)
+    }
+
+    /// Live sessions whose last report was a failure.
+    fn failing(&self) -> usize {
+        self.sessions.values().filter(|m| m.failing).count()
+    }
+
+    /// A live session, not failing, proved the path within
+    /// [`PROOF_FRESH`].
+    fn proven(&self, now: Instant) -> bool {
+        self.sessions
+            .values()
+            .any(|m| !m.failing && m.ok_at.is_some_and(|t| now.duration_since(t) < PROOF_FRESH))
     }
 }
 
@@ -245,6 +280,8 @@ pub struct KernelDialer {
     /// Per exit, same order as `exits`.
     channels: Vec<Channel>,
     control: ControlTiming,
+    /// Session timing and limits (validated: [`Self::with_session_config`]).
+    session_cfg: segue_session::Config,
 }
 
 impl Drop for KernelDialer {
@@ -263,15 +300,7 @@ impl KernelDialer {
         home: BTreeSet<String>,
     ) -> Self {
         let exits_len = exits.len();
-        let health = vec![
-            Health {
-                ks: KillSwitch::new(),
-                last_fail: None,
-                unproven: false,
-                failing: 0,
-            };
-            exits.len()
-        ];
+        let health = (0..exits.len()).map(|_| Health::new()).collect();
         Self {
             engine,
             exits,
@@ -288,7 +317,20 @@ impl KernelDialer {
             revoked: Arc::new(watch::channel(None).0),
             channels: (0..exits_len).map(|_| Channel::default()).collect(),
             control: ControlTiming::default(),
+            session_cfg: segue_session::Config::default(),
         }
+    }
+
+    /// Use `cfg` for new sessions. Refused when the client timing is one
+    /// the protocol cannot honour (r10 N3: a `t_stall` below
+    /// [`segue_session::MIN_CLIENT_STALL`] would be floored by the relay
+    /// and the client would take live carriers for stalled ones).
+    pub fn with_session_config(mut self, cfg: segue_session::Config) -> Result<Self, DialError> {
+        cfg.timing
+            .validate_client()
+            .map_err(|e| DialError(format!("session config: {e}")))?;
+        self.session_cfg = cfg;
+        Ok(self)
     }
 
     /// Charge sessions to `pool` instead of [`process_pool`].
@@ -565,7 +607,7 @@ impl KernelDialer {
             // Refused at once while the exit's carrier connects fail, or
             // its sessions are backing off after failures (r9 F5).
             let down = matches!(h.ks.posture(), Posture::Reconnecting | Posture::Error)
-                && (h.recently_failed() || h.failing > 0);
+                && (h.recently_failed() || h.failing() > 0);
             if r.exit_class == EXIT_AI && down {
                 return Err((
                     DialError("refused: tunnel reconnecting (strict route)".into()),
@@ -586,7 +628,7 @@ impl KernelDialer {
             anchor_node_id: self.exits[i].node_id,
             instance_hint: 0,
         };
-        let s = ClientSession::new(Default::default(), &self.pool, params, Instant::now())
+        let s = ClientSession::new(self.session_cfg.clone(), &self.pool, params, Instant::now())
             .ok_or_else(|| (DialError("refused: session memory exhausted".into()), None))?;
         // Pool-charged and released when drained (tokio's duplex keeps a
         // burst's capacity for the life of the stream); its reserved blocks
@@ -607,11 +649,7 @@ impl KernelDialer {
             opened: Some(open_tx),
             cancel: Some(self.revoked.subscribe()),
             health: Some({
-                let rep = HealthReporter {
-                    state: self.state.clone(),
-                    i,
-                    failing: Mutex::new(false),
-                };
+                let rep = HealthReporter::new(self.state.clone(), i);
                 Arc::new(move |r| rep.report(r))
             }),
         };
@@ -643,59 +681,76 @@ impl KernelDialer {
     }
 }
 
-/// A session's health report (r9 F5) into its exit's health: failures
-/// put the exit in `Reconnecting` (or `Error` if it never worked), so new
-/// strict (AI) flows are refused at once while the session backs off;
-/// only a valid protocol answer brings it back to `Connected`.
-fn session_health(h: &mut Health, failing: &mut bool, r: SessionHealth) {
+/// A session's health report (r9 F5) into its exit's health (r10 N6).
+/// The exit health aggregates its sessions, apart from their recovery
+/// budgets:
+///
+/// - `Up` (a valid protocol answer) proves the exit: `Connected`.
+/// - `Failed` / `GaveUp` takes it down (`Reconnecting`, or `Error` if it
+///   never worked) only when no other live session proved the path
+///   within [`PROOF_FRESH`]: one bad session among good ones blocks
+///   nothing, and does not flip the exit back and forth.
+/// - A failed carrier connect (the exit's probe) takes it down at once.
+///
+/// While down, new strict (AI) flows are refused at once while sessions
+/// back off; only a valid protocol answer brings the exit back.
+fn session_health(h: &mut Health, id: u64, r: SessionHealth, now: Instant) {
     match r {
         SessionHealth::Up => {
-            if std::mem::take(failing) {
-                h.failing -= 1;
-            }
+            let m = h.sessions.entry(id).or_default();
+            m.failing = false;
+            m.ok_at = Some(now);
             h.unproven = false;
             h.last_fail = None;
             h.ks.on_event(Event::ChannelUp);
         }
-        SessionHealth::Failed => {
-            if !std::mem::replace(failing, true) {
-                h.failing += 1;
+        SessionHealth::Failed | SessionHealth::GaveUp => {
+            if r == SessionHealth::GaveUp {
+                // It is ending: nothing of it counts any more.
+                h.sessions.remove(&id);
+            } else {
+                let m = h.sessions.entry(id).or_default();
+                m.failing = true;
+                m.ok_at = None;
             }
-            h.unproven = true;
-            mark_failed(h);
-        }
-        SessionHealth::GaveUp => {
-            if std::mem::take(failing) {
-                h.failing -= 1;
+            if !h.proven(now) {
+                h.unproven = true;
+                mark_failed(h);
             }
-            h.unproven = true;
-            mark_failed(h);
         }
     }
 }
 
 /// One session's [`ClientCtl::health`] hook: reports into exit `i`, and
-/// when the session ends (the driver drops the hook) it no longer counts
-/// as failing.
+/// when the session ends (the driver drops the hook) it leaves the exit's
+/// health.
 struct HealthReporter {
     state: Arc<Mutex<State>>,
     i: usize,
-    failing: Mutex<bool>,
+    id: u64,
 }
 
+static NEXT_REPORTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl HealthReporter {
+    fn new(state: Arc<Mutex<State>>, i: usize) -> Self {
+        let id = NEXT_REPORTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.lock().unwrap().health[i]
+            .sessions
+            .insert(id, SessionMark::default());
+        Self { state, i, id }
+    }
+
     fn report(&self, r: SessionHealth) {
         let mut st = self.state.lock().unwrap();
-        session_health(&mut st.health[self.i], &mut self.failing.lock().unwrap(), r);
+        session_health(&mut st.health[self.i], self.id, r, Instant::now());
     }
 }
 
 impl Drop for HealthReporter {
     fn drop(&mut self) {
-        if *self.failing.get_mut().unwrap() {
-            if let Ok(mut st) = self.state.lock() {
-                st.health[self.i].failing -= 1;
-            }
+        if let Ok(mut st) = self.state.lock() {
+            st.health[self.i].sessions.remove(&self.id);
         }
     }
 }

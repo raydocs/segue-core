@@ -2014,9 +2014,11 @@ async fn dead_carriers_are_redialled_with_backoff_and_a_bound() {
     );
 }
 
-/// Checklist r8 #3: admission measured after real sessions ran to steady
-/// state (a burst each way, then idle), not on fresh pools: the 8 MiB
-/// pool still admits as many flows as fresh.
+/// Checklist r8 #3: what a burst each way leaves held once sessions go
+/// idle, then how many more *fresh* sessions (and pipes) the pool takes
+/// on top. Only 24 of them ran, so its 260+ is not a steady-state
+/// capacity: that is ~181 (at least 170) sessions that all ran
+/// (`each_session_reaches_steady_state_before_the_next_is_admitted`, r10).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admission_is_measured_after_sessions_reach_steady_state() {
     use segue_session::pipe::pipe;
@@ -2113,8 +2115,9 @@ async fn admission_is_measured_after_sessions_reach_steady_state() {
         more.len()
     );
     // Fresh pools admit at least 280 (the_8mb_pool_admits_hundreds_of_
-    // flows); sessions that ran keep at most one more window each.
-    assert!(total >= 260, "{total} flows after steady state");
+    // flows); the 24 that ran keep at most one more window each. With
+    // every session having run, the figure is ~181 (see above).
+    assert!(total >= 260, "{total} flows (24 that ran, the rest fresh)");
     drop(more);
     drop(done);
     for c in clients {
@@ -2444,4 +2447,285 @@ async fn each_session_reaches_steady_state_before_the_next_is_admitted() {
         let _ = tokio::time::timeout(Duration::from_secs(10), c).await;
     }
     relay.abort();
+}
+
+/// A scripted relay end for one carrier: answers the client's OPEN with
+/// OPENED (or a RESUME with RESUMED), waits `hold`, writes `tail` and
+/// closes the carrier.
+async fn answer_then_cut(mut b: DuplexStream, hold: Duration, tail: Vec<u8>) {
+    use segue_session::codec::{Frame, FrameDecoder, Opened, Resumed};
+    let mut dec = FrameDecoder::new();
+    let mut buf = [0u8; 4096];
+    let answer = loop {
+        let n = match b.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        dec.push(&buf[..n]);
+        match dec.next_frame() {
+            Ok(Some(Frame::Open(o))) => {
+                break Frame::Opened(Opened {
+                    instance_id: INSTANCE,
+                    attach_gen: o.attach_gen,
+                    recv_offset: o.first_data.len() as u64,
+                    max_offset: 1 << 20,
+                    window_cap: 1 << 20,
+                    ack_bytes: 0,
+                })
+            }
+            Ok(Some(Frame::Resume(r))) => {
+                break Frame::Resumed(Resumed {
+                    instance_id: INSTANCE,
+                    attach_gen: r.attach_gen,
+                    recv_offset: 0,
+                    max_offset: 1 << 20,
+                })
+            }
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    };
+    if b.write_all(&answer.to_bytes()).await.is_err() {
+        return;
+    }
+    tokio::time::sleep(hold).await;
+    let _ = b.write_all(&tail).await;
+    // Drop: EOF on the client's reader.
+}
+
+/// r10 N5: a carrier that ends inside a frame header (after the type
+/// byte, the flags, or part of the length varint) owed the rest of the
+/// frame, as one that ends inside a body does: it counts against the
+/// recovery budget. Download-only (nothing of ours outstanding, no STALL
+/// hint) and cut well after `t_live`, so nothing else counts it: before,
+/// such a path was redialled for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn carriers_cut_inside_a_frame_header_count_against_the_budget() {
+    use segue_session::client::{LOCAL_GIVE_UP, MAX_FRUITLESS};
+    use segue_session::codec::Frame;
+    // 100 bytes: a 2-byte length varint. The encoder never needs a
+    // 4-byte one (MAX_PAYLOAD fits in two), but a peer may send any
+    // varint form: the same frame with its length as 4 bytes.
+    let small = Frame::Data {
+        offset: 0,
+        data: vec![7; 100],
+        pad: 0,
+    }
+    .to_bytes();
+    assert_eq!(small[2] >> 6, 1, "2-byte varint");
+    let len = (small.len() - 4) as u32;
+    let mut big = small[..2].to_vec();
+    big.extend_from_slice(&(len | 0x8000_0000).to_be_bytes());
+    big.extend_from_slice(&small[4..]);
+    let mut cuts: Vec<(&'static str, Vec<u8>)> = vec![
+        ("type", small[..1].to_vec()),
+        ("type+flags", small[..2].to_vec()),
+        ("varint 1/2", small[..3].to_vec()),
+    ];
+    for k in 1..4 {
+        cuts.push((
+            ["", "varint 1/4", "varint 2/4", "varint 3/4"][k],
+            big[..2 + k].to_vec(),
+        ));
+    }
+    // Cut after `t_live` (not a brief carrier: only the truncation counts
+    // it) and before (brief: counted either way).
+    let cases = [
+        (Duration::from_millis(300), Duration::from_millis(100)),
+        (Duration::from_millis(50), Duration::from_secs(1)),
+    ];
+    let runs = cuts
+        .into_iter()
+        .flat_map(|(name, tail)| cases.map(|c| (name, tail.clone(), c)))
+        .map(|(name, tail, (hold, t_live))| {
+            tokio::spawn(async move {
+                let dials = Arc::new(AtomicUsize::new(0));
+                let connector: Connector = {
+                    let (dials, tail) = (dials.clone(), tail.clone());
+                    Arc::new(move || {
+                        dials.fetch_add(1, Ordering::SeqCst);
+                        let tail = tail.clone();
+                        Box::pin(async move {
+                            let (a, b) = tokio::io::duplex(64 << 10);
+                            tokio::spawn(answer_then_cut(b, hold, tail));
+                            Ok(Box::new(a) as BoxCarrier)
+                        })
+                    })
+                };
+                let mut cfg = Config::default();
+                cfg.timing.t_live = t_live;
+                cfg.timing.t_detached = Duration::from_secs(600);
+                let pool = Pool::new(8 << 20);
+                let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+                // The app keeps its end open and sends nothing.
+                let (_app, far) = tokio::io::duplex(64 << 10);
+                let r =
+                    tokio::time::timeout(Duration::from_secs(40), run_client(s, far, connector))
+                        .await;
+                let n = dials.load(Ordering::SeqCst);
+                (format!("{name} hold {hold:?} t_live {t_live:?}"), r, n)
+            })
+        });
+    for run in runs.collect::<Vec<_>>() {
+        let (name, r, n) = run.await.unwrap();
+        let reason = r.unwrap_or_else(|_| panic!("{name}: redialled for ever ({n} dials in 40 s)"));
+        assert_eq!(reason, CloseReason::Reset(LOCAL_GIVE_UP), "{name}");
+        // OPENED resets the budget, so the first carrier counts as one.
+        assert_eq!(n, MAX_FRUITLESS as usize, "{name}: {n} dials");
+    }
+}
+
+/// r10 N4: the client's pool is full (no elastic block left) and the
+/// session's one transport-region frame is stuck in a slow writer, whose
+/// queue still has room; meanwhile the relay keeps sending DATA, so a
+/// delayed ACK falls due. It cannot be sent without credit: before, its
+/// deadline stayed in the past and the driver woke in a loop until the
+/// writer moved. Now it waits for credit (or the writer), at almost no
+/// CPU and a bounded number of wakeups.
+#[tokio::test]
+async fn client_does_not_spin_on_an_ack_it_has_no_credit_for() {
+    use segue_session::codec::{Frame, FrameDecoder, Opened};
+    use segue_session::pool::Tier;
+    let pool = Pool::new(1 << 20);
+    // Only the bound under test may end the stuck frame.
+    pool.set_transport_hold(Duration::from_secs(60));
+    pool.set_transport_hold_max(Duration::from_secs(60));
+    let dials = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::new(AtomicUsize::new(0));
+    // Set: the relay end reads again, and counts the ACKs it gets.
+    let go = Arc::new(tokio::sync::Notify::new());
+    let acks = Arc::new(AtomicUsize::new(0));
+    let connector: Connector = {
+        let (dials, sent, go, acks) = (dials.clone(), sent.clone(), go.clone(), acks.clone());
+        Arc::new(move || {
+            let (sent, go, acks) = (sent.clone(), go.clone(), acks.clone());
+            dials.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                // A tiny pipe: the relay end reads the OPEN and then
+                // nothing, so the client's writer blocks inside its next
+                // frame.
+                let (a, b) = tokio::io::duplex(256);
+                tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(b);
+                    let mut dec = FrameDecoder::new();
+                    let mut buf = [0u8; 256];
+                    let gen = loop {
+                        let n = r.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        dec.push(&buf[..n]);
+                        if let Ok(Some(Frame::Open(o))) = dec.next_frame() {
+                            break o.attach_gen;
+                        }
+                    };
+                    let opened = Frame::Opened(Opened {
+                        instance_id: INSTANCE,
+                        attach_gen: gen,
+                        recv_offset: 0,
+                        max_offset: 1 << 30,
+                        window_cap: 1 << 30,
+                        ack_bytes: 0,
+                    });
+                    if w.write_all(&opened.to_bytes()).await.is_err() {
+                        return;
+                    }
+                    tokio::spawn(async move {
+                        go.notified().await;
+                        loop {
+                            let n = r.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            dec.push(&buf[..n]);
+                            while let Ok(Some(f)) = dec.next_frame() {
+                                if matches!(f, Frame::Ack { .. }) {
+                                    acks.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    });
+                    // A slow download, 200 bytes every 20 ms.
+                    let mut off = 0u64;
+                    loop {
+                        let f = Frame::Data {
+                            offset: off,
+                            data: vec![9; 200],
+                            pad: 0,
+                        };
+                        if w.write_all(&f.to_bytes()).await.is_err() {
+                            return;
+                        }
+                        off += 200;
+                        sent.store(off as usize, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                });
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    let mut cfg = Config::default();
+    cfg.timing.t_stall = Duration::from_secs(60);
+    cfg.timing.t_live = Duration::from_secs(60);
+    let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+    let (mut app, far) = tokio::io::duplex(64 << 10);
+    let client = tokio::spawn(run_client(s, far, connector));
+    let mut buf = [0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), app.read(&mut buf))
+        .await
+        .expect("no download")
+        .unwrap();
+    assert!(n > 0);
+    // Spend every elastic block, then upload: the next frame takes the
+    // transport slot and sticks in the writer.
+    let mut held = 0;
+    loop {
+        let k = pool.take_blocks(1 << 20, 1, pool.limit(Tier::Elastic));
+        if k == 0 {
+            break;
+        }
+        held += k;
+    }
+    app.write_all(&pattern(4 << 10, 5)).await.unwrap();
+    // The app keeps taking the download (so ACKs fall due).
+    let reader = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = app.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+        app
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        pool.transport_used_blocks() > 0,
+        "no frame in the transport region"
+    );
+    let cpu = thread_cpu();
+    let at = sent.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let used = thread_cpu() - cpu;
+    println!("full pool, stuck slot, ACK due: {used:?} CPU in 2 s");
+    assert!(sent.load(Ordering::SeqCst) > at, "the download stopped");
+    assert!(
+        used < CPU_LIMIT,
+        "client burnt {used:?} CPU on an ACK it had no credit for"
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "carrier given up");
+    // Credit comes back and the relay reads again: the stuck frame
+    // completes, and ACKs go out promptly.
+    pool.give_blocks(held);
+    go.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while acks.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no ACK after credit came back");
+    assert!(!client.is_finished(), "session ended");
+    client.abort();
+    reader.abort();
 }
