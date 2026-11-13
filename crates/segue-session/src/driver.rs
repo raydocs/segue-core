@@ -210,9 +210,139 @@ fn now() -> std::time::Instant {
     tokio::time::Instant::now().into_std()
 }
 
+/// When bytes last moved through an I/O object: the time of the read or
+/// write itself, not of when the driver happened to look (r8 N4/N5/N8).
+#[derive(Debug)]
+struct Stamp {
+    base: tokio::time::Instant,
+    /// Nanoseconds after `base`, plus one; 0 = never.
+    at: AtomicU64,
+}
+
+impl Stamp {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: tokio::time::Instant::now(),
+            at: AtomicU64::new(0),
+        })
+    }
+
+    fn touch(&self) {
+        let n = self.base.elapsed().as_nanos() as u64 + 1;
+        self.at.fetch_max(n, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> Option<tokio::time::Instant> {
+        match self.at.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(self.base + std::time::Duration::from_nanos(n - 1)),
+        }
+    }
+}
+
+/// A writer that records in a [`Stamp`] each write that moved at least
+/// one byte.
+struct Touch<T> {
+    inner: T,
+    stamp: Arc<Stamp>,
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Touch<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let r = std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, buf));
+        if matches!(r, Ok(n) if n > 0) {
+            self.stamp.touch();
+        }
+        std::task::Poll::Ready(r)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A carrier's reader and writer; the writer records when it last sent
+/// bytes.
+fn split_carrier(
+    stream: BoxCarrier,
+) -> (
+    tokio::io::ReadHalf<BoxCarrier>,
+    Touch<tokio::io::WriteHalf<BoxCarrier>>,
+    Arc<Stamp>,
+) {
+    let (r, w) = tokio::io::split(stream);
+    let ws = Stamp::new();
+    (
+        r,
+        Touch {
+            inner: w,
+            stamp: ws.clone(),
+        },
+        ws,
+    )
+}
+
+/// How often a reader reports bytes of a frame still arriving
+/// ([`CarrierEv::Progress`]).
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Rate-limited [`CarrierEv::Progress`] reports of one reader.
+struct Progress {
+    cid: u64,
+    tx: mpsc::Sender<CarrierEv>,
+    last: Option<tokio::time::Instant>,
+}
+
+impl Progress {
+    fn new(cid: u64, tx: mpsc::Sender<CarrierEv>) -> Self {
+        Self {
+            cid,
+            tx,
+            last: None,
+        }
+    }
+
+    /// Bytes arrived (or wait, already here, for local memory): report it
+    /// unless reported within [`PROGRESS_EVERY`]. Never blocks; a report
+    /// that finds the channel full is dropped (the frames in it show the
+    /// carrier moving anyway).
+    fn report(&mut self) {
+        let now = tokio::time::Instant::now();
+        if self.last.is_some_and(|l| now < l + PROGRESS_EVERY) {
+            return;
+        }
+        self.last = Some(now);
+        let _ = self.tx.try_send(CarrierEv::Progress(self.cid));
+    }
+
+    /// A whole frame went out to the driver: the next partial one reports
+    /// at once.
+    fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
 enum CarrierEv {
     /// With what covers the decoded frame until it is handled.
     Frame(u64, Result<Frame, ProtoError>, Option<Charge>),
+    /// Bytes of a frame not yet complete arrived on the carrier (or are
+    /// there, waiting for memory): the peer and the path are alive though
+    /// no frame came in (r8 N4/N5). See [`Progress`].
+    Progress(u64),
     Closed(u64),
 }
 
@@ -243,6 +373,7 @@ async fn read_charged<R: AsyncRead + Unpin>(
     let mut r = tokio::io::BufReader::with_capacity(SMALL_READ, r);
     let slot = Arc::new(AtomicBool::new(false));
     let mut ticket = None;
+    let mut progress = Progress::new(cid, tx.clone());
     loop {
         let mut hdr = [0u8; 10];
         if r.read_exact(&mut hdr[..3]).await.is_err() {
@@ -265,10 +396,11 @@ async fn read_charged<R: AsyncRead + Unpin>(
         // into a copy while the payload is still held.
         let cover = if ty == ty::DATA { len } else { 2 * len };
         let Some((payload, charge)) =
-            read_body(&mut r, &pool, &slot, &mut ticket, len, cover).await
+            read_body(&mut r, &pool, &slot, &mut ticket, &mut progress, len, cover).await
         else {
             break;
         };
+        progress.reset();
         match Frame::decode_owned(ty, flags, payload) {
             Ok(Some(f)) => {
                 if tx.send(CarrierEv::Frame(cid, Ok(f), charge)).await.is_err() {
@@ -290,9 +422,9 @@ async fn read_charged<R: AsyncRead + Unpin>(
 /// are any, else the whole frame from the transport region (in line, see
 /// [`take_charge`]), and only once its first byte has arrived, so a
 /// carrier that delivers a header and stalls holds nothing there. A frame
-/// charged to the transport region must then arrive within the pool's
-/// hold; a carrier that does not deliver it in time is closed (the peer
-/// replays on the next one; r7 #1). Whole frames only: a reader never
+/// charged to the transport region must then keep arriving: a carrier that
+/// moves none of it for the pool's hold, or does not finish it within the
+/// hold cap, is closed (the peer replays on the next one; r7 #1, r8 N5). Whole frames only: a reader never
 /// holds part of a frame while waiting for more blocks, so readers cannot
 /// wait on each other. `None`: the carrier ended or timed out.
 async fn read_body<R: AsyncRead + Unpin>(
@@ -300,6 +432,7 @@ async fn read_body<R: AsyncRead + Unpin>(
     pool: &Arc<Pool>,
     slot: &Arc<AtomicBool>,
     ticket: &mut Option<Ticket>,
+    progress: &mut Progress,
     len: usize,
     cover: usize,
 ) -> Option<(Vec<u8>, Option<Charge>)> {
@@ -316,23 +449,53 @@ async fn read_body<R: AsyncRead + Unpin>(
         if r.fill_buf().await.ok()?.is_empty() {
             return None;
         }
-        charge = Some(wait_charge(pool, slot, ticket, cover).await);
+        // The body is here and waits only for local memory: the carrier
+        // is not stalled.
+        progress.report();
+        let c = {
+            let wait = wait_charge(pool, slot, ticket, cover);
+            tokio::pin!(wait);
+            let mut tick = tokio::time::interval(PROGRESS_EVERY);
+            loop {
+                tokio::select! {
+                    c = &mut wait => break c,
+                    _ = tick.tick() => progress.report(),
+                }
+            }
+        };
+        charge = Some(c);
         *ticket = None;
     }
     let mut payload = vec![0u8; len];
     let transport = charge
         .as_ref()
         .is_some_and(|c| c.grant.tier() == Tier::Transport);
-    let read = r.read_exact(&mut payload);
-    let ok = if transport {
-        matches!(
-            tokio::time::timeout(pool.transport_hold(), read).await,
-            Ok(Ok(_))
-        )
-    } else {
-        read.await.is_ok()
-    };
-    ok.then_some((payload, charge))
+    // A transport-region frame is held by progress (r8 N5): every read
+    // that moves part of it restarts the hold; the cap bounds the whole
+    // frame however it moves.
+    let cap = transport.then(|| tokio::time::Instant::now() + pool.transport_hold_max());
+    let mut got = 0;
+    while got < len {
+        let read = r.read(&mut payload[got..]);
+        let n = match cap {
+            Some(cap) => {
+                let idle = (tokio::time::Instant::now() + pool.transport_hold()).min(cap);
+                match tokio::time::timeout_at(idle, read).await {
+                    Ok(r) => r,
+                    Err(_) => return None,
+                }
+            }
+            None => read.await,
+        };
+        match n {
+            Ok(n) if n > 0 => got += n,
+            _ => return None,
+        }
+        if got < len {
+            progress.report();
+        }
+    }
+    Some((payload, charge))
 }
 
 /// [`take_charge`] of `cover` bytes, waiting for blocks: listening before
@@ -366,6 +529,7 @@ async fn wait_charge(
 
 /// Relay side: no pool, a [`FrameDecoder`] over adaptive reads.
 async fn read_frames<R: AsyncRead + Unpin>(cid: u64, mut r: R, tx: mpsc::Sender<CarrierEv>) {
+    let mut progress = Progress::new(cid, tx.clone());
     let mut dec = FrameDecoder::new();
     let mut buf = ReadBuffer::new(None);
     loop {
@@ -411,6 +575,11 @@ async fn read_frames<R: AsyncRead + Unpin>(cid: u64, mut r: R, tx: mpsc::Sender<
                     return;
                 }
             }
+        }
+        if dec.held_bytes() > 0 {
+            progress.report();
+        } else {
+            progress.reset();
         }
     }
     let _ = tx.send(CarrierEv::Closed(cid)).await;
@@ -566,6 +735,8 @@ struct CarrierIo {
     tx: mpsc::Sender<Out>,
     reader: Task,
     writer: Task,
+    /// When the writer last sent a byte.
+    tx_at: Arc<Stamp>,
     /// The reader's buffer (client side).
     _charge: Option<PoolGrant>,
 }
@@ -642,8 +813,10 @@ where
     let pool = s.pool().clone();
     let tx_slot = Arc::new(AtomicBool::new(false));
     let mut tx_ticket: Option<Ticket> = None;
-    // The carrier whose queued frame holds the transport slot, and until
-    // when it may (r7 #1).
+    // The carrier whose queued frame holds the transport slot, and when it
+    // was queued (r7 #1). It may hold it while the carrier's writer keeps
+    // moving bytes (the frames queued before it, then its own), for the
+    // pool's hold without progress, and for the hold cap at most (r8 N5).
     let mut tx_hold: Option<(u64, tokio::time::Instant)> = None;
     let mut abuf = ReadBuffer::new(Some(pool.clone()));
     // A queued message the pool could not cover is waiting for blocks.
@@ -651,6 +824,14 @@ where
 
     loop {
         let t = now();
+        // An attach's clock runs from the last byte of its hello the
+        // carrier took: a slow carrier still taking a large OPEN is not
+        // an unanswered one.
+        for (&cid, io) in &carriers {
+            if let Some(at) = io.tx_at.get() {
+                s.on_carrier_sent(cid, at.into_std());
+            }
+        }
         s.handle_timeout(t);
         let backoff_ok = connect_backoff.is_none_or(|b| tokio::time::Instant::now() >= b);
         if !connecting && backoff_ok && s.wants_attach(t) {
@@ -700,10 +881,7 @@ where
                     match s.poll_transmit_into(cid, t, &mut v, c.grant.bytes()) {
                         Tx::Wrote => {
                             if transport {
-                                tx_hold = Some((
-                                    cid,
-                                    tokio::time::Instant::now() + pool.transport_hold(),
-                                ));
+                                tx_hold = Some((cid, tokio::time::Instant::now()));
                             }
                             let _ = io.tx.try_send(charged(v, c));
                             tx_ticket = None;
@@ -772,13 +950,18 @@ where
         let backoff = connect_backoff.filter(|_| !connecting);
         let abuf_idle = abuf.idle_at();
         let drain = tasks.next_deadline();
-        let hold_at = tx_hold.map(|(_, d)| d);
+        let hold_at = tx_hold.map(|(cid, queued)| {
+            let moved = carriers.get(&cid).and_then(|io| io.tx_at.get());
+            let last = moved.map_or(queued, |m| m.max(queued));
+            (last + pool.transport_hold()).min(queued + pool.transport_hold_max())
+        });
         tokio::select! {
             ev = ev_rx.recv() => {
                 let t = now();
                 match ev {
                     Some(CarrierEv::Frame(cid, Ok(f), _c)) => { let _ = s.on_frame(cid, f, t); }
                     Some(CarrierEv::Frame(cid, Err(e), _)) => s.on_decode_error(cid, e),
+                    Some(CarrierEv::Progress(cid)) => s.on_carrier_progress(cid, t),
                     Some(CarrierEv::Closed(cid)) => {
                         s.on_carrier_closed(cid, t);
                         if let Some(io) = carriers.remove(&cid) {
@@ -796,7 +979,7 @@ where
                     match res {
                         Ok(stream) => {
                             connect_backoff = None;
-                            let (r, w) = tokio::io::split(stream);
+                            let (r, w, tx_at) = split_carrier(stream);
                             let reader = spawn_reader(
                                 cid,
                                 r,
@@ -807,7 +990,7 @@ where
                             let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                                 let _ = etx.send(CarrierEv::Closed(cid)).await;
                             });
-                            carriers.insert(cid, CarrierIo { tx, reader, writer, _charge: None });
+                            carriers.insert(cid, CarrierIo { tx, reader, writer, tx_at, _charge: None });
                             s.attach(cid, now());
                         }
                         Err(_) => {
@@ -905,6 +1088,15 @@ where
             // back with its writer); the session resumes on a new one and
             // replays what was not acknowledged (r7 #1).
             _ = tokio::time::sleep_until(hold_at.unwrap_or_else(tokio::time::Instant::now)), if hold_at.is_some() => {
+                // Bytes may have moved while this slept: the loop computes
+                // the hold again from them.
+                let moved = tx_hold.and_then(|(cid, _)| carriers.get(&cid)).and_then(|io| io.tx_at.get());
+                let at = tx_hold.map(|(_, q)| {
+                    (moved.map_or(q, |m| m.max(q)) + pool.transport_hold()).min(q + pool.transport_hold_max())
+                });
+                if at.is_some_and(|at| at > tokio::time::Instant::now()) {
+                    continue;
+                }
                 if let Some((cid, _)) = tx_hold.take() {
                     if tx_slot.load(Ordering::Acquire) {
                         s.on_carrier_closed(cid, now());
@@ -1005,8 +1197,8 @@ struct SiteIo {
     outstanding: bool,
     shut: bool,
     eof: bool,
-    /// Upload bytes the site has accepted (see [`SiteWrite`]).
-    accepted: Arc<AtomicU64>,
+    /// When the site last accepted upload bytes (see [`SiteWrite`]).
+    wrote: Arc<Stamp>,
     /// The upload drain after the client's FIN (see [`Flush`]).
     flush: Flush,
 }
@@ -1023,52 +1215,39 @@ struct SiteIo {
 enum Flush {
     /// The client's upload is still arriving.
     Waiting,
-    Draining {
-        since: tokio::time::Instant,
-        /// `accepted` as last seen, and when it last changed.
-        seen: u64,
-        moved: tokio::time::Instant,
-    },
+    /// Since when; the site writer's [`Stamp`] says when the site last
+    /// took a byte.
+    Draining { since: tokio::time::Instant },
     /// The site writer shut down: the FIN is acknowledged.
     Done,
 }
 
 impl Flush {
-    fn deadline(&self, t: &crate::Timing) -> Option<tokio::time::Instant> {
+    /// The idle bound counts from the site's last actual write (its
+    /// [`Stamp`]), not from when the driver noticed it (r8 N8): a write
+    /// that went unnoticed for a while does not stretch the bound.
+    fn deadline(&self, wrote: &Stamp, t: &crate::Timing) -> Option<tokio::time::Instant> {
         match self {
-            Flush::Draining { since, moved, .. } => {
-                Some((*moved + t.site_flush_idle).min(*since + t.site_flush_max))
+            Flush::Draining { since } => {
+                let moved = wrote.get().map_or(*since, |w| w.max(*since));
+                Some((moved + t.site_flush_idle).min(*since + t.site_flush_max))
             }
             _ => None,
         }
     }
 
-    /// Start or advance the drain clock; true when it ran out.
+    /// Start the drain clock; true when it ran out.
     fn check(
         &mut self,
         complete: bool,
-        accepted: u64,
+        wrote: &Stamp,
         now: tokio::time::Instant,
         t: &crate::Timing,
     ) -> bool {
-        match self {
-            Flush::Waiting if complete => {
-                *self = Flush::Draining {
-                    since: now,
-                    seen: accepted,
-                    moved: now,
-                };
-                false
-            }
-            Flush::Draining { seen, moved, .. } => {
-                if accepted != *seen {
-                    *seen = accepted;
-                    *moved = now;
-                }
-                self.deadline(t).is_some_and(|d| d <= now)
-            }
-            _ => false,
+        if matches!(self, Flush::Waiting) && complete {
+            *self = Flush::Draining { since: now };
         }
+        self.deadline(wrote, t).is_some_and(|d| d <= now)
     }
 }
 
@@ -1078,8 +1257,9 @@ struct SiteWrite<W> {
     inner: W,
     sid: SessionId,
     flushed: Option<mpsc::UnboundedSender<SessionId>>,
-    /// Bytes the site accepted: the drain's progress (see [`Flush`]).
-    accepted: Arc<AtomicU64>,
+    /// When the site last accepted bytes: the drain's progress (see
+    /// [`Flush`]).
+    wrote: Arc<Stamp>,
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for SiteWrite<W> {
@@ -1089,8 +1269,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for SiteWrite<W> {
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         let r = std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, buf));
-        if let Ok(n) = r {
-            self.accepted.fetch_add(n as u64, Ordering::Relaxed);
+        if matches!(r, Ok(n) if n > 0) {
+            self.wrote.touch();
         }
         std::task::Poll::Ready(r)
     }
@@ -1177,9 +1357,8 @@ pub async fn run_relay_ctl(
             .iter_mut()
             .filter_map(|(sid, io)| {
                 let complete = table.upload_complete(sid);
-                let a = io.accepted.load(Ordering::Relaxed);
                 io.flush
-                    .check(complete, a, tnow, table.timing())
+                    .check(complete, &io.wrote, tnow, table.timing())
                     .then_some(*sid)
             })
             .collect();
@@ -1307,19 +1486,22 @@ pub async fn run_relay_ctl(
         let deadline = table.poll_timeout().map(tokio::time::Instant::from_std);
         let drain = tasks.next_deadline();
         let tm = table.timing();
-        let flush = sites.values().filter_map(|io| io.flush.deadline(tm)).min();
+        let flush = sites
+            .values()
+            .filter_map(|io| io.flush.deadline(&io.wrote, tm))
+            .min();
         tokio::select! {
             c = accept.recv(), if accepting => match c {
                 Some(stream) => {
                     next_cid += 1;
                     let cid = next_cid;
-                    let (r, w) = tokio::io::split(stream);
+                    let (r, w, tx_at) = split_carrier(stream);
                     let reader = spawn_reader(cid, r, ev_tx.clone(), None);
                     let etx = ev_tx.clone();
                     let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                         let _ = etx.send(CarrierEv::Closed(cid)).await;
                     });
-                    carriers.insert(cid, CarrierIo { tx, reader, writer, _charge: None });
+                    carriers.insert(cid, CarrierIo { tx, reader, writer, tx_at, _charge: None });
                     table.add_carrier(cid);
                 }
                 None => accepting = false,
@@ -1329,6 +1511,7 @@ pub async fn run_relay_ctl(
                 match ev {
                     Some(CarrierEv::Frame(cid, Ok(f), _)) => table.on_frame(cid, f, t),
                     Some(CarrierEv::Frame(cid, Err(e), _)) => table.on_decode_error(cid, e),
+                    Some(CarrierEv::Progress(cid)) => table.on_carrier_progress(cid, t),
                     Some(CarrierEv::Closed(cid)) => {
                         if let Some(io) = carriers.remove(&cid) {
                             io.reader.abort();
@@ -1351,8 +1534,8 @@ pub async fn run_relay_ctl(
                             continue;
                         }
                         let (mut r, w) = tokio::io::split(stream);
-                        let accepted = Arc::new(AtomicU64::new(0));
-                        let w = SiteWrite { inner: w, sid, flushed: Some(flushed_tx.clone()), accepted: accepted.clone() };
+                        let wrote = Stamp::new();
+                        let w = SiteWrite { inner: w, sid, flushed: Some(flushed_tx.clone()), wrote: wrote.clone() };
                         let etx = site_tx.clone();
                         let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                             let _ = etx.send(SiteEv::Error(sid)).await;
@@ -1369,7 +1552,7 @@ pub async fn run_relay_ctl(
                                 }
                             }
                         });
-                        sites.insert(sid, SiteIo { tx, req, reader, writer, outstanding: false, shut: false, eof: false, accepted, flush: Flush::Waiting });
+                        sites.insert(sid, SiteIo { tx, req, reader, writer, outstanding: false, shut: false, eof: false, wrote, flush: Flush::Waiting });
                         table.connect_done(&sid, Ok(()), t);
                     }
                     Some(SiteEv::Connected(sid, Err(e))) => {

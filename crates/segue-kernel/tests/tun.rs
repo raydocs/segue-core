@@ -2311,3 +2311,283 @@ async fn tun_session_flow_moves_both_ways_with_the_elastic_pool_spent() {
     assert_eq!(up, UP);
     drop(hog);
 }
+
+/// Review r8 checklist #4: several sessions on slow (but moving) carriers
+/// and one healthy TUN flow both ways over a real carrier (an in-memory
+/// duplex through `KernelDialer` to `run_relay`), all on one shared pool
+/// with its elastic part spent, so every frame competes for the transport
+/// region. The healthy flow must finish in bounded time, the slow sessions
+/// must finish too, with bounded redials; the pool's peak use is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_carriers_and_a_healthy_tun_flow_share_the_pool() {
+    use segue_kernel::session::{Exit, KernelDialer, SegueRoute};
+    use segue_session::client::{ClientSession, CloseReason, OpenParams};
+    use segue_session::codec::{Kind, Target};
+    use segue_session::driver::{run_client, run_relay, BoxCarrier, Connector, SiteConnector};
+    use segue_session::pool::{Grant, Pool, Tier};
+    use segue_session::relay::{AllowAll, RelayTable};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    const UP: usize = 192 << 10;
+    const DOWN: u64 = 192 << 10;
+    const SLOW: usize = 6;
+    const SLOW_DOWN: usize = 48 << 10;
+    // Each slow carrier moves 1000 B per 100 ms each way: 10 KB/s, a full
+    // frame in about 1.6 s.
+    const SLOW_CHUNK: usize = 1000;
+    const SLOW_EVERY: Duration = Duration::from_millis(100);
+
+    let pool = Pool::new(1 << 20);
+    let site_got = Arc::new(AtomicUsize::new(0));
+    let (got_tx, mut got_rx) = mpsc::unbounded_channel::<usize>();
+    let (connected_tx, mut connected_rx) = mpsc::unbounded_channel::<()>();
+    let site: SiteConnector = {
+        let seen = site_got.clone();
+        Arc::new(move |t: Target, _k: Kind| {
+            let got_tx = got_tx.clone();
+            let connected_tx = connected_tx.clone();
+            let seen = seen.clone();
+            Box::pin(async move {
+                let (a, b) = tokio::io::duplex(64 << 10);
+                let (mut r, mut w) = tokio::io::split(b);
+                if matches!(t, Target::Domain(..)) {
+                    // A slow session's site: a large download in large
+                    // writes (full frames), the upload taken and dropped.
+                    tokio::spawn(async move {
+                        let down: Vec<u8> =
+                            (0..SLOW_DOWN as u64).map(|x| pattern_byte(x, 3)).collect();
+                        let _ = w.write_all(&down).await;
+                        let _ = w.shutdown().await;
+                        std::future::pending::<()>().await;
+                        drop(w);
+                    });
+                    tokio::spawn(async move {
+                        let mut sink = Vec::new();
+                        let _ = r.read_to_end(&mut sink).await;
+                        std::future::pending::<()>().await;
+                        drop(r);
+                    });
+                    return Ok(Box::new(a) as BoxCarrier);
+                }
+                tokio::spawn(async move {
+                    let mut i = 0u64;
+                    while i < DOWN {
+                        let chunk: Vec<u8> = (i..(i + 4096).min(DOWN))
+                            .map(|x| pattern_byte(x, 0))
+                            .collect();
+                        if w.write_all(&chunk).await.is_err() {
+                            return;
+                        }
+                        i += chunk.len() as u64;
+                    }
+                    let _ = w.shutdown().await;
+                });
+                tokio::spawn(async move {
+                    let mut at = 0u64;
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match r.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                for &x in &buf[..n] {
+                                    assert_eq!(x, pattern_byte(at, 0x5a), "upload byte {at}");
+                                    at += 1;
+                                }
+                                seen.store(at as usize, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    let _ = got_tx.send(at as usize);
+                });
+                let _ = connected_tx.send(());
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    let (accept_tx, accept_rx) = mpsc::channel(64);
+    let table = RelayTable::new(
+        segue_session::Config::default(),
+        Pool::new(8 << 20),
+        Box::new(AllowAll),
+        9,
+    );
+    tokio::spawn(run_relay(table, accept_rx, site, None));
+
+    // The slow sessions: default timing, the shared pool, each carrier a
+    // throttled pipe to the relay.
+    async fn pump(
+        mut from: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        mut to: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        let mut buf = vec![0u8; SLOW_CHUNK];
+        let mut tick = tokio::time::interval(SLOW_EVERY);
+        loop {
+            tick.tick().await;
+            match from.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if to.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = to.shutdown().await;
+    }
+    let slow_dials = Arc::new(AtomicUsize::new(0));
+    let slow_connector: Connector = {
+        let (accept_tx, dials) = (accept_tx.clone(), slow_dials.clone());
+        Arc::new(move || {
+            let accept_tx = accept_tx.clone();
+            dials.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let (client, ca) = tokio::io::duplex(SLOW_CHUNK);
+                let (rb, relay) = tokio::io::duplex(SLOW_CHUNK);
+                let (car, caw) = tokio::io::split(ca);
+                let (rbr, rbw) = tokio::io::split(rb);
+                tokio::spawn(pump(car, rbw));
+                tokio::spawn(pump(rbr, caw));
+                accept_tx
+                    .send(Box::new(relay) as BoxCarrier)
+                    .await
+                    .map_err(|_| std::io::Error::other("gone"))?;
+                Ok(Box::new(client) as BoxCarrier)
+            })
+        })
+    };
+    let mut slow = Vec::new();
+    for i in 0..SLOW {
+        let params = OpenParams {
+            ticket: b"ticket".to_vec(),
+            kind: Kind::Tcp,
+            target: Target::Domain(format!("slow{i}.example"), 443),
+            exit_class: 0,
+            anchor_node_id: 1,
+            instance_hint: 9,
+        };
+        let s = ClientSession::new(Default::default(), &pool, params, std::time::Instant::now())
+            .expect("slow session admitted");
+        let (mut app, far) = tokio::io::duplex(64 << 10);
+        let client = tokio::spawn(run_client(s, far, slow_connector.clone()));
+        slow.push(tokio::spawn(async move {
+            let (mut r, mut w) = tokio::io::split(&mut app);
+            let ((), down) = tokio::join!(
+                async {
+                    let _ = w.write_all(&[i as u8; 8 << 10]).await;
+                    let _ = w.shutdown().await;
+                },
+                async {
+                    let mut down = Vec::new();
+                    let _ = r.read_to_end(&mut down).await;
+                    down
+                }
+            );
+            let reason = client.await.unwrap();
+            (reason, down)
+        }));
+    }
+
+    // The healthy flow: TUN → KernelDialer → a plain duplex carrier.
+    let dialer = KernelDialer::new(
+        Arc::new(RelayEngine { accept: accept_tx }),
+        vec![Exit {
+            name: "la".into(),
+            carrier: "relay".into(),
+            relay: "127.0.0.1:7443".parse().unwrap(),
+            node_id: 1,
+        }],
+        [(
+            "p1".to_string(),
+            SegueRoute {
+                ticket: b"ticket".to_vec(),
+                exit_class: 0,
+            },
+        )]
+        .into(),
+        Default::default(),
+    )
+    .with_pool(pool.clone());
+    let mut tun = TunStack::new(Arc::new(rules_proxy_default()), Arc::new(dialer));
+    tun.config.shared_pool = Some(pool.clone());
+    let mut h = Harness::run(tun);
+
+    // Keep the elastic part spent, and record the peaks.
+    let done = Arc::new(AtomicBool::new(false));
+    let watch = tokio::spawn({
+        let (pool, done) = (pool.clone(), done.clone());
+        async move {
+            // From the moment the healthy flow is admitted (a spent pool
+            // refuses new flows).
+            connected_rx.recv().await.expect("healthy site connected");
+            let mut hog = Vec::new();
+            let (mut peak, mut peak_transport) = (0, 0);
+            while !done.load(Ordering::SeqCst) {
+                while let Some(g) = Grant::fixed(&pool, BLOCK) {
+                    hog.push(g);
+                }
+                assert!(pool.used_blocks() >= pool.limit(Tier::Elastic));
+                peak = peak.max(pool.used_blocks() + pool.transport_used_blocks());
+                peak_transport = peak_transport.max(pool.transport_used_blocks());
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            (hog.len(), peak, peak_transport)
+        }
+    });
+    // Let the slow sessions open and start their downloads.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let started = Instant::now();
+    let down = tokio::time::timeout(
+        Duration::from_secs(60),
+        raw_transfer(&mut h, CLIENT4, SITE4, UP, &site_got),
+    )
+    .await
+    .expect("healthy TUN flow stalled behind the slow carriers");
+    let healthy = started.elapsed();
+    let slow_running = slow.iter().filter(|j| !j.is_finished()).count();
+    assert_eq!(down.len() as u64, DOWN);
+    for (i, &x) in down.iter().enumerate() {
+        assert_eq!(x, pattern_byte(i as u64, 0), "download byte {i}");
+    }
+    let up = tokio::time::timeout(Duration::from_secs(10), got_rx.recv())
+        .await
+        .expect("site never saw the upload end")
+        .unwrap();
+    assert_eq!(up, UP);
+    // The slow sessions finish too, with the pool still spent.
+    let t_slow = Instant::now();
+    for (i, j) in slow.into_iter().enumerate() {
+        let (reason, d) = tokio::time::timeout(Duration::from_secs(90), j)
+            .await
+            .expect("slow session never finished")
+            .unwrap();
+        assert_eq!(reason, CloseReason::Clean, "slow session {i}");
+        assert_eq!(d.len(), SLOW_DOWN, "slow session {i} download");
+        for (k, &x) in d.iter().enumerate() {
+            assert_eq!(x, pattern_byte(k as u64, 3), "slow {i} byte {k}");
+        }
+    }
+    let slow_more = t_slow.elapsed();
+    done.store(true, Ordering::SeqCst);
+    let (hogged, peak, peak_transport) = watch.await.unwrap();
+    let dials = slow_dials.load(Ordering::SeqCst);
+    println!(
+        "healthy {} KiB each way in {healthy:?} ({slow_running} of {SLOW} slow sessions still running), \
+         slow done {slow_more:?} later; pool {} blocks, {hogged} hogged, peak {peak} used ({} elastic limit), \
+         transport peak {peak_transport}/{}; slow dials {dials}",
+        UP >> 10,
+        pool.blocks(),
+        pool.limit(Tier::Elastic),
+        pool.transport_blocks(),
+    );
+    assert!(hogged > 100, "the pool was never spent ({hogged} blocks)");
+    assert!(
+        slow_running > 0,
+        "the slow sessions ended before the healthy flow: no contention"
+    );
+    assert!(
+        peak <= pool.blocks(),
+        "peak {peak} of {} blocks",
+        pool.blocks()
+    );
+    assert!(peak_transport <= pool.transport_blocks());
+    assert!(dials <= 2 * SLOW, "{dials} dials for {SLOW} slow sessions");
+}

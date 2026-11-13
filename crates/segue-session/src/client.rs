@@ -99,6 +99,15 @@ impl std::fmt::Debug for OpenParams {
 /// Local code used when the client gives up re-attaching / retrying OPEN.
 pub const LOCAL_GIVE_UP: u8 = code::CONNECT_TIMEOUT;
 
+/// Carriers that may be lost in a row with data outstanding and no
+/// progress before the session gives up (r8 N5). With the backoff below
+/// that is about 11 s of waiting between attempts (and `t_detached` bounds
+/// the time detached in any case).
+pub const MAX_FRUITLESS: u32 = 8;
+/// Wait before redialling after the first such loss; doubles per loss.
+pub const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+pub const RECONNECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Result of [`ClientSession::poll_transmit_into`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tx {
@@ -143,6 +152,16 @@ pub struct ClientSession {
     backoff_until: Option<Instant>,
     backoff: std::time::Duration,
     last_rx: Instant,
+    /// The current carrier acknowledged new data or delivered new data
+    /// since it was attached.
+    progressed: bool,
+    /// Carriers lost in a row, each with data outstanding and no progress
+    /// on it (r8 N5): they back off, and too many end the session.
+    fruitless: u32,
+    /// When a frame last went out, and a keepalive ACK is owed (see
+    /// [`on_carrier_progress`](Self::on_carrier_progress)).
+    last_sent: Instant,
+    ka_due: bool,
     send: SendHalf,
     recv: RecvHalf,
     park: ParkTracker,
@@ -210,6 +229,10 @@ impl ClientSession {
             detached_since: None,
             backoff_until: None,
             last_rx: now,
+            progressed: false,
+            fruitless: 0,
+            last_sent: now,
+            ka_due: false,
             send,
             recv,
             park: ParkTracker::default(),
@@ -290,6 +313,8 @@ impl ClientSession {
         self.attach_started = Some(now);
         self.park.cancel();
         self.last_rx = now;
+        self.progressed = false;
+        self.ka_due = false;
         let hello = if !self.ever_opened {
             let retry = self.attached_once;
             if !retry {
@@ -366,14 +391,85 @@ impl ClientSession {
     /// `STALL{session_id, attach_gen}` from the control stream (B1).
     pub fn on_stall(&mut self, gen: u32, now: Instant) {
         if gen == self.gen && self.state == State::Active {
+            self.carrier_lost(now);
             self.reattach(now);
         }
+    }
+
+    /// Bytes of a frame not yet complete arrived on carrier `cid` (the
+    /// driver's reader reports it, rate-limited): the relay and the path
+    /// are alive, only slow, so the carrier is not stalled (r8 N5). The
+    /// session repeats its current ACK (no offset moves; at most once per
+    /// keepalive period) so the relay's `t_live` sees the same. Only bytes
+    /// that arrived count, never bytes this side wrote.
+    pub fn on_carrier_progress(&mut self, cid: CarrierId, now: Instant) {
+        if self.carrier != Some(cid) || self.is_closed() {
+            return;
+        }
+        self.last_rx = self.last_rx.max(now);
+        if self.confirmed && now >= self.last_sent + self.keepalive() {
+            self.ka_due = true;
+        }
+    }
+
+    /// The carrier's writer moved bytes at `at`. Before the attach is
+    /// answered those are the hello's: [`crate::Timing::t_attach`] counts from
+    /// the last of them, so a hello that takes long to cross a slow
+    /// carrier is not given up while it is still moving (r8 N5).
+    pub fn on_carrier_sent(&mut self, cid: CarrierId, at: Instant) {
+        if self.carrier != Some(cid) || self.confirmed || self.is_closed() {
+            return;
+        }
+        if let Some(s) = self.attach_started.as_mut() {
+            *s = (*s).max(at);
+        }
+    }
+
+    fn keepalive(&self) -> std::time::Duration {
+        (self.cfg.timing.t_stall / 2).max(std::time::Duration::from_millis(10))
+    }
+
+    /// Carriers lost in a row with data outstanding and nothing moved on
+    /// them (see [`MAX_FRUITLESS`]).
+    pub fn fruitless_carriers(&self) -> u32 {
+        self.fruitless
+    }
+
+    /// The current carrier is being given up (closed, stalled, or held a
+    /// frame too long). Losing one that moved nothing while data was
+    /// outstanding backs off the next attempt, exponentially, and after
+    /// [`MAX_FRUITLESS`] in a row the session ends: a path that cannot
+    /// move data is not redialled without bound (r8 N5). A carrier that
+    /// made progress is replaced at once.
+    fn carrier_lost(&mut self, now: Instant) {
+        if self.is_closed() || self.carrier.is_none() {
+            return;
+        }
+        if self.progressed {
+            self.fruitless = 0;
+            return;
+        }
+        // Anything outstanding, sent or not: bytes that arrived after the
+        // last carrier that took data died are never sent before an
+        // attach is answered, and must still count.
+        if !self.send.pending() {
+            return;
+        }
+        self.fruitless += 1;
+        if self.fruitless > MAX_FRUITLESS {
+            self.close(CloseReason::Reset(LOCAL_GIVE_UP));
+            return;
+        }
+        let d = (RECONNECT_BACKOFF * (1 << (self.fruitless - 1).min(8))).min(RECONNECT_BACKOFF_MAX);
+        let until = now + d;
+        self.backoff_until = Some(self.backoff_until.map_or(until, |b| b.max(until)));
     }
 
     pub fn on_carrier_closed(&mut self, cid: CarrierId, now: Instant) {
         if self.carrier != Some(cid) {
             return;
         }
+        self.carrier_lost(now);
         self.carrier = None;
         if self.is_closed() {
             return;
@@ -492,13 +588,17 @@ impl ClientSession {
             Frame::Rst { code } => self.close(CloseReason::Reset(code)),
             Frame::Pad(_) | Frame::Dgram { .. } => {}
             Frame::Data { offset, data, .. } if self.confirmed => {
-                self.recv.on_data(offset, &data, now)?;
+                if self.recv.on_data(offset, &data, now)? > 0 {
+                    self.progressed = true;
+                }
             }
             Frame::Ack {
                 recv_offset,
                 max_offset,
             } if self.confirmed => {
-                self.send.on_ack(recv_offset, max_offset)?;
+                if self.send.on_ack(recv_offset, max_offset)? {
+                    self.progressed = true;
+                }
             }
             Frame::Fin { offset } if self.confirmed => self.recv.on_fin(offset, now)?,
             _ => return Err(ProtoError::Violation("unexpected frame on session carrier")),
@@ -543,8 +643,13 @@ impl ClientSession {
         if self.confirmed {
             let piggyback = self.send.has_sendable();
             if let Some(ack) = self.recv.poll_ack(now, piggyback) {
+                self.ka_due = false;
                 self.check_done();
                 return Some(TxNext::Frame(ack));
+            }
+            if self.ka_due && !self.send.has_sendable() {
+                self.ka_due = false;
+                return Some(TxNext::Frame(self.recv.force_ack()));
             }
         }
         Some(TxNext::Send)
@@ -567,11 +672,20 @@ impl ClientSession {
             return false;
         }
         self.send.has_sendable()
-            || (self.confirmed && self.recv.ack_deadline().is_some_and(|d| d <= now))
+            || (self.confirmed
+                && (self.ka_due || self.recv.ack_deadline().is_some_and(|d| d <= now)))
     }
 
     /// Next frame for carrier `cid`, if any.
     pub fn poll_transmit(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
+        let f = self.poll_transmit_inner(cid, now);
+        if f.is_some() {
+            self.last_sent = now;
+        }
+        f
+    }
+
+    fn poll_transmit_inner(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
         match self.next_tx(cid, now)? {
             TxNext::Hello => {
                 let mut h = self.hello.take().expect("checked");
@@ -590,6 +704,20 @@ impl ClientSession {
     /// buffer, r6 N13), using at most `room` bytes. DATA is cut to fit;
     /// an OPEN or RESUME that does not fit is kept and its size returned.
     pub fn poll_transmit_into(
+        &mut self,
+        cid: CarrierId,
+        now: Instant,
+        out: &mut Vec<u8>,
+        room: usize,
+    ) -> Tx {
+        let r = self.poll_transmit_into_inner(cid, now, out, room);
+        if r == Tx::Wrote {
+            self.last_sent = now;
+        }
+        r
+    }
+
+    fn poll_transmit_into_inner(
         &mut self,
         cid: CarrierId,
         now: Instant,
@@ -681,13 +809,19 @@ impl ClientSession {
             && !self.confirmed
             && self.attach_started.is_some_and(|s| now >= s + t.t_attach)
         {
-            // T_attach: abandon this attempt, retry on a new carrier.
+            // T_attach: abandon this attempt, retry on a new carrier (an
+            // attempt that got no answer counts against the bound).
+            self.carrier_lost(now);
+            if self.is_closed() {
+                return;
+            }
             let old = self.carrier.take().unwrap();
             self.abandoned.push(old);
             self.need_attach = true;
             self.detached_since.get_or_insert(now);
         }
         if self.confirmed && self.send.unacked() && now >= self.last_rx + t.t_stall {
+            self.carrier_lost(now);
             self.reattach(now);
         }
         if self.recv.idle_deadline().is_some_and(|d| now >= d) {

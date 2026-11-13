@@ -135,6 +135,13 @@ struct Session {
     /// the site has not taken the upload yet (see
     /// [`RelayTable::confirm_site_flush`]).
     held_fin: Option<u64>,
+    /// When a frame of this session last went out (see
+    /// [`RelayTable::keepalive`]).
+    last_sent: Instant,
+    /// Bytes of a frame from the client are arriving: repeat the current
+    /// ACK so the client sees its carrier alive (see
+    /// [`RelayTable::on_carrier_progress`]).
+    ka_due: bool,
 }
 
 // Manual so the resume secret never reaches a log.
@@ -556,6 +563,8 @@ impl RelayTable {
                     rst: None,
                     created: now,
                     held_fin: None,
+                    last_sent: now,
+                    ka_due: false,
                 };
                 self.sessions.insert(sid, s);
                 self.carriers.get_mut(&cid).unwrap().session = Some(sid);
@@ -671,7 +680,15 @@ impl RelayTable {
                 recv_offset,
                 max_offset,
             } => {
-                if s.send.on_ack(recv_offset, max_offset)? {
+                let progressed = s.send.on_ack(recv_offset, max_offset)?;
+                if s.state == SessionState::Active {
+                    // Any ACK on the current carrier shows the client is
+                    // taking what this side sends, if slowly: a client
+                    // receiving a large frame piecemeal repeats its ACK
+                    // (r8 N5), which keeps `t_live` from firing.
+                    s.last_progress = now;
+                }
+                if progressed {
                     s.last_progress = now;
                     if s.state == SessionState::Detached && s.carrier.is_some() {
                         // B1: ACK progress on the current carrier.
@@ -763,6 +780,7 @@ impl RelayTable {
     /// Next frame for carrier `cid`.
     pub fn poll_transmit(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
         self.clock = self.clock.max(now);
+        let keepalive = self.keepalive();
         let slot = self.carriers.get_mut(&cid)?;
         if let Some(f) = slot.out.take() {
             return Some(f);
@@ -804,6 +822,7 @@ impl RelayTable {
         }
         let piggyback = s.send.has_sendable();
         if let Some(a) = s.recv.poll_ack(now, piggyback) {
+            s.last_sent = now;
             self.check_done(&sid, now);
             return Some(a);
         }
@@ -813,7 +832,51 @@ impl RelayTable {
         if s.send.has_sendable() && !s.send.unacked() {
             s.last_progress = now;
         }
-        s.send.poll_frame()
+        if let Some(f) = s.send.poll_frame() {
+            s.last_sent = now;
+            return Some(f);
+        }
+        // r8 N4: while the client's FIN waits for the site to take the
+        // upload, nothing else may go out for a long time, and the client
+        // would take the quiet carrier (its FIN unacknowledged) for a
+        // stalled one. Repeat the current ACK (it moves no offset, so the
+        // FIN stays unacknowledged) to show the carrier is alive.
+        if s.ka_due || (s.held_fin.is_some() && now >= s.last_sent + keepalive) {
+            s.ka_due = false;
+            s.last_sent = now;
+            return Some(s.recv.force_ack());
+        }
+        None
+    }
+
+    /// How often a session whose upload FIN waits for the site repeats its
+    /// ACK: twice per `t_stall` (the client's stall bound; the client must
+    /// not use a shorter one than the relay's configuration).
+    fn keepalive(&self) -> std::time::Duration {
+        (self.cfg.timing.t_stall / 2).max(std::time::Duration::from_millis(10))
+    }
+
+    /// Bytes of a frame not yet complete arrived on carrier `cid` (the
+    /// driver's reader reports it, rate-limited): the client and the path
+    /// are alive, only slow. The session repeats its current ACK (no
+    /// offset moves; at most once per keepalive period) so the client does
+    /// not take a carrier busy with a large frame for a stalled one
+    /// (r8 N5). Only bytes that arrived count, never bytes this side wrote:
+    /// a black-holed carrier's socket buffer absorbs writes.
+    pub fn on_carrier_progress(&mut self, cid: CarrierId, now: Instant) {
+        self.clock = self.clock.max(now);
+        let keepalive = self.keepalive();
+        let Some(sid) = self.carriers.get(&cid).and_then(|c| c.session) else {
+            return;
+        };
+        if let Some(s) = self.sessions.get_mut(&sid) {
+            if s.carrier == Some(cid)
+                && s.state == SessionState::Active
+                && now >= s.last_sent + keepalive
+            {
+                s.ka_due = true;
+            }
+        }
     }
 
     // ---- site side ----
@@ -924,6 +987,9 @@ impl RelayTable {
             }
             if s.state == SessionState::Active && s.send.unacked() {
                 put(s.last_progress + t.t_live);
+            }
+            if s.held_fin.is_some() && s.carrier.is_some() && s.connected {
+                put(s.last_sent + self.keepalive());
             }
             // ACKs go out only once connected (`poll_transmit` holds them
             // back before), so an earlier deadline could never be served.
