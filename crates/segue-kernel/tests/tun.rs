@@ -18,6 +18,7 @@ use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
 use segue_kernel::sniff::client_hello_for_test;
 use segue_kernel::socks::{Kernel, SniffSettings};
 use segue_kernel::tun::{
+    MemoryBudget,
     mss_for, Event, FlowKey, Netstack, NetstackConfig, PacketIo, Proto, TunStack, UdpDatagram,
     Verdict, BLOCK,
 };
@@ -1536,10 +1537,67 @@ fn default_memory_budget_is_well_under_20_mib() {
         b.total,
         b.tcp_pool + b.tcp_flows + b.packet_queues + b.udp_flows + b.dns
     );
-    assert!(b.total < 16 * 1024 * 1024, "{b:?}");
-    // The pool, not the flow count, bounds TCP buffering.
+    // r7 #8: every term is the worst case the code can hold, computed here
+    // from the defaults independently of `memory_budget`.
     let cfg = NetstackConfig::default();
+    let mtu = cfg.mtu;
+    assert_eq!(mtu, 1500);
+    let kept = segue_kernel::quic::GUARD_KEPT;
+    assert_eq!(kept, 2 * (3072 + 64) + 8 * (20 + 32) + 128);
+    // 3 held datagrams + their CRYPTO copies + 256 × (offset, Vec) + DCID.
+    let sniff = 3 * mtu + 3 * mtu + 256 * 32 + 20;
+    assert_eq!(segue_kernel::tun::sniff_state(mtu), sniff);
+    let per_udp = (8 + 1) * mtu + 1024 + kept + sniff;
+    assert_eq!(per_udp, 38_552);
+    let want = MemoryBudget {
+        tcp_pool: cfg.buffer_pool / 4096 * 4096,
+        tcp_flows: 512 * 4096,
+        packet_queues: (512 + 2 * 256 + 1) * mtu,
+        udp_flows: 256 * per_udp,
+        dns: 32 * 2 * mtu,
+        total: 19_891_420,
+    };
+    assert_eq!(b, want);
+    assert!(b.total < 20 * 1024 * 1024, "{b:?}");
+    // The pool, not the flow count, bounds TCP buffering.
     assert!(b.tcp_pool < cfg.max_tcp_flows * (cfg.tcp_rx_buffer + cfg.tcp_tx_buffer) / 4);
+}
+
+/// r7 #8: the per-connection sniff term covers what classifying one QUIC
+/// connection really allocates: three datagrams of a ClientHello that is
+/// not complete yet, held, plus the sniffer's state.
+#[test]
+fn quic_sniff_state_stays_within_its_budget_term() {
+    use segue_kernel::quic::{seal_initial_for_test, InitialSniffer, Quic};
+    // A ClientHello prefix whose extensions run past three datagrams.
+    let mut hello = vec![0x01, 0x00, 0x20, 0x00, 0x03, 0x03];
+    hello.extend_from_slice(&[7; 32]);
+    hello.extend_from_slice(&[0, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00, 0x1f, 0x00]);
+    hello.resize(4000, 0xfa);
+    let dcid = [9u8; 8];
+    let chunk = 1100;
+    let dgrams: Vec<Vec<u8>> = (0..3)
+        .map(|i| {
+            let off = i * chunk;
+            seal_initial_for_test(&dcid, off as u64, &hello[off..off + chunk])
+        })
+        .collect();
+    let mtu = dgrams.iter().map(Vec::len).max().unwrap();
+    counting::TRACKED.with(|t| t.set(true));
+    let base = counting::live();
+    let mut sniffer = InitialSniffer::default();
+    let mut held = Vec::with_capacity(3);
+    for d in &dgrams {
+        assert_eq!(sniffer.push(d), Quic::NeedMore);
+        held.push(d.clone());
+    }
+    let used = counting::live() - base;
+    counting::TRACKED.with(|t| t.set(false));
+    let term = segue_kernel::tun::sniff_state(mtu) as isize;
+    println!("classifying one connection holds {used} B, budget term {term} B");
+    assert!(used >= 2 * 3 * chunk as isize, "{used}: copies not measured");
+    assert!(used <= term, "{used} > {term}");
+    drop((sniffer, held));
 }
 
 struct RefuseAllRules;
