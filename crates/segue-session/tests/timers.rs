@@ -456,3 +456,97 @@ fn live_control_streams_of_many_exits_are_not_kicked() {
     assert_eq!(kicked, 0, "live control streams closed");
     assert_eq!(next_cid as usize - 1, exits, "streams reconnected");
 }
+
+/// A relay with the FIN held for the site writer and site data out that
+/// the client never acknowledges, plus the client whose OPEN made it.
+fn held_fin_relay(t0: Instant, relay_cfg: Config, client_cfg: Config) -> RelayTable {
+    let mut c = ClientSession::with_ids(client_cfg, &Pool::new(1 << 20), params(), SID, SECRET, t0)
+        .unwrap();
+    c.attach(1, t0);
+    let mut r = RelayTable::new(relay_cfg, Pool::new(1 << 20), Box::new(AllowAll), INSTANCE);
+    r.confirm_site_flush(true);
+    r.add_carrier(1);
+    r.on_frame(1, c.poll_transmit(1, t0).unwrap(), t0);
+    let _ = r.take_event();
+    r.connect_done(&SID, Ok(()), t0);
+    r.on_frame(1, Frame::Fin { offset: 0 }, t0);
+    r.site_data(&SID, &[7u8; 1000]);
+    while r.poll_transmit(1, t0).is_some() {}
+    r
+}
+
+/// Drive `r` like its driver for `span` from `t`: wake at each deadline,
+/// handle it, send what carrier 1 has. Returns the wake-ups at which the
+/// deadline was already due (each one a lap of a spinning driver).
+fn spins(r: &mut RelayTable, mut t: Instant, span: Duration) -> usize {
+    let end = t + span;
+    let mut due = 0;
+    while t < end && due < 1000 {
+        r.handle_timeout(t);
+        while r.poll_transmit(1, t).is_some() {}
+        match r.poll_timeout() {
+            Some(d) if d <= t => due += 1,
+            Some(d) => t = d,
+            None => break,
+        }
+    }
+    due
+}
+
+/// r9 F3: with the client's FIN held and the session DETACHED (nothing is
+/// acknowledged for `t_live`), the held-FIN keepalive cannot go out
+/// (`poll_transmit` sends nothing while detached). Before, its deadline
+/// stayed in the past and the driver woke in a loop until `t_detached`.
+#[test]
+fn a_held_fin_keepalive_is_no_deadline_while_detached() {
+    let t0 = Instant::now();
+    let mut r = held_fin_relay(t0, Config::default(), Config::default());
+    let t = t0 + Config::default().timing.t_live;
+    r.handle_timeout(t);
+    assert_eq!(
+        r.state(&SID),
+        Some(segue_session::relay::SessionState::Detached)
+    );
+    assert_eq!(spins(&mut r, t, Duration::from_secs(5)), 0);
+}
+
+/// r9 F3: while the carrier's writer is full the driver asks with
+/// `poll_timeout_writable`: deadlines only sending can serve (the
+/// keepalive, a delayed ACK) are left out, nothing else is.
+#[test]
+fn deadlines_served_by_sending_wait_for_a_writable_carrier() {
+    let t0 = Instant::now();
+    let r = held_fin_relay(t0, Config::default(), Config::default());
+    let ka = r.keepalive(&SID).unwrap();
+    let t = t0 + ka;
+    let free = r.poll_timeout_writable(|_| true).unwrap();
+    assert!(free <= t, "keepalive not due with room");
+    let blocked = r.poll_timeout_writable(|_| false).unwrap();
+    assert!(
+        blocked > t,
+        "a blocked carrier's keepalive kept a due deadline"
+    );
+    // Still bounded by the session's own timers (t_live here).
+    assert!(blocked <= t0 + Config::default().timing.t_live);
+}
+
+/// r9 (keepalive assumption): the relay keeps alive at half the shorter
+/// of its own and the client's announced `t_stall`, with a floor.
+#[test]
+fn relay_keepalive_follows_the_shorter_stall_bound() {
+    let t0 = Instant::now();
+    let with = |relay_ms: u64, client_ms: u64| {
+        let mut rc = Config::default();
+        rc.timing.t_stall = Duration::from_millis(relay_ms);
+        let mut cc = Config::default();
+        cc.timing.t_stall = Duration::from_millis(client_ms);
+        held_fin_relay(t0, rc, cc).keepalive(&SID).unwrap()
+    };
+    assert_eq!(with(4000, 1000), Duration::from_millis(500));
+    assert_eq!(with(1000, 4000), Duration::from_millis(500));
+    assert_eq!(
+        with(4000, 1),
+        segue_session::relay::MIN_CLIENT_STALL / 2,
+        "a client cannot make the relay send ACKs in a loop"
+    );
+}
