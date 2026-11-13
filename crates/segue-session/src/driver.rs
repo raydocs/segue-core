@@ -824,6 +824,14 @@ where
 
     loop {
         let t = now();
+        // An attach's clock runs from the last byte of its hello the
+        // carrier took: a slow carrier still taking a large OPEN is not
+        // an unanswered one.
+        for (&cid, io) in &carriers {
+            if let Some(at) = io.tx_at.get() {
+                s.on_carrier_sent(cid, at.into_std());
+            }
+        }
         s.handle_timeout(t);
         let backoff_ok = connect_backoff.is_none_or(|b| tokio::time::Instant::now() >= b);
         if !connecting && backoff_ok && s.wants_attach(t) {

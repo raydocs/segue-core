@@ -1829,7 +1829,12 @@ async fn slow_echo(len: usize, chunk: usize, every: Duration) -> (CloseReason, D
     done.store(true, Ordering::SeqCst);
     let hogged = hog.await.unwrap();
     assert!(hogged > 100, "the pool was never spent ({hogged} blocks)");
-    assert!(r.len() == len, "download {} of {len} bytes", r.len());
+    assert!(
+        r.len() == len,
+        "download {} of {len} bytes; session ended {reason:?} after {took:?}, {} dial(s)",
+        r.len(),
+        dials.load(Ordering::SeqCst)
+    );
     assert!(r == *want, "download differs");
     relay.abort();
     (reason, took, dials.load(Ordering::SeqCst))
@@ -1927,10 +1932,13 @@ async fn dead_carriers_are_redialled_with_backoff_and_a_bound() {
     relay.abort();
     app.write_all(&pattern(4096, 1)).await.unwrap();
     let t0 = Instant::now();
-    let reason = tokio::time::timeout(Duration::from_secs(60), client)
-        .await
-        .expect("session kept redialling")
-        .unwrap();
+    let reason = match tokio::time::timeout(Duration::from_secs(60), client).await {
+        Ok(r) => r.unwrap(),
+        Err(_) => panic!(
+            "session kept going: {} dial(s) in 60 s",
+            dials.load(Ordering::SeqCst)
+        ),
+    };
     let took = t0.elapsed();
     let n = dials.load(Ordering::SeqCst);
     println!("gave up after {took:?} and {n} dials");

@@ -412,6 +412,19 @@ impl ClientSession {
         }
     }
 
+    /// The carrier's writer moved bytes at `at`. Before the attach is
+    /// answered those are the hello's: [`crate::Timing::t_attach`] counts from
+    /// the last of them, so a hello that takes long to cross a slow
+    /// carrier is not given up while it is still moving (r8 N5).
+    pub fn on_carrier_sent(&mut self, cid: CarrierId, at: Instant) {
+        if self.carrier != Some(cid) || self.confirmed || self.is_closed() {
+            return;
+        }
+        if let Some(s) = self.attach_started.as_mut() {
+            *s = (*s).max(at);
+        }
+    }
+
     fn keepalive(&self) -> std::time::Duration {
         (self.cfg.timing.t_stall / 2).max(std::time::Duration::from_millis(10))
     }
@@ -436,7 +449,10 @@ impl ClientSession {
             self.fruitless = 0;
             return;
         }
-        if !self.send.unacked() {
+        // Anything outstanding, sent or not: bytes that arrived after the
+        // last carrier that took data died are never sent before an
+        // attach is answered, and must still count.
+        if !self.send.pending() {
             return;
         }
         self.fruitless += 1;
