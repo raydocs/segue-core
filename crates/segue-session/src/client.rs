@@ -101,11 +101,12 @@ pub const LOCAL_GIVE_UP: u8 = code::CONNECT_TIMEOUT;
 
 /// Carriers that may be lost in a row with data outstanding and no
 /// progress before the session gives up (r8 N5). With the backoff below
-/// that is about 20 s of trying.
+/// that is about 11 s of waiting between attempts (and `t_detached` bounds
+/// the time detached in any case).
 pub const MAX_FRUITLESS: u32 = 8;
 /// Wait before redialling after the first such loss; doubles per loss.
 pub const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
-pub const RECONNECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+pub const RECONNECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Result of [`ClientSession::poll_transmit_into`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -792,7 +793,12 @@ impl ClientSession {
             && !self.confirmed
             && self.attach_started.is_some_and(|s| now >= s + t.t_attach)
         {
-            // T_attach: abandon this attempt, retry on a new carrier.
+            // T_attach: abandon this attempt, retry on a new carrier (an
+            // attempt that got no answer counts against the bound).
+            self.carrier_lost(now);
+            if self.is_closed() {
+                return;
+            }
             let old = self.carrier.take().unwrap();
             self.abandoned.push(old);
             self.need_attach = true;
