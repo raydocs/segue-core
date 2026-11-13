@@ -121,9 +121,12 @@ impl Relay {
             cfg.revocation_file.clone(),
             cfg.revocation_state.clone(),
         ));
-        if let Err(e) = revoked.restore() {
-            crate::log!("error", "revocation state not restored", "error" = e);
-        }
+        // An accepted state that exists but cannot be read is fatal (review
+        // r6 R3): its floor is unknown, and starting from nothing would
+        // take back an older snapshot that un-revokes devices.
+        revoked
+            .restore()
+            .map_err(|e| format!("{e}; refusing to start (repair or remove it)"))?;
         if cfg.revocation_file.is_some() {
             // Without an earlier snapshot a bad file is fatal; with one,
             // the file (e.g. an older list replayed) is refused and the
@@ -134,9 +137,9 @@ impl Relay {
                     "error",
                     "revocation file refused; keeping restored list",
                     "seq" = seq,
-                    "error" = e
+                    "error" = e.message
                 ),
-                (Err(e), None) => return Err(e),
+                (Err(e), None) => return Err(e.into()),
             }
         }
         let ai = Arc::new(AiPolicy::with_state(
@@ -225,7 +228,7 @@ impl Relay {
 
     /// Re-read the revocation list; RST sessions of newly revoked devices.
     pub async fn reload_revocations(&self, ctrl: &mpsc::Sender<RelayCtrl>) {
-        match self.revoked.reload() {
+        let added = match self.revoked.reload() {
             Ok(added) => {
                 if !added.is_empty() {
                     Metrics::inc(&self.metrics.revocation_reloads);
@@ -236,21 +239,31 @@ impl Relay {
                         "new" = added.len()
                     );
                 }
-                for d in added {
-                    Metrics::inc(&self.metrics.devices_reset);
-                    let _ = ctrl
-                        .send(RelayCtrl::ResetDevice {
-                            device: d,
-                            close_code: code::REVOKED,
-                        })
-                        .await;
-                }
+                added
             }
-            Err(e) => crate::log!(
-                "error",
-                "revocation reload failed; keeping last list",
-                "error" = e
-            ),
+            Err(e) => {
+                if !e.newly_revoked.is_empty() || self.revoked.storage_fault() {
+                    // Not committed (state not durable), but the newly
+                    // revoked devices are enforced now (review r6 R2).
+                    Metrics::inc(&self.metrics.state_persist_failures);
+                }
+                crate::log!(
+                    "error",
+                    "revocation snapshot not committed; keeping last list",
+                    "enforced_now" = e.newly_revoked.len(),
+                    "error" = e.message
+                );
+                e.newly_revoked
+            }
+        };
+        for d in added {
+            Metrics::inc(&self.metrics.devices_reset);
+            let _ = ctrl
+                .send(RelayCtrl::ResetDevice {
+                    device: d,
+                    close_code: code::REVOKED,
+                })
+                .await;
         }
     }
 }
