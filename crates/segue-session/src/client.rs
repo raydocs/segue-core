@@ -99,6 +99,14 @@ impl std::fmt::Debug for OpenParams {
 /// Local code used when the client gives up re-attaching / retrying OPEN.
 pub const LOCAL_GIVE_UP: u8 = code::CONNECT_TIMEOUT;
 
+/// Carriers that may be lost in a row with data outstanding and no
+/// progress before the session gives up (r8 N5). With the backoff below
+/// that is about 20 s of trying.
+pub const MAX_FRUITLESS: u32 = 8;
+/// Wait before redialling after the first such loss; doubles per loss.
+pub const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+pub const RECONNECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Result of [`ClientSession::poll_transmit_into`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tx {
@@ -143,6 +151,12 @@ pub struct ClientSession {
     backoff_until: Option<Instant>,
     backoff: std::time::Duration,
     last_rx: Instant,
+    /// The current carrier acknowledged new data or delivered new data
+    /// since it was attached.
+    progressed: bool,
+    /// Carriers lost in a row, each with data outstanding and no progress
+    /// on it (r8 N5): they back off, and too many end the session.
+    fruitless: u32,
     send: SendHalf,
     recv: RecvHalf,
     park: ParkTracker,
@@ -210,6 +224,8 @@ impl ClientSession {
             detached_since: None,
             backoff_until: None,
             last_rx: now,
+            progressed: false,
+            fruitless: 0,
             send,
             recv,
             park: ParkTracker::default(),
@@ -290,6 +306,7 @@ impl ClientSession {
         self.attach_started = Some(now);
         self.park.cancel();
         self.last_rx = now;
+        self.progressed = false;
         let hello = if !self.ever_opened {
             let retry = self.attached_once;
             if !retry {
@@ -366,14 +383,58 @@ impl ClientSession {
     /// `STALL{session_id, attach_gen}` from the control stream (B1).
     pub fn on_stall(&mut self, gen: u32, now: Instant) {
         if gen == self.gen && self.state == State::Active {
+            self.carrier_lost(now);
             self.reattach(now);
         }
+    }
+
+    /// Bytes moved on carrier `cid` (either way) at `at`, though maybe no
+    /// whole frame yet: a carrier that keeps moving is not stalled, however
+    /// slowly it goes (r8 N4/N5).
+    pub fn note_carrier_activity(&mut self, cid: CarrierId, at: Instant) {
+        if self.carrier == Some(cid) && at > self.last_rx {
+            self.last_rx = at;
+        }
+    }
+
+    /// Carriers lost in a row with data outstanding and nothing moved on
+    /// them (see [`MAX_FRUITLESS`]).
+    pub fn fruitless_carriers(&self) -> u32 {
+        self.fruitless
+    }
+
+    /// The current carrier is being given up (closed, stalled, or held a
+    /// frame too long). Losing one that moved nothing while data was
+    /// outstanding backs off the next attempt, exponentially, and after
+    /// [`MAX_FRUITLESS`] in a row the session ends: a path that cannot
+    /// move data is not redialled without bound (r8 N5). A carrier that
+    /// made progress is replaced at once.
+    fn carrier_lost(&mut self, now: Instant) {
+        if self.is_closed() || self.carrier.is_none() {
+            return;
+        }
+        if self.progressed {
+            self.fruitless = 0;
+            return;
+        }
+        if !self.send.unacked() {
+            return;
+        }
+        self.fruitless += 1;
+        if self.fruitless > MAX_FRUITLESS {
+            self.close(CloseReason::Reset(LOCAL_GIVE_UP));
+            return;
+        }
+        let d = (RECONNECT_BACKOFF * (1 << (self.fruitless - 1).min(8))).min(RECONNECT_BACKOFF_MAX);
+        let until = now + d;
+        self.backoff_until = Some(self.backoff_until.map_or(until, |b| b.max(until)));
     }
 
     pub fn on_carrier_closed(&mut self, cid: CarrierId, now: Instant) {
         if self.carrier != Some(cid) {
             return;
         }
+        self.carrier_lost(now);
         self.carrier = None;
         if self.is_closed() {
             return;
@@ -492,13 +553,17 @@ impl ClientSession {
             Frame::Rst { code } => self.close(CloseReason::Reset(code)),
             Frame::Pad(_) | Frame::Dgram { .. } => {}
             Frame::Data { offset, data, .. } if self.confirmed => {
-                self.recv.on_data(offset, &data, now)?;
+                if self.recv.on_data(offset, &data, now)? > 0 {
+                    self.progressed = true;
+                }
             }
             Frame::Ack {
                 recv_offset,
                 max_offset,
             } if self.confirmed => {
-                self.send.on_ack(recv_offset, max_offset)?;
+                if self.send.on_ack(recv_offset, max_offset)? {
+                    self.progressed = true;
+                }
             }
             Frame::Fin { offset } if self.confirmed => self.recv.on_fin(offset, now)?,
             _ => return Err(ProtoError::Violation("unexpected frame on session carrier")),
@@ -688,6 +753,7 @@ impl ClientSession {
             self.detached_since.get_or_insert(now);
         }
         if self.confirmed && self.send.unacked() && now >= self.last_rx + t.t_stall {
+            self.carrier_lost(now);
             self.reattach(now);
         }
         if self.recv.idle_deadline().is_some_and(|d| now >= d) {

@@ -135,6 +135,9 @@ struct Session {
     /// the site has not taken the upload yet (see
     /// [`RelayTable::confirm_site_flush`]).
     held_fin: Option<u64>,
+    /// When a frame of this session last went out (see
+    /// [`RelayTable::keepalive`]).
+    last_sent: Instant,
 }
 
 // Manual so the resume secret never reaches a log.
@@ -556,6 +559,7 @@ impl RelayTable {
                     rst: None,
                     created: now,
                     held_fin: None,
+                    last_sent: now,
                 };
                 self.sessions.insert(sid, s);
                 self.carriers.get_mut(&cid).unwrap().session = Some(sid);
@@ -763,6 +767,7 @@ impl RelayTable {
     /// Next frame for carrier `cid`.
     pub fn poll_transmit(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
         self.clock = self.clock.max(now);
+        let keepalive = self.keepalive();
         let slot = self.carriers.get_mut(&cid)?;
         if let Some(f) = slot.out.take() {
             return Some(f);
@@ -804,6 +809,7 @@ impl RelayTable {
         }
         let piggyback = s.send.has_sendable();
         if let Some(a) = s.recv.poll_ack(now, piggyback) {
+            s.last_sent = now;
             self.check_done(&sid, now);
             return Some(a);
         }
@@ -813,7 +819,42 @@ impl RelayTable {
         if s.send.has_sendable() && !s.send.unacked() {
             s.last_progress = now;
         }
-        s.send.poll_frame()
+        if let Some(f) = s.send.poll_frame() {
+            s.last_sent = now;
+            return Some(f);
+        }
+        // r8 N4: while the client's FIN waits for the site to take the
+        // upload, nothing else may go out for a long time, and the client
+        // would take the quiet carrier (its FIN unacknowledged) for a
+        // stalled one. Repeat the current ACK (it moves no offset, so the
+        // FIN stays unacknowledged) to show the carrier is alive.
+        if s.held_fin.is_some() && now >= s.last_sent + keepalive {
+            s.last_sent = now;
+            return Some(s.recv.force_ack());
+        }
+        None
+    }
+
+    /// How often a session whose upload FIN waits for the site repeats its
+    /// ACK: twice per `t_stall` (the client's stall bound; the client must
+    /// not use a shorter one than the relay's configuration).
+    fn keepalive(&self) -> std::time::Duration {
+        (self.cfg.timing.t_stall / 2).max(std::time::Duration::from_millis(10))
+    }
+
+    /// Bytes moved on carrier `cid` (either way) at `at`, though maybe no
+    /// whole frame: an active session on it is making progress and is not
+    /// detached for want of an ACK while its carrier keeps moving, however
+    /// slowly (r8 N4/N5).
+    pub fn note_carrier_activity(&mut self, cid: CarrierId, at: Instant) {
+        let Some(sid) = self.carriers.get(&cid).and_then(|c| c.session) else {
+            return;
+        };
+        if let Some(s) = self.sessions.get_mut(&sid) {
+            if s.carrier == Some(cid) && s.state == SessionState::Active && at > s.last_progress {
+                s.last_progress = at;
+            }
+        }
     }
 
     // ---- site side ----
@@ -924,6 +965,9 @@ impl RelayTable {
             }
             if s.state == SessionState::Active && s.send.unacked() {
                 put(s.last_progress + t.t_live);
+            }
+            if s.held_fin.is_some() && s.carrier.is_some() && s.connected {
+                put(s.last_sent + self.keepalive());
             }
             // ACKs go out only once connected (`poll_transmit` holds them
             // back before), so an earlier deadline could never be served.

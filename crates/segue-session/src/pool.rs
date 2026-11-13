@@ -68,12 +68,19 @@ pub enum Tier {
     Transport,
 }
 
+/// Default [`Pool::transport_hold`]: how long a frame holding the
+/// transport region may go with *no byte of it* moving. Well above the gap
+/// between reads or writes on a working carrier, short enough that
+/// carriers that stopped moving cannot keep the region from healthy ones
+/// for long. Progress-based (r8 N5): a slow carrier that keeps moving the
+/// frame is not cut by it.
+pub const TRANSPORT_HOLD: Duration = Duration::from_secs(2);
+/// Default [`Pool::transport_hold_max`]: overall bound on one frame's
+/// hold, however it progresses. A [`FRAME_MAX`] frame within it needs
+/// about 550 B/s.
+pub const TRANSPORT_HOLD_MAX: Duration = Duration::from_secs(30);
 /// Default regions on top of the elastic part, in blocks: two full
 /// frames for carriers, four 16 KiB chunks for the TUN relay.
-/// Default [`Pool::transport_hold`]: well above a frame's write time on a
-/// working carrier, short enough that carriers that stopped moving cannot
-/// keep the region from healthy ones for long.
-pub const TRANSPORT_HOLD: Duration = Duration::from_secs(2);
 pub const TRANSPORT_REGION: usize = 2 * FRAME_MAX.div_ceil(BLOCK);
 pub const RELAY_REGION: usize = 16;
 
@@ -90,8 +97,10 @@ pub struct Pool {
     transport_used: AtomicUsize,
     /// Tickets waiting for the transport region, oldest first.
     queue: Mutex<TicketQueue>,
-    /// How long a frame may hold transport blocks (milliseconds).
+    /// How long a frame may hold transport blocks without progress, and
+    /// at most (milliseconds).
     hold_ms: AtomicU64,
+    hold_max_ms: AtomicU64,
     sessions: AtomicUsize,
     waiters: AtomicUsize,
     freed: Notify,
@@ -120,6 +129,7 @@ impl Pool {
             transport_used: AtomicUsize::new(0),
             queue: Mutex::new(TicketQueue::default()),
             hold_ms: AtomicU64::new(TRANSPORT_HOLD.as_millis() as u64),
+            hold_max_ms: AtomicU64::new(TRANSPORT_HOLD_MAX.as_millis() as u64),
             sessions: AtomicUsize::new(0),
             waiters: AtomicUsize::new(0),
             freed: Notify::new(),
@@ -209,20 +219,28 @@ impl Pool {
     /// what it last asked for reserved: everyone else takes only what
     /// leaves that much free, so blocks given back go to the first in line
     /// as soon as they cover it, however many others retry (r7 #1).
+    ///
+    /// The reservation is read and the blocks are claimed under the queue
+    /// lock (r8 N6): the first in line cannot raise what it needs between
+    /// another taker's check and its claim, so a reservation, once made, is
+    /// never taken from. Blocks given back only lower the count, so they
+    /// need no lock.
     fn take_transport(&self, want: usize, min: usize, ticket: Option<&Ticket>) -> usize {
-        let reserve = {
-            let mut q = self.queue.lock().unwrap();
-            let head_id = q.ids.front().map(|(id, _)| *id);
-            match head_id {
-                None => 0,
-                Some(h) if ticket.is_some_and(|t| t.id == h) => {
-                    q.need = min.min(self.transport);
-                    0
-                }
-                Some(_) => q.need,
+        let mut q = self.queue.lock().unwrap();
+        let head_id = q.ids.front().map(|(id, _)| *id);
+        let reserve = match head_id {
+            None => 0,
+            Some(h) if ticket.is_some_and(|t| t.id == h) => {
+                q.need = min.min(self.transport);
+                0
             }
+            Some(_) => q.need,
         };
-        self.take_counter(&self.transport_used, want, min, self.transport - reserve)
+        #[cfg(test)]
+        tests::between_check_and_claim();
+        let n = self.take_counter(&self.transport_used, want, min, self.transport - reserve);
+        drop(q);
+        n
     }
 
     fn take_counter(&self, c: &AtomicUsize, want: usize, min: usize, limit: usize) -> usize {
@@ -284,14 +302,26 @@ impl Pool {
         }
     }
 
-    /// How long a frame may hold transport-region blocks before its
-    /// carrier is given up (its data is replayed on the next one).
+    /// How long a frame holding transport-region blocks may go without
+    /// any of its bytes moving before its carrier is given up (its data is
+    /// replayed on the next one).
     pub fn transport_hold(&self) -> Duration {
         Duration::from_millis(self.hold_ms.load(Ordering::Relaxed))
     }
 
     pub fn set_transport_hold(&self, d: Duration) {
         self.hold_ms
+            .store(d.as_millis().max(1) as u64, Ordering::Relaxed);
+    }
+
+    /// Overall bound on one frame's hold of transport-region blocks,
+    /// however steadily it moves.
+    pub fn transport_hold_max(&self) -> Duration {
+        Duration::from_millis(self.hold_max_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn set_transport_hold_max(&self, d: Duration) {
+        self.hold_max_ms
             .store(d.as_millis().max(1) as u64, Ordering::Relaxed);
     }
 
@@ -535,6 +565,67 @@ pub const FRAME_MAX: usize = crate::codec::MAX_PAYLOAD + 16;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static BETWEEN: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    /// Runs (once) the hook this thread set, between a transport taker's
+    /// reservation check and its claim.
+    pub(super) fn between_check_and_claim() {
+        if let Some(f) = BETWEEN.with(|b| b.borrow_mut().take()) {
+            f();
+        }
+    }
+
+    #[test]
+    fn a_reservation_cannot_be_raised_between_anothers_check_and_claim() {
+        // r8 N6: another taker read the reservation (1 block, the first in
+        // line had not asked yet), then the first in line asked for the
+        // whole region and failed (one block held), then that block came
+        // back, and only then did the other claim, against the stale
+        // reservation: it took blocks reserved for the first in line. Now
+        // the check and the claim happen under one lock, so the first in
+        // line cannot register in between.
+        let pool = Pool::with_regions(16 * BLOCK, 0, 8);
+        let head = pool.ticket();
+        let held = Grant::up_to(&pool, BLOCK, Tier::Transport).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = pool.clone();
+        let head_thread = std::thread::spawn(move || {
+            let g = Grant::transport(&p, 8 * BLOCK, 8 * BLOCK, &head);
+            let _ = tx.send(g.is_some());
+            (head, g.is_some())
+        });
+        let p2 = pool.clone();
+        BETWEEN.with(|b| {
+            *b.borrow_mut() = Some(Box::new(move || {
+                // Give the first in line every chance to register now.
+                let registered = rx.recv_timeout(Duration::from_millis(200)).ok();
+                // Give the held block back without the wake-up (which takes
+                // the queue lock this taker may hold).
+                std::mem::forget(held);
+                p2.transport_used.fetch_sub(1, Ordering::AcqRel);
+                REGISTERED.with(|r| r.set(registered));
+            }))
+        });
+        let other = Grant::up_to(&pool, 4 * BLOCK, Tier::Transport);
+        let registered = REGISTERED.with(|r| r.get());
+        let (_head, _) = head_thread.join().unwrap();
+        assert!(
+            !(registered == Some(false) && other.is_some()),
+            "the first in line registered its need between another's check and \
+             claim, and the other took {} reserved blocks",
+            other.as_ref().map_or(0, |g| g.bytes() / BLOCK)
+        );
+    }
+
+    thread_local! {
+        static REGISTERED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
 
     #[test]
     fn never_overcommits() {
