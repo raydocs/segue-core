@@ -140,7 +140,13 @@ pub enum Health {
     /// during an upload). Repeated every [`HEALTH_REFRESH`] while bytes
     /// keep arriving. It never touches the recovery budget (only business
     /// progress resets that) and never replaces a report not yet taken.
-    Alive,
+    ///
+    /// Carries when those bytes were read off the carrier, which may be
+    /// earlier than the report (r12 #1): a frame already here that waits
+    /// for local memory (the shared pool) keeps the carrier from being
+    /// taken for stalled but is no new evidence, so no report follows
+    /// until a byte newer than the last reported evidence arrives.
+    Alive(Instant),
 }
 
 /// Result of [`ClientSession::poll_transmit_into`].
@@ -203,6 +209,9 @@ pub struct ClientSession {
     up_reported: Option<Instant>,
     /// When [`Health::Up`] or [`Health::Alive`] was last reported.
     alive_reported: Option<Instant>,
+    /// The latest evidence reported: when the bytes behind the last
+    /// [`Health::Up`] or [`Health::Alive`] arrived (r12 #1).
+    evidence_at: Option<Instant>,
     /// When the current carrier's attach was answered.
     confirmed_at: Option<Instant>,
     /// When a frame last went out, and a keepalive ACK is owed (see
@@ -282,6 +291,7 @@ impl ClientSession {
             health: None,
             up_reported: None,
             alive_reported: None,
+            evidence_at: None,
             confirmed_at: None,
             last_sent: now,
             ka_due: false,
@@ -477,12 +487,16 @@ impl ClientSession {
     }
 
     /// Bytes of a frame not yet complete arrived on carrier `cid` (the
-    /// driver's reader reports it, rate-limited): the relay and the path
-    /// are alive, only slow, so the carrier is not stalled (r8 N5). The
-    /// session repeats its current ACK (no offset moves; at most once per
-    /// keepalive period) so the relay's `t_live` sees the same. Only bytes
-    /// that arrived count, never bytes this side wrote.
-    pub fn on_carrier_progress(&mut self, cid: CarrierId, now: Instant) {
+    /// driver's reader reports it, rate-limited), the last of them read at
+    /// `rx_at`; or such a frame is here and waits for local memory: the
+    /// relay and the path are alive, only slow, so the carrier is not
+    /// stalled (r8 N5). The session repeats its current ACK (no offset
+    /// moves; at most once per keepalive period) so the relay's `t_live`
+    /// sees the same. Only bytes that arrived count, never bytes this side
+    /// wrote, and as path liveness ([`Health::Alive`]) only at `rx_at`: a
+    /// local wait repeats the report with the same `rx_at`, which is no
+    /// new evidence (r12 #1).
+    pub fn on_carrier_progress(&mut self, cid: CarrierId, rx_at: Instant, now: Instant) {
         if self.carrier != Some(cid) || self.is_closed() {
             return;
         }
@@ -491,7 +505,7 @@ impl ClientSession {
         if self.confirmed && now >= self.last_sent + self.keepalive() {
             self.ka_due = true;
         }
-        self.alive(now);
+        self.alive(rx_at.min(now), now);
     }
 
     /// The carrier's writer moved bytes at `at`. Before the attach is
@@ -552,8 +566,7 @@ impl ClientSession {
             && self
                 .confirmed_at
                 .is_some_and(|c| now < c + self.cfg.timing.t_live);
-        let failed =
-            expected || !self.confirmed || brief || self.send.pending() || self.rx_partial;
+        let failed = expected || !self.confirmed || brief || self.send.pending() || self.rx_partial;
         if failed && (expected || !self.progressed) {
             // Health: this carrier failed. A stall, a hold timeout or an
             // unanswered attach is a failure even if data moved on it
@@ -654,7 +667,7 @@ impl ClientSession {
             return self.fatal(e);
         }
         // After the frame: OPENED / progress report Up instead.
-        self.alive(now);
+        self.alive(now, now);
         self.check_done();
         Ok(())
     }
@@ -774,19 +787,28 @@ impl ClientSession {
         if self.up_reported.is_none_or(|t| now >= t + HEALTH_REFRESH) {
             self.up_reported = Some(now);
             self.alive_reported = Some(now);
+            self.evidence_at = Some(now);
             self.health = Some(Health::Up);
         }
     }
 
-    /// Bytes from the relay arrived on the current carrier (see
-    /// [`Health::Alive`]).
-    fn alive(&mut self, now: Instant) {
+    /// Bytes from the relay arrived on the current carrier at `at` (see
+    /// [`Health::Alive`]). Nothing is reported unless they are newer than
+    /// the evidence already reported (r12 #1).
+    fn alive(&mut self, at: Instant, now: Instant) {
         if !self.confirmed || self.is_closed() || self.health.is_some() {
             return;
         }
-        if self.alive_reported.is_none_or(|t| now >= t + HEALTH_REFRESH) {
+        if self.evidence_at.is_some_and(|e| at <= e) {
+            return;
+        }
+        if self
+            .alive_reported
+            .is_none_or(|t| now >= t + HEALTH_REFRESH)
+        {
             self.alive_reported = Some(now);
-            self.health = Some(Health::Alive);
+            self.evidence_at = Some(at);
+            self.health = Some(Health::Alive(at));
         }
     }
 

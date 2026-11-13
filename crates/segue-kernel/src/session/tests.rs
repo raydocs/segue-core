@@ -367,6 +367,17 @@ fn lab_parts(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>) -> La
 
 /// [`lab_parts`] with the la relay's configuration `la_cfg`.
 fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg: Config) -> Lab {
+    lab_full(la_auth, la_site, la_cfg, None)
+}
+
+/// [`lab_cfg`] whose dialer charges its sessions to `pool` (default: the
+/// process pool).
+fn lab_full(
+    la_auth: Box<dyn Authorizer>,
+    la_site: Option<SiteConnector>,
+    la_cfg: Config,
+    pool: Option<Arc<Pool>>,
+) -> Lab {
     let la = node(la_auth, la_site, la_cfg);
     let ny = node(Box::new(AllowAll), None, Config::default());
     let la_cut = la.cut.clone();
@@ -407,7 +418,10 @@ fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg:
     ]
     .into();
     let home = ["ai".to_string(), "home-out".to_string()].into();
-    let d = KernelDialer::new(engine.clone(), exits, routes, home);
+    let mut d = KernelDialer::new(engine.clone(), exits, routes, home);
+    if let Some(p) = pool {
+        d = d.with_pool(p);
+    }
     Lab {
         d,
         la_up,
@@ -1216,7 +1230,7 @@ mod exit_health {
         // B's proof is old; B shows liveness at t + 4 s (a large frame
         // still crossing).
         let alive = t + Duration::from_secs(4);
-        assert_eq!(feed(&mut h, 2, S::Alive, alive), Posture::Connected);
+        assert_eq!(feed(&mut h, 2, S::Alive(alive), alive), Posture::Connected);
         let edge = alive + PROOF_FRESH;
         assert_eq!(
             feed(&mut h, 1, S::Failed, edge - Duration::from_millis(1)),
@@ -1230,6 +1244,34 @@ mod exit_health {
         );
     }
 
+    /// r12 #1: liveness counts from when its bytes arrived, not from when
+    /// it was reported: a report of old bytes renews nothing.
+    #[test]
+    fn liveness_counts_from_its_receive_time() {
+        let t = Instant::now();
+        let mut h = exit();
+        feed(&mut h, 1, S::Up, t);
+        feed(&mut h, 2, S::Up, t);
+        let rx = t + Duration::from_secs(1);
+        let late = rx + PROOF_FRESH;
+        assert_eq!(feed(&mut h, 2, S::Alive(rx), late), Posture::Connected);
+        assert_eq!(
+            feed(&mut h, 1, S::Failed, late),
+            Posture::Reconnecting,
+            "a late report of old bytes counted as fresh"
+        );
+        // An older report never moves liveness back.
+        let mut h = exit();
+        feed(&mut h, 1, S::Up, t);
+        feed(&mut h, 2, S::Alive(rx), rx);
+        feed(&mut h, 2, S::Alive(t), rx);
+        assert_eq!(
+            feed(&mut h, 1, S::Failed, t + PROOF_FRESH),
+            Posture::Connected,
+            "liveness moved back"
+        );
+    }
+
     /// r11 R4: liveness restores nothing and does not count for a session
     /// that is failing; that session's own failure drops it.
     #[test]
@@ -1240,19 +1282,29 @@ mod exit_health {
         let t = t + PROOF_FRESH;
         assert_eq!(feed(&mut h, 1, S::Failed, t), Posture::Reconnecting);
         // Down: bytes arriving on another session do not bring it back.
-        assert_eq!(feed(&mut h, 2, S::Alive, t), Posture::Reconnecting);
+        assert_eq!(feed(&mut h, 2, S::Alive(t), t), Posture::Reconnecting);
         assert!(h.unproven);
         // A failing session's liveness does not outweigh a failure.
         let mut h = exit();
         feed(&mut h, 1, S::Up, t);
         feed(&mut h, 2, S::Up, t);
-        feed(&mut h, 2, S::Alive, t + Duration::from_secs(1));
+        feed(
+            &mut h,
+            2,
+            S::Alive(t + Duration::from_secs(1)),
+            t + Duration::from_secs(1),
+        );
         assert_eq!(
             feed(&mut h, 2, S::Failed, t + Duration::from_secs(2)),
             Posture::Connected,
             "1's proof still fresh"
         );
-        feed(&mut h, 2, S::Alive, t + Duration::from_secs(3));
+        feed(
+            &mut h,
+            2,
+            S::Alive(t + Duration::from_secs(3)),
+            t + Duration::from_secs(3),
+        );
         assert_eq!(
             feed(&mut h, 1, S::Failed, t + PROOF_FRESH),
             Posture::Reconnecting,
@@ -1479,6 +1531,70 @@ async fn a_control_stream_refused_for_good_is_not_redialled() {
     );
     assert_eq!(l.d.posture(), Posture::Connected);
     assert_eq!(l.d.status().revoked, None);
+}
+
+/// r12 #2: the refusal reaches the UI. `GET /v1/status` (through
+/// `Control::handle`) names the exit and the `REJECT` code while the data
+/// sessions keep the posture `connected`; it stays while disconnected and
+/// a new connect clears it.
+#[tokio::test]
+async fn a_control_refusal_shows_in_the_http_status() {
+    use crate::control::Control;
+    use crate::policy::{Policy, PolicyStore};
+    use crate::rules::{Action, CidrTable, RuleSet};
+    let mut l = lab_with(Box::new(NoControl(code::VERSION)));
+    quicken(&mut l);
+    l.d.set_exit("la").unwrap();
+    let s = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    let d = Arc::new(std::mem::replace(
+        &mut l.d,
+        KernelDialer::new(
+            Arc::new(Engine::default()),
+            vec![],
+            Default::default(),
+            Default::default(),
+        ),
+    ));
+    let policy = PolicyStore::inline(Policy::inline(
+        RuleSet::new(Vec::new(), Action::Reject),
+        CidrTable::default(),
+    ));
+    let c = Control::new(d.clone(), policy, "t".into());
+    let (code, before) = c.handle("GET", "/v1/status", b"").await;
+    assert_eq!(code, 200);
+    assert!(before["control_refused"].is_array(), "{before}");
+    let refused = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (_, st) = c.handle("GET", "/v1/status", b"").await;
+            if st["control_refused"] != serde_json::json!([]) {
+                return st;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("refusal never reached the HTTP status");
+    assert_eq!(
+        refused["control_refused"],
+        serde_json::json!([{"exit": "la", "code": code::VERSION}]),
+        "{refused}"
+    );
+    assert_eq!(refused["state"], "connected", "{refused}");
+    assert_eq!(refused["revoked"], false);
+    roundtrip(s).await;
+    let (_, off) = c.handle("POST", "/v1/disconnect", b"").await;
+    assert_eq!(off["state"], "disconnected");
+    assert_eq!(
+        off["control_refused"],
+        serde_json::json!([{"exit": "la", "code": code::VERSION}]),
+        "the reason went away with the disconnect: {off}"
+    );
+    let (_, on) = c.handle("POST", "/v1/connect", b"").await;
+    assert_eq!(
+        on["control_refused"],
+        serde_json::json!([]),
+        "a new connect kept the old refusal: {on}"
+    );
 }
 
 fn la_posture(l: &Lab) -> Posture {
@@ -1819,6 +1935,102 @@ async fn a_slow_frame_keeps_the_exit_up_beside_a_failing_session() {
         "frame arrived early: {:?}",
         t0.elapsed()
     );
+    bad.abort();
+}
+
+/// A site that sends one byte at once, then holds its stream until `go`
+/// is set, then sends `n` bytes in one write and holds it open.
+fn site_on_cue(go: Arc<AtomicBool>, n: usize) -> SiteConnector {
+    Arc::new(move |_t, _k| {
+        let go = go.clone();
+        Box::pin(async move {
+            let (a, mut b) = tokio::io::duplex(64 << 10);
+            tokio::spawn(async move {
+                let _ = b.write_all(&[7]).await;
+                while !go.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let _ = b.write_all(&vec![7u8; n]).await;
+                std::future::pending::<()>().await;
+                drop(b);
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
+/// r12 #1: session B's next frame (a full 16 KiB DATA) is here, header
+/// and body read off the carrier, but the shared pool cannot hold it: the
+/// transport region is taken (another exit's slow frame) and fewer
+/// elastic blocks are free than the frame needs, so B's reader waits in
+/// `wait_charge`, reporting progress every 250 ms, while nothing more
+/// arrives. That wait keeps B's carrier from stalling, but it is no new
+/// path liveness: once B's last real bytes are older than PROOF_FRESH,
+/// session A failing on the same exit (its small frames still fit) takes
+/// the exit down.
+#[tokio::test]
+async fn a_local_pool_wait_is_no_liveness_beside_a_failing_session() {
+    use segue_session::pool::{Grant, Tier, BLOCK};
+    const FRAME: usize = segue_session::codec::MAX_PAYLOAD;
+    let pool = Pool::new(8 << 20);
+    let go = Arc::new(AtomicBool::new(false));
+    let l = lab_full(
+        Box::new(AllowAll),
+        Some(site_on_cue(go.clone(), FRAME)),
+        Config::default(),
+        Some(pool.clone()),
+    );
+    warm(&l).await;
+    // B's real evidence (OPENED, its first byte) is no older than this.
+    let b_start = Instant::now();
+    let mut b = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    let mut one = [0u8; 1];
+    b.read_exact(&mut one).await.unwrap();
+    let bad = start_bad_session(&l).await;
+    // Leave fewer elastic blocks than B's frame needs (A's frames, of a
+    // block or so, still fit), and take the whole transport region.
+    let room = FRAME / BLOCK - 1;
+    let free = pool.limit(Tier::Elastic) - pool.used_blocks();
+    let elastic = Grant::fixed_in(&pool, (free - room) * BLOCK, Tier::Elastic).expect("elastic");
+    let transport =
+        Grant::between(&pool, BLOCK, usize::MAX / 2, Tier::Transport).expect("transport region");
+    assert!(Grant::between(&pool, FRAME, FRAME, Tier::Elastic).is_none());
+    assert!(Grant::between(&pool, 1, 1, Tier::Transport).is_none());
+    let t0 = Instant::now();
+    go.store(true, Ordering::SeqCst);
+    let down = tokio::time::timeout(PROOF_FRESH * 3, async {
+        loop {
+            if l.d.state.lock().unwrap().health[0].ks.posture() != Posture::Connected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        down.is_ok(),
+        "a local pool wait kept la Connected for {:?}: {:?}",
+        t0.elapsed(),
+        l.d.state.lock().unwrap().health[0].sessions
+    );
+    assert!(
+        b_start.elapsed() >= PROOF_FRESH,
+        "la went down before B's evidence aged: {:?}",
+        b_start.elapsed()
+    );
+    // B itself never failed (its carrier was not taken for stalled): the
+    // exit went down on A alone. With memory back, B's frame arrives.
+    {
+        let st = l.d.state.lock().unwrap();
+        let failing = st.health[0].sessions.values().filter(|m| m.failing).count();
+        assert_eq!(failing, 1, "{:?}", st.health[0].sessions);
+    }
+    drop((elastic, transport));
+    let mut buf = vec![0u8; FRAME];
+    tokio::time::timeout(Duration::from_secs(5), b.read_exact(&mut buf))
+        .await
+        .expect("B's frame never arrived")
+        .unwrap();
     bad.abort();
 }
 

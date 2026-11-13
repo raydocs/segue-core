@@ -303,6 +303,29 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Touch<T> {
     }
 }
 
+/// A reader that records in a [`Stamp`] each read that moved at least
+/// one byte: when bytes really arrived, which a frame waiting for local
+/// memory does not change (r12 #1).
+struct TouchRead<T> {
+    inner: T,
+    stamp: Arc<Stamp>,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for TouchRead<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let r = std::task::ready!(Pin::new(&mut self.inner).poll_read(cx, buf));
+        if r.is_ok() && buf.filled().len() > before {
+            self.stamp.touch();
+        }
+        std::task::Poll::Ready(r)
+    }
+}
+
 /// A carrier's reader and writer; the writer records when it last sent
 /// bytes.
 fn split_carrier(
@@ -328,18 +351,22 @@ fn split_carrier(
 /// ([`CarrierEv::Progress`]).
 const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Rate-limited [`CarrierEv::Progress`] reports of one reader.
+/// Rate-limited [`CarrierEv::Progress`] reports of one reader, each with
+/// when its carrier last delivered bytes (`rx`, stamped by the read
+/// itself).
 struct Progress {
     cid: u64,
     tx: mpsc::Sender<CarrierEv>,
+    rx: Arc<Stamp>,
     last: Option<tokio::time::Instant>,
 }
 
 impl Progress {
-    fn new(cid: u64, tx: mpsc::Sender<CarrierEv>) -> Self {
+    fn new(cid: u64, tx: mpsc::Sender<CarrierEv>, rx: Arc<Stamp>) -> Self {
         Self {
             cid,
             tx,
+            rx,
             last: None,
         }
     }
@@ -347,14 +374,20 @@ impl Progress {
     /// Bytes arrived (or wait, already here, for local memory): report it
     /// unless reported within [`PROGRESS_EVERY`]. Never blocks; a report
     /// that finds the channel full is dropped (the frames in it show the
-    /// carrier moving anyway).
+    /// carrier moving anyway). The report carries the last read's time,
+    /// not now: waiting for memory is not a byte arriving (r12 #1).
     fn report(&mut self) {
         let now = tokio::time::Instant::now();
         if self.last.is_some_and(|l| now < l + PROGRESS_EVERY) {
             return;
         }
+        let Some(at) = self.rx.get() else {
+            return;
+        };
         self.last = Some(now);
-        let _ = self.tx.try_send(CarrierEv::Progress(self.cid));
+        let _ = self
+            .tx
+            .try_send(CarrierEv::Progress(self.cid, at.into_std()));
     }
 
     /// A whole frame went out to the driver: the next partial one reports
@@ -369,8 +402,9 @@ enum CarrierEv {
     Frame(u64, Result<Frame, ProtoError>, Option<Charge>),
     /// Bytes of a frame not yet complete arrived on the carrier (or are
     /// there, waiting for memory): the peer and the path are alive though
-    /// no frame came in (r8 N4/N5). See [`Progress`].
-    Progress(u64),
+    /// no frame came in (r8 N4/N5), the last byte read at the instant
+    /// given. See [`Progress`].
+    Progress(u64, std::time::Instant),
     Closed(u64),
     /// The carrier ended in the middle of a frame, or a frame on it
     /// stopped arriving for the transport hold or outlived the hold cap:
@@ -402,10 +436,15 @@ async fn read_charged<R: AsyncRead + Unpin>(
     tx: mpsc::Sender<CarrierEv>,
     pool: Arc<Pool>,
 ) {
+    let rx = Stamp::new();
+    let r = TouchRead {
+        inner: r,
+        stamp: rx.clone(),
+    };
     let mut r = tokio::io::BufReader::with_capacity(SMALL_READ, r);
     let slot = Arc::new(AtomicBool::new(false));
     let mut ticket = None;
-    let mut progress = Progress::new(cid, tx.clone());
+    let mut progress = Progress::new(cid, tx.clone(), rx);
     loop {
         let mut hdr = [0u8; 10];
         let vlen = match read_header(&mut r, &mut hdr, &mut progress).await {
@@ -526,7 +565,8 @@ async fn read_body<R: AsyncRead + Unpin>(
             return Body::Ended;
         }
         // The body is here and waits only for local memory: the carrier
-        // is not stalled.
+        // is not stalled. The reports while it waits carry when its bytes
+        // arrived, so they show no new path liveness (r12 #1).
         progress.report();
         let c = {
             let wait = wait_charge(pool, slot, ticket, cover);
@@ -613,8 +653,13 @@ async fn wait_charge(
 }
 
 /// Relay side: no pool, a [`FrameDecoder`] over adaptive reads.
-async fn read_frames<R: AsyncRead + Unpin>(cid: u64, mut r: R, tx: mpsc::Sender<CarrierEv>) {
-    let mut progress = Progress::new(cid, tx.clone());
+async fn read_frames<R: AsyncRead + Unpin>(cid: u64, r: R, tx: mpsc::Sender<CarrierEv>) {
+    let rx = Stamp::new();
+    let mut r = TouchRead {
+        inner: r,
+        stamp: rx.clone(),
+    };
+    let mut progress = Progress::new(cid, tx.clone(), rx);
     let mut dec = FrameDecoder::new();
     let mut buf = ReadBuffer::new(None);
     loop {
@@ -1083,7 +1128,7 @@ where
                 match ev {
                     Some(CarrierEv::Frame(cid, Ok(f), _c)) => { let _ = s.on_frame(cid, f, t); }
                     Some(CarrierEv::Frame(cid, Err(e), _)) => s.on_decode_error(cid, e),
-                    Some(CarrierEv::Progress(cid)) => s.on_carrier_progress(cid, t),
+                    Some(CarrierEv::Progress(cid, at)) => s.on_carrier_progress(cid, at, t),
                     Some(CarrierEv::Closed(cid)) => {
                         s.on_carrier_closed(cid, t);
                         if let Some(io) = carriers.remove(&cid) {
@@ -1642,7 +1687,7 @@ pub async fn run_relay_ctl(
                 match ev {
                     Some(CarrierEv::Frame(cid, Ok(f), _)) => table.on_frame(cid, f, t),
                     Some(CarrierEv::Frame(cid, Err(e), _)) => table.on_decode_error(cid, e),
-                    Some(CarrierEv::Progress(cid)) => table.on_carrier_progress(cid, t),
+                    Some(CarrierEv::Progress(cid, _)) => table.on_carrier_progress(cid, t),
                     Some(CarrierEv::Closed(cid) | CarrierEv::Stuck(cid)) => {
                         if let Some(io) = carriers.remove(&cid) {
                             io.reader.abort();

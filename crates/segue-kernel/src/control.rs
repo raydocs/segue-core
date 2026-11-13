@@ -8,7 +8,7 @@
 //!
 //! | Request | Body | Answer |
 //! |---|---|---|
-//! | `GET /v1/status` | | `{"state", "posture", "exit_choice", "current_exit", "exits", "policy"}` |
+//! | `GET /v1/status` | | `{"state", "posture", "exit_choice", "current_exit", "exits", "revoked", "control_refused", "policy"}` |
 //! | `POST /v1/connect` | | status |
 //! | `POST /v1/disconnect` | | status |
 //! | `POST /v1/exit` | `{"exit": "auto" \| "la" \| "ny" ...}` | status |
@@ -16,6 +16,14 @@
 //! `state` is what the UI shows: `connected`, `reconnecting` (connecting,
 //! re-attaching or no carrier available, i.e. the kill switch is holding
 //! traffic) or `disconnected` (user turned it off).
+//!
+//! `control_refused` lists the exits whose relay refused the control
+//! stream for good, `[{"exit": "la", "code": 1}]` with the `REJECT` code
+//! (SESSION_PROTOCOL §8; `1` = version, e.g. after a mixed-version deploy,
+//! `2` = auth, ...). Data sessions may still work, so `state` can be
+//! `connected` meanwhile; the UI tells the user to reconnect or update.
+//! Kept while disconnected, cleared by the next `POST /v1/connect` (r12
+//! #2).
 //!
 //! Requests need `Authorization: Bearer <token>`. Requests carrying an
 //! `Origin` header (a web page) or a `Host` that is not a loopback name are
@@ -81,6 +89,11 @@ impl Control {
             "current_exit": s.current_exit,
             "exits": s.exits,
             "revoked": s.revoked.is_some(),
+            "control_refused": s
+                .control_refused
+                .iter()
+                .map(|(exit, code)| json!({"exit": exit, "code": code}))
+                .collect::<Vec<_>>(),
             "policy": self.policy.status(),
         })
     }

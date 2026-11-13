@@ -792,7 +792,9 @@ fn refusal_fails_exit(c: u8) -> bool {
 /// - `Up` (a valid protocol answer) proves the exit: `Connected`.
 /// - `Alive` (bytes arriving without data moving end to end: a large
 ///   frame on a slow path, keepalive ACKs during an upload; r11 R4) is
-///   path liveness: it counts like proof below, restores nothing.
+///   path liveness: it counts like proof below, restores nothing. It
+///   counts from when those bytes arrived: a frame that is here and waits
+///   for local memory (a full shared pool) renews nothing (r12 #1).
 /// - `Failed` / `GaveUp` takes it down (`Reconnecting`, or `Error` if it
 ///   never worked) only when no other live, non-failing session proved
 ///   the path or showed it alive within [`PROOF_FRESH`]: one bad session
@@ -818,9 +820,11 @@ fn session_health(h: &mut Health, id: u64, r: SessionHealth, now: Instant) {
         // bytes arriving are not a valid protocol answer. It does not clear
         // the session's own failing mark either (a failing session's next
         // carrier has to bring proof).
-        SessionHealth::Alive => {
+        // Stamped with when the bytes arrived, not with the report (r12
+        // #1): a frame waiting for local memory adds nothing.
+        SessionHealth::Alive(at) => {
             let m = h.sessions.entry(id).or_default();
-            m.alive_at = Some(now);
+            m.alive_at = m.alive_at.max(Some(at.min(now)));
         }
         SessionHealth::Failed | SessionHealth::GaveUp => {
             if r == SessionHealth::GaveUp {

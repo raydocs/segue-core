@@ -673,7 +673,11 @@ fn a_stall_after_success_reports_failed_and_progress_refreshes_up() {
         Some(Health::Failed),
         "a stall after earlier success went unreported"
     );
-    assert_eq!(c.fruitless_carriers(), 0, "budget counted a carrier that moved data");
+    assert_eq!(
+        c.fruitless_carriers(),
+        0,
+        "budget counted a carrier that moved data"
+    );
 }
 
 /// r11 R4: bytes arriving without data moving end to end (part of a large
@@ -689,7 +693,7 @@ fn partial_frames_and_keepalive_acks_report_alive_not_up() {
     c.attach(1, t0);
     while c.poll_transmit(1, t0).is_some() {}
     // Before OPENED: bytes arriving prove nothing.
-    c.on_carrier_progress(1, t0);
+    c.on_carrier_progress(1, t0, t0);
     assert_eq!(c.take_health(), None);
     c.on_frame(
         1,
@@ -707,16 +711,22 @@ fn partial_frames_and_keepalive_acks_report_alive_not_up() {
     assert_eq!(c.take_health(), Some(Health::Up));
     // A large frame crossing slowly: no report within the interval, then
     // Alive (not Up), again once per interval.
-    c.on_carrier_progress(1, t0 + Duration::from_millis(300));
+    {
+        let at = t0 + Duration::from_millis(300);
+        c.on_carrier_progress(1, at, at);
+    }
     assert_eq!(c.take_health(), None);
     let t = t0 + HEALTH_REFRESH;
-    c.on_carrier_progress(1, t);
-    assert_eq!(c.take_health(), Some(Health::Alive));
-    c.on_carrier_progress(1, t + Duration::from_millis(500));
+    c.on_carrier_progress(1, t, t);
+    assert!(matches!(c.take_health(), Some(Health::Alive(_))));
+    {
+        let at = t + Duration::from_millis(500);
+        c.on_carrier_progress(1, at, at);
+    }
     assert_eq!(c.take_health(), None);
     let t = t + HEALTH_REFRESH;
-    c.on_carrier_progress(1, t);
-    assert_eq!(c.take_health(), Some(Health::Alive));
+    c.on_carrier_progress(1, t, t);
+    assert!(matches!(c.take_health(), Some(Health::Alive(_))));
     // Upload: the relay repeats its ACK (no offset moves).
     assert_eq!(c.write(b"hello"), 5);
     while c.poll_transmit(1, t).is_some() {}
@@ -726,10 +736,10 @@ fn partial_frames_and_keepalive_acks_report_alive_not_up() {
     };
     let t = t + HEALTH_REFRESH;
     c.on_frame(1, ka.clone(), t).unwrap();
-    assert_eq!(c.take_health(), Some(Health::Alive));
+    assert!(matches!(c.take_health(), Some(Health::Alive(_))));
     let t = t + HEALTH_REFRESH;
     c.on_frame(1, ka, t).unwrap();
-    assert_eq!(c.take_health(), Some(Health::Alive));
+    assert!(matches!(c.take_health(), Some(Health::Alive(_))));
     // The ACK of the upload is progress: Up.
     let t = t + HEALTH_REFRESH;
     c.on_frame(
@@ -742,6 +752,54 @@ fn partial_frames_and_keepalive_acks_report_alive_not_up() {
     )
     .unwrap();
     assert_eq!(c.take_health(), Some(Health::Up));
+}
+
+/// r12 #1: a frame that is here and waits for local memory repeats its
+/// progress report with the time its bytes arrived. That keeps the
+/// carrier from stalling but is no new evidence: `Alive` carries the
+/// receive time and is not repeated until newer bytes arrive.
+#[test]
+fn a_local_wait_reports_no_new_liveness() {
+    use segue_session::client::{Health, HEALTH_REFRESH};
+    use segue_session::codec::Opened;
+    let t0 = Instant::now();
+    let mut c = client(t0);
+    c.attach(1, t0);
+    while c.poll_transmit(1, t0).is_some() {}
+    c.on_frame(
+        1,
+        Frame::Opened(Opened {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            recv_offset: 0,
+            max_offset: 1 << 20,
+            window_cap: 1 << 20,
+            ack_bytes: 0,
+        }),
+        t0,
+    )
+    .unwrap();
+    assert_eq!(c.take_health(), Some(Health::Up));
+    // Part of a frame arrives, then it waits for memory: the reader keeps
+    // reporting with the same receive time.
+    let rx = t0 + Duration::from_millis(200);
+    let t = t0 + HEALTH_REFRESH;
+    c.on_carrier_progress(1, rx, t);
+    assert_eq!(c.take_health(), Some(Health::Alive(rx)));
+    let stall = Config::default().timing.t_stall;
+    let mut t = t;
+    for _ in 0..40 {
+        t += Duration::from_millis(250);
+        c.on_carrier_progress(1, rx, t);
+        c.handle_timeout(t);
+        assert_eq!(c.take_health(), None, "a local wait renewed liveness");
+    }
+    assert!(t > rx + stall, "the wait outlasted t_stall");
+    assert_eq!(c.state(), State::Active, "a local wait stalled the carrier");
+    // A new byte is new evidence.
+    t += Duration::from_millis(250);
+    c.on_carrier_progress(1, t, t);
+    assert_eq!(c.take_health(), Some(Health::Alive(t)));
 }
 
 /// r11 R4: liveness does not reset the recovery budget.
@@ -802,9 +860,9 @@ fn liveness_neither_resets_the_budget_nor_hides_a_failure() {
     let mut alive = 0;
     for _ in 0..5 {
         t += HEALTH_REFRESH;
-        c.on_carrier_progress(2, t);
+        c.on_carrier_progress(2, t, t);
         match c.take_health() {
-            Some(Health::Alive) => alive += 1,
+            Some(Health::Alive(_)) => alive += 1,
             h => assert_eq!(h, None),
         }
     }
