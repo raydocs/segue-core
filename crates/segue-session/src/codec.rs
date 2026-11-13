@@ -630,7 +630,7 @@ impl Frame {
             }
             Frame::Fin { offset } => put_varint(p, *offset),
             Frame::Rst { code } => p.push(*code),
-            Frame::Pad(n) => p.resize(*n, 0),
+            Frame::Pad(n) => p.resize(p.len() + *n, 0),
             Frame::Dgram { addr, data } => {
                 put_target(p, &Target::Ip(*addr));
                 p.extend_from_slice(data);
