@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, KcpMask, StreamTransport};
+use serde_json::{json, Value};
 
 fn config(stream: Value) -> String {
     json!({"outbounds":[{"tag":"proxy","protocol":"vless",

@@ -13,10 +13,10 @@ mod client_hello_draws;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use segue_routing::{Network, Target, TargetAddr};
 use segue_transport::{TlsClientConfig, TlsConnector};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::client_hello_draws::{extension_body, extension_types};
 

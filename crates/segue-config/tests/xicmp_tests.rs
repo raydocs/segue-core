@@ -1,8 +1,8 @@
 //! The `xicmp` mask's settings against what Xray-core's `Xicmp.Build` does
 //! with them, from `tests/fixtures/xicmp/vectors.json`, which
 //! `tools/xicmp-oracle` records in the pinned checkout.
-use serde_json::{json, Value};
 use segue_config::parse_xray_json;
+use serde_json::{json, Value};
 
 fn vectors() -> Value {
     serde_json::from_str(include_str!("../../../tests/fixtures/xicmp/vectors.json")).unwrap()

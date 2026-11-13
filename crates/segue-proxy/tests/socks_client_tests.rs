@@ -1,8 +1,3 @@
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use segue_proxy::inbound::{
     negotiate_socks5, parse_socks5_request_message, parse_socks5_udp_datagram,
     write_socks5_success, write_socks5_success_with_bind, SocksAccount, SocksCommand,
@@ -13,6 +8,11 @@ use segue_proxy::outbound::{
     SocksClientError, SocksUdpDrop, MAX_SOCKS_UDP_DATAGRAM_LENGTH,
 };
 use segue_routing::{Network, Target, TargetAddr};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 const USER: &[u8] = b"synthetic-user";
 const PASS: &[u8] = b"synthetic-pass";

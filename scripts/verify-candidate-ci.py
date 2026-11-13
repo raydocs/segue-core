@@ -17,7 +17,7 @@ import sys
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "raydocs/segue-core")
 WORKFLOW = ".github/workflows/ci.yml"
 REQUIRED = {
-    "release-metadata", "secrets", "rust", "go-oracles", "rc-interop",
+    "release-metadata", "secrets", "rust", "tproxy-linux", "go-oracles", "rc-interop",
     "scheduled-pinned-interop", "host-hardening", "fuzz-smoke",
     "controlled-network", "apple", "android", "supply-chain",
 }

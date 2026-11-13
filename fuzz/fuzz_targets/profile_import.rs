@@ -1,11 +1,11 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use std::ptr;
 use segue_config::profile_import::{
     import_profile, import_request, is_import_advisory, ProfileFormat, MAX_RESULT_BYTES,
 };
 use segue_ffi::{xray_error_free, xray_profile_import_json, XrayStatus};
+use std::ptr;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(data) {

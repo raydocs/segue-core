@@ -5,6 +5,8 @@
 //! binary's other `--ignored` runs, unprivileged, pass it by.
 //! Every QUIC packet goes out in an echo request and comes back in a reply.
 use super::support::{ReferenceServer, Task, DEADLINE, SALAMANDER_PASSWORD};
+use segue_routing::{Network, Target, TargetAddr};
+use segue_transport::{hysteria::HysteriaClient, xicmp::XicmpConfig};
 use serde_json::json;
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio::{
@@ -12,8 +14,6 @@ use tokio::{
     net::{TcpListener, UdpSocket},
     time::timeout,
 };
-use segue_routing::{Network, Target, TargetAddr};
-use segue_transport::{hysteria::HysteriaClient, xicmp::XicmpConfig};
 
 async fn scenario(salamander: bool) {
     let server_xicmp = json!({"type":"xicmp","settings":{}});

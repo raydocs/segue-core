@@ -4,11 +4,11 @@
 
 use std::io::Cursor;
 
-use tokio::io::BufReader;
 use segue_proxy::inbound::{
     canonical_header_key, copy_body_chunked, read_http_request_head, read_http_response, HttpBody,
     HttpParseError, PlainHttpError, PlainHttpRequest,
 };
+use tokio::io::BufReader;
 
 async fn request(raw: &[u8]) -> Result<PlainHttpRequest, PlainHttpError> {
     let head = read_http_request_head(&mut Cursor::new(raw.to_vec()))

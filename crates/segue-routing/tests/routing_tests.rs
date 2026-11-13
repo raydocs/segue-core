@@ -1,5 +1,5 @@
-use std::net::{IpAddr, Ipv4Addr};
 use segue_routing::{Network, Session, StaticRouter, Target, TargetAddr};
+use std::net::{IpAddr, Ipv4Addr};
 
 #[test]
 fn static_router_uses_default_outbound() {

@@ -8,12 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::support::{ReferenceServer, Task, DEADLINE};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::time::timeout;
 use segue_routing::{Network, Target, TargetAddr};
 use segue_transport::hysteria::HysteriaClient;
 use segue_transport::{SocketHandle, SocketProtector};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::time::timeout;
 
 pub(super) struct Relay {
     pub(super) address: SocketAddr,

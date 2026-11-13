@@ -33,9 +33,9 @@ class StablePromotionTests(unittest.TestCase):
         self.git("config", "user.name", "Release fixture")
         self.git("config", "user.email", "fixture@example.invalid")
         self.write("Cargo.toml", '[workspace.package]\nversion = "0.7.0-rc.1"\n[workspace.dependencies]\nbytes = "1"\n')
-        self.write("Cargo.lock", 'version = 4\n[[package]]\nname = "segue-config"\nversion = "0.7.0-rc.1"\n[[package]]\nname = "bytes"\nversion = "1.0.0"\nsource = "registry+https://example.invalid"\nchecksum = "abc"\n')
+        self.write("Cargo.lock", 'version = 4\n[[package]]\nname = "xray-config"\nversion = "0.7.0-rc.1"\n[[package]]\nname = "bytes"\nversion = "1.0.0"\nsource = "registry+https://example.invalid"\nchecksum = "abc"\n')
         self.write("docs/config-contract.json", '{"coreVersion":"0.7.0-rc.1","supported":["vless"]}')
-        self.write("crates/segue-config/src/lib.rs", "pub const VALUE: u8 = 1;\n")
+        self.write("crates/xray-config/src/lib.rs", "pub const VALUE: u8 = 1;\n")
         self.write("README.md", "Candidate\n")
         for name in PROMOTION.SCANNER_POLICY_FILES:
             self.write(name, "measured scanner policy\n")
@@ -75,7 +75,7 @@ class StablePromotionTests(unittest.TestCase):
         self.assertIn("Cargo.lock", self.validate())
 
     def test_runtime_edit_is_rejected(self):
-        self.write("crates/segue-config/src/lib.rs", "pub const VALUE: u8 = 2;\n")
+        self.write("crates/xray-config/src/lib.rs", "pub const VALUE: u8 = 2;\n")
         self.commit()
         with self.assertRaisesRegex(ValueError, "runtime or unapproved"):
             self.validate()
@@ -159,6 +159,15 @@ class StablePromotionTests(unittest.TestCase):
         # These hashes constrain the historical v0.7 promotion, not future
         # development of the scanner policy. Keep the published bytes pinned.
         published = "67969094b352f948c6b8b9e2ac75402c577cb7f7"
+        present = subprocess.run(
+            ["git", "-C", str(ROOT), "cat-file", "-e", f"{published}^{{commit}}"],
+            capture_output=True,
+        )
+        if present.returncode != 0:
+            # This repository starts from a snapshot of upstream xray-rust, so
+            # the published upstream v0.7 commit is not in its history. The
+            # fixture test above still pins the published bytes.
+            self.skipTest(f"published v0.7 commit {published} is not in this history")
         for name, (_, expected) in PROMOTION.SCANNER_POLICY_FILES.items():
             with self.subTest(name=name):
                 content = PROMOTION.git(ROOT, "show", f"{published}:{name}")

@@ -5,6 +5,8 @@ pub(crate) mod reference;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
 pub use common::{echo, socks, tcp_echo, udp_echo, Protector};
+use segue_engine::Core;
+use segue_transport::{DnsResolver, TransportDialer, TransportError};
 use serde_json::{json, Value};
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -15,8 +17,6 @@ use std::{
     time::Duration,
 };
 use x25519_dalek::{PublicKey, StaticSecret};
-use segue_engine::Core;
-use segue_transport::{DnsResolver, TransportDialer, TransportError};
 pub const DEADLINE: Duration = Duration::from_secs(40);
 pub const INNER_IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
 pub struct ReferenceServer {

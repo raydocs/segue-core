@@ -5,10 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UdpSocket;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::time::{timeout, Instant};
 use segue_config::{DnsHostTarget, DomainHostIndex};
 use segue_proxy::vless::{
     encode_udp_packet, encode_xudp_new_packet, read_udp_packet, read_xudp_packet,
@@ -20,6 +16,10 @@ use segue_transport::{
     DnsQueryTransport, DnsQueryTransportKind, DnsResolver, HappyEyeballsConfig, NameServer,
     TlsClientConfig, TlsConnector, TransportDialer,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UdpSocket;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{timeout, Instant};
 
 use crate::dns_outbound_runtime::DnsDirectExecutor;
 use crate::outbound::{
@@ -1096,10 +1096,6 @@ mod tests {
     use http::{header, Method, Response};
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, UdpSocket};
-    use tokio::sync::oneshot;
-    use tokio_rustls::TlsAcceptor;
     use segue_config::{
         compile_dns_domain_matchers, CoreConfig, DnsConfig, DnsHostTarget, DnsOutboundRule,
         DnsOutboundRuleAction, DnsOutboundSettings, DnsQTypeRange, DnsServerConfig,
@@ -1112,6 +1108,10 @@ mod tests {
         DnsQueryMetadata, DnsQueryTransportKind, SocketHandle, SocketProtector, TlsConnector,
         TransportError,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, UdpSocket};
+    use tokio::sync::oneshot;
+    use tokio_rustls::TlsAcceptor;
 
     fn ip_matcher_set(cidr: IpCidr) -> IpMatcherSet {
         let mut matchers = IpMatcherSet::builder();

@@ -5,12 +5,12 @@ mod reference;
 use super::{key, RawPeer};
 use bytes::BytesMut;
 use gotatun::packet::{Ip, Packet};
+use segue_wireguard::PeerConfig;
 use tokio::{
     net::UnixDatagram,
     sync::{mpsc, oneshot},
 };
 use x25519_dalek::{PublicKey, StaticSecret};
-use segue_wireguard::PeerConfig;
 
 pub(super) async fn start(seed: u8, ipv6: bool, prefixes: &[&str]) -> RawPeer {
     let secret = StaticSecret::from([seed; 32]);

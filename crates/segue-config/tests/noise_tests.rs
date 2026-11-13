@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, FragmentRange, NoiseSegment};
+use serde_json::{json, Value};
 fn profile(noise: Value) -> Value {
     json!({"outbounds":[{"protocol":"hysteria","settings":{"version":2,"address":"example.com","port":443},
         "streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"serverName":"example.com"},

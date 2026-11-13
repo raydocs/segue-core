@@ -18,12 +18,12 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
-use tokio::time::Instant;
 use segue_proxy::mux::{self as wire, Frame, Status};
 use segue_proxy::reverse::{decode_control, CONTROL_DOMAIN};
 use segue_routing::{Network, Target, TargetAddr};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
+use tokio::time::Instant;
 
 use super::TunnelState;
 

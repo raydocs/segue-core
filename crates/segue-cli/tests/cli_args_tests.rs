@@ -1,6 +1,5 @@
 use std::{fs, net::SocketAddr, path::PathBuf};
 
-use tokio::sync::oneshot;
 use segue_cli::{
     format_bound_inbounds, format_config_warnings, load_config, load_config_with_diagnostics,
     parse_cli_args, parse_tun_fd_env_from_pairs, parse_tun_runtime_options_env_from_pairs,
@@ -8,6 +7,7 @@ use segue_cli::{
 };
 use segue_config::Diagnostic;
 use segue_engine::{TunFdClosePolicy, TunFdPacketFormat, TunRuntimeOptions, TunRuntimeProfile};
+use tokio::sync::oneshot;
 
 #[test]
 fn parses_run_dash_config() {

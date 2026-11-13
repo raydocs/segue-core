@@ -7,6 +7,8 @@ use gotatun::{
     tun::{IpRecv, IpSend, MtuWatcher},
     udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams},
 };
+use segue_proxy::wireguard::KeyMaterial;
+use segue_wireguard::PeerConfig;
 use smoltcp::wire::{Ipv4Packet, Ipv6Packet, UdpPacket};
 use std::{io, net::SocketAddr, sync::Arc};
 use tokio::{
@@ -15,8 +17,6 @@ use tokio::{
     task::JoinHandle,
 };
 use x25519_dalek::{PublicKey, StaticSecret};
-use segue_proxy::wireguard::KeyMaterial;
-use segue_wireguard::PeerConfig;
 
 #[cfg(unix)]
 #[path = "native.rs"]

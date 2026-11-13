@@ -8,12 +8,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tokio::{io::AsyncWriteExt, net::TcpListener};
 use segue_routing::{Network, Target, TargetAddr};
 use segue_transport::{
     ConnectorConfig, HappyEyeballsConfig, RealityClientConfig, SocketHandle, SocketOptions,
     SocketProtector, TransportDialer, TransportError,
 };
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 
 /// The platform's protector: records each socket it is handed.
 #[derive(Default)]

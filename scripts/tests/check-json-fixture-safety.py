@@ -118,19 +118,14 @@ FORBIDDEN_RETIRED_VALUE_DIGESTS = frozenset(
     }
 )
 
-# Commits that carried the retired values before they were scrubbed in
-# 755a3a4 ("Prepare repository for open source release", 2026-07-27). The
-# disclosure is recorded in SECURITY.md and the profile has been revoked
-# server-side; rewriting these commits would invalidate every published
-# commit SHA without withdrawing anything that is already public, so the
-# history scan grandfathers them by identity rather than by date. Any other
-# commit carrying a retired value — including a new one — still fails.
-GRANDFATHERED_RETIRED_VALUE_COMMITS = frozenset(
-    {
-        "2d8d92e141acc4d65638df6cb41ff1ca0200b10c",
-        "755a3a40e6f1abb58a768a80b5babea62d14f00f",
-    }
-)
+# Commits allowed to carry the retired values. Upstream (aimalygin/xray-rust)
+# grandfathered 2d8d92e and 755a3a4, which carried the values before they were
+# scrubbed in 755a3a4 ("Prepare repository for open source release",
+# 2026-07-27; disclosure in SECURITY.md, profile revoked server-side). This
+# repository was started from a scrubbed upstream snapshot, so none of its
+# commits carry a retired value and the allowlist is empty. Any commit carrying
+# a retired value fails the history scan.
+GRANDFATHERED_RETIRED_VALUE_COMMITS: frozenset[str] = frozenset()
 RETIRED_VALUE_CANDIDATE_PATTERN = re.compile(
     r"(?<![A-Za-z0-9._:-])[A-Za-z0-9][A-Za-z0-9._:-]{5,127}"
 )
@@ -606,10 +601,13 @@ class JsonFixtureSafetyTests(unittest.TestCase):
 
     def test_history_scan_grandfathers_only_the_listed_commits(self) -> None:
         newcomer = "0" * 40
+        grandfathered = frozenset({"1" * 40})
 
         with unittest.mock.patch(
+            f"{__name__}.GRANDFATHERED_RETIRED_VALUE_COMMITS", grandfathered
+        ), unittest.mock.patch(
             f"{__name__}.commits_carrying_retired_values",
-            return_value={*GRANDFATHERED_RETIRED_VALUE_COMMITS, newcomer},
+            return_value={*grandfathered, newcomer},
         ):
             violations = scan_git_history_for_retired_values()
 
@@ -619,9 +617,12 @@ class JsonFixtureSafetyTests(unittest.TestCase):
         )
 
     def test_history_scan_reports_a_stale_allowlist(self) -> None:
-        expected = sorted(GRANDFATHERED_RETIRED_VALUE_COMMITS)
+        grandfathered = frozenset({"1" * 40, "2" * 40})
+        expected = sorted(grandfathered)
 
         with unittest.mock.patch(
+            f"{__name__}.GRANDFATHERED_RETIRED_VALUE_COMMITS", grandfathered
+        ), unittest.mock.patch(
             f"{__name__}.commits_carrying_retired_values", return_value=set()
         ):
             violations = scan_git_history_for_retired_values()

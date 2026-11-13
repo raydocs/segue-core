@@ -69,8 +69,8 @@ mod tests {
     use super::*;
     use crate::mux::{self, Frame, Status};
     use crate::vless::{encode_request_header, VlessCommand, VlessRequest};
-    use serde_json::Value;
     use segue_routing::{Network, Target, TargetAddr};
+    use serde_json::Value;
 
     fn bytes(value: &Value) -> Vec<u8> {
         let text = value.as_str().unwrap();

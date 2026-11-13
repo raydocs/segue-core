@@ -10,14 +10,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
-use tokio::net::TcpStream;
 use segue_config::{ContentAttributes, CoreConfig, RouteContext};
 use segue_proxy::inbound::{
     copy_body_chunked, copy_body_length, read_http_response, HttpBody, InboundUser,
     PlainHttpRequest,
 };
 use segue_transport::TransportDialer;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
+use tokio::net::TcpStream;
 
 use crate::connection::{wait_for_connection_close, ConnectionTraffic};
 use crate::dns::RuntimeDnsResolvers;

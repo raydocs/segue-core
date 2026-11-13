@@ -63,10 +63,10 @@ mod platform {
     use std::time::Duration;
 
     use bytes::{Buf, BufMut, Bytes, BytesMut};
+    use segue_tun::{TunEndpoint, TunError};
     use tokio::io::unix::AsyncFd;
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
-    use segue_tun::{TunEndpoint, TunError};
 
     use super::{TunFdConfig, MAX_IP_PACKET_SIZE};
     use crate::TunFdPacketFormat;

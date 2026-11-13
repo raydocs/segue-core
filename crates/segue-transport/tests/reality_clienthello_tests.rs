@@ -1,10 +1,10 @@
 mod reality_clienthello_tests {
-    use serde::Deserialize;
     use segue_transport::reality::{
         prepare_reality_handshake, validate_reality_client_hello_metadata,
         RealityClientHelloKeyShareGroup, RealityError, RealityHandshakeInput,
         RealityPreparedClientHello,
     };
+    use serde::Deserialize;
 
     const CLIENTHELLO_FIXTURE_JSON: &str =
         include_str!("../../../tests/fixtures/reality/clienthello_chrome_auto.json");

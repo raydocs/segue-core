@@ -20,27 +20,6 @@ use bytes::{Bytes, BytesMut};
 use hkdf::Hkdf;
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-use sha2::Sha256;
-use smoltcp::iface::{
-    Config as SmolInterfaceConfig, Interface as SmolInterface, SocketHandle, SocketSet,
-};
-use smoltcp::phy::{
-    ChecksumCapabilities, Device as SmolDevice, DeviceCapabilities as SmolDeviceCapabilities,
-    Medium as SmolMedium, RxToken as SmolRxToken, TxToken as SmolTxToken,
-};
-use smoltcp::socket::tcp as smol_tcp;
-use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{
-    HardwareAddress as SmolHardwareAddress, IpAddress as SmolIpAddress, IpCidr as SmolIpCidr,
-    Ipv4Address as SmolIpv4Address,
-};
-use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Notify;
-use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{sleep, timeout, Duration, Instant as TokioInstant};
-use tokio_rustls::TlsAcceptor;
-use uuid::Uuid;
 use segue_config::{
     compile_dns_domain_matchers, compile_domain_matchers, parse_xray_json, CoreConfig, DnsConfig,
     DnsFakeIpConfig, DnsHostTarget, DnsNameServerConfig, DnsOutboundRule, DnsOutboundRuleAction,
@@ -70,6 +49,27 @@ use segue_transport::{
     TransportDialer, TransportError, TransportStream,
 };
 use segue_tun::{TunEndpoint, TunError, TunStats};
+use sha2::Sha256;
+use smoltcp::iface::{
+    Config as SmolInterfaceConfig, Interface as SmolInterface, SocketHandle, SocketSet,
+};
+use smoltcp::phy::{
+    ChecksumCapabilities, Device as SmolDevice, DeviceCapabilities as SmolDeviceCapabilities,
+    Medium as SmolMedium, RxToken as SmolRxToken, TxToken as SmolTxToken,
+};
+use smoltcp::socket::tcp as smol_tcp;
+use smoltcp::time::Instant as SmolInstant;
+use smoltcp::wire::{
+    HardwareAddress as SmolHardwareAddress, IpAddress as SmolIpAddress, IpCidr as SmolIpCidr,
+    Ipv4Address as SmolIpv4Address,
+};
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Notify;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{sleep, timeout, Duration, Instant as TokioInstant};
+use tokio_rustls::TlsAcceptor;
+use uuid::Uuid;
 
 #[path = "runtime_data_path_tests/tun_admission.rs"]
 mod tun_admission;

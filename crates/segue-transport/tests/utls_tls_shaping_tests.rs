@@ -9,13 +9,13 @@ mod utls_tls_shaping_tests {
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::ProtocolVersion;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-    use tokio_rustls::TlsAcceptor;
     use segue_routing::{Network, Target, TargetAddr};
     use segue_transport::{
         plain_tls_client_hello_bytes, TlsClientConfig, TlsConnector, TransportError,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
 
     use crate::client_hello_draws::{self, shuffles};
 

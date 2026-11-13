@@ -6,7 +6,6 @@ use std::{
 
 use std::fmt;
 
-use uuid::Uuid;
 use segue_routing::{
     canonicalize_ip, domain_matcher::domain_matches_suffix, Cidr, DomainMatcherSetBuilder,
     DomainMatcherSetError, DomainRegexError,
@@ -15,6 +14,7 @@ pub use segue_routing::{
     DnsHostTarget, DnsIpFilter, DomainHostIndex, DomainMatcher, DomainMatcherSet, DomainNameMode,
     IpMatcherSet, RegexMatcher,
 };
+use uuid::Uuid;
 use zeroize::Zeroize;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

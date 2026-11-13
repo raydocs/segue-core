@@ -4,18 +4,18 @@
 //! introduced and punches, and QUIC runs over the punched path.
 use super::realm_rendezvous::{stun_server, Rendezvous};
 use super::support::{ReferenceServer, Task, DEADLINE, SALAMANDER_PASSWORD};
+use segue_routing::{Network, Target, TargetAddr};
+use segue_transport::{
+    hysteria::HysteriaClient,
+    realm::{RealmConfig, RealmEnv, RealmFamily, RealmScheme, RealmStunServer},
+    SystemDnsResolver,
+};
 use serde_json::json;
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     time::timeout,
-};
-use segue_routing::{Network, Target, TargetAddr};
-use segue_transport::{
-    hysteria::HysteriaClient,
-    realm::{RealmConfig, RealmEnv, RealmFamily, RealmScheme, RealmStunServer},
-    SystemDnsResolver,
 };
 
 const TOKEN: &str = "interop-token";

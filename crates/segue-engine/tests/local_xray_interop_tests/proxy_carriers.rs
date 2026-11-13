@@ -9,12 +9,12 @@
 use super::xhttp_download::json_process;
 use super::*;
 use base64::Engine as _;
-use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use tokio::net::UdpSocket;
 use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
 use segue_routing::{Network as RouteNetwork, Target, TargetAddr as RouteAddr};
 use segue_transport::{SocketHandle, SocketProtector};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tokio::net::UdpSocket;
 
 const SERVER: &str = "proxy-carrier.test";
 pub(super) const USER: &str = "synthetic-proxy-carrier-user";

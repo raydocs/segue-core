@@ -1,7 +1,7 @@
 //! HTTP inbound settings read as Xray-core v26.10.31 reads them.
 
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, DiagnosticSeverity, HttpInboundSettings, InboundProtocol};
+use serde_json::{json, Value};
 
 fn config(settings: Value) -> String {
     json!({

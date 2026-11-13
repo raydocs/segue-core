@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, OutboundSettings};
+use serde_json::{json, Value};
 
 const ID: &str = "00112233-4455-6677-8899-aabbccddeeff";
 fn profile(settings: Value) -> Value {

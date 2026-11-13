@@ -3,10 +3,10 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json, AddressFamilies, DiagnosticSeverity, DomainStrategy, ParsedConfig,
 };
+use serde_json::{json, Value};
 
 const VLESS: &str = r#"{"protocol":"vless","tag":"proxy","settings":{"vnext":[{"address":"example.com","port":443,"users":[{"id":"00010203-0405-0607-0809-0a0b0c0d0e0f","encryption":"none"}]}]},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"example.com"}}}"#;
 

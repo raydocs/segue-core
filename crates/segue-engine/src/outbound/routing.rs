@@ -3,10 +3,12 @@
 #[cfg(test)]
 mod tests;
 
-use std::net::{IpAddr, SocketAddr};
-use segue_config::{Network, RouteContext, RoutingConfig, RoutingDomainStrategy, RoutingRuleTarget};
+use segue_config::{
+    Network, RouteContext, RoutingConfig, RoutingDomainStrategy, RoutingRuleTarget,
+};
 use segue_routing::Target;
 use segue_transport::DnsResolver;
+use std::net::{IpAddr, SocketAddr};
 
 use super::{target_domain, target_ip, target_network};
 use crate::CoreError;

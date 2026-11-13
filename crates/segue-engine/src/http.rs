@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
-use tokio::task::JoinSet;
 use segue_config::{CoreConfig, InboundSniffingConfig};
 use segue_proxy::inbound::{
     read_http_request_head, HttpInboundAccounts, PlainHttpError, PlainHttpRequest,
 };
 use segue_transport::TransportDialer;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use crate::dns::RuntimeDnsResolvers;
 use crate::http_forward::{forward_plain_request, ForwardContext};

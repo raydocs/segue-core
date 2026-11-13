@@ -1,6 +1,7 @@
 use super::{Method, Records, MAX_PAYLOAD_LENGTH, MAX_WRITE_PAYLOAD, TAG_LENGTH};
 use crate::shadowsocks::address;
 use rand::RngCore;
+use segue_routing::{Network, Target};
 use std::{
     io,
     pin::Pin,
@@ -8,7 +9,6 @@ use std::{
     task::{ready, Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use segue_routing::{Network, Target};
 use zeroize::{Zeroize, Zeroizing};
 
 fn invalid(message: &'static str) -> io::Error {
@@ -264,9 +264,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ClientStream<S> {
 mod tests {
     use super::super::tests::{fixtures, method, unhex};
     use super::*;
+    use segue_routing::TargetAddr;
     use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use segue_routing::TargetAddr;
 
     fn target() -> Target {
         Target::new(TargetAddr::Domain("example.test".into()), 443, Network::Tcp)

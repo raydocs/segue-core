@@ -27,7 +27,7 @@ fi
 
 cd "$WORKSPACE_ROOT"
 cargo build --locked --release -p segue-bench
-cargo build --locked --release -p segue-cli --bin xray-rust
+cargo build --locked --release -p segue-cli --bin segue
 
 readonly TARGET_ARGUMENT="${CARGO_TARGET_DIR:-$WORKSPACE_ROOT/target}"
 if [[ "$TARGET_ARGUMENT" = /* ]]; then

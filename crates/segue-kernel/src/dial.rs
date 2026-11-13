@@ -31,7 +31,12 @@ pub type Stream = BoxedTransportStream;
 #[async_trait]
 pub trait Dialer: Send + Sync {
     /// Dial `addr:port` through outbound `tag`, or directly when `tag` is None.
-    async fn dial(&self, tag: Option<&str>, addr: &TargetAddr, port: u16) -> Result<Stream, DialError>;
+    async fn dial(
+        &self,
+        tag: Option<&str>,
+        addr: &TargetAddr,
+        port: u16,
+    ) -> Result<Stream, DialError>;
 }
 
 /// Dialer backed by segue-engine.
@@ -50,21 +55,31 @@ impl EngineDialer {
                 map.insert("tag".into(), Value::String(tag.clone()));
             }
             let doc = json!({ "outbounds": [spec] }).to_string();
-            let parsed = parse_xray_json(&doc).map_err(|e| DialError(format!("outbound {tag:?}: {e}")))?;
+            let parsed =
+                parse_xray_json(&doc).map_err(|e| DialError(format!("outbound {tag:?}: {e}")))?;
             let router = OutboundRouter::new(Arc::new(parsed.config));
             let outbound = router
                 .select_tcp_outbound()
                 .map_err(|e| DialError(format!("outbound {tag:?}: {e}")))?;
             outbounds.insert(tag.clone(), outbound);
         }
-        let transport = TransportDialer::system().map_err(|e| DialError(format!("transport: {e}")))?;
-        Ok(Self { outbounds, transport })
+        let transport =
+            TransportDialer::system().map_err(|e| DialError(format!("transport: {e}")))?;
+        Ok(Self {
+            outbounds,
+            transport,
+        })
     }
 }
 
 #[async_trait]
 impl Dialer for EngineDialer {
-    async fn dial(&self, tag: Option<&str>, addr: &TargetAddr, port: u16) -> Result<Stream, DialError> {
+    async fn dial(
+        &self,
+        tag: Option<&str>,
+        addr: &TargetAddr,
+        port: u16,
+    ) -> Result<Stream, DialError> {
         let Some(tag) = tag else {
             let stream = match addr {
                 TargetAddr::Ip(ip) => TcpStream::connect((*ip, port)).await,
@@ -79,8 +94,13 @@ impl Dialer for EngineDialer {
             .get(tag)
             .ok_or_else(|| DialError(format!("unknown outbound {tag:?}")))?;
         let target = Target::new(addr.clone(), port, Network::Tcp);
-        open_tcp_stream_with_resolver_and_dialer(outbound, &target, &SystemDnsResolver, &self.transport)
-            .await
-            .map_err(|e| DialError(format!("{tag}: {e}")))
+        open_tcp_stream_with_resolver_and_dialer(
+            outbound,
+            &target,
+            &SystemDnsResolver,
+            &self.transport,
+        )
+        .await
+        .map_err(|e| DialError(format!("{tag}: {e}")))
     }
 }

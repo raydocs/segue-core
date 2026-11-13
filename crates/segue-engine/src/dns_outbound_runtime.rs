@@ -8,15 +8,15 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::runtime::Handle;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::time::{sleep, timeout, Instant};
 use segue_config::{DnsHostTarget, DomainHostIndex};
 use segue_routing::{Target, TargetAddr};
 use segue_transport::{
     BoxedTransportStream, DnsLookup, DnsQueryStrategy, DnsResolver, TransportDialer, TransportError,
 };
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::runtime::Handle;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{sleep, timeout, Instant};
 
 use crate::dns::{
     exchange_direct_dns_query_with_udp_admission, static_dns_host_target_from_index,
@@ -612,7 +612,8 @@ impl DnsDirectExecutor {
         original_target: &Target,
         query: &[u8],
     ) -> io::Result<Vec<u8>> {
-        if original_target.network == segue_routing::Network::Udp && is_dns_tcp_transfer_query(query)
+        if original_target.network == segue_routing::Network::Udp
+            && is_dns_tcp_transfer_query(query)
         {
             return crate::build_refused_response(query)
                 .map(|response| response.to_vec())
@@ -1337,14 +1338,14 @@ fn dns_error_response_with_limit(
 mod tests {
     use std::net::Ipv4Addr;
 
-    use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
     use segue_config::{
         DnsFakeIpConfig, DnsHostTarget, DnsOutboundRule, DnsOutboundRuleAction,
         DnsOutboundSettings, DomainMatcher, IpCidr, Network, TargetAddr as ConfigTargetAddr,
     };
     use segue_routing::{Network as RoutingNetwork, TargetAddr};
     use segue_transport::{ConfiguredDnsResolver, SystemDnsResolver, TransportDialer};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     use super::*;
 

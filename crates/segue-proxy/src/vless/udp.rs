@@ -2,8 +2,8 @@ use std::io;
 use std::net::IpAddr;
 
 use bytes::{Buf, Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt};
 use segue_routing::{Network, Target, TargetAddr};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::WireError;
 

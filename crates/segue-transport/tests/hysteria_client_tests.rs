@@ -9,14 +9,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::Response;
-use support::{AUTH, DEADLINE};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
-use tokio::time::timeout;
 use segue_proxy::hysteria::{decode_tcp_request, decode_udp_message};
 use segue_routing::{Network, Target, TargetAddr};
 use segue_transport::hysteria::{HysteriaClient, HysteriaConfig, HysteriaError};
 use segue_transport::{SocketHandle, SocketProtector, TlsConnector};
+use support::{AUTH, DEADLINE};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 
 #[derive(Clone, Copy)]
 enum Mode {

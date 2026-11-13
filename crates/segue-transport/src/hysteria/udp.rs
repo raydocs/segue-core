@@ -4,13 +4,13 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use quinn::Connection;
-use tokio::sync::{mpsc, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinHandle;
-use tokio::time::timeout;
 use segue_proxy::hysteria::{
     decode_udp_message, encode_udp_message, fragment_udp_message, Reassembler, UdpMessage,
 };
 use segue_routing::{Network, Target};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use super::client::Shared;
 use super::{HysteriaClient, HysteriaError, HysteriaLimits};

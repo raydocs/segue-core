@@ -1,10 +1,10 @@
 //! Runtime ownership of one authenticated connection per configured Hysteria outbound.
 use super::*;
-use std::sync::atomic::AtomicBool;
-use tokio::sync::Mutex as AsyncMutex;
 use segue_transport::hysteria::{
     GeckoPacketSize, HysteriaClient, HysteriaConfig, HysteriaError, HysteriaUdpSession,
 };
+use std::sync::atomic::AtomicBool;
+use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Clone, Debug)]
 pub struct HysteriaOutbound {

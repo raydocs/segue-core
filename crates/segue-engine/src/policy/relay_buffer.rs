@@ -19,8 +19,8 @@ use std::pin::Pin;
 use std::sync::{Mutex, PoisonError};
 use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, ReadBuf};
 use segue_transport::MemoryClass;
+use tokio::io::{AsyncRead, ReadBuf};
 
 /// The size of a lent buffer: the default cap of one read.
 pub(super) const LENT_BUFFER_SIZE: usize = super::DEFAULT_COPY_BUFFER_SIZE;

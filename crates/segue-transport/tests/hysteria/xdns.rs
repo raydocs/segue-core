@@ -3,17 +3,17 @@
 //! names of several queries and comes back in TXT, A, AAAA or CNAME
 //! answers.
 use super::support::{ReferenceServer, Task, DEADLINE, SALAMANDER_PASSWORD};
+use segue_routing::{Network, Target, TargetAddr};
+use segue_transport::{
+    hysteria::HysteriaClient,
+    xdns::{XdnsConfig, XdnsDomain, XdnsResolver},
+};
 use serde_json::json;
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
     time::timeout,
-};
-use segue_routing::{Network, Target, TargetAddr};
-use segue_transport::{
-    hysteria::HysteriaClient,
-    xdns::{XdnsConfig, XdnsDomain, XdnsResolver},
 };
 
 fn xdns(name: &str, resolver: std::net::SocketAddr) -> Arc<XdnsConfig> {

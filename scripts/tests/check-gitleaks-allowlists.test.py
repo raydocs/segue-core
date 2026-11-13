@@ -113,7 +113,7 @@ class EvidenceAllowlists(unittest.TestCase):
         self.assertEqual(self.scan(outside),
                          {(path, "jfrog-identity-token") for path in outside})
 
-        source = "crates/segue-ffi/include/segue_ffi.h"
+        source = "crates/xray-ffi/include/xray_ffi.h"
         digest = json.loads(reviewed[paths[0]])["nativeSourceDigests"][source]
         other = "e79a0029cc782ff8166c708f8c911ef39de33563b71a30df2cd2ff1d63d799ab"
         changed = {path: content.replace(digest, other) for path, content in reviewed.items()}
@@ -216,7 +216,7 @@ class EvidenceAllowlists(unittest.TestCase):
                 if member.name.endswith("/manifest.json"):
                     manifest = json.loads(data)
                     binaries = {name: digest for name, digest in manifest.get("file_hashes", {}).items()
-                                if Path(name).name in ("xray-rust", "segue-bench", "xray-core")}
+                                if Path(name).name in ("xray-rust", "xray-bench", "xray-core")}
                     if binaries:
                         reviewed[archive_path + "!" + member.name] = json.dumps(binaries)
         self.assertGreaterEqual(len(reviewed), 15)
@@ -664,6 +664,29 @@ class EvidenceAllowlists(unittest.TestCase):
             "unreviewed.py": json.dumps({"privateKey": PUBLIC_FIXTURE}),
         }), {("unreviewed.json", "generic-api-key"),
              ("unreviewed.py", "generic-api-key")})
+
+    def test_vendored_rustls_fixture_exceptions_are_narrow(self):
+        # Synthetic PEM assembled at runtime to avoid embedding a key literal.
+        body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7" * 2
+        key = "-----BEGIN " + "PRIVATE KEY-----\n" + body + "\n-----END " + "PRIVATE KEY-----\n"
+        vectors = "vendor/shaped-rustls/rustls-provider-test/tests/rfc-9180-test-vectors.json"
+        lock = "vendor/shaped-rustls/Cargo.lock"
+        reviewed = {
+            "vendor/shaped-rustls/test-ca/rsa-2048/end.key": key,
+            "vendor/shaped-rustls/bogo/keys/key.pem": key,
+            vectors: json.dumps({"api_key": DIGEST}),
+            lock: '[[package]]\ndependencies = [\n "libcrux-secrets",\n "libcrux-sha3",\n]\n',
+        }
+        self.assertEqual(self.scan(reviewed), set())
+        self.assertEqual(self.scan({
+            "vendor/shaped-rustls/rustls/src/end.key": key,
+            "vendor/shaped-rustls/test-ca/rsa-2048/end.pem": key,
+            vectors: key,
+            lock: json.dumps({"api_key": DIGEST}),
+        }), {("vendor/shaped-rustls/rustls/src/end.key", "private-key"),
+             ("vendor/shaped-rustls/test-ca/rsa-2048/end.pem", "private-key"),
+             (vectors, "private-key"),
+             (lock, "generic-api-key")})
 
     def test_other_rules_still_scan_reviewed_paths(self):
         # Synthetic scanner control, assembled to avoid embedding a token literal.

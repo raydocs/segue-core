@@ -9,9 +9,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rcgen::{generate_simple_self_signed, CertifiedKey};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{sleep, timeout, Duration, Instant};
 use segue_config::{
     parse_xray_json, CoreConfig, GrpcSettings, HttpUpgradeSettings, InboundConfig, InboundProtocol,
     Network, OutboundConfig, OutboundSettings, RealitySettings, RealityShortId, RoutingBalancer,
@@ -25,6 +22,9 @@ use segue_proxy::inbound::SocksInboundAuth;
 use segue_transport::{
     DnsResolver, SystemDnsResolver, TlsConnector, TransportDialer, TransportError,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{sleep, timeout, Duration, Instant};
 
 const TEST_UUID: &str = "00010203-0405-0607-0809-0a0b0c0d0e0f";
 const TLS_SERVER_NAME: &str = "vless.test";

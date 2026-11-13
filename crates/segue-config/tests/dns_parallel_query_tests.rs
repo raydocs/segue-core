@@ -1,8 +1,8 @@
 //! `dns.enableParallelQuery` and the policy key each server gets, as
 //! Xray-core v26.10.31's config builder writes it.
 
-use serde_json::{json, Value};
 use segue_config::{parse_xray_json, DiagnosticSeverity, DnsConfig, DEFAULT_DNS_POLICY_KEY};
+use serde_json::{json, Value};
 
 fn dns(dns: Value) -> DnsConfig {
     let raw = json!({"dns": dns, "outbounds": [{"protocol": "freedom"}]}).to_string();

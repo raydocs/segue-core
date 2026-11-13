@@ -9,9 +9,9 @@ for key in ("GOMAXPROCS","TOKIO_WORKER_THREADS","GOMEMLIMIT","GOGC"):
     os.environ.pop(key,None)
 out=ROOT/"target/release-081/performance-protocols"
 out.mkdir(exist_ok=False)
-paths={"candidate":ROOT/"target/release-081/host-cargo/release/segue",
-       "harness":ROOT/"target/release-081/host-cargo/release/segue-bench",
-       "baseline":ROOT/"target/release-081/baseline-cargo/release/segue",
+paths={"candidate":ROOT/"target/release-081/host-cargo/release/xray-rust",
+       "harness":ROOT/"target/release-081/host-cargo/release/xray-bench",
+       "baseline":ROOT/"target/release-081/baseline-cargo/release/xray-rust",
        "xray":ROOT/"target/issue69-tvos/xray-reference"}
 c.device.verify_reference(paths["xray"])
 assert not b.command(["git","status","--porcelain"],ROOT)

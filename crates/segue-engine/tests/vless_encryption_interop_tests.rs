@@ -1,5 +1,3 @@
-use std::{sync::Arc, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use segue_config::parse_xray_json;
 use segue_engine::{
     open_vless_tcp_stream, open_vless_udp_stream_with_resolver_and_dialer, OutboundRouter,
@@ -10,6 +8,8 @@ use segue_proxy::vless::{
 };
 use segue_routing::{Network, Target, TargetAddr};
 use segue_transport::{SystemDnsResolver, TransportDialer};
+use std::{sync::Arc, time::Duration};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[path = "../../../tools/vless-encryption-oracle/support.rs"]
 mod support;

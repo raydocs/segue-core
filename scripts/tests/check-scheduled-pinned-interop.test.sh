@@ -196,7 +196,7 @@ case "${1:-}" in
     ;;
   build)
     assert_args "scheduled xray-rust build" \
-      build --locked --release -p segue-cli --bin xray-rust
+      build --locked --release -p segue-cli --bin segue
     case "$FAKE_EXPECTED_CARGO_TARGET_MODE" in
       unset)
         [[ -z "${CARGO_TARGET_DIR+x}" ]] || \
@@ -327,7 +327,7 @@ assert_prefix_count() {
 assert_line_count 1 \
   "test|command=test --locked -p segue-engine --test local_xray_interop_tests -- --ignored --skip vless_encryption:: --skip xhttp_download:: --skip rust_socks_client_reaches_target_through_remote_xhttp_profile --nocapture --test-threads=1|fingerprints=$BROAD_FINGERPRINTS|burst_fingerprints=hellofirefox_148|burst_flows=32|xhttp_cases=all|goflags=unset|goexperiment=unset|core_expected_revision=unset|goenv=off|gowork=off|gotoolchain=local|cgo=0"
 assert_line_count 1 \
-  'build|command=build --locked --release -p segue-cli --bin xray-rust'
+  'build|command=build --locked --release -p segue-cli --bin segue'
 
 for engine in xray-rust xray-core; do
   assert_line_count 1 \

@@ -5,6 +5,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 pub use server::{ReferenceServer, Task, AUTH};
 pub const DEADLINE: std::time::Duration = server::DEADLINE;
+use segue_engine::Core;
+use segue_transport::{
+    DnsResolver, SocketHandle, SocketProtector, TransportDialer, TransportError,
+};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{
@@ -13,8 +17,6 @@ use std::sync::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use segue_engine::Core;
-use segue_transport::{DnsResolver, SocketHandle, SocketProtector, TransportDialer, TransportError};
 
 pub fn profile(address: SocketAddr) -> Value {
     let mut config: Value = serde_json::from_str(include_str!(

@@ -1,9 +1,9 @@
 //! SOCKS-style target addresses shared by both Shadowsocks families.
+use segue_routing::{Network, Target, TargetAddr};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
-use segue_routing::{Network, Target, TargetAddr};
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)

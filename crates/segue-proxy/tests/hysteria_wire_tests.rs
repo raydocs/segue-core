@@ -1,5 +1,5 @@
-use std::time::{Duration, Instant};
 use segue_proxy::hysteria::*;
+use std::time::{Duration, Instant};
 
 fn message(payload: &[u8]) -> UdpMessage<'_> {
     UdpMessage {

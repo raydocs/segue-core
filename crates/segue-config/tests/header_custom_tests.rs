@@ -1,10 +1,10 @@
 //! The `header-custom` TCP mask, read as Xray-core v26.10.31's
 //! `HeaderCustomTCP.Build` reads it.
-use serde_json::{json, Value};
 use segue_config::{
     parse_xray_json, DiagnosticSeverity, HeaderCustomArg, HeaderCustomExpr, HeaderCustomItem,
     HeaderCustomTcp,
 };
+use serde_json::{json, Value};
 
 fn config(tcp: Value) -> String {
     json!({"outbounds": [{"protocol": "vless",

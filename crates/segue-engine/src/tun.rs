@@ -9,6 +9,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant as StdInstant;
 
 use bytes::{Bytes, BytesMut};
+use segue_config::{CoreConfig, DnsServerConfig, DomainStrategy, InboundSniffingConfig};
+use segue_routing::{Network as RoutingNetwork, Target, TargetAddr as RoutingTargetAddr};
+use segue_transport::{
+    dns_response_matches_query, protect_udp_socket, BoxedTransportStream, DnsLookup,
+    DnsQueryStrategy as TransportDnsQueryStrategy, DnsQueryTransport, DnsResolver, TlsConnector,
+    TransportDialer, TransportError,
+};
+use segue_tun::{
+    TunEndpoint, TunError, TunTcpBufferState, TunTcpFlowSummaryEvent, TunTcpOpenErrorEvent,
+    TunTcpRemoteWriteSlowEvent, TunTcpSlowFlowEvent, TunTcpSlowFlowKind, TunUdpResponseGapEvent,
+    TunUdpSlowFlowEvent,
+};
 use smoltcp::iface::{
     Config as InterfaceConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle,
     SocketSet,
@@ -22,18 +34,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio::time::{sleep, Duration, Instant as TokioInstant};
-use segue_config::{CoreConfig, DnsServerConfig, DomainStrategy, InboundSniffingConfig};
-use segue_routing::{Network as RoutingNetwork, Target, TargetAddr as RoutingTargetAddr};
-use segue_transport::{
-    dns_response_matches_query, protect_udp_socket, BoxedTransportStream, DnsLookup,
-    DnsQueryStrategy as TransportDnsQueryStrategy, DnsQueryTransport, DnsResolver, TlsConnector,
-    TransportDialer, TransportError,
-};
-use segue_tun::{
-    TunEndpoint, TunError, TunTcpBufferState, TunTcpFlowSummaryEvent, TunTcpOpenErrorEvent,
-    TunTcpRemoteWriteSlowEvent, TunTcpSlowFlowEvent, TunTcpSlowFlowKind, TunUdpResponseGapEvent,
-    TunUdpSlowFlowEvent,
-};
 
 use crate::connection::{
     wait_for_connection_close, ConnectionLease, ConnectionRegistry, ConnectionTraffic,
@@ -6433,11 +6433,11 @@ impl TxToken for PacketTxToken<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use segue_config::DnsQueryStrategy as ConfigDnsQueryStrategy;
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::AsyncWrite;
-    use segue_config::DnsQueryStrategy as ConfigDnsQueryStrategy;
 
     const NORMAL_TCP_REMOTE_PENDING_LIMIT: usize = 4 * 1024 * 1024;
     const PRESSURE_TCP_REMOTE_PENDING_LIMIT: usize = 2 * 1024 * 1024;

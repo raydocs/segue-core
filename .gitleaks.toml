@@ -112,7 +112,7 @@ paths = [
   '''^docs/device-results/2026-10-17-issue69-tvos/build-manifest\.json$''',
 ]
 regexes = [
-  '''^\s*"crates/segue-ffi/include/segue_ffi\.h": "08d5b3e82bcd8687c7395a2de136285da18afad17838aed9c8c398c8b04796d7",?\s*$''',
+  '''^\s*"crates/xray-ffi/include/xray_ffi\.h": "08d5b3e82bcd8687c7395a2de136285da18afad17838aed9c8c398c8b04796d7",?\s*$''',
   '''^\s*"platform/apple/Sources/XrayAppleClient/XrayClientRootView\.swift": "59423f46c0790069d2356e928d8d0d1ea6a8ffdddc55b693b6f4bc88e165d252",?\s*$''',
   '''^\s*"platform/apple/Sources/XrayAppleClient/XrayMacMenuBarView\.swift": "ea892c099020205706c7abf4b36ceb1de5e202e7f53b1493f433489072520762",?\s*$''',
   '''^\s*"platform/apple/Sources/XrayAppleClient/XrayMacRootView\.swift": "c9258ec1585f11abdebcaa376fd6c71d7a727341317aa1822cbdd70aded6cdd1",?\s*$''',
@@ -983,7 +983,7 @@ regexes = ['''^879751ac43a741e7826a9266cc1efb609907eb8ede3ea2cf9953bebdc887c5f7$
 paths = ['''^docs/device\-results/2026\-10\-12\-v08\-candidate/performance\-features/build\-manifest\.json$''']
 
 # Executable SHA-256 values that pin the 2026-10-30 benchmark inputs: the
-# segue-bench driver, the xray-rust client and the Xray-core v26.10.21 server.
+# xray-bench driver, the xray-rust client and the Xray-core v26.10.21 server.
 # The JFrog rule reads "xray" before a 64-character hex value as an Xray token.
 [[allowlists]]
 description = "Pinned executable SHA256 values in the 2026-10-30 benchmark scripts"
@@ -999,3 +999,28 @@ paths = [
   '''^docs/benchmarks/results/2026-10-30-xhttp-h3-send-budget/scripts/stream_ab\.py$''',
   '''^docs/benchmarks/results/2026-10-30-v26\.10\.21-three-engine/commands\.sh$''',
 ]
+
+# vendor/shaped-rustls is a vendored copy of the shaped-rustls fork of rustls
+# (upstream xray-rust consumed it as a git dependency). Its public test
+# fixtures carry throwaway test keys and RFC 9180 HPKE test vectors; none are
+# credentials. Each exception keeps its rule and exact path.
+[[allowlists]]
+description = "Public rustls test CA and BoGo keys in vendored shaped-rustls"
+targetRules = ["private-key"]
+paths = [
+  '''^vendor/shaped-rustls/test-ca/(ecdsa-p256|ecdsa-p384|ecdsa-p521|eddsa|rsa-2048|rsa-3072|rsa-4096)/(ca|inter|end|client)\.key$''',
+  '''^vendor/shaped-rustls/bogo/keys/(key|ecdsa_p256_key|ecdsa_p384_key|rsa_1024_key|rsa_chain_key)\.pem$''',
+]
+
+[[allowlists]]
+description = "RFC 9180 HPKE test vectors in vendored shaped-rustls"
+targetRules = ["generic-api-key"]
+paths = ['''^vendor/shaped-rustls/rustls-provider-test/tests/rfc-9180-test-vectors\.json$''']
+
+[[allowlists]]
+description = "libcrux-secrets/libcrux-sha3 dependency names in vendored shaped-rustls Cargo.lock"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "match"
+regexes = ['''^libcrux-secrets",\s*"libcrux-sha3"$''']
+paths = ['''^vendor/shaped-rustls/Cargo\.lock$''']

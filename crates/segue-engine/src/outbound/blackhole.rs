@@ -11,9 +11,9 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use segue_config::{BlackholeResponse, OutboundSettings};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
-use segue_config::{BlackholeResponse, OutboundSettings};
 
 use super::{OutboundFactory, OutboundNodeId};
 use crate::connection::wait_for_connection_close;
@@ -162,11 +162,11 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::mpsc;
     use segue_config::{parse_xray_json, BlackholeResponse};
     use segue_routing::{Network as RoutingNetwork, Target, TargetAddr as RoutingTargetAddr};
     use segue_transport::{DnsResolver, TransportError};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
 
     use super::*;
     use crate::outbound::{

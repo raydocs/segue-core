@@ -1,11 +1,11 @@
 {
   "binaries": {
     "candidate": {
-      "path": "<campaign>/build/cargo-host/release/segue",
+      "path": "<campaign>/build/cargo-host/release/xray-rust",
       "sha256": "879751ac43a741e7826a9266cc1efb609907eb8ede3ea2cf9953bebdc887c5f7"
     },
     "harness": {
-      "path": "<campaign>/build/cargo-host/release/segue-bench",
+      "path": "<campaign>/build/cargo-host/release/xray-bench",
       "sha256": "b73975ce26203636c21b322e0fa6555a095778c9da4ab2a15a5a738190351dc9"
     },
     "xray": {
@@ -176,7 +176,7 @@
       },
       "case": "trojan-tls-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-full-duplex-1-candidate-1.json"
       ],
@@ -218,7 +218,7 @@
       },
       "case": "trojan-tls-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-full-duplex-1-xray-1.json"
       ],
@@ -256,7 +256,7 @@
       },
       "case": "trojan-tls-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-full-duplex-1-xray-2.json"
       ],
@@ -290,7 +290,7 @@
       },
       "case": "trojan-tls-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-full-duplex-1-candidate-2.json"
       ],
@@ -324,7 +324,7 @@
       },
       "case": "trojan-tls-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-full-duplex-1-candidate-3.json"
       ],
@@ -362,7 +362,7 @@
       },
       "case": "trojan-tls-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-full-duplex-1-xray-3.json"
       ],
@@ -400,7 +400,7 @@
       },
       "case": "trojan-tls-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-full-duplex-1-xray-4.json"
       ],
@@ -434,7 +434,7 @@
       },
       "case": "trojan-tls-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-full-duplex-1-candidate-4.json"
       ],
@@ -468,7 +468,7 @@
       },
       "case": "trojan-tls-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-full-duplex-1-candidate-5.json"
       ],
@@ -506,7 +506,7 @@
       },
       "case": "trojan-tls-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-full-duplex-1-xray-5.json"
       ],
@@ -544,7 +544,7 @@
       },
       "case": "trojan-tls-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-tcp-latency-1-xray-1.json"
       ],
@@ -578,7 +578,7 @@
       },
       "case": "trojan-tls-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-tcp-latency-1-candidate-1.json"
       ],
@@ -612,7 +612,7 @@
       },
       "case": "trojan-tls-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-tcp-latency-1-candidate-2.json"
       ],
@@ -650,7 +650,7 @@
       },
       "case": "trojan-tls-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-tcp-latency-1-xray-2.json"
       ],
@@ -688,7 +688,7 @@
       },
       "case": "trojan-tls-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-tcp-latency-1-xray-3.json"
       ],
@@ -722,7 +722,7 @@
       },
       "case": "trojan-tls-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-tcp-latency-1-candidate-3.json"
       ],
@@ -756,7 +756,7 @@
       },
       "case": "trojan-tls-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-tcp-latency-1-candidate-4.json"
       ],
@@ -794,7 +794,7 @@
       },
       "case": "trojan-tls-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-tcp-latency-1-xray-4.json"
       ],
@@ -832,7 +832,7 @@
       },
       "case": "trojan-tls-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-tcp-latency-1-xray-5.json"
       ],
@@ -866,7 +866,7 @@
       },
       "case": "trojan-tls-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/trojan-tls-socks-tcp-latency-1-candidate-5.json"
       ],
@@ -900,7 +900,7 @@
       },
       "case": "ss2022-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-full-duplex-1-candidate-1.json"
       ],
@@ -934,7 +934,7 @@
       },
       "case": "ss2022-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-full-duplex-1-xray-1.json"
       ],
@@ -968,7 +968,7 @@
       },
       "case": "ss2022-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-full-duplex-1-xray-2.json"
       ],
@@ -1002,7 +1002,7 @@
       },
       "case": "ss2022-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-full-duplex-1-candidate-2.json"
       ],
@@ -1036,7 +1036,7 @@
       },
       "case": "ss2022-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-full-duplex-1-candidate-3.json"
       ],
@@ -1070,7 +1070,7 @@
       },
       "case": "ss2022-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-full-duplex-1-xray-3.json"
       ],
@@ -1104,7 +1104,7 @@
       },
       "case": "ss2022-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-full-duplex-1-xray-4.json"
       ],
@@ -1138,7 +1138,7 @@
       },
       "case": "ss2022-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-full-duplex-1-candidate-4.json"
       ],
@@ -1172,7 +1172,7 @@
       },
       "case": "ss2022-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-full-duplex-1-candidate-5.json"
       ],
@@ -1206,7 +1206,7 @@
       },
       "case": "ss2022-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-full-duplex-1-xray-5.json"
       ],
@@ -1240,7 +1240,7 @@
       },
       "case": "ss2022-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-tcp-latency-1-xray-1.json"
       ],
@@ -1274,7 +1274,7 @@
       },
       "case": "ss2022-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-tcp-latency-1-candidate-1.json"
       ],
@@ -1308,7 +1308,7 @@
       },
       "case": "ss2022-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-tcp-latency-1-candidate-2.json"
       ],
@@ -1342,7 +1342,7 @@
       },
       "case": "ss2022-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-tcp-latency-1-xray-2.json"
       ],
@@ -1376,7 +1376,7 @@
       },
       "case": "ss2022-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-tcp-latency-1-xray-3.json"
       ],
@@ -1410,7 +1410,7 @@
       },
       "case": "ss2022-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-tcp-latency-1-candidate-3.json"
       ],
@@ -1444,7 +1444,7 @@
       },
       "case": "ss2022-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-tcp-latency-1-candidate-4.json"
       ],
@@ -1478,7 +1478,7 @@
       },
       "case": "ss2022-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-tcp-latency-1-xray-4.json"
       ],
@@ -1512,7 +1512,7 @@
       },
       "case": "ss2022-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-tcp-latency-1-xray-5.json"
       ],
@@ -1546,7 +1546,7 @@
       },
       "case": "ss2022-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes128-socks-tcp-latency-1-candidate-5.json"
       ],
@@ -1580,7 +1580,7 @@
       },
       "case": "ss2022-aes256-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-full-duplex-1-candidate-1.json"
       ],
@@ -1614,7 +1614,7 @@
       },
       "case": "ss2022-aes256-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-full-duplex-1-xray-1.json"
       ],
@@ -1648,7 +1648,7 @@
       },
       "case": "ss2022-aes256-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-full-duplex-1-xray-2.json"
       ],
@@ -1682,7 +1682,7 @@
       },
       "case": "ss2022-aes256-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-full-duplex-1-candidate-2.json"
       ],
@@ -1716,7 +1716,7 @@
       },
       "case": "ss2022-aes256-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-full-duplex-1-candidate-3.json"
       ],
@@ -1750,7 +1750,7 @@
       },
       "case": "ss2022-aes256-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-full-duplex-1-xray-3.json"
       ],
@@ -1784,7 +1784,7 @@
       },
       "case": "ss2022-aes256-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-full-duplex-1-xray-4.json"
       ],
@@ -1818,7 +1818,7 @@
       },
       "case": "ss2022-aes256-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-full-duplex-1-candidate-4.json"
       ],
@@ -1852,7 +1852,7 @@
       },
       "case": "ss2022-aes256-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-full-duplex-1-candidate-5.json"
       ],
@@ -1886,7 +1886,7 @@
       },
       "case": "ss2022-aes256-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-full-duplex-1-xray-5.json"
       ],
@@ -1920,7 +1920,7 @@
       },
       "case": "ss2022-aes256-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-tcp-latency-1-xray-1.json"
       ],
@@ -1954,7 +1954,7 @@
       },
       "case": "ss2022-aes256-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-tcp-latency-1-candidate-1.json"
       ],
@@ -1988,7 +1988,7 @@
       },
       "case": "ss2022-aes256-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-tcp-latency-1-candidate-2.json"
       ],
@@ -2022,7 +2022,7 @@
       },
       "case": "ss2022-aes256-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-tcp-latency-1-xray-2.json"
       ],
@@ -2056,7 +2056,7 @@
       },
       "case": "ss2022-aes256-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-tcp-latency-1-xray-3.json"
       ],
@@ -2090,7 +2090,7 @@
       },
       "case": "ss2022-aes256-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-tcp-latency-1-candidate-3.json"
       ],
@@ -2124,7 +2124,7 @@
       },
       "case": "ss2022-aes256-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-tcp-latency-1-candidate-4.json"
       ],
@@ -2158,7 +2158,7 @@
       },
       "case": "ss2022-aes256-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-tcp-latency-1-xray-4.json"
       ],
@@ -2192,7 +2192,7 @@
       },
       "case": "ss2022-aes256-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-tcp-latency-1-xray-5.json"
       ],
@@ -2226,7 +2226,7 @@
       },
       "case": "ss2022-aes256-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-aes256-socks-tcp-latency-1-candidate-5.json"
       ],
@@ -2264,7 +2264,7 @@
       },
       "case": "ss2022-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-full-duplex-1-candidate-1.json"
       ],
@@ -2302,7 +2302,7 @@
       },
       "case": "ss2022-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-full-duplex-1-xray-1.json"
       ],
@@ -2340,7 +2340,7 @@
       },
       "case": "ss2022-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-full-duplex-1-xray-2.json"
       ],
@@ -2378,7 +2378,7 @@
       },
       "case": "ss2022-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-full-duplex-1-candidate-2.json"
       ],
@@ -2416,7 +2416,7 @@
       },
       "case": "ss2022-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-full-duplex-1-candidate-3.json"
       ],
@@ -2454,7 +2454,7 @@
       },
       "case": "ss2022-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-full-duplex-1-xray-3.json"
       ],
@@ -2492,7 +2492,7 @@
       },
       "case": "ss2022-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-full-duplex-1-xray-4.json"
       ],
@@ -2530,7 +2530,7 @@
       },
       "case": "ss2022-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-full-duplex-1-candidate-4.json"
       ],
@@ -2568,7 +2568,7 @@
       },
       "case": "ss2022-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-full-duplex-1-candidate-5.json"
       ],
@@ -2606,7 +2606,7 @@
       },
       "case": "ss2022-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-full-duplex-1-xray-5.json"
       ],
@@ -2640,7 +2640,7 @@
       },
       "case": "ss2022-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-tcp-latency-1-xray-1.json"
       ],
@@ -2674,7 +2674,7 @@
       },
       "case": "ss2022-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-tcp-latency-1-candidate-1.json"
       ],
@@ -2708,7 +2708,7 @@
       },
       "case": "ss2022-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-tcp-latency-1-candidate-2.json"
       ],
@@ -2742,7 +2742,7 @@
       },
       "case": "ss2022-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-tcp-latency-1-xray-2.json"
       ],
@@ -2776,7 +2776,7 @@
       },
       "case": "ss2022-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-tcp-latency-1-xray-3.json"
       ],
@@ -2810,7 +2810,7 @@
       },
       "case": "ss2022-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-tcp-latency-1-candidate-3.json"
       ],
@@ -2844,7 +2844,7 @@
       },
       "case": "ss2022-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-tcp-latency-1-candidate-4.json"
       ],
@@ -2878,7 +2878,7 @@
       },
       "case": "ss2022-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-tcp-latency-1-xray-4.json"
       ],
@@ -2912,7 +2912,7 @@
       },
       "case": "ss2022-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-tcp-latency-1-xray-5.json"
       ],
@@ -2946,7 +2946,7 @@
       },
       "case": "ss2022-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/ss2022-chacha20-socks-tcp-latency-1-candidate-5.json"
       ],
@@ -2980,7 +2980,7 @@
       },
       "case": "vmess-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-full-duplex-1-candidate-1.json"
       ],
@@ -3014,7 +3014,7 @@
       },
       "case": "vmess-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-full-duplex-1-xray-1.json"
       ],
@@ -3048,7 +3048,7 @@
       },
       "case": "vmess-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-full-duplex-1-xray-2.json"
       ],
@@ -3082,7 +3082,7 @@
       },
       "case": "vmess-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-full-duplex-1-candidate-2.json"
       ],
@@ -3116,7 +3116,7 @@
       },
       "case": "vmess-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-full-duplex-1-candidate-3.json"
       ],
@@ -3150,7 +3150,7 @@
       },
       "case": "vmess-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-full-duplex-1-xray-3.json"
       ],
@@ -3184,7 +3184,7 @@
       },
       "case": "vmess-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-full-duplex-1-xray-4.json"
       ],
@@ -3218,7 +3218,7 @@
       },
       "case": "vmess-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-full-duplex-1-candidate-4.json"
       ],
@@ -3252,7 +3252,7 @@
       },
       "case": "vmess-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-full-duplex-1-candidate-5.json"
       ],
@@ -3286,7 +3286,7 @@
       },
       "case": "vmess-aes128-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-full-duplex-1-xray-5.json"
       ],
@@ -3320,7 +3320,7 @@
       },
       "case": "vmess-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-tcp-latency-1-xray-1.json"
       ],
@@ -3354,7 +3354,7 @@
       },
       "case": "vmess-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-tcp-latency-1-candidate-1.json"
       ],
@@ -3388,7 +3388,7 @@
       },
       "case": "vmess-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-tcp-latency-1-candidate-2.json"
       ],
@@ -3422,7 +3422,7 @@
       },
       "case": "vmess-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-tcp-latency-1-xray-2.json"
       ],
@@ -3456,7 +3456,7 @@
       },
       "case": "vmess-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-tcp-latency-1-xray-3.json"
       ],
@@ -3490,7 +3490,7 @@
       },
       "case": "vmess-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-tcp-latency-1-candidate-3.json"
       ],
@@ -3524,7 +3524,7 @@
       },
       "case": "vmess-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-tcp-latency-1-candidate-4.json"
       ],
@@ -3558,7 +3558,7 @@
       },
       "case": "vmess-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-tcp-latency-1-xray-4.json"
       ],
@@ -3592,7 +3592,7 @@
       },
       "case": "vmess-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-tcp-latency-1-xray-5.json"
       ],
@@ -3626,7 +3626,7 @@
       },
       "case": "vmess-aes128-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-aes128-socks-tcp-latency-1-candidate-5.json"
       ],
@@ -3660,7 +3660,7 @@
       },
       "case": "vmess-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-full-duplex-1-candidate-1.json"
       ],
@@ -3698,7 +3698,7 @@
       },
       "case": "vmess-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-full-duplex-1-xray-1.json"
       ],
@@ -3736,7 +3736,7 @@
       },
       "case": "vmess-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-full-duplex-1-xray-2.json"
       ],
@@ -3770,7 +3770,7 @@
       },
       "case": "vmess-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-full-duplex-1-candidate-2.json"
       ],
@@ -3804,7 +3804,7 @@
       },
       "case": "vmess-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-full-duplex-1-candidate-3.json"
       ],
@@ -3842,7 +3842,7 @@
       },
       "case": "vmess-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-full-duplex-1-xray-3.json"
       ],
@@ -3880,7 +3880,7 @@
       },
       "case": "vmess-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-full-duplex-1-xray-4.json"
       ],
@@ -3914,7 +3914,7 @@
       },
       "case": "vmess-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-full-duplex-1-candidate-4.json"
       ],
@@ -3952,7 +3952,7 @@
       },
       "case": "vmess-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-full-duplex-1-candidate-5.json"
       ],
@@ -3990,7 +3990,7 @@
       },
       "case": "vmess-chacha20-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-full-duplex-1-xray-5.json"
       ],
@@ -4024,7 +4024,7 @@
       },
       "case": "vmess-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-tcp-latency-1-xray-1.json"
       ],
@@ -4058,7 +4058,7 @@
       },
       "case": "vmess-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-tcp-latency-1-candidate-1.json"
       ],
@@ -4092,7 +4092,7 @@
       },
       "case": "vmess-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-tcp-latency-1-candidate-2.json"
       ],
@@ -4126,7 +4126,7 @@
       },
       "case": "vmess-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-tcp-latency-1-xray-2.json"
       ],
@@ -4160,7 +4160,7 @@
       },
       "case": "vmess-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-tcp-latency-1-xray-3.json"
       ],
@@ -4194,7 +4194,7 @@
       },
       "case": "vmess-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-tcp-latency-1-candidate-3.json"
       ],
@@ -4228,7 +4228,7 @@
       },
       "case": "vmess-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-tcp-latency-1-candidate-4.json"
       ],
@@ -4262,7 +4262,7 @@
       },
       "case": "vmess-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-tcp-latency-1-xray-4.json"
       ],
@@ -4296,7 +4296,7 @@
       },
       "case": "vmess-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-tcp-latency-1-xray-5.json"
       ],
@@ -4330,7 +4330,7 @@
       },
       "case": "vmess-chacha20-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-chacha20-socks-tcp-latency-1-candidate-5.json"
       ],
@@ -4364,7 +4364,7 @@
       },
       "case": "vmess-auto-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-full-duplex-1-candidate-1.json"
       ],
@@ -4398,7 +4398,7 @@
       },
       "case": "vmess-auto-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-full-duplex-1-xray-1.json"
       ],
@@ -4432,7 +4432,7 @@
       },
       "case": "vmess-auto-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-full-duplex-1-xray-2.json"
       ],
@@ -4466,7 +4466,7 @@
       },
       "case": "vmess-auto-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-full-duplex-1-candidate-2.json"
       ],
@@ -4500,7 +4500,7 @@
       },
       "case": "vmess-auto-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-full-duplex-1-candidate-3.json"
       ],
@@ -4534,7 +4534,7 @@
       },
       "case": "vmess-auto-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-full-duplex-1-xray-3.json"
       ],
@@ -4568,7 +4568,7 @@
       },
       "case": "vmess-auto-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-full-duplex-1-xray-4.json"
       ],
@@ -4602,7 +4602,7 @@
       },
       "case": "vmess-auto-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-full-duplex-1-candidate-4.json"
       ],
@@ -4636,7 +4636,7 @@
       },
       "case": "vmess-auto-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-full-duplex-1-candidate-5.json"
       ],
@@ -4670,7 +4670,7 @@
       },
       "case": "vmess-auto-socks-full-duplex-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-full-duplex-1-xray-5.json"
       ],
@@ -4704,7 +4704,7 @@
       },
       "case": "vmess-auto-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-tcp-latency-1-xray-1.json"
       ],
@@ -4738,7 +4738,7 @@
       },
       "case": "vmess-auto-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-tcp-latency-1-candidate-1.json"
       ],
@@ -4772,7 +4772,7 @@
       },
       "case": "vmess-auto-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-tcp-latency-1-candidate-2.json"
       ],
@@ -4806,7 +4806,7 @@
       },
       "case": "vmess-auto-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-tcp-latency-1-xray-2.json"
       ],
@@ -4840,7 +4840,7 @@
       },
       "case": "vmess-auto-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-tcp-latency-1-xray-3.json"
       ],
@@ -4874,7 +4874,7 @@
       },
       "case": "vmess-auto-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-tcp-latency-1-candidate-3.json"
       ],
@@ -4908,7 +4908,7 @@
       },
       "case": "vmess-auto-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-tcp-latency-1-candidate-4.json"
       ],
@@ -4942,7 +4942,7 @@
       },
       "case": "vmess-auto-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-tcp-latency-1-xray-4.json"
       ],
@@ -4976,7 +4976,7 @@
       },
       "case": "vmess-auto-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-tcp-latency-1-xray-5.json"
       ],
@@ -5010,7 +5010,7 @@
       },
       "case": "vmess-auto-socks-tcp-latency-1",
       "command": [
-        "<campaign>/build/cargo-host/release/segue-bench",
+        "<campaign>/build/cargo-host/release/xray-bench",
         "protocol-run",
         "<campaign>/performance-protocols/vmess-auto-socks-tcp-latency-1-candidate-5.json"
       ],

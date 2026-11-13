@@ -13,9 +13,9 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use http::Method;
+use segue_proxy::go_url::{self, Encoding};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
-use segue_proxy::go_url::{self, Encoding};
 use zeroize::Zeroizing;
 
 use super::client::ServiceResponse;

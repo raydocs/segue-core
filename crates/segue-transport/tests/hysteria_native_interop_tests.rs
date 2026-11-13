@@ -1,13 +1,13 @@
 #[path = "hysteria/support.rs"]
 mod support;
 
+use segue_routing::{Network, Target, TargetAddr};
+use segue_transport::hysteria::{HysteriaClient, HysteriaError};
 use std::net::Ipv4Addr;
 use support::{ReferenceServer, Task, DEADLINE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::timeout;
-use segue_routing::{Network, Target, TargetAddr};
-use segue_transport::hysteria::{HysteriaClient, HysteriaError};
 
 #[tokio::test]
 #[ignore = "requires official Hysteria; run scripts/check-native-hysteria-interop.sh"]

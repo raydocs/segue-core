@@ -1,14 +1,14 @@
 use super::*;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use segue_engine::Core;
+use segue_transport::{DnsResolver, TransportDialer, TransportError};
 use serde_json::json;
 use std::{
     net::SocketAddr,
     sync::{atomic::AtomicUsize, Arc},
 };
 use x25519_dalek::{PublicKey, StaticSecret};
-use segue_engine::Core;
-use segue_transport::{DnsResolver, TransportDialer, TransportError};
 
 #[derive(Default)]
 struct Bootstrap(AtomicUsize);

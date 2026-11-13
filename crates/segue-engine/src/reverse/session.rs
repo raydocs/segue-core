@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::watch;
 use segue_config::RouteContext;
 use segue_routing::{Network, Target};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
 
 use super::mux::NewSession;
 use super::{client_label, BridgeContext};

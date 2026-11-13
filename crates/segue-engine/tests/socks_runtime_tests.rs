@@ -8,6 +8,11 @@
 #[path = "hysteria_runtime/support.rs"]
 mod hysteria_support;
 use hysteria_support::{tcp_echo, udp_echo, Bootstrap, Protector, Task};
+use segue_engine::Core;
+use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
+use segue_proxy::outbound::socks5_udp_associate;
+use segue_routing::{Network, Target, TargetAddr};
+use segue_transport::{TlsConnector, TransportDialer};
 use serde_json::{json, Value};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -19,11 +24,6 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     time::timeout,
 };
-use segue_engine::Core;
-use segue_proxy::inbound::{encode_socks5_udp_datagram, parse_socks5_udp_datagram};
-use segue_proxy::outbound::socks5_udp_associate;
-use segue_routing::{Network, Target, TargetAddr};
-use segue_transport::{TlsConnector, TransportDialer};
 
 #[path = "socks_runtime/support.rs"]
 mod support;

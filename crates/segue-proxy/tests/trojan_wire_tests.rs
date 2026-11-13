@@ -1,8 +1,8 @@
 use std::net::IpAddr;
 
-use serde_json::Value;
 use segue_proxy::trojan::*;
 use segue_routing::{Network, Target, TargetAddr};
+use serde_json::Value;
 
 fn target(address: &str, port: u16, network: Network) -> Target {
     let addr = match address.parse::<IpAddr>() {

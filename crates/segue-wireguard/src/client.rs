@@ -1,6 +1,7 @@
 use crate::Config;
 use crate::{io as transport, stack};
 use bytes::Bytes;
+use segue_transport::{SocketProtector, TransportStream};
 use std::{
     fmt, io,
     net::{IpAddr, SocketAddr},
@@ -16,7 +17,6 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf},
     sync::{mpsc, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore},
 };
-use segue_transport::{SocketProtector, TransportStream};
 
 pub(crate) const TCP_LIMIT: usize = 16;
 // Match the normal mobile TUN UDP budget. A TUN cannot observe a caller closing

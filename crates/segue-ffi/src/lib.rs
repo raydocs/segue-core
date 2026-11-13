@@ -5,16 +5,6 @@ pub use profile_import::xray_profile_import_json;
 
 use bytes::Bytes;
 use libc::{c_char, c_int, c_void};
-use std::collections::VecDeque;
-use std::ffi::{CStr, CString};
-use std::io;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
-use std::ptr;
-use std::slice;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::runtime::{Builder, Runtime};
 use segue_config::{
     parse_xray_json, parse_xray_json_with_exclusive_geodata_dirs, parse_xray_json_with_geodata_dirs,
 };
@@ -27,6 +17,16 @@ use segue_engine::{
 use segue_routing::{Network, TargetAddr};
 use segue_transport::{SocketHandle, SocketProtector, TransportDialer};
 use segue_tun::TunTcpSlowFlowKind;
+use std::collections::VecDeque;
+use std::ffi::{CStr, CString};
+use std::io;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::ptr;
+use std::slice;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::runtime::{Builder, Runtime};
 use zeroize::Zeroize;
 
 pub const XRAY_FFI_ABI_MAJOR: u32 = 1;

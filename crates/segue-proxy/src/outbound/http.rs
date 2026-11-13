@@ -21,9 +21,9 @@ use std::io;
 use std::net::IpAddr;
 
 use base64::Engine as _;
+use segue_routing::{Target, TargetAddr};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use segue_routing::{Target, TargetAddr};
 use zeroize::Zeroizing;
 
 /// The largest response head, plus any tunnel bytes read with it, that the

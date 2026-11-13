@@ -1,9 +1,9 @@
+use segue_vless_encryption::{CipherSuite, Client, Encryption};
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
-use segue_vless_encryption::{CipherSuite, Client, Encryption};
 
 #[path = "../../../tools/vless-encryption-oracle/support.rs"]
 mod support;

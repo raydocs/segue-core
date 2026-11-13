@@ -49,7 +49,7 @@ fi
 if [[ "$use_explicit_binaries" == true ]]; then
   xray_rust_bin=$xray_rust_bin_override
 else
-  cargo build --locked --release -p segue-cli --bin xray-rust
+  cargo build --locked --release -p segue-cli --bin segue
   cargo_target_dir=${CARGO_TARGET_DIR:-target}
   xray_rust_bin="$cargo_target_dir/release/segue"
 fi

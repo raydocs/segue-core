@@ -1,6 +1,6 @@
 use crate::Error;
-use std::net::{IpAddr, SocketAddr};
 use segue_proxy::wireguard::{AllowedIp, KeyMaterial};
+use std::net::{IpAddr, SocketAddr};
 
 /// One device with 1..8 peers and at most one local address per IP family.
 /// PSK is optional; reserved-byte extensions are unsupported.

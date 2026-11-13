@@ -10,7 +10,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::net::{TcpListener, TcpStream};
 use segue_routing::{Network, Target, TargetAddr};
 use segue_transport::{
     reality::{RealityPreparedClientHello, RealityPreparedHandshake},
@@ -23,6 +22,7 @@ use segue_transport::{
     SocketProtector, SystemRealityHandshakeContextProvider, TlsConnector, TransportDialer,
     TransportError,
 };
+use tokio::net::{TcpListener, TcpStream};
 
 const CLIENTHELLO_FIXTURE_JSON: &str =
     include_str!("../../../tests/fixtures/reality/clienthello_chrome_auto.json");

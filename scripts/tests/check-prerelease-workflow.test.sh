@@ -268,10 +268,20 @@ done
 # A stable tag skips exactly the gates its candidate run proved, and only
 # after its own history scan and evidence pass does it bind to that run.
 stable_tag_skip="    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')"
-for job in rust go-oracles apple android supply-chain; do
+for job in rust tproxy-linux go-oracles android supply-chain; do
   grep -Fxq "$stable_tag_skip" <<<"$(job_body "$job")" || \
     die "$job does not run for every event except a stable tag push"
 done
+# The owner turned the macOS job off while no macOS runner is available
+# (2026-11-13). It keeps the stable-tag condition or is off outright; while
+# it is off, publish-prerelease, which needs it, cannot run either.
+apple_job="$(job_body apple)"
+if ! grep -Fxq "$stable_tag_skip" <<<"$apple_job"; then
+  grep -Fxq '    if: false' <<<"$apple_job" || \
+    die "apple does not run for every event except a stable tag push"
+  grep -Fxq '      - apple' <<<"$(job_body publish-prerelease)" || \
+    die "publish-prerelease no longer waits for the disabled apple job"
+fi
 candidate_job="$(job_body candidate-ci)"
 grep -Fxq "    if: needs.release-metadata.outputs.bind_candidate_ci == 'true'" <<<"$candidate_job" || \
   die "candidate binding is not restricted to stable tags"

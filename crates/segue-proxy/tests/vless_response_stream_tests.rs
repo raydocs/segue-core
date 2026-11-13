@@ -1,6 +1,6 @@
+use segue_proxy::vless::VlessResponseStream;
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
-use segue_proxy::vless::VlessResponseStream;
 
 #[tokio::test]
 async fn strips_vless_response_header_before_payload() {

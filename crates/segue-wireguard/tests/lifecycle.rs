@@ -1,3 +1,6 @@
+use segue_proxy::wireguard::KeyMaterial;
+use segue_transport::{SocketHandle, SocketProtector};
+use segue_wireguard::{Client, Config, Error};
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::{
@@ -7,9 +10,6 @@ use std::{
     time::Duration,
 };
 use tokio::{net::UdpSocket, time::timeout};
-use segue_proxy::wireguard::KeyMaterial;
-use segue_transport::{SocketHandle, SocketProtector};
-use segue_wireguard::{Client, Config, Error};
 
 fn config(endpoint: SocketAddr) -> Config {
     Config {

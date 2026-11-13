@@ -6,9 +6,9 @@ use aes::Aes128;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Nonce};
 use hkdf::Hkdf;
-use sha2::Sha256;
 use segue_config::{go_lowercase, ContentAttributes, InboundSniffingConfig, SniffingDestination};
 use segue_routing::{Target, TargetAddr};
+use sha2::Sha256;
 use zeroize::Zeroize;
 
 const QUIC_V1: u32 = 1;

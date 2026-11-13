@@ -9,8 +9,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use libfuzzer_sys::fuzz_target;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
-use tokio::runtime::Builder;
 use segue_proxy::shadowsocks::{ClientStream, Method};
 use segue_proxy::vless::{VisionStream, VisionStreamIo, VlessResponseStream};
 use segue_routing::{Network, Target, TargetAddr};
@@ -18,6 +16,8 @@ use segue_transport::stream::grpc_test_only::{
     encode_hunk, HunkDecoder, HunkMode, MAX_HUNK_PAYLOAD_LEN,
 };
 use segue_transport::stream::{FrameDecoder, FrameEvent};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::runtime::Builder;
 
 // Matches the seed corpus; the fuzzer can still reach other ids.
 const VISION_USER_ID: [u8; 16] = [0x11; 16];

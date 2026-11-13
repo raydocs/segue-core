@@ -80,7 +80,7 @@ env \
     --skip rust_socks_client_reaches_target_through_remote_xhttp_profile \
     --nocapture --test-threads=1
 
-cargo build --locked --release -p segue-cli --bin xray-rust
+cargo build --locked --release -p segue-cli --bin segue
 xray_rust_binary="${CARGO_TARGET_DIR:-target}/release/segue"
 if [[ "$xray_rust_binary" != /* ]]; then
   xray_rust_binary="$repository_root/$xray_rust_binary"

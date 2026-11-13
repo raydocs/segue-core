@@ -5,8 +5,8 @@
 
 use super::{insert_domain_matchers, normalize_u16_ranges, Parser, U16SelectorKind};
 use crate::{DomainMatcherSet, DomainNameMode, Network, RoutingPortRange};
-use serde_json::Value;
 use segue_routing::{DomainMatcher, RegexMatcher};
+use serde_json::Value;
 
 /// One entry of a `StringList`, with the path an error about it names.
 pub(super) struct ListEntry<'v> {

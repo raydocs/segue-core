@@ -17,12 +17,12 @@ use std::{
 };
 
 use async_trait::async_trait;
+use segue_transport::{BoxedTransportStream, TransportDialer};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::Instant,
 };
-use segue_transport::{BoxedTransportStream, TransportDialer};
 
 use crate::CoreError;
 

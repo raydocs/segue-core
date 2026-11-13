@@ -1,11 +1,11 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use std::sync::Arc;
 use segue_proxy::{
     mux,
     shadowsocks2022::{Method, UdpSession},
     trojan, vmess,
 };
+use std::sync::Arc;
 
 fuzz_target!(|data: &[u8]| {
     let _ = trojan::decode_udp_packet(data);
