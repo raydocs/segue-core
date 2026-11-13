@@ -133,6 +133,14 @@ pub enum Health {
     Failed,
     /// The session gave up ([`LOCAL_GIVE_UP`]).
     GaveUp,
+    /// Path liveness, not proof (r11 R4): on an established session, bytes
+    /// from the relay arrived on the current carrier without moving data
+    /// end to end: part of a frame still being decoded (a large frame over
+    /// a slow path), or a whole frame that moves nothing (a keepalive ACK
+    /// during an upload). Repeated every [`HEALTH_REFRESH`] while bytes
+    /// keep arriving. It never touches the recovery budget (only business
+    /// progress resets that) and never replaces a report not yet taken.
+    Alive,
 }
 
 /// Result of [`ClientSession::poll_transmit_into`].
@@ -193,6 +201,8 @@ pub struct ClientSession {
     health: Option<Health>,
     /// When [`Health::Up`] was last reported (see [`HEALTH_REFRESH`]).
     up_reported: Option<Instant>,
+    /// When [`Health::Up`] or [`Health::Alive`] was last reported.
+    alive_reported: Option<Instant>,
     /// When the current carrier's attach was answered.
     confirmed_at: Option<Instant>,
     /// When a frame last went out, and a keepalive ACK is owed (see
@@ -271,6 +281,7 @@ impl ClientSession {
             rx_partial: false,
             health: None,
             up_reported: None,
+            alive_reported: None,
             confirmed_at: None,
             last_sent: now,
             ka_due: false,
@@ -480,6 +491,7 @@ impl ClientSession {
         if self.confirmed && now >= self.last_sent + self.keepalive() {
             self.ka_due = true;
         }
+        self.alive(now);
     }
 
     /// The carrier's writer moved bytes at `at`. Before the attach is
@@ -550,6 +562,7 @@ impl ClientSession {
             // way (the next one shows).
             self.health = Some(Health::Failed);
             self.up_reported = None;
+            self.alive_reported = None;
         }
         if self.progressed {
             // Budget: a carrier that moved data resets it.
@@ -640,6 +653,8 @@ impl ClientSession {
         if let Err(e) = r {
             return self.fatal(e);
         }
+        // After the frame: OPENED / progress report Up instead.
+        self.alive(now);
         self.check_done();
         Ok(())
     }
@@ -671,6 +686,7 @@ impl ClientSession {
                 // budget in a loop (RESUMED never resets it).
                 self.fruitless = 0;
                 self.up_reported = Some(now);
+                self.alive_reported = Some(now);
                 self.health = Some(Health::Up);
             }
             Frame::Resumed(r) => {
@@ -757,7 +773,20 @@ impl ClientSession {
         // caller can tell recent success from old (r10 N6).
         if self.up_reported.is_none_or(|t| now >= t + HEALTH_REFRESH) {
             self.up_reported = Some(now);
+            self.alive_reported = Some(now);
             self.health = Some(Health::Up);
+        }
+    }
+
+    /// Bytes from the relay arrived on the current carrier (see
+    /// [`Health::Alive`]).
+    fn alive(&mut self, now: Instant) {
+        if !self.confirmed || self.is_closed() || self.health.is_some() {
+            return;
+        }
+        if self.alive_reported.is_none_or(|t| now >= t + HEALTH_REFRESH) {
+            self.alive_reported = Some(now);
+            self.health = Some(Health::Alive);
         }
     }
 

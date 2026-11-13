@@ -46,6 +46,12 @@ struct Node {
     cut: Arc<AtomicUsize>,
     /// The next this many carriers drop everything from the start.
     drop_next: Arc<AtomicUsize>,
+    /// Checked before `drop_next`: each new carrier takes the next entry
+    /// (true: it drops everything from the start).
+    drop_plan: Arc<Mutex<std::collections::VecDeque<bool>>>,
+    /// When non-zero, the next carrier's downlink is throttled to this
+    /// many bytes per second (control streams are spared); then reset.
+    slow_next: Arc<AtomicUsize>,
 }
 
 /// Engine stand-in: `dial(Some(carrier), relay)` → a pipe into that
@@ -77,6 +83,7 @@ async fn path<R, W>(
     mut w: W,
     hole: Arc<AtomicBool>,
     cut: Option<(usize, Arc<AtomicBool>)>,
+    slow: Option<(usize, Arc<AtomicBool>)>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -84,7 +91,15 @@ async fn path<R, W>(
     let mut buf = vec![0u8; 4096];
     let mut left = cut.as_ref().map(|c| c.0);
     loop {
-        let mut n = match r.read(&mut buf).await {
+        // Throttled: at most rate/10 bytes per 100 ms.
+        let lim = match &slow {
+            Some((rate, control)) if !control.load(Ordering::SeqCst) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                (rate / 10).clamp(1, buf.len())
+            }
+            _ => buf.len(),
+        };
+        let mut n = match r.read(&mut buf[..lim]).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
@@ -208,10 +223,12 @@ impl Dialer for Engine {
         // that drops every byte both ways and closes nothing.
         let (client, a) = tokio::io::duplex(64 << 10);
         let (b, relay) = tokio::io::duplex(64 << 10);
-        let dropped = node
-            .drop_next
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok();
+        let planned = node.drop_plan.lock().unwrap().pop_front();
+        let dropped = planned.unwrap_or_else(|| {
+            node.drop_next
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        });
         let hole = Arc::new(AtomicBool::new(dropped));
         let is_control = Arc::new(AtomicBool::new(false));
         node.holes
@@ -224,8 +241,12 @@ impl Dialer for Engine {
             0 => None,
             n => Some((n, is_control.clone())),
         };
-        tokio::spawn(path(ar, bw, hole.clone(), None));
-        tokio::spawn(path(br, aw, hole, cut));
+        let slow = match node.slow_next.swap(0, Ordering::SeqCst) {
+            0 => None,
+            n => Some((n, is_control.clone())),
+        };
+        tokio::spawn(path(ar, bw, hole.clone(), None, None));
+        tokio::spawn(path(br, aw, hole, cut, slow));
         node.accept
             .send(Box::new(relay))
             .await
@@ -302,6 +323,8 @@ fn node(auth: Box<dyn Authorizer>, site: Option<SiteConnector>, cfg: Config) -> 
         sites,
         cut: Arc::default(),
         drop_next: Arc::default(),
+        drop_plan: Arc::default(),
+        slow_next: Arc::default(),
     }
 }
 
@@ -316,6 +339,9 @@ struct Lab {
     la_ctrl: mpsc::Sender<RelayCtrl>,
     la_cut: Arc<AtomicUsize>,
     la_drop_next: Arc<AtomicUsize>,
+    la_controls: Arc<AtomicUsize>,
+    la_drop_plan: Arc<Mutex<std::collections::VecDeque<bool>>>,
+    la_slow_next: Arc<AtomicUsize>,
     engine: Arc<Engine>,
 }
 
@@ -345,6 +371,9 @@ fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg:
     let ny = node(Box::new(AllowAll), None, Config::default());
     let la_cut = la.cut.clone();
     let la_drop_next = la.drop_next.clone();
+    let la_controls = la.controls.clone();
+    let la_drop_plan = la.drop_plan.clone();
+    let la_slow_next = la.slow_next.clone();
     let (la_up, ny_up) = (la.up.clone(), ny.up.clone());
     let (la_carriers, ny_carriers) = (la.carriers.clone(), ny.carriers.clone());
     let la_sites = la.sites.clone();
@@ -390,6 +419,9 @@ fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg:
         la_ctrl,
         la_cut,
         la_drop_next,
+        la_controls,
+        la_drop_plan,
+        la_slow_next,
         engine,
     }
 }
@@ -772,6 +804,20 @@ async fn download_lab() -> (Lab, crate::dial::Stream, u64) {
     download_lab_cfg(Config::default()).await
 }
 
+/// Give `l`'s dialer the quick control timing.
+fn quicken(l: &mut Lab) {
+    l.d = std::mem::replace(
+        &mut l.d,
+        KernelDialer::new(
+            Arc::new(Engine::default()),
+            vec![],
+            Default::default(),
+            Default::default(),
+        ),
+    )
+    .with_control_timing(quick_control());
+}
+
 /// [`download_lab`] with the la relay's configuration `la_cfg`.
 async fn download_lab_cfg(la_cfg: Config) -> (Lab, crate::dial::Stream, u64) {
     let mut l = lab_cfg(Box::new(AllowAll), Some(endless_download()), la_cfg);
@@ -1143,6 +1189,7 @@ mod exit_health {
             user_off: false,
             revoked: None,
             choice: None,
+            choice_gen: 0,
             health: vec![exit()],
         }));
         let a = HealthReporter::new(st.clone(), 0);
@@ -1155,6 +1202,76 @@ mod exit_health {
         assert_eq!(st.lock().unwrap().health[0].failing(), 0);
         drop(a);
         assert!(st.lock().unwrap().health[0].sessions.is_empty());
+    }
+
+    /// r11 R4: path liveness (bytes arriving, no data moving end to end)
+    /// keeps a session's path counted for its exit, with the same window
+    /// as proof, on both sides of it.
+    #[test]
+    fn liveness_counts_within_the_window_and_not_after() {
+        let t = Instant::now();
+        let mut h = exit();
+        feed(&mut h, 1, S::Up, t);
+        feed(&mut h, 2, S::Up, t);
+        // B's proof is old; B shows liveness at t + 4 s (a large frame
+        // still crossing).
+        let alive = t + Duration::from_secs(4);
+        assert_eq!(feed(&mut h, 2, S::Alive, alive), Posture::Connected);
+        let edge = alive + PROOF_FRESH;
+        assert_eq!(
+            feed(&mut h, 1, S::Failed, edge - Duration::from_millis(1)),
+            Posture::Connected,
+            "fresh liveness did not count"
+        );
+        assert_eq!(
+            feed(&mut h, 1, S::Failed, edge),
+            Posture::Reconnecting,
+            "stale liveness counted"
+        );
+    }
+
+    /// r11 R4: liveness restores nothing and does not count for a session
+    /// that is failing; that session's own failure drops it.
+    #[test]
+    fn liveness_restores_nothing_and_a_failing_session_has_none() {
+        let t = Instant::now();
+        let mut h = exit();
+        feed(&mut h, 1, S::Up, t);
+        let t = t + PROOF_FRESH;
+        assert_eq!(feed(&mut h, 1, S::Failed, t), Posture::Reconnecting);
+        // Down: bytes arriving on another session do not bring it back.
+        assert_eq!(feed(&mut h, 2, S::Alive, t), Posture::Reconnecting);
+        assert!(h.unproven);
+        // A failing session's liveness does not outweigh a failure.
+        let mut h = exit();
+        feed(&mut h, 1, S::Up, t);
+        feed(&mut h, 2, S::Up, t);
+        feed(&mut h, 2, S::Alive, t + Duration::from_secs(1));
+        assert_eq!(
+            feed(&mut h, 2, S::Failed, t + Duration::from_secs(2)),
+            Posture::Connected,
+            "1's proof still fresh"
+        );
+        feed(&mut h, 2, S::Alive, t + Duration::from_secs(3));
+        assert_eq!(
+            feed(&mut h, 1, S::Failed, t + PROOF_FRESH),
+            Posture::Reconnecting,
+            "a failing session's liveness counted"
+        );
+    }
+
+    /// r11 R4 boundary: a session idle for the whole window gives no
+    /// evidence; a failure then takes the exit down, until a valid
+    /// answer (the next OPENED or data moving).
+    #[test]
+    fn an_idle_session_gives_no_evidence() {
+        let t = Instant::now();
+        let mut h = exit();
+        feed(&mut h, 1, S::Up, t);
+        feed(&mut h, 2, S::Up, t);
+        let t = t + PROOF_FRESH;
+        assert_eq!(feed(&mut h, 1, S::Failed, t), Posture::Reconnecting);
+        assert_eq!(feed(&mut h, 2, S::Up, t), Posture::Connected);
     }
 }
 
@@ -1279,8 +1396,9 @@ async fn one_good_and_one_bad_session_on_an_exit() {
 /// relay answers the retry UNKNOWN_SESSION (it never saw the first). That
 /// slow OPEN reported failures that took la down; the fresh session then
 /// re-picked an exit and went to ny, whose carrier is down, and the AI
-/// flow failed although la had just answered. Now the relay's answer is
-/// proof for la and the fresh session stays on it.
+/// flow failed although la had just answered. The answer lets the fresh
+/// session try la once more (r11 R5: it is not proof by itself, la is
+/// still down until then); its OPENED makes la `Connected` again.
 #[tokio::test]
 async fn a_fresh_session_after_unknown_session_stays_on_the_exit_that_answered() {
     let l = lab();
@@ -1293,6 +1411,11 @@ async fn a_fresh_session_after_unknown_session_stays_on_the_exit_that_answered()
         .await
         .expect("AI dial hung")
         .expect("AI flow failed although la answered");
+    assert_eq!(
+        la_posture(&l),
+        Posture::Connected,
+        "OPENED did not restore la"
+    );
     roundtrip(s).await;
     assert_eq!(
         l.la_sites.load(Ordering::SeqCst),
@@ -1302,4 +1425,437 @@ async fn a_fresh_session_after_unknown_session_stays_on_the_exit_that_answered()
     assert_eq!(l.ny_carriers.load(Ordering::SeqCst), 0, "moved to ny");
     assert_eq!(l.d.posture(), Posture::Connected);
     assert_eq!(l.d.status().current_exit.as_deref(), Some("la"));
+}
+
+/// Opens sessions, refuses every control stream (RESUME / CTRL_HELLO)
+/// with `code`.
+struct NoControl(u8);
+
+impl Authorizer for NoControl {
+    fn open(&self, _: &[u8], _: &Target, _: Kind) -> Result<segue_session::relay::Grant, u8> {
+        Ok(segue_session::relay::Grant::all(0))
+    }
+    fn resume(&self, _: &[u8]) -> Result<u64, u8> {
+        Err(self.0)
+    }
+}
+
+/// r11 R3, through the kernel: a relay that refuses the control stream
+/// for good (here: the ticket) gets one CTRL_HELLO, no redial loop and no
+/// dead-channel resume storm; the refusal shows in the status; later
+/// sessions do not restart it; a new connect does.
+#[tokio::test]
+async fn a_control_stream_refused_for_good_is_not_redialled() {
+    let mut l = lab_with(Box::new(NoControl(code::AUTH)));
+    quicken(&mut l);
+    l.d.set_exit("la").unwrap();
+    let s = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while l.d.status().control_refused.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("refusal never reported");
+    assert_eq!(
+        l.d.status().control_refused,
+        vec![("la".to_string(), code::AUTH)]
+    );
+    let carriers = l.la_carriers.load(Ordering::SeqCst);
+    roundtrip(s).await;
+    for _ in 0..3 {
+        roundtrip(l.d.dial(Some("overseas"), &site(), 443).await.unwrap()).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        l.la_controls.load(Ordering::SeqCst),
+        1,
+        "control stream redialled"
+    );
+    assert_eq!(
+        l.la_carriers.load(Ordering::SeqCst),
+        carriers + 3,
+        "sessions reattached (a Dead resume storm)"
+    );
+    assert_eq!(l.d.posture(), Posture::Connected);
+    assert_eq!(l.d.status().revoked, None);
+}
+
+fn la_posture(l: &Lab) -> Posture {
+    l.d.state.lock().unwrap().health[0].ks.posture()
+}
+
+/// A strict (AI) flow on la is refused at once by la's health (la is
+/// chosen manually: under Auto the flow would rightly move to ny).
+async fn ai_refused_fast(l: &Lab, what: &str) {
+    l.d.set_exit("la").unwrap();
+    let t = Instant::now();
+    match l.d.dial(Some("ai"), &site(), 443).await {
+        Ok(_) => panic!("{what}: AI flow opened"),
+        Err(e) => assert!(e.0.contains("strict"), "{what}: {e}"),
+    }
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "{what}: refused after {:?}",
+        t.elapsed()
+    );
+}
+
+/// The lab with la probed `Connected`, ny down, and la's next carriers
+/// following `plan` (true: dropped from the start).
+async fn unknown_session_lab(l: Lab, plan: &[bool]) -> Lab {
+    l.d.probe().await.unwrap();
+    assert_eq!(l.d.posture(), Posture::Connected);
+    l.ny_up.store(false, Ordering::SeqCst);
+    l.la_drop_plan.lock().unwrap().extend(plan.iter().copied());
+    l
+}
+
+/// r11 R5: the relay restarted (so the OPEN retry is UNKNOWN_SESSION,
+/// answered before the ticket is read) and the ticket was revoked
+/// meanwhile. The fresh OPEN is refused; la must not be left `Connected`
+/// by the UNKNOWN_SESSION, and the refusal is a health failure.
+#[tokio::test]
+async fn unknown_session_then_a_revoked_ticket_leaves_the_exit_down() {
+    for c in [code::REVOKED, code::AUTH, code::EXIT_DENIED] {
+        let l = unknown_session_lab(lab_with(Box::new(Deny(c))), &[true]).await;
+        let e = tokio::time::timeout(Duration::from_secs(15), l.d.dial(Some("ai"), &site(), 443))
+            .await
+            .expect("AI dial hung")
+            .err()
+            .expect("AI flow opened with a refused ticket");
+        assert!(e.0.contains(&format!("code {c}")), "{c}: {e}");
+        assert_ne!(la_posture(&l), Posture::Connected, "{c}: la Connected");
+        assert_eq!(l.la_sites.load(Ordering::SeqCst), 0);
+        assert_eq!(l.ny_carriers.load(Ordering::SeqCst), 0, "{c}: moved to ny");
+        ai_refused_fast(&l, "after the refusal").await;
+    }
+}
+
+/// r11 R5: relay restart, and the Home exit is down: the fresh OPEN is
+/// reset with HOME_UNAVAILABLE before OPENED. la stays down.
+#[tokio::test]
+async fn unknown_session_then_home_unavailable_leaves_the_exit_down() {
+    let home_down: SiteConnector = Arc::new(|_, _| {
+        Box::pin(async { Err(segue_session::driver::SiteError::io(code::HOME_UNAVAILABLE)) })
+    });
+    let l = unknown_session_lab(lab_parts(Box::new(AllowAll), Some(home_down)), &[true]).await;
+    let e = tokio::time::timeout(Duration::from_secs(15), l.d.dial(Some("ai"), &site(), 443))
+        .await
+        .expect("AI dial hung")
+        .err()
+        .expect("AI flow opened with Home down");
+    assert!(
+        e.0.contains(&format!("code {}", code::HOME_UNAVAILABLE)),
+        "{e}"
+    );
+    assert_eq!(
+        l.la_sites.load(Ordering::SeqCst),
+        1,
+        "fresh OPEN never reached the relay"
+    );
+    assert_ne!(la_posture(&l), Posture::Connected);
+    ai_refused_fast(&l, "Home down").await;
+}
+
+/// Refuses OPENs to `denied.example`, allows the rest.
+struct DenyTarget;
+
+impl Authorizer for DenyTarget {
+    fn open(&self, _: &[u8], t: &Target, _: Kind) -> Result<segue_session::relay::Grant, u8> {
+        match t {
+            Target::Domain(d, _) if d == "denied.example" => Err(code::TARGET_DENIED),
+            _ => Ok(segue_session::relay::Grant::all(0)),
+        }
+    }
+    fn resume(&self, _: &[u8]) -> Result<u64, u8> {
+        Ok(0)
+    }
+}
+
+/// r11 R5: another session on la is failing (it took la down). An
+/// UNKNOWN_SESSION answer to some flow does not bring la back nor clear
+/// that failure; a fresh OPEN refused for its target (TARGET_DENIED: the
+/// one flow, not the exit) leaves la as it was; a fresh OPEN that is
+/// answered OPENED restores it.
+#[tokio::test]
+async fn unknown_session_beside_a_failing_session_restores_nothing_until_opened() {
+    let l = unknown_session_lab(lab_with(Box::new(DenyTarget)), &[]).await;
+    l.d.set_exit("la").unwrap();
+    // The coexisting bad session: its carriers fail, nothing proves la.
+    let bad = HealthReporter::new(l.d.state.clone(), 0);
+    bad.report(SessionHealth::Failed);
+    assert_eq!(la_posture(&l), Posture::Reconnecting);
+    let denied = TargetAddr::Domain("denied.example".into());
+    l.la_drop_plan.lock().unwrap().extend([true, false]);
+    // An overseas flow (not refused while la is down) gets UNKNOWN_SESSION.
+    let e = tokio::time::timeout(
+        Duration::from_secs(15),
+        l.d.dial(Some("overseas"), &denied, 443),
+    )
+    .await
+    .expect("dial hung")
+    .err()
+    .expect("denied target opened");
+    assert!(
+        e.0.contains(&format!("code {}", code::TARGET_DENIED)),
+        "{e}"
+    );
+    {
+        let st = l.d.state.lock().unwrap();
+        let h = &st.health[0];
+        assert_eq!(
+            h.ks.posture(),
+            Posture::Reconnecting,
+            "la restored without OPENED"
+        );
+        assert!(h.unproven, "failure state cleared");
+        assert_eq!(h.failing(), 1, "the bad session's failure was cleared");
+    }
+    ai_refused_fast(&l, "beside the failing session").await;
+    // OPENED (after an UNKNOWN_SESSION too) is proof.
+    l.la_drop_plan.lock().unwrap().extend([true, false]);
+    let s = tokio::time::timeout(
+        Duration::from_secs(15),
+        l.d.dial(Some("overseas"), &site(), 443),
+    )
+    .await
+    .expect("dial hung")
+    .expect("fresh session failed");
+    assert_eq!(la_posture(&l), Posture::Connected);
+    roundtrip(s).await;
+    drop(bad);
+}
+
+/// r11 R5: every attempt's OPEN is lost and its retry answered
+/// UNKNOWN_SESSION. Each answer grants one more try on la, bounded; none
+/// of them restores la or clears its failures.
+#[tokio::test]
+async fn repeated_unknown_session_never_restores_the_exit() {
+    let plan = [true, false].repeat(1 + FRESH_OPENS as usize);
+    let l = unknown_session_lab(lab(), &plan).await;
+    let seen_connected = Arc::new(AtomicBool::new(false));
+    let watch = {
+        let st = l.d.state.clone();
+        let seen = seen_connected.clone();
+        let failed_once = Arc::new(AtomicBool::new(false));
+        tokio::spawn(async move {
+            loop {
+                let p = st.lock().unwrap().health[0].ks.posture();
+                if p != Posture::Connected {
+                    failed_once.store(true, Ordering::SeqCst);
+                } else if failed_once.load(Ordering::SeqCst) {
+                    seen.store(true, Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let e = tokio::time::timeout(Duration::from_secs(25), l.d.dial(Some("ai"), &site(), 443))
+        .await
+        .expect("AI dial hung")
+        .err()
+        .expect("AI flow opened although every OPEN was lost");
+    watch.abort();
+    assert!(
+        e.0.contains(&format!("code {}", code::UNKNOWN_SESSION)),
+        "{e}"
+    );
+    assert!(
+        !seen_connected.load(Ordering::SeqCst),
+        "UNKNOWN_SESSION made la Connected"
+    );
+    assert_ne!(la_posture(&l), Posture::Connected);
+    assert!(l.d.state.lock().unwrap().health[0].unproven);
+    assert!(
+        l.la_drop_plan.lock().unwrap().is_empty(),
+        "fewer attempts than allowed"
+    );
+    assert_eq!(l.la_sites.load(Ordering::SeqCst), 0);
+    assert_eq!(l.ny_carriers.load(Ordering::SeqCst), 0, "moved to ny");
+    ai_refused_fast(&l, "after the attempts").await;
+}
+
+/// r11 R5: the user changes the manual exit while the first attempt is
+/// outstanding. The fresh session after UNKNOWN_SESSION follows the new
+/// choice, not the old attempt's exit.
+#[tokio::test]
+async fn a_manual_exit_change_during_the_attempt_voids_the_pin() {
+    let l = lab();
+    l.d.set_exit("la").unwrap();
+    l.d.probe().await.unwrap();
+    l.la_drop_plan.lock().unwrap().extend([true, false]);
+    let d = Arc::new(l.d);
+    let dial = {
+        let d = d.clone();
+        tokio::spawn(async move { d.dial(Some("ai"), &site(), 443).await })
+    };
+    // Before T_attach (2 s): the first OPEN is still outstanding on la.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(l.ny_carriers.load(Ordering::SeqCst), 0);
+    d.set_exit("ny").unwrap();
+    let s = tokio::time::timeout(Duration::from_secs(15), dial)
+        .await
+        .expect("AI dial hung")
+        .unwrap()
+        .expect("AI flow failed on the new exit");
+    roundtrip(s).await;
+    assert!(
+        l.ny_carriers.load(Ordering::SeqCst) >= 1,
+        "fresh session stayed on la"
+    );
+    assert_eq!(l.la_sites.load(Ordering::SeqCst), 0, "opened on la");
+    assert_eq!(d.status().current_exit.as_deref(), Some("ny"));
+}
+
+/// A site that sends `n` bytes in one write as soon as it is connected
+/// (the relay then sends full frames), then holds the stream open.
+fn burst_site(n: usize) -> SiteConnector {
+    Arc::new(move |_t, _k| {
+        Box::pin(async move {
+            let (a, mut b) = tokio::io::duplex(256 << 10);
+            tokio::spawn(async move {
+                let _ = b.write_all(&vec![7u8; n]).await;
+                std::future::pending::<()>().await;
+                drop(b);
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
+/// A site that never reads (its buffer takes 1 KiB): an upload's FIN
+/// stays held at the relay, which repeats its ACK to show it is alive.
+fn deaf_site() -> SiteConnector {
+    let keep = Arc::new(Mutex::new(Vec::new()));
+    Arc::new(move |_t, _k| {
+        let keep = keep.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(1024);
+            keep.lock().unwrap().push(b);
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
+/// Open a session on la, then lose its carrier and every carrier after
+/// it (a bad session beside the others on the same exit); it keeps
+/// failing in the background.
+async fn start_bad_session(l: &Lab) -> tokio::task::JoinHandle<()> {
+    let mut bad = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    l.la_drop_next.store(1000, Ordering::SeqCst);
+    {
+        let holes = l.la_holes.lock().unwrap();
+        let (hole, _) = holes
+            .iter()
+            .rev()
+            .find(|(_, c)| !c.load(Ordering::SeqCst))
+            .expect("no session carrier");
+        hole.store(true, Ordering::SeqCst);
+    }
+    tokio::spawn(async move {
+        let _ = bad.write_all(b"ping").await;
+        let _ = read_to_end_within(&mut bad, Duration::from_secs(120)).await;
+    })
+}
+
+/// Watch la for `dur`: it must stay `Connected`; returns whether some
+/// session on it was failing meanwhile (the bad one did fail).
+async fn la_stays_connected(l: &Lab, dur: Duration, what: &str) -> bool {
+    let end = Instant::now() + dur;
+    let mut saw_failing = false;
+    while Instant::now() < end {
+        {
+            let st = l.d.state.lock().unwrap();
+            let h = &st.health[0];
+            assert_eq!(h.ks.posture(), Posture::Connected, "{what}: la taken down");
+            saw_failing |= h.failing() > 0;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    saw_failing
+}
+
+/// Open la's control stream first, so the next carrier is a session's.
+async fn warm(l: &Lab) {
+    l.d.set_exit("la").unwrap();
+    let mut s = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    let mut one = [0u8; 1];
+    s.read_exact(&mut one).await.unwrap();
+    drop(s);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while l.la_controls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no control stream");
+}
+
+/// r11 R4: session B receives a 16 KiB frame at 1 KB/s (about 16 s, no
+/// whole frame for far longer than PROOF_FRESH) while session A on the
+/// same exit keeps failing. B's bytes arriving are path liveness: the
+/// exit stays `Connected`, and B gets its frame.
+#[tokio::test]
+async fn a_slow_frame_keeps_the_exit_up_beside_a_failing_session() {
+    let l = lab_parts(Box::new(AllowAll), Some(burst_site(64 << 10)));
+    warm(&l).await;
+    l.la_slow_next.store(1024, Ordering::SeqCst);
+    let mut b = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    let bad = start_bad_session(&l).await;
+    let t0 = Instant::now();
+    let failed =
+        la_stays_connected(&l, PROOF_FRESH * 2 + Duration::from_secs(1), "slow frame").await;
+    assert!(failed, "the bad session never failed");
+    // No whole frame reached B meanwhile (the test's premise) ...
+    let mut buf = vec![0u8; 64 << 10];
+    let n = tokio::time::timeout(Duration::from_secs(15), b.read(&mut buf))
+        .await
+        .expect("B's frame never arrived")
+        .unwrap();
+    assert!(n > 0);
+    assert!(
+        t0.elapsed() > PROOF_FRESH * 2,
+        "frame arrived early: {:?}",
+        t0.elapsed()
+    );
+    bad.abort();
+}
+
+/// r11 R4: an upload-only session B (its FIN held at the relay, which only
+/// repeats its ACK) beside a failing session A: the keepalive ACKs are
+/// path liveness, the exit stays `Connected`.
+#[tokio::test]
+async fn an_upload_only_session_keeps_the_exit_up_beside_a_failing_session() {
+    let l = lab_parts(Box::new(AllowAll), Some(deaf_site()));
+    l.d.set_exit("la").unwrap();
+    l.d.probe().await.unwrap();
+    let mut b = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    b.write_all(&vec![1u8; 8 << 10]).await.unwrap();
+    b.shutdown().await.unwrap();
+    // B's last data moved now (its upload acknowledged).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let bad = start_bad_session(&l).await;
+    let failed = la_stays_connected(&l, PROOF_FRESH * 2, "upload only").await;
+    assert!(failed, "the bad session never failed");
+    bad.abort();
+    drop(b);
+}
+
+/// r11 R4: an exit whose only session sat idle well past PROOF_FRESH is
+/// still `Connected` (idle is no evidence against it), and the first AI
+/// request after the idle period opens.
+#[tokio::test]
+async fn the_first_request_after_idle_opens() {
+    let l = lab();
+    l.d.set_exit("la").unwrap();
+    let s = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    tokio::time::sleep(PROOF_FRESH + Duration::from_secs(1)).await;
+    assert_eq!(l.d.posture(), Posture::Connected);
+    let ai =
+        l.d.dial(Some("ai"), &site(), 443)
+            .await
+            .expect("AI refused after idle");
+    roundtrip(ai).await;
+    roundtrip(s).await;
 }

@@ -675,3 +675,139 @@ fn a_stall_after_success_reports_failed_and_progress_refreshes_up() {
     );
     assert_eq!(c.fruitless_carriers(), 0, "budget counted a carrier that moved data");
 }
+
+/// r11 R4: bytes arriving without data moving end to end (part of a large
+/// frame, a keepalive ACK) report `Alive`, at most every
+/// `HEALTH_REFRESH`, never `Up`, never before the session is confirmed,
+/// and they leave the recovery budget alone.
+#[test]
+fn partial_frames_and_keepalive_acks_report_alive_not_up() {
+    use segue_session::client::{Health, HEALTH_REFRESH};
+    use segue_session::codec::Opened;
+    let t0 = Instant::now();
+    let mut c = client(t0);
+    c.attach(1, t0);
+    while c.poll_transmit(1, t0).is_some() {}
+    // Before OPENED: bytes arriving prove nothing.
+    c.on_carrier_progress(1, t0);
+    assert_eq!(c.take_health(), None);
+    c.on_frame(
+        1,
+        Frame::Opened(Opened {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            recv_offset: 0,
+            max_offset: 1 << 20,
+            window_cap: 1 << 20,
+            ack_bytes: 0,
+        }),
+        t0,
+    )
+    .unwrap();
+    assert_eq!(c.take_health(), Some(Health::Up));
+    // A large frame crossing slowly: no report within the interval, then
+    // Alive (not Up), again once per interval.
+    c.on_carrier_progress(1, t0 + Duration::from_millis(300));
+    assert_eq!(c.take_health(), None);
+    let t = t0 + HEALTH_REFRESH;
+    c.on_carrier_progress(1, t);
+    assert_eq!(c.take_health(), Some(Health::Alive));
+    c.on_carrier_progress(1, t + Duration::from_millis(500));
+    assert_eq!(c.take_health(), None);
+    let t = t + HEALTH_REFRESH;
+    c.on_carrier_progress(1, t);
+    assert_eq!(c.take_health(), Some(Health::Alive));
+    // Upload: the relay repeats its ACK (no offset moves).
+    assert_eq!(c.write(b"hello"), 5);
+    while c.poll_transmit(1, t).is_some() {}
+    let ka = Frame::Ack {
+        recv_offset: 0,
+        max_offset: 1 << 20,
+    };
+    let t = t + HEALTH_REFRESH;
+    c.on_frame(1, ka.clone(), t).unwrap();
+    assert_eq!(c.take_health(), Some(Health::Alive));
+    let t = t + HEALTH_REFRESH;
+    c.on_frame(1, ka, t).unwrap();
+    assert_eq!(c.take_health(), Some(Health::Alive));
+    // The ACK of the upload is progress: Up.
+    let t = t + HEALTH_REFRESH;
+    c.on_frame(
+        1,
+        Frame::Ack {
+            recv_offset: 5,
+            max_offset: 1 << 20,
+        },
+        t,
+    )
+    .unwrap();
+    assert_eq!(c.take_health(), Some(Health::Up));
+}
+
+/// r11 R4: liveness does not reset the recovery budget.
+#[test]
+fn liveness_neither_resets_the_budget_nor_hides_a_failure() {
+    use segue_session::client::{Health, HEALTH_REFRESH};
+    use segue_session::codec::{Opened, Resumed};
+    let t0 = Instant::now();
+    let mut c = client(t0);
+    c.attach(1, t0);
+    while c.poll_transmit(1, t0).is_some() {}
+    c.on_frame(
+        1,
+        Frame::Opened(Opened {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            recv_offset: 0,
+            max_offset: 1 << 20,
+            window_cap: 1 << 20,
+            ack_bytes: 0,
+        }),
+        t0,
+    )
+    .unwrap();
+    assert_eq!(c.take_health(), Some(Health::Up));
+    // An upload nobody acknowledges: the carrier stalls, moved nothing.
+    assert_eq!(c.write(b"hello"), 5);
+    while c.poll_transmit(1, t0).is_some() {}
+    let mut t = t0 + Config::default().timing.t_stall + Duration::from_millis(1);
+    c.handle_timeout(t);
+    assert_eq!(c.take_health(), Some(Health::Failed));
+    assert_eq!(c.fruitless_carriers(), 1);
+    // The next carrier is answered RESUMED (not progress); bytes then
+    // keep arriving without completing a frame.
+    for _ in 0..100 {
+        if c.wants_attach(t) {
+            break;
+        }
+        t += Duration::from_millis(50);
+        c.handle_timeout(t);
+    }
+    assert!(c.wants_attach(t));
+    c.attach(2, t);
+    while c.poll_transmit(2, t).is_some() {}
+    c.on_frame(
+        2,
+        Frame::Resumed(Resumed {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            recv_offset: 0,
+            max_offset: 1 << 20,
+        }),
+        t,
+    )
+    .unwrap();
+    assert_eq!(c.state(), State::Active);
+    let _ = c.take_health();
+    let mut alive = 0;
+    for _ in 0..5 {
+        t += HEALTH_REFRESH;
+        c.on_carrier_progress(2, t);
+        match c.take_health() {
+            Some(Health::Alive) => alive += 1,
+            h => assert_eq!(h, None),
+        }
+    }
+    assert!(alive >= 4, "{alive} Alive reports");
+    assert_eq!(c.fruitless_carriers(), 1, "liveness reset the budget");
+}

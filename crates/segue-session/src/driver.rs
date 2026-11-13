@@ -1758,12 +1758,35 @@ pub enum ControlHint {
     Dead,
     /// `REVOKED` on the control stream (§6).
     Revoked(u8),
+    /// The relay refused `CTRL_HELLO` for good (r11 R3): `REJECT` with
+    /// this code (`version`, `auth`, `expired` or `revoked`). The control
+    /// task has stopped; reconnecting would get the same answer. Never
+    /// followed by [`ControlHint::Dead`]: the channel was never up.
+    Rejected(u8),
+}
+
+/// A `REJECT` of `CTRL_HELLO` that a reconnect cannot change: another
+/// wire version, or credentials the relay refuses (r11 R3). Anything else
+/// (capacity, rate limits, internal errors) is retried after
+/// [`ControlTiming::retry`].
+pub fn control_reject_is_terminal(code: u8) -> bool {
+    matches!(
+        code,
+        code::VERSION | code::AUTH | code::EXPIRED | code::REVOKED
+    )
 }
 
 /// Keep a control stream to the relay (§3, KERNEL_SPEC §7.2): CTRL_HELLO,
-/// then PING every `ping_every`. Runs until `hints` is closed. A silent
-/// stream (a blackhole that drops packets but never closes the socket) is
-/// reported as [`ControlHint::Dead`] and replaced.
+/// then PING every `ping_every`. Runs until `hints` is closed, or until
+/// the relay ends the device (`REVOKED`) or refuses the hello for good
+/// ([`ControlHint::Rejected`]).
+///
+/// Only a valid CTRL_HELLO reply makes a stream accepted (r11 R3). An
+/// accepted stream that then goes silent (a blackhole that drops packets
+/// but never closes the socket) or breaks is reported as
+/// [`ControlHint::Dead`]; one that never was accepted (refused, closed,
+/// answered with anything else, or silent) is not. Every reconnect waits
+/// [`ControlTiming::retry`] first, so no relay answer can make it spin.
 pub async fn run_control(
     connect: Connector,
     hello: CtrlHello,
@@ -1772,21 +1795,22 @@ pub async fn run_control(
 ) {
     use tokio::time::{sleep, Instant};
     let mut nonce = 0u64;
+    let mut first = true;
     while !hints.is_closed() {
+        if !first {
+            tokio::select! {
+                _ = sleep(timing.retry) => {}
+                _ = hints.closed() => return,
+            }
+        }
+        first = false;
         let c = tokio::select! {
             c = connect() => c,
             _ = hints.closed() => return,
         };
-        let c = match c {
-            Ok(c) => c,
-            Err(_) => {
-                sleep(timing.retry).await;
-                continue;
-            }
-        };
+        let Ok(c) = c else { continue };
         let (mut r, mut w) = tokio::io::split(c);
         if !write_within(&mut w, hello.to_frame(), timing.dead_after).await {
-            sleep(timing.retry).await;
             continue;
         }
         let mut dec = FrameDecoder::new();
@@ -1794,9 +1818,9 @@ pub async fn run_control(
         let mut last_rx = Instant::now();
         let mut ping = tokio::time::interval(timing.ping_every);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut revoked = false;
-        // Only a stream the relay accepted (answered CTRL_HELLO) can be
-        // judged dead; a refused or unreachable one is just retried.
+        // Set by the relay's CTRL_HELLO reply only: until then the stream
+        // carries nothing a session can rely on, and losing it is not a
+        // dead channel.
         let mut accepted = false;
         'stream: loop {
             tokio::select! {
@@ -1806,21 +1830,35 @@ pub async fn run_control(
                         Ok(n) => n,
                     };
                     last_rx = Instant::now();
-                    accepted = true;
                     dec.push(&buf[..n]);
                     loop {
                         match dec.next_frame() {
-                            Ok(Some(Frame::Stall(entries))) => {
-                                for (session_id, attach_gen) in entries {
-                                    let _ = hints.send(ControlHint::Stall { session_id, attach_gen });
-                                }
-                            }
                             Ok(Some(Frame::Control { ty: ty::REVOKED, payload })) => {
                                 let _ = hints.send(ControlHint::Revoked(
                                     payload.first().copied().unwrap_or(code::REVOKED),
                                 ));
-                                revoked = true;
+                                return;
+                            }
+                            Ok(Some(Frame::Control { ty: ty::CTRL_HELLO, payload })) if !accepted => {
+                                if crate::codec::CtrlHelloReply::parse(&payload).is_err() {
+                                    break 'stream;
+                                }
+                                accepted = true;
+                            }
+                            Ok(Some(Frame::Reject(rj))) if !accepted => {
+                                if control_reject_is_terminal(rj.code) {
+                                    let _ = hints.send(ControlHint::Rejected(rj.code));
+                                    return;
+                                }
                                 break 'stream;
+                            }
+                            // Anything else before the reply: not a relay
+                            // that accepted us.
+                            Ok(Some(_)) if !accepted => break 'stream,
+                            Ok(Some(Frame::Stall(entries))) => {
+                                for (session_id, attach_gen) in entries {
+                                    let _ = hints.send(ControlHint::Stall { session_id, attach_gen });
+                                }
                             }
                             Ok(Some(_)) => {}
                             Ok(None) => break,
@@ -1841,13 +1879,8 @@ pub async fn run_control(
                 _ = hints.closed() => return,
             }
         }
-        if revoked {
-            return;
-        }
         if accepted {
             let _ = hints.send(ControlHint::Dead);
-        } else {
-            sleep(timing.retry).await;
         }
     }
 }
