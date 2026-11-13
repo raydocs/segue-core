@@ -796,6 +796,20 @@ fn a_local_wait_reports_no_new_liveness() {
     }
     assert!(t > rx + stall, "the wait outlasted t_stall");
     assert_eq!(c.state(), State::Active, "a local wait stalled the carrier");
+    // r13: the waiting frame, all of it read at `rx`, is a duplicate ACK
+    // handled now: it moves nothing and is no newer evidence.
+    t += Duration::from_millis(250);
+    c.on_frame_at(
+        1,
+        Frame::Ack {
+            recv_offset: 0,
+            max_offset: 1 << 20,
+        },
+        rx,
+        t,
+    )
+    .unwrap();
+    assert_eq!(c.take_health(), None, "a buffered ACK renewed liveness");
     // A new byte is new evidence.
     t += Duration::from_millis(250);
     c.on_carrier_progress(1, t, t);

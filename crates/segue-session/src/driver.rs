@@ -418,15 +418,18 @@ enum CarrierEv {
 /// any, else one frame at a time from the transport region, which the
 /// driver frees as soon as it handled the frame. The only uncharged
 /// memory is a [`SMALL_READ`] header buffer.
+///
+/// `rx` records when bytes last arrived on the carrier.
 fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
     cid: u64,
     r: R,
     tx: mpsc::Sender<CarrierEv>,
     pool: Option<Arc<Pool>>,
+    rx: Arc<Stamp>,
 ) -> Task {
     match pool {
-        Some(p) => spawn(read_charged(cid, r, tx, p)),
-        None => spawn(read_frames(cid, r, tx)),
+        Some(p) => spawn(read_charged(cid, r, tx, p, rx)),
+        None => spawn(read_frames(cid, r, tx, rx)),
     }
 }
 
@@ -435,8 +438,8 @@ async fn read_charged<R: AsyncRead + Unpin>(
     r: R,
     tx: mpsc::Sender<CarrierEv>,
     pool: Arc<Pool>,
+    rx: Arc<Stamp>,
 ) {
-    let rx = Stamp::new();
     let r = TouchRead {
         inner: r,
         stamp: rx.clone(),
@@ -653,8 +656,12 @@ async fn wait_charge(
 }
 
 /// Relay side: no pool, a [`FrameDecoder`] over adaptive reads.
-async fn read_frames<R: AsyncRead + Unpin>(cid: u64, r: R, tx: mpsc::Sender<CarrierEv>) {
-    let rx = Stamp::new();
+async fn read_frames<R: AsyncRead + Unpin>(
+    cid: u64,
+    r: R,
+    tx: mpsc::Sender<CarrierEv>,
+    rx: Arc<Stamp>,
+) {
     let mut r = TouchRead {
         inner: r,
         stamp: rx.clone(),
@@ -876,6 +883,9 @@ struct CarrierIo {
     writer: Task,
     /// When the writer last sent a byte.
     tx_at: Arc<Stamp>,
+    /// When the reader last read a byte off the carrier (r13): a frame
+    /// handed over late (it waited for local memory) arrived no later.
+    rx_at: Arc<Stamp>,
     /// The reader's buffer (client side).
     _charge: Option<PoolGrant>,
 }
@@ -1126,7 +1136,12 @@ where
             ev = ev_rx.recv() => {
                 let t = now();
                 match ev {
-                    Some(CarrierEv::Frame(cid, Ok(f), _c)) => { let _ = s.on_frame(cid, f, t); }
+                    // A frame is evidence of bytes read when they were
+                    // read, not when it is handled (r13).
+                    Some(CarrierEv::Frame(cid, Ok(f), _c)) => {
+                        let at = carriers.get(&cid).and_then(|io| io.rx_at.get()).map_or(t, |a| a.into_std());
+                        let _ = s.on_frame_at(cid, f, at, t);
+                    }
                     Some(CarrierEv::Frame(cid, Err(e), _)) => s.on_decode_error(cid, e),
                     Some(CarrierEv::Progress(cid, at)) => s.on_carrier_progress(cid, at, t),
                     Some(CarrierEv::Closed(cid)) => {
@@ -1154,17 +1169,19 @@ where
                         Ok(stream) => {
                             connect_backoff = None;
                             let (r, w, tx_at) = split_carrier(stream);
+                            let rx_at = Stamp::new();
                             let reader = spawn_reader(
                                 cid,
                                 r,
                                 ev_tx.clone(),
                                 Some(pool.clone()),
+                                rx_at.clone(),
                             );
                             let etx = ev_tx.clone();
                             let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                                 let _ = etx.send(CarrierEv::Closed(cid)).await;
                             });
-                            carriers.insert(cid, CarrierIo { tx, reader, writer, tx_at, _charge: None });
+                            carriers.insert(cid, CarrierIo { tx, reader, writer, tx_at, rx_at, _charge: None });
                             s.attach(cid, now());
                         }
                         Err(_) => {
@@ -1672,12 +1689,13 @@ pub async fn run_relay_ctl(
                     next_cid += 1;
                     let cid = next_cid;
                     let (r, w, tx_at) = split_carrier(stream);
-                    let reader = spawn_reader(cid, r, ev_tx.clone(), None);
+                    let rx_at = Stamp::new();
+                    let reader = spawn_reader(cid, r, ev_tx.clone(), None, rx_at.clone());
                     let etx = ev_tx.clone();
                     let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                         let _ = etx.send(CarrierEv::Closed(cid)).await;
                     });
-                    carriers.insert(cid, CarrierIo { tx, reader, writer, tx_at, _charge: None });
+                    carriers.insert(cid, CarrierIo { tx, reader, writer, tx_at, rx_at, _charge: None });
                     table.add_carrier(cid);
                 }
                 None => accepting = false,

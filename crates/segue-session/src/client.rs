@@ -640,12 +640,28 @@ impl ClientSession {
         Err(e)
     }
 
-    /// A frame decoded from carrier `cid`. An error means the carrier is
-    /// broken; for the current carrier the session is closed as well.
+    /// A frame decoded from carrier `cid`, read off it just now (see
+    /// [`Self::on_frame_at`]).
     pub fn on_frame(
         &mut self,
         cid: CarrierId,
         frame: Frame,
+        now: Instant,
+    ) -> Result<(), ProtoError> {
+        self.on_frame_at(cid, frame, now, now)
+    }
+
+    /// A frame decoded from carrier `cid`, its last byte read off it at
+    /// `rx_at`. An error means the carrier is broken; for the current
+    /// carrier the session is closed as well. A frame that moves nothing
+    /// (a duplicate keepalive ACK) is path liveness only at `rx_at`: one
+    /// already buffered that waited for local memory and is handled now
+    /// is no new evidence (r13).
+    pub fn on_frame_at(
+        &mut self,
+        cid: CarrierId,
+        frame: Frame,
+        rx_at: Instant,
         now: Instant,
     ) -> Result<(), ProtoError> {
         if self.carrier != Some(cid) {
@@ -667,7 +683,7 @@ impl ClientSession {
             return self.fatal(e);
         }
         // After the frame: OPENED / progress report Up instead.
-        self.alive(now, now);
+        self.alive(rx_at.min(now), now);
         self.check_done();
         Ok(())
     }

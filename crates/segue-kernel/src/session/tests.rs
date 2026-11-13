@@ -367,16 +367,18 @@ fn lab_parts(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>) -> La
 
 /// [`lab_parts`] with the la relay's configuration `la_cfg`.
 fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg: Config) -> Lab {
-    lab_full(la_auth, la_site, la_cfg, None)
+    lab_full(la_auth, la_site, la_cfg, None, None)
 }
 
 /// [`lab_cfg`] whose dialer charges its sessions to `pool` (default: the
-/// process pool).
+/// process pool) and opens them with `client` (default: the default
+/// session configuration).
 fn lab_full(
     la_auth: Box<dyn Authorizer>,
     la_site: Option<SiteConnector>,
     la_cfg: Config,
     pool: Option<Arc<Pool>>,
+    client: Option<Config>,
 ) -> Lab {
     let la = node(la_auth, la_site, la_cfg);
     let ny = node(Box::new(AllowAll), None, Config::default());
@@ -421,6 +423,9 @@ fn lab_full(
     let mut d = KernelDialer::new(engine.clone(), exits, routes, home);
     if let Some(p) = pool {
         d = d.with_pool(p);
+    }
+    if let Some(c) = client {
+        d = d.with_session_config(c).unwrap();
     }
     Lab {
         d,
@@ -1979,6 +1984,7 @@ async fn a_local_pool_wait_is_no_liveness_beside_a_failing_session() {
         Some(site_on_cue(go.clone(), FRAME)),
         Config::default(),
         Some(pool.clone()),
+        None,
     );
     warm(&l).await;
     // B's real evidence (OPENED, its first byte) is no older than this.
@@ -2032,6 +2038,113 @@ async fn a_local_pool_wait_is_no_liveness_beside_a_failing_session() {
         .expect("B's frame never arrived")
         .unwrap();
     bad.abort();
+}
+
+/// A site that sends one byte at once and then never reads: an upload's
+/// FIN stays held at the relay, which repeats its ACK as a keepalive.
+fn one_byte_deaf_site() -> SiteConnector {
+    let keep = Arc::new(Mutex::new(Vec::new()));
+    Arc::new(move |_t, _k| {
+        let keep = keep.clone();
+        Box::pin(async move {
+            let (a, mut b) = tokio::io::duplex(1024);
+            let _ = b.write_all(&[7]).await;
+            keep.lock().unwrap().push(b);
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
+/// r13: session B's next frame is a whole duplicate keepalive ACK, read
+/// off the carrier into the reader's buffer, but the shared pool is full
+/// (every elastic block and the transport region taken), so it waits in
+/// `wait_charge` while nothing more arrives (B's carrier black-holed
+/// right after). Past PROOF_FRESH the memory comes back and the ACK is
+/// handled: it was read long ago and moves nothing, so it is no fresh
+/// liveness, and session A failing on the same exit right after takes the
+/// exit down. (A long client `t_stall` keeps B's own carrier from
+/// stalling once the wait ends, so B never fails itself.)
+#[tokio::test]
+async fn a_buffered_ack_after_a_pool_wait_is_no_liveness_beside_a_failing_session() {
+    use segue_session::pool::{Grant, Tier, BLOCK};
+    let pool = Pool::new(8 << 20);
+    let mut client = Config::default();
+    client.timing.t_stall = Duration::from_secs(30);
+    let l = lab_full(
+        Box::new(AllowAll),
+        Some(one_byte_deaf_site()),
+        Config::default(),
+        Some(pool.clone()),
+        Some(client),
+    );
+    warm(&l).await;
+    let mut b = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    let mut one = [0u8; 1];
+    b.read_exact(&mut one).await.unwrap();
+    // Upload and FIN: the site never reads, the relay holds the FIN and
+    // repeats its ACK twice a second.
+    b.write_all(&vec![1u8; 8 << 10]).await.unwrap();
+    b.shutdown().await.unwrap();
+    // Let idle buffers go back first (READ_IDLE, idle credit).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let free = pool.limit(Tier::Elastic) - pool.used_blocks();
+    let elastic = Grant::fixed_in(&pool, free * BLOCK, Tier::Elastic).expect("elastic");
+    let transport =
+        Grant::between(&pool, BLOCK, usize::MAX / 2, Tier::Transport).expect("transport region");
+    assert!(Grant::between(&pool, 1, 1, Tier::Elastic).is_none());
+    assert!(Grant::between(&pool, 1, 1, Tier::Transport).is_none());
+    // The next keepalive ACK arrives whole and waits for memory; before
+    // another can follow, B's carrier delivers nothing more.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while pool.queued() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("B's ACK never waited for memory");
+    let t0 = Instant::now();
+    {
+        let holes = l.la_holes.lock().unwrap();
+        let (hole, _) = holes
+            .iter()
+            .rev()
+            .find(|(_, c)| !c.load(Ordering::SeqCst))
+            .expect("no session carrier");
+        hole.store(true, Ordering::SeqCst);
+    }
+    tokio::time::sleep(PROOF_FRESH + Duration::from_secs(1)).await;
+    assert_eq!(pool.queued(), 1, "B's ACK no longer waits");
+    assert_eq!(
+        l.d.state.lock().unwrap().health[0].ks.posture(),
+        Posture::Connected
+    );
+    // Memory back: B's ACK is handled now; then A fails on la.
+    drop((elastic, transport));
+    let release = Instant::now();
+    let bad = start_bad_session(&l).await;
+    let down = tokio::time::timeout(PROOF_FRESH - Duration::from_secs(1), async {
+        loop {
+            if l.d.state.lock().unwrap().health[0].ks.posture() != Posture::Connected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        down.is_ok(),
+        "a buffered ACK kept la Connected {:?} after the wait ({:?} after its arrival): {:?}",
+        release.elapsed(),
+        t0.elapsed(),
+        l.d.state.lock().unwrap().health[0].sessions
+    );
+    {
+        let st = l.d.state.lock().unwrap();
+        let failing = st.health[0].sessions.values().filter(|m| m.failing).count();
+        assert_eq!(failing, 1, "B failed too: {:?}", st.health[0].sessions);
+    }
+    bad.abort();
+    drop(b);
 }
 
 /// r11 R4: an upload-only session B (its FIN held at the relay, which only
