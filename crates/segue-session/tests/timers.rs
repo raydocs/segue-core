@@ -317,7 +317,10 @@ fn control_stream_answers_ping_and_carries_stall_and_revoked() {
     };
     assert_eq!(entries, vec![(SID, c.gen())]);
     c.on_stall(entries[0].1, t);
-    assert!(c.wants_attach(t));
+    // A stalled carrier counts against the redial bound (r9 F2) even
+    // with nothing to upload: the first redial waits the first backoff.
+    assert_eq!(c.fruitless_carriers(), 1);
+    assert!(c.wants_attach(t + segue_session::client::RECONNECT_BACKOFF));
     // Device reset: REVOKED on the control stream, which then closes.
     r.reset_device(0, code::REVOKED);
     let mut got_revoked = false;

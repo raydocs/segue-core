@@ -977,6 +977,17 @@ impl RelayTable {
     // ---- time ----
 
     pub fn poll_timeout(&self) -> Option<Instant> {
+        self.poll_timeout_writable(|_| true)
+    }
+
+    /// [`poll_timeout`](Self::poll_timeout) for a driver that can tell
+    /// which carriers' writers have room (r9 F3). A deadline that is only
+    /// served by sending (a delayed ACK, the held-FIN keepalive) is left
+    /// out for a carrier that cannot take a frame now: once due it would
+    /// stay in the past and wake the driver in a loop until the writer
+    /// drains. The driver waits for the writer instead (it wakes on every
+    /// message the writer finishes) and calls this again.
+    pub fn poll_timeout_writable(&self, writable: impl Fn(CarrierId) -> bool) -> Option<Instant> {
         let t = &self.cfg.timing;
         let mut d: Option<Instant> = self.tombs.values().map(|x| x.until).min();
         let mut put = |x: Instant| d = Some(d.map_or(x, |d| d.min(x)));
@@ -988,12 +999,16 @@ impl RelayTable {
             if s.state == SessionState::Active && s.send.unacked() {
                 put(s.last_progress + t.t_live);
             }
-            if s.held_fin.is_some() && s.carrier.is_some() && s.connected {
+            let sendable = s.connected && s.carrier.is_some_and(&writable);
+            // The keepalive goes out only where `poll_transmit` sends it:
+            // never while DETACHED (r9 F3: the deadline stayed in the past
+            // and the driver spun until T_detached).
+            if s.held_fin.is_some() && sendable && s.state == SessionState::Active {
                 put(s.last_sent + self.keepalive());
             }
             // ACKs go out only once connected (`poll_transmit` holds them
             // back before), so an earlier deadline could never be served.
-            if s.carrier.is_some() && s.connected {
+            if sendable {
                 if let Some(a) = s.recv.ack_deadline() {
                     put(a);
                 }

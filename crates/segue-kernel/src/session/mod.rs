@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use segue_routing::TargetAddr;
-use segue_session::client::{ClientSession, CloseReason, OpenParams};
+use segue_session::client::{ClientSession, CloseReason, Health as SessionHealth, OpenParams};
 use segue_session::codec::{code, CtrlHello, Kind, SessionId, Target, VERSION};
 use segue_session::driver::{
     run_client_ctl, run_control, BoxCarrier, ClientCtl, Connector, ControlHint, ControlTiming,
@@ -132,6 +132,17 @@ impl ExitChoice {
 struct Health {
     ks: KillSwitch,
     last_fail: Option<Instant>,
+    /// A session on this exit failed (its carrier stalled, held a frame
+    /// too long, or went unanswered; or it gave up) and no session has
+    /// had a valid answer since (r9 F5). A carrier connect alone does
+    /// not clear it: the outer tunnel can come up while session frames
+    /// are black-holed. Cleared by [`SessionHealth::Up`] (OPENED, or data
+    /// moving end to end).
+    unproven: bool,
+    /// Live sessions on this exit whose last report was a failure: they
+    /// are backing off to redial. While any is, strict flows are refused
+    /// at once (however long ago the last failure was).
+    failing: usize,
 }
 
 impl Health {
@@ -256,6 +267,8 @@ impl KernelDialer {
             Health {
                 ks: KillSwitch::new(),
                 last_fail: None,
+                unproven: false,
+                failing: 0,
             };
             exits.len()
         ];
@@ -412,6 +425,7 @@ impl KernelDialer {
         for h in &mut st.health {
             h.ks.on_event(Event::UserConnect);
             h.last_fail = None;
+            h.unproven = false;
         }
         self.off.send_replace(false);
     }
@@ -476,8 +490,12 @@ impl KernelDialer {
                 let h = &mut st.health[i];
                 match res {
                     Ok(Ok(s)) => {
-                        h.ks.on_event(Event::ChannelUp);
-                        h.last_fail = None;
+                        // While sessions are failing, the carrier being up
+                        // proves nothing (r9 F5): wait for a valid answer.
+                        if !h.unproven {
+                            h.ks.on_event(Event::ChannelUp);
+                            h.last_fail = None;
+                        }
                         Ok(Box::new(s) as BoxCarrier)
                     }
                     Ok(Err(e)) => {
@@ -544,8 +562,10 @@ impl KernelDialer {
             }
             let i = st.pick();
             let h = &st.health[i];
+            // Refused at once while the exit's carrier connects fail, or
+            // its sessions are backing off after failures (r9 F5).
             let down = matches!(h.ks.posture(), Posture::Reconnecting | Posture::Error)
-                && h.recently_failed();
+                && (h.recently_failed() || h.failing > 0);
             if r.exit_class == EXIT_AI && down {
                 return Err((
                     DialError("refused: tunnel reconnecting (strict route)".into()),
@@ -586,6 +606,14 @@ impl KernelDialer {
             closed: Some(closed_tx),
             opened: Some(open_tx),
             cancel: Some(self.revoked.subscribe()),
+            health: Some({
+                let rep = HealthReporter {
+                    state: self.state.clone(),
+                    i,
+                    failing: Mutex::new(false),
+                };
+                Arc::new(move |r| rep.report(r))
+            }),
         };
         let run = run_client_ctl(s, far, self.connector(i), ctl);
         let mut off = self.off.subscribe();
@@ -611,6 +639,63 @@ impl KernelDialer {
             },
             c = &mut closed_rx => Err(closed_err(c.ok())),
             _ = tokio::time::sleep(OPEN_WAIT) => Err((DialError("session open timed out".into()), None)),
+        }
+    }
+}
+
+/// A session's health report (r9 F5) into its exit's health: failures
+/// put the exit in `Reconnecting` (or `Error` if it never worked), so new
+/// strict (AI) flows are refused at once while the session backs off;
+/// only a valid protocol answer brings it back to `Connected`.
+fn session_health(h: &mut Health, failing: &mut bool, r: SessionHealth) {
+    match r {
+        SessionHealth::Up => {
+            if std::mem::take(failing) {
+                h.failing -= 1;
+            }
+            h.unproven = false;
+            h.last_fail = None;
+            h.ks.on_event(Event::ChannelUp);
+        }
+        SessionHealth::Failed => {
+            if !std::mem::replace(failing, true) {
+                h.failing += 1;
+            }
+            h.unproven = true;
+            mark_failed(h);
+        }
+        SessionHealth::GaveUp => {
+            if std::mem::take(failing) {
+                h.failing -= 1;
+            }
+            h.unproven = true;
+            mark_failed(h);
+        }
+    }
+}
+
+/// One session's [`ClientCtl::health`] hook: reports into exit `i`, and
+/// when the session ends (the driver drops the hook) it no longer counts
+/// as failing.
+struct HealthReporter {
+    state: Arc<Mutex<State>>,
+    i: usize,
+    failing: Mutex<bool>,
+}
+
+impl HealthReporter {
+    fn report(&self, r: SessionHealth) {
+        let mut st = self.state.lock().unwrap();
+        session_health(&mut st.health[self.i], &mut self.failing.lock().unwrap(), r);
+    }
+}
+
+impl Drop for HealthReporter {
+    fn drop(&mut self) {
+        if *self.failing.get_mut().unwrap() {
+            if let Ok(mut st) = self.state.lock() {
+                st.health[self.i].failing -= 1;
+            }
         }
     }
 }
