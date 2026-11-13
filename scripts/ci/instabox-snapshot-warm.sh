@@ -54,6 +54,10 @@ log "Build outputs in $target_dir, as the CI jobs mount them"
 mkdir -p "$target_dir" target
 mountpoint -q target || sudo mount --bind "$target_dir" target
 
+# The rust and go-oracles jobs both build with this profile, so they share
+# one set of warm outputs.
+export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=line-tables-only
+
 log "rust job"
 cargo fetch --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::perf -W clippy::suspicious
@@ -80,14 +84,14 @@ git -C target/references/hysteria-2.12.2 checkout --quiet --detach "$hysteria_re
 for module in . tools/reality-oracle/masquerade tools/reality-oracle/grpc tools/wireguard-reference; do
   (cd "$module" && go mod download)
 done
-# The same profile the job sets; the interop steps run in workflow order. A
+# The interop steps run in workflow order. A
 # step that fails here still leaves its build outputs, so only report it.
 mapfile -t steps < <(awk '/^  go-oracles:/,/^  rc-interop:/' .github/workflows/ci.yml |
   sed -n 's/^ *\(run: \)\{0,1\}\(bash scripts\/[^ ]*\.sh\)$/\2/p')
 failed=0
 for step in "${steps[@]}"; do
   log "$step"
-  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=line-tables-only bash -c "$step" || {
+  bash -c "$step" || {
     echo "warm: '$step' failed; its caches are kept" >&2
     failed=$((failed + 1))
   }
