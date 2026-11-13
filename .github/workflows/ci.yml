@@ -755,7 +755,12 @@ jobs:
           retention-days: 14
 
   apple:
-    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    # disabled: no macOS runner, owner 2026-11-13. GitHub-hosted macos-15 is
+    # blocked on billing and Instabox has no macOS runs-on label. Restore
+    # this condition to re-enable:
+    # github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    # publish-prerelease still needs this job, so RC prereleases wait for it.
+    if: false
     runs-on: macos-15
     timeout-minutes: 90
     env:
