@@ -1024,8 +1024,7 @@ async fn ai_is_refused_fast_while_sessions_back_off_and_after_give_up_then_recov
 async fn session_config_with_a_too_short_stall_is_refused() {
     let mut cfg = Config::default();
     cfg.timing.t_stall = Duration::from_millis(50);
-    let lab = lab();
-    assert!(lab.d.with_session_config(cfg).is_err());
+    assert!(lab().d.with_session_config(cfg).is_err());
     let lab = lab();
     let mut cfg = Config::default();
     cfg.timing.t_stall = segue_session::MIN_CLIENT_STALL;
