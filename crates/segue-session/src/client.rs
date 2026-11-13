@@ -17,7 +17,8 @@ use std::time::Instant;
 use rand::RngCore;
 
 use crate::codec::{
-    code, Frame, Kind, Open, Reject, Resume, Secret, SessionId, Target, MAX_PAYLOAD, VERSION,
+    code, Frame, Kind, Open, Reject, Resume, Secret, SessionId, Target, MAX_PAYLOAD, STALL_MS_MAX,
+    VERSION,
 };
 use crate::flow::{RecvHalf, SendHalf};
 use crate::park::{ParkDecision, ParkTracker};
@@ -397,9 +398,16 @@ impl ClientSession {
     }
 
     /// This side's stall bound, told to the relay so its keepalive comes
-    /// often enough for it (r9).
+    /// often enough for it (r9). In the wire range ([`STALL_MS_MAX`]); a
+    /// validated configuration ([`crate::Timing::validate_client`]) is
+    /// never below [`crate::MIN_CLIENT_STALL`], so the relay serves it as
+    /// announced.
     fn stall_ms(&self) -> u64 {
-        self.cfg.timing.t_stall.as_millis().min(u64::MAX as u128) as u64
+        self.cfg
+            .timing
+            .t_stall
+            .as_millis()
+            .clamp(1, u128::from(STALL_MS_MAX)) as u64
     }
 
     fn open_header_len(&self) -> usize {
@@ -656,7 +664,12 @@ impl ClientSession {
                 }
             }
             Frame::Reject(rj) => {
-                if rj.attach_gen != self.gen {
+                // REJECT(version) carries generation 0 whatever we sent: a
+                // peer of another wire version cannot read the rest of our
+                // OPEN / RESUME (r10 N3). On the current carrier it answers
+                // our latest frame, so it ends the session at once rather
+                // than leaving a RESUME to time out and redial.
+                if rj.attach_gen != self.gen && rj.code != code::VERSION {
                     return Ok(());
                 }
                 match rj.code {

@@ -550,3 +550,20 @@ fn relay_keepalive_follows_the_shorter_stall_bound() {
         "a client cannot make the relay send ACKs in a loop"
     );
 }
+
+/// r10 N3: a client `t_stall` below what a relay serves keepalives for
+/// is a configuration error, not something the relay floors silently.
+#[test]
+fn client_stall_below_the_relay_floor_is_refused() {
+    use segue_session::{TimingError, MIN_CLIENT_STALL};
+    let mut t = Config::default().timing;
+    assert_eq!(t.validate_client(), Ok(()));
+    t.t_stall = MIN_CLIENT_STALL;
+    assert_eq!(t.validate_client(), Ok(()));
+    t.t_stall = MIN_CLIENT_STALL - Duration::from_millis(1);
+    assert_eq!(t.validate_client(), Err(TimingError::StallTooShort(t.t_stall)));
+    t.t_stall = Duration::ZERO;
+    assert!(t.validate_client().is_err());
+    t.t_stall = Duration::MAX;
+    assert_eq!(t.validate_client(), Err(TimingError::StallTooLong(t.t_stall)));
+}

@@ -184,8 +184,7 @@ struct CarrierSlot {
     ctrl_seen: Option<Instant>,
 }
 
-/// The shortest client stall bound the relay serves keepalives for.
-pub const MIN_CLIENT_STALL: std::time::Duration = std::time::Duration::from_millis(100);
+pub use crate::MIN_CLIENT_STALL;
 
 /// Control frames queued per control stream; PINGs beyond this are not
 /// answered (a peer that never reads cannot grow the queue).

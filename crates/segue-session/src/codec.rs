@@ -17,7 +17,11 @@
 //!   come often enough for the client's bound, not only its own): in OPEN,
 //!   `open_flags` bit 1 says a varint follows `exit_class` (before
 //!   `first_data`); in RESUME, an optional varint after `max_offset`.
-//!   Absent: the relay assumes its own configuration.
+//!   Absent: the relay assumes its own configuration. A value of 0 is
+//!   malformed; the range is `1..=VARINT_MAX` ([`STALL_MS_MAX`]). The field
+//!   is new in wire version 5 (r10 N3): a version-4 decoder would read it
+//!   as `first_data` (OPEN) or trailing garbage (RESUME), so the version
+//!   changed and a v4 peer answers `REJECT(version)` instead.
 //!
 //! CTRL_HELLO, RESOLVE, RESOLVED, REFRESH, REFRESHED and REVOKED are
 //! recognised (so they are not fatal) but carried as [`Frame::Control`] with
@@ -28,7 +32,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use crate::ProtoError;
 
 /// Protocol version carried by OPEN / RESUME / CTRL_HELLO (§10).
-pub const VERSION: u8 = 4;
+///
+/// 5 (r10 N3): OPEN / RESUME carry `t_stall_ms`. Nothing older is
+/// deployed, so there is no negotiation: a peer of another version
+/// answers `REJECT(version)` before reading any other field.
+pub const VERSION: u8 = 5;
+/// Largest `t_stall_ms` on the wire (the varint range); 0 is malformed.
+pub const STALL_MS_MAX: u64 = VARINT_MAX;
 /// Largest allowed payload (§2).
 pub const MAX_PAYLOAD: usize = 16_384;
 /// Unknown frame types carrying this flag are skipped instead of fatal.
@@ -356,6 +366,13 @@ impl<'a> Reader<'a> {
         self.buf = &self.buf[n..];
         Ok(v)
     }
+    /// `t_stall_ms`: a varint, 0 malformed (a zero bound means nothing).
+    fn stall_ms(&mut self) -> Result<u64, ProtoError> {
+        match self.varint()? {
+            0 => Err(Self::bad()),
+            v => Ok(v),
+        }
+    }
     fn usize(&mut self) -> Result<usize, ProtoError> {
         usize::try_from(self.varint()?).map_err(|_| Self::bad())
     }
@@ -583,7 +600,7 @@ impl Frame {
                 put_target(p, &o.target);
                 p.push(o.exit_class);
                 if let Some(ms) = o.t_stall_ms {
-                    put_varint(p, ms);
+                    put_varint(p, ms.clamp(1, STALL_MS_MAX));
                 }
                 p.extend_from_slice(&o.first_data);
                 p.extend_from_slice(tail[0]);
@@ -608,7 +625,7 @@ impl Frame {
                 put_varint(p, r.recv_offset);
                 put_varint(p, r.max_offset);
                 if let Some(ms) = r.t_stall_ms {
-                    put_varint(p, ms);
+                    put_varint(p, ms.clamp(1, STALL_MS_MAX));
                 }
             }
             Frame::Resumed(r) => {
@@ -781,7 +798,7 @@ impl Frame {
                 let target = r.target()?;
                 let exit_class = r.u8()?;
                 let t_stall_ms = if open_flags & 2 != 0 {
-                    Some(r.varint()?)
+                    Some(r.stall_ms()?)
                 } else {
                     None
                 };
@@ -826,7 +843,7 @@ impl Frame {
                     t_stall_ms: if r.buf.is_empty() {
                         None
                     } else {
-                        Some(r.varint()?)
+                        Some(r.stall_ms()?)
                     },
                 })
             }

@@ -245,6 +245,8 @@ pub struct KernelDialer {
     /// Per exit, same order as `exits`.
     channels: Vec<Channel>,
     control: ControlTiming,
+    /// Session timing and limits (validated: [`Self::with_session_config`]).
+    session_cfg: segue_session::Config,
 }
 
 impl Drop for KernelDialer {
@@ -288,7 +290,20 @@ impl KernelDialer {
             revoked: Arc::new(watch::channel(None).0),
             channels: (0..exits_len).map(|_| Channel::default()).collect(),
             control: ControlTiming::default(),
+            session_cfg: segue_session::Config::default(),
         }
+    }
+
+    /// Use `cfg` for new sessions. Refused when the client timing is one
+    /// the protocol cannot honour (r10 N3: a `t_stall` below
+    /// [`segue_session::MIN_CLIENT_STALL`] would be floored by the relay
+    /// and the client would take live carriers for stalled ones).
+    pub fn with_session_config(mut self, cfg: segue_session::Config) -> Result<Self, DialError> {
+        cfg.timing
+            .validate_client()
+            .map_err(|e| DialError(format!("session config: {e}")))?;
+        self.session_cfg = cfg;
+        Ok(self)
     }
 
     /// Charge sessions to `pool` instead of [`process_pool`].
@@ -586,7 +601,7 @@ impl KernelDialer {
             anchor_node_id: self.exits[i].node_id,
             instance_hint: 0,
         };
-        let s = ClientSession::new(Default::default(), &self.pool, params, Instant::now())
+        let s = ClientSession::new(self.session_cfg.clone(), &self.pool, params, Instant::now())
             .ok_or_else(|| (DialError("refused: session memory exhausted".into()), None))?;
         // Pool-charged and released when drained (tokio's duplex keeps a
         // burst's capacity for the life of the stream); its reserved blocks
