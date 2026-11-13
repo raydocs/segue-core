@@ -926,6 +926,21 @@ fn flush_pair_cfg(
     tokio::task::JoinHandle<()>,
     mpsc::UnboundedReceiver<segue_session::driver::RelayNotice>,
 ) {
+    flush_pair_cfgs(cfg.clone(), cfg, site_conn, dials)
+}
+
+/// [`flush_pair_cfg`] with separate relay and client configurations.
+fn flush_pair_cfgs(
+    cfg: Config,
+    client_cfg: Config,
+    site_conn: segue_session::driver::DeviceSiteConnector,
+    dials: Arc<AtomicUsize>,
+) -> (
+    DuplexStream,
+    tokio::task::JoinHandle<CloseReason>,
+    tokio::task::JoinHandle<()>,
+    mpsc::UnboundedReceiver<segue_session::driver::RelayNotice>,
+) {
     let pool = Pool::new(8 << 20);
     let table = RelayTable::new(cfg.clone(), pool.clone(), Box::new(AllowAll), INSTANCE);
     let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(4);
@@ -949,7 +964,7 @@ fn flush_pair_cfg(
             Ok(Box::new(a) as BoxCarrier)
         })
     });
-    let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+    let s = ClientSession::new(client_cfg, &pool, params(), Instant::now()).unwrap();
     let (app, far) = tokio::io::duplex(512 << 10);
     let client = tokio::spawn(run_client(s, far, connector));
     (app, client, relay, note_rx)
@@ -1613,6 +1628,50 @@ async fn a_slow_site_drain_with_default_timing_does_not_redial() {
     relay.abort();
 }
 
+/// r9 (keepalive assumption): the relay is configured with a 4 s
+/// `t_stall`, the client with 1 s. Before, the relay's held-FIN keepalive
+/// came every 2 s, and the client took its healthy carrier for stalled
+/// once a second for the whole drain. Now the client announces its bound
+/// in OPEN/RESUME and the relay keeps alive at half the shorter one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_with_a_shorter_stall_bound_than_the_relay_does_not_redial() {
+    const UP: usize = 24 << 10;
+    let (got_tx, got_rx) = oneshot::channel();
+    // About 3 s of drain: three client `t_stall`s.
+    let site = slow_site(
+        2048,
+        Duration::from_millis(250),
+        Arc::new(Mutex::new(Some(got_tx))),
+    );
+    let mut relay_cfg = Config::default();
+    relay_cfg.timing.t_stall = Duration::from_secs(4);
+    let mut client_cfg = Config::default();
+    client_cfg.timing.t_stall = Duration::from_secs(1);
+    let dials = Arc::new(AtomicUsize::new(0));
+    let (app, client, relay, mut notes) =
+        flush_pair_cfgs(relay_cfg, client_cfg, site, dials.clone());
+    let up = pattern(UP, 5);
+    let (reason, took) = upload_and_fin(app, &up, client).await;
+    assert_eq!(reason, CloseReason::Clean);
+    assert_eq!(
+        closed_code(&mut notes).await,
+        segue_session::codec::code::CLEAN
+    );
+    assert!(
+        took > Duration::from_secs(2),
+        "drain took only {took:?}: the test proves nothing"
+    );
+    let got = tokio::time::timeout(Duration::from_secs(10), got_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(got == up, "site got {} of {UP} bytes", got.len());
+    let n = dials.load(Ordering::SeqCst);
+    println!("relay 4 s / client 1 s over {took:?}: {n} dial(s)");
+    assert_eq!(n, 1, "the client took a live carrier for stalled");
+    relay.abort();
+}
+
 /// r8 N8: the drain's idle bound counts from the site's last actual write,
 /// not from when the relay driver noticed it. The site takes 1 KiB once,
 /// some time into the drain, while the site writer is in the middle of a
@@ -1943,7 +2002,10 @@ async fn dead_carriers_are_redialled_with_backoff_and_a_bound() {
     let n = dials.load(Ordering::SeqCst);
     println!("gave up after {took:?} and {n} dials");
     assert_eq!(reason, CloseReason::Reset(LOCAL_GIVE_UP));
-    assert!(n <= 2 + MAX_FRUITLESS as usize, "{n} dials for a dead path");
+    // The working carrier, then exactly MAX_FRUITLESS dead ones: the
+    // MAX_FRUITLESS-th fruitless carrier ends the session (r9: before,
+    // `fruitless > MAX_FRUITLESS` gave up only on the one after).
+    assert_eq!(n, 1 + MAX_FRUITLESS as usize, "{n} dials for a dead path");
     // The backoff spaced them: without it the attempts take t_attach
     // each (2.7 s in all).
     assert!(
@@ -2055,6 +2117,329 @@ async fn admission_is_measured_after_sessions_reach_steady_state() {
     assert!(total >= 260, "{total} flows after steady state");
     drop(more);
     drop(done);
+    for c in clients {
+        let _ = tokio::time::timeout(Duration::from_secs(10), c).await;
+    }
+    relay.abort();
+}
+
+/// A relay-side carrier end whose writes stop completing once `block` is
+/// set (the client stopped reading: the relay's writer is stuck and its
+/// queue fills), while reads keep working.
+struct Blockable {
+    inner: DuplexStream,
+    block: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AsyncRead for Blockable {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Blockable {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        b: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.block.load(Ordering::SeqCst) {
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, b)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// r9 F3: the client's FIN is held (the site never takes the upload) and
+/// the relay's carrier writer is blocked (the client stopped reading), so
+/// the held-FIN keepalive and the ACK of the upload can not go out; after
+/// `t_live` the session is also DETACHED. Before, their deadlines stayed
+/// in the past and the relay driver woke in a loop for as long as that
+/// lasted. Now it waits for the writer: a few seconds of it cost almost
+/// no CPU.
+#[tokio::test]
+async fn relay_does_not_spin_with_a_held_fin_and_a_blocked_writer() {
+    let cfg = Config::default();
+    let pool = Pool::new(8 << 20);
+    let table = RelayTable::new(cfg.clone(), pool.clone(), Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(4);
+    // The site sends an endless download and never reads the upload.
+    let site_conn: SiteConnector = Arc::new(|_t, _k| {
+        Box::pin(async {
+            let (a, mut b) = tokio::io::duplex(4 << 10);
+            tokio::spawn(async move {
+                let chunk = vec![7u8; 4096];
+                while b.write_all(&chunk).await.is_ok() {}
+                std::future::pending::<()>().await;
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let relay = tokio::spawn(run_relay(table, accept_rx, site_conn, None));
+    let block = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let connector: Connector = {
+        let (block, first) = (block.clone(), first.clone());
+        Arc::new(move || {
+            let accept_tx = accept_tx.clone();
+            let block = block.clone();
+            let live = first.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if !live {
+                    // No second carrier: only the first one's relay side
+                    // is measured.
+                    std::future::pending::<()>().await;
+                }
+                let (a, b) = tokio::io::duplex(64 << 10);
+                accept_tx
+                    .send(Box::new(Blockable { inner: b, block }))
+                    .await
+                    .map_err(|_| std::io::Error::other("gone"))?;
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    // The client never takes its quiet carrier for a stalled one here.
+    let mut ccfg = cfg.clone();
+    ccfg.timing.t_stall = Duration::from_secs(60);
+    ccfg.timing.t_detached = Duration::from_secs(600);
+    let s = ClientSession::new(ccfg, &pool, params(), Instant::now()).unwrap();
+    let (mut app, far) = tokio::io::duplex(1 << 20);
+    let client = tokio::spawn(run_client(s, far, connector));
+    app.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), app.read(&mut buf))
+        .await
+        .expect("no download")
+        .unwrap();
+    assert!(n > 0);
+    // Block the relay's writer, then upload and FIN: the relay acknowledges
+    // nothing from here on and holds the FIN.
+    block.store(true, Ordering::SeqCst);
+    app.write_all(&pattern(8 << 10, 3)).await.unwrap();
+    app.shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Past the keepalive (t_stall / 2) and, at 3 s, t_live (DETACHED).
+    let cpu = thread_cpu();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let used = thread_cpu() - cpu;
+    println!("held FIN, blocked writer: {used:?} CPU in 4 s");
+    assert!(
+        used < CPU_LIMIT,
+        "relay burnt {used:?} CPU with a held FIN and a blocked writer"
+    );
+    client.abort();
+    relay.abort();
+}
+
+/// A site that takes the whole upload, sends nothing, and closes after
+/// the upload's end.
+fn sink_site() -> SiteConnector {
+    Arc::new(|_t, _k| {
+        Box::pin(async {
+            let (a, mut b) = tokio::io::duplex(64 << 10);
+            tokio::spawn(async move {
+                let mut sink = vec![0u8; 16 << 10];
+                while b.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+                let _ = b.shutdown().await;
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
+/// r9 (write side cap): a frame charged to the transport region waits in
+/// the carrier's writer queue behind frames queued before it (charged to
+/// the elastic part while it lasted). The carrier moves bytes steadily,
+/// only slowly: the frames ahead take longer than the hold cap, the frame
+/// itself much less. Before, the cap counted from when the frame was
+/// queued, so the healthy carrier was given up; now it counts from when
+/// the writer starts on the frame. (Scaled: cap 2.5 s, hold 1 s, 10 KB/s,
+/// so one 16 KiB frame takes 1.6 s and the ~16 KiB send window queued
+/// ahead of it about as much again.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_write_hold_cap_counts_from_the_frame_start_not_its_enqueue() {
+    use segue_session::pool::{Grant, BLOCK};
+    let cfg = Config::default();
+    let pool = Pool::new(8 << 20);
+    pool.set_transport_hold(Duration::from_secs(1));
+    pool.set_transport_hold_max(Duration::from_millis(2500));
+    let table = RelayTable::new(
+        cfg.clone(),
+        Pool::new(8 << 20),
+        Box::new(AllowAll),
+        INSTANCE,
+    );
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(16);
+    let (note_tx, mut notes) = mpsc::unbounded_channel();
+    let relay = tokio::spawn(run_relay(table, accept_rx, sink_site(), Some(note_tx)));
+    let dials = Arc::new(AtomicUsize::new(0));
+    let connector = throttled_connector(accept_tx, dials.clone(), 1000, Duration::from_millis(100));
+    let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+    let (mut app, far) = tokio::io::duplex(512 << 10);
+    let client = tokio::spawn(run_client(s, far, connector));
+    const UP: usize = 64 << 10;
+    app.write_all(&pattern(UP, 8)).await.unwrap();
+    app.shutdown().await.unwrap();
+    // The send window's worth of elastic frames is queued; then the
+    // elastic part runs out and the next frame is charged to the
+    // transport region, behind them.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hog = tokio::spawn({
+        let (pool, done) = (pool.clone(), done.clone());
+        async move {
+            let mut hog = Vec::new();
+            while !done.load(Ordering::SeqCst) {
+                while let Some(g) = Grant::fixed(&pool, BLOCK) {
+                    hog.push(g);
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            hog.len()
+        }
+    });
+    let reason = tokio::time::timeout(Duration::from_secs(30), client)
+        .await
+        .expect("client did not end")
+        .unwrap();
+    done.store(true, Ordering::SeqCst);
+    assert!(hog.await.unwrap() > 100, "the pool was never spent");
+    let n = dials.load(Ordering::SeqCst);
+    println!("write hold behind queued frames: {reason:?}, {n} dial(s)");
+    assert_eq!(reason, CloseReason::Clean);
+    let _ = notes.try_recv();
+    assert_eq!(n, 1, "a carrier that kept moving was given up");
+    relay.abort();
+}
+
+/// r9 F7: admission measured one session at a time, each driven to its
+/// steady state by a real transfer (a burst each way through its app pipe
+/// and carrier, then idle until the pool stops changing) before the next
+/// is admitted; until the 8 MiB pool refuses. Every admitted session then
+/// still moves data (the first and the last), with the pool full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_session_reaches_steady_state_before_the_next_is_admitted() {
+    use segue_session::pipe::pipe;
+    use segue_session::pool::BLOCK;
+    const BURST: usize = 32 << 10;
+    const MAX: usize = 1000;
+    let cfg = Config::default();
+    let pool = Pool::new(8 << 20);
+    let table = RelayTable::new(
+        cfg.clone(),
+        Pool::new(256 << 20),
+        Box::new(AllowAll),
+        INSTANCE,
+    );
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(64);
+    let relay = tokio::spawn(run_relay(table, accept_rx, echo_site(), None));
+    let connector: Connector = Arc::new(move || {
+        let accept_tx = accept_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(64 << 10);
+            accept_tx
+                .send(Box::new(b))
+                .await
+                .map_err(|_| std::io::Error::other("gone"))?;
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    async fn echo_burst<A: AsyncRead + AsyncWrite + Unpin>(app: &mut A, salt: u8) {
+        let up = pattern(BURST, salt);
+        let (mut r, mut w) = tokio::io::split(app);
+        let (_, down) = tokio::join!(async { w.write_all(&up).await.unwrap() }, async {
+            let mut d = vec![0u8; BURST];
+            r.read_exact(&mut d).await.unwrap();
+            d
+        });
+        assert!(down == up, "echo differs");
+    }
+    async fn steady(pool: &Pool) -> usize {
+        let mut last = usize::MAX;
+        let mut since = Instant::now();
+        let t0 = Instant::now();
+        while since.elapsed() < Duration::from_millis(80) && t0.elapsed() < Duration::from_secs(3) {
+            let u = pool.used_bytes();
+            if u != last {
+                last = u;
+                since = Instant::now();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pool.used_bytes()
+    }
+    let mut apps = Vec::new();
+    let mut clients = Vec::new();
+    let mut worst = 0usize;
+    let mut refused = "";
+    while apps.len() < MAX {
+        let before = pool.used_bytes();
+        let Some(s) = ClientSession::new(cfg.clone(), &pool, params(), Instant::now()) else {
+            refused = "session";
+            break;
+        };
+        let Some((mut app, far)) = pipe(&pool, 64 << 10) else {
+            refused = "pipe";
+            break;
+        };
+        clients.push(tokio::spawn(run_client(s, far, connector.clone())));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            echo_burst(&mut app, apps.len() as u8),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("session {} stalled in its burst", apps.len()));
+        let after = steady(&pool).await;
+        worst = worst.max(after.saturating_sub(before));
+        apps.push(app);
+    }
+    let n = apps.len();
+    let held = pool.used_bytes();
+    println!(
+        "{n} sessions admitted one by one after a {} KiB echo each ({refused} refused): \
+         {:.1} KiB each idle, worst {:.1} KiB",
+        BURST >> 10,
+        held as f64 / n as f64 / 1024.0,
+        worst as f64 / 1024.0
+    );
+    assert!(n < MAX, "the pool never refused");
+    // Steady state per session: its floors (initial credit, a replay
+    // block, a pipe block each way) plus the credit it advertised and the
+    // peer has not used (at most one more initial window, r7 #7), and a
+    // read buffer block. Measured: about 45 KiB each, so the 8 MiB pool
+    // holds ~180 sessions that ran (fresh ones: 280+). Raising that is
+    // the protocol v0.5 item (initial credit), not this test's.
+    let per = 2 * cfg.limits.initial_credit + 4 * BLOCK;
+    assert!(
+        held <= n * per,
+        "{n} sessions hold {held} bytes at steady state, over {per} each"
+    );
+    assert!(n >= 170, "only {n} sessions at steady state");
+    // The pool is full; earlier and later sessions still move data.
+    let last = n - 1;
+    for i in [0, last] {
+        tokio::time::timeout(Duration::from_secs(20), echo_burst(&mut apps[i], 0x33))
+            .await
+            .unwrap_or_else(|_| panic!("session {i} stalled with the pool full"));
+    }
+    drop(apps);
     for c in clients {
         let _ = tokio::time::timeout(Duration::from_secs(10), c).await;
     }

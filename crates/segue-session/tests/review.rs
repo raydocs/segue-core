@@ -20,6 +20,7 @@ fn open(version: u8) -> Open {
         kind: Kind::Tcp,
         target: Target::Domain("example.com".into(), 443),
         exit_class: 0,
+        t_stall_ms: None,
         first_data: Vec::new(),
     }
 }

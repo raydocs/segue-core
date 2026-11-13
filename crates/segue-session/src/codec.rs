@@ -13,6 +13,11 @@
 //! - `anchor_instance_id` / `instance_id` / `anchor_node_id`: varint; 0 means
 //!   "none" (the first OPEN carries 0).
 //! - OPEN's `first_data` is the rest of the payload.
+//! - The client's stall bound `t_stall_ms` (r9: the relay's keepalive must
+//!   come often enough for the client's bound, not only its own): in OPEN,
+//!   `open_flags` bit 1 says a varint follows `exit_class` (before
+//!   `first_data`); in RESUME, an optional varint after `max_offset`.
+//!   Absent: the relay assumes its own configuration.
 //!
 //! CTRL_HELLO, RESOLVE, RESOLVED, REFRESH, REFRESHED and REVOKED are
 //! recognised (so they are not fatal) but carried as [`Frame::Control`] with
@@ -117,6 +122,8 @@ pub struct Open {
     pub target: Target,
     /// Hint only: the relay classifies the target itself (R2-1).
     pub exit_class: u8,
+    /// The client's `t_stall` in milliseconds (`open_flags` bit 1).
+    pub t_stall_ms: Option<u64>,
     pub first_data: Vec<u8>,
 }
 
@@ -141,6 +148,8 @@ pub struct Resume {
     pub attach_gen: u32,
     pub recv_offset: u64,
     pub max_offset: u64,
+    /// The client's `t_stall` in milliseconds (trailing, optional).
+    pub t_stall_ms: Option<u64>,
 }
 
 // Debug never prints the ticket or the resume secret (no secrets in logs).
@@ -174,6 +183,7 @@ impl std::fmt::Debug for Resume {
             .field("attach_gen", &self.attach_gen)
             .field("recv_offset", &self.recv_offset)
             .field("max_offset", &self.max_offset)
+            .field("t_stall_ms", &self.t_stall_ms)
             .finish()
     }
 }
@@ -567,11 +577,14 @@ impl Frame {
                 p.extend_from_slice(&o.session_id);
                 p.extend_from_slice(&o.resume_secret);
                 p.extend_from_slice(&o.attach_gen.to_be_bytes());
-                p.push(u8::from(o.retry));
+                p.push(u8::from(o.retry) | if o.t_stall_ms.is_some() { 2 } else { 0 });
                 put_varint(p, o.anchor_instance_id);
                 p.push(o.kind as u8);
                 put_target(p, &o.target);
                 p.push(o.exit_class);
+                if let Some(ms) = o.t_stall_ms {
+                    put_varint(p, ms);
+                }
                 p.extend_from_slice(&o.first_data);
                 p.extend_from_slice(tail[0]);
                 p.extend_from_slice(tail[1]);
@@ -594,6 +607,9 @@ impl Frame {
                 p.extend_from_slice(&r.attach_gen.to_be_bytes());
                 put_varint(p, r.recv_offset);
                 put_varint(p, r.max_offset);
+                if let Some(ms) = r.t_stall_ms {
+                    put_varint(p, ms);
+                }
             }
             Frame::Resumed(r) => {
                 put_varint(p, r.instance_id);
@@ -764,6 +780,11 @@ impl Frame {
                 };
                 let target = r.target()?;
                 let exit_class = r.u8()?;
+                let t_stall_ms = if open_flags & 2 != 0 {
+                    Some(r.varint()?)
+                } else {
+                    None
+                };
                 Frame::Open(Open {
                     version,
                     ticket,
@@ -775,6 +796,7 @@ impl Frame {
                     kind,
                     target,
                     exit_class,
+                    t_stall_ms,
                     first_data: r.rest(),
                 })
             }
@@ -801,6 +823,11 @@ impl Frame {
                     attach_gen: r.u32()?,
                     recv_offset: r.varint()?,
                     max_offset: r.varint()?,
+                    t_stall_ms: if r.buf.is_empty() {
+                        None
+                    } else {
+                        Some(r.varint()?)
+                    },
                 })
             }
             ty::RESUMED => Frame::Resumed(Resumed {

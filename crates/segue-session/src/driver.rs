@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
-use crate::client::{ClientSession, CloseReason, State, Tx};
+use crate::client::{ClientSession, CloseReason, Health, State, Tx};
 use crate::codec::{code, ty, CtrlHello, Frame, FrameDecoder, Kind, SessionId, Target};
 use crate::pool::{Grant as PoolGrant, Pool, Ticket, Tier, FRAME_MAX};
 use crate::relay::{Grant, RelayEvent, RelayTable};
@@ -137,6 +137,8 @@ impl Drop for Slot {
 struct Out {
     data: Vec<u8>,
     _charge: Option<Charge>,
+    /// Stamped by the writer when it starts writing this message.
+    started: Option<Arc<Stamp>>,
 }
 
 impl From<Vec<u8>> for Out {
@@ -144,6 +146,7 @@ impl From<Vec<u8>> for Out {
         Self {
             data,
             _charge: None,
+            started: None,
         }
     }
 }
@@ -154,6 +157,31 @@ fn charged(data: Vec<u8>, mut c: Charge) -> Out {
     Out {
         data,
         _charge: Some(c),
+        started: None,
+    }
+}
+
+/// A frame holding the transport slot (client side, r7 #1). It may hold
+/// it while its carrier's writer keeps moving bytes (the frames queued
+/// before it, then its own), for the pool's hold without progress, and
+/// for the hold cap at most, counted from when the writer started on it
+/// (r9: not from when it was queued, so frames waiting behind a slow one
+/// do not use up their cap in the queue).
+#[derive(Clone)]
+struct TxHold {
+    cid: u64,
+    queued: tokio::time::Instant,
+    started: Arc<Stamp>,
+}
+
+impl TxHold {
+    fn deadline(&self, tx_at: Option<tokio::time::Instant>, pool: &Pool) -> tokio::time::Instant {
+        let last = tx_at.map_or(self.queued, |m| m.max(self.queued));
+        let idle = last + pool.transport_hold();
+        match self.started.get() {
+            Some(st) => idle.min(st + pool.transport_hold_max()),
+            None => idle,
+        }
     }
 }
 
@@ -344,6 +372,10 @@ enum CarrierEv {
     /// no frame came in (r8 N4/N5). See [`Progress`].
     Progress(u64),
     Closed(u64),
+    /// The carrier ended in the middle of a frame, or a frame on it
+    /// stopped arriving for the transport hold or outlived the hold cap:
+    /// it owed us bytes it never delivered (r9 F2).
+    Stuck(u64),
 }
 
 /// Reader task: decode frames until EOF or a decode error. With `pool`
@@ -395,11 +427,14 @@ async fn read_charged<R: AsyncRead + Unpin>(
         // DATA keeps the payload's allocation; anything else is decoded
         // into a copy while the payload is still held.
         let cover = if ty == ty::DATA { len } else { 2 * len };
-        let Some((payload, charge)) =
-            read_body(&mut r, &pool, &slot, &mut ticket, &mut progress, len, cover).await
-        else {
-            break;
-        };
+        let (payload, charge) =
+            match read_body(&mut r, &pool, &slot, &mut ticket, &mut progress, len, cover).await {
+                Body::Read(p, c) => (p, c),
+                Body::Ended | Body::Stuck => {
+                    let _ = tx.send(CarrierEv::Stuck(cid)).await;
+                    return;
+                }
+            };
         progress.reset();
         match Frame::decode_owned(ty, flags, payload) {
             Ok(Some(f)) => {
@@ -426,7 +461,7 @@ async fn read_charged<R: AsyncRead + Unpin>(
 /// moves none of it for the pool's hold, or does not finish it within the
 /// hold cap, is closed (the peer replays on the next one; r7 #1, r8 N5). Whole frames only: a reader never
 /// holds part of a frame while waiting for more blocks, so readers cannot
-/// wait on each other. `None`: the carrier ended or timed out.
+/// wait on each other.
 async fn read_body<R: AsyncRead + Unpin>(
     r: &mut tokio::io::BufReader<R>,
     pool: &Arc<Pool>,
@@ -435,10 +470,10 @@ async fn read_body<R: AsyncRead + Unpin>(
     progress: &mut Progress,
     len: usize,
     cover: usize,
-) -> Option<(Vec<u8>, Option<Charge>)> {
+) -> Body {
     use tokio::io::AsyncBufReadExt;
     if len == 0 {
-        return Some((Vec::new(), None));
+        return Body::Read(Vec::new(), None);
     }
     let mut charge = PoolGrant::between(pool, cover, cover, Tier::Elastic).map(|g| Charge {
         _slot: None,
@@ -446,8 +481,8 @@ async fn read_body<R: AsyncRead + Unpin>(
     });
     if charge.is_none() {
         // Nothing is charged while the body has not started.
-        if r.fill_buf().await.ok()?.is_empty() {
-            return None;
+        if r.fill_buf().await.map_or(true, |b| b.is_empty()) {
+            return Body::Ended;
         }
         // The body is here and waits only for local memory: the carrier
         // is not stalled.
@@ -482,20 +517,29 @@ async fn read_body<R: AsyncRead + Unpin>(
                 let idle = (tokio::time::Instant::now() + pool.transport_hold()).min(cap);
                 match tokio::time::timeout_at(idle, read).await {
                     Ok(r) => r,
-                    Err(_) => return None,
+                    Err(_) => return Body::Stuck,
                 }
             }
             None => read.await,
         };
         match n {
             Ok(n) if n > 0 => got += n,
-            _ => return None,
+            _ => return Body::Ended,
         }
         if got < len {
             progress.report();
         }
     }
-    Some((payload, charge))
+    Body::Read(payload, charge)
+}
+
+/// What [`read_body`] got.
+enum Body {
+    Read(Vec<u8>, Option<Charge>),
+    /// The carrier ended (EOF or error).
+    Ended,
+    /// The transport hold or its cap ran out with the body incomplete.
+    Stuck,
 }
 
 /// [`take_charge`] of `cover` bytes, waiting for blocks: listening before
@@ -660,6 +704,9 @@ where
     let (tx, mut rx) = mpsc::channel::<Out>(WRITE_QUEUE);
     let h = spawn(async move {
         while let Some(m) = rx.recv().await {
+            if let Some(st) = &m.started {
+                st.touch();
+            }
             let r = if m.data.is_empty() {
                 w.shutdown().await
             } else {
@@ -773,7 +820,13 @@ pub struct ClientCtl {
     /// (the control stream said REVOKED, r5 N10): the reason reaches
     /// `closed` before the app stream ends, so the app sees a reset.
     pub cancel: Option<tokio::sync::watch::Receiver<Option<u8>>>,
+    /// Session-level health reports (r9 F5, see [`Health`]): called
+    /// from the driver task whenever the session's health changes.
+    pub health: Option<HealthHook>,
 }
+
+/// Receives a session's [`Health`] reports.
+pub type HealthHook = Arc<dyn Fn(Health) + Send + Sync>;
 
 /// [`run_client`] with hooks.
 pub async fn run_client_ctl<A>(
@@ -791,7 +844,15 @@ where
         mut closed,
         mut opened,
         mut cancel,
+        health,
     } = ctl;
+    let report = |s: &mut ClientSession| {
+        if let Some(h) = s.take_health() {
+            if let Some(f) = &health {
+                f(h);
+            }
+        }
+    };
     let writable = Arc::new(Notify::new());
     let (mut app_r, mut app_w) = tokio::io::split(app);
     // One received byte whose write to the app is pending, and a pending
@@ -813,11 +874,8 @@ where
     let pool = s.pool().clone();
     let tx_slot = Arc::new(AtomicBool::new(false));
     let mut tx_ticket: Option<Ticket> = None;
-    // The carrier whose queued frame holds the transport slot, and when it
-    // was queued (r7 #1). It may hold it while the carrier's writer keeps
-    // moving bytes (the frames queued before it, then its own), for the
-    // pool's hold without progress, and for the hold cap at most (r8 N5).
-    let mut tx_hold: Option<(u64, tokio::time::Instant)> = None;
+    // The queued frame that holds the transport slot (see [`TxHold`]).
+    let mut tx_hold: Option<TxHold> = None;
     let mut abuf = ReadBuffer::new(Some(pool.clone()));
     // A queued message the pool could not cover is waiting for blocks.
     let mut pool_blocked;
@@ -833,6 +891,7 @@ where
             }
         }
         s.handle_timeout(t);
+        report(&mut s);
         let backoff_ok = connect_backoff.is_none_or(|b| tokio::time::Instant::now() >= b);
         if !connecting && backoff_ok && s.wants_attach(t) {
             connecting = true;
@@ -880,10 +939,17 @@ where
                     let mut v = Vec::new();
                     match s.poll_transmit_into(cid, t, &mut v, c.grant.bytes()) {
                         Tx::Wrote => {
+                            let mut out = charged(v, c);
                             if transport {
-                                tx_hold = Some((cid, tokio::time::Instant::now()));
+                                let h = TxHold {
+                                    cid,
+                                    queued: tokio::time::Instant::now(),
+                                    started: Stamp::new(),
+                                };
+                                out.started = Some(h.started.clone());
+                                tx_hold = Some(h);
                             }
-                            let _ = io.tx.try_send(charged(v, c));
+                            let _ = io.tx.try_send(out);
                             tx_ticket = None;
                             min = 1;
                         }
@@ -946,15 +1012,19 @@ where
             // 16 KiB prefetch per connection (r7 #7).
             s.write_capacity_for(abuf.len().min(CHUNK))
         };
-        let deadline = s.poll_timeout().map(tokio::time::Instant::from_std);
+        let room = s
+            .carrier()
+            .and_then(|cid| carriers.get(&cid))
+            .is_none_or(|io| io.tx.capacity() > 0);
+        let deadline = s
+            .poll_timeout_writable(room)
+            .map(tokio::time::Instant::from_std);
         let backoff = connect_backoff.filter(|_| !connecting);
         let abuf_idle = abuf.idle_at();
         let drain = tasks.next_deadline();
-        let hold_at = tx_hold.map(|(cid, queued)| {
-            let moved = carriers.get(&cid).and_then(|io| io.tx_at.get());
-            let last = moved.map_or(queued, |m| m.max(queued));
-            (last + pool.transport_hold()).min(queued + pool.transport_hold_max())
-        });
+        let hold_at = tx_hold
+            .as_ref()
+            .map(|h| h.deadline(carriers.get(&h.cid).and_then(|io| io.tx_at.get()), &pool));
         tokio::select! {
             ev = ev_rx.recv() => {
                 let t = now();
@@ -964,6 +1034,13 @@ where
                     Some(CarrierEv::Progress(cid)) => s.on_carrier_progress(cid, t),
                     Some(CarrierEv::Closed(cid)) => {
                         s.on_carrier_closed(cid, t);
+                        if let Some(io) = carriers.remove(&cid) {
+                            io.reader.abort();
+                            io.writer.abort();
+                        }
+                    }
+                    Some(CarrierEv::Stuck(cid)) => {
+                        s.on_carrier_stuck(cid, t);
                         if let Some(io) = carriers.remove(&cid) {
                             io.reader.abort();
                             io.writer.abort();
@@ -1090,16 +1167,15 @@ where
             _ = tokio::time::sleep_until(hold_at.unwrap_or_else(tokio::time::Instant::now)), if hold_at.is_some() => {
                 // Bytes may have moved while this slept: the loop computes
                 // the hold again from them.
-                let moved = tx_hold.and_then(|(cid, _)| carriers.get(&cid)).and_then(|io| io.tx_at.get());
-                let at = tx_hold.map(|(_, q)| {
-                    (moved.map_or(q, |m| m.max(q)) + pool.transport_hold()).min(q + pool.transport_hold_max())
-                });
+                let at = tx_hold
+                    .as_ref()
+                    .map(|h| h.deadline(carriers.get(&h.cid).and_then(|io| io.tx_at.get()), &pool));
                 if at.is_some_and(|at| at > tokio::time::Instant::now()) {
                     continue;
                 }
-                if let Some((cid, _)) = tx_hold.take() {
+                if let Some(TxHold { cid, .. }) = tx_hold.take() {
                     if tx_slot.load(Ordering::Acquire) {
-                        s.on_carrier_closed(cid, now());
+                        s.on_carrier_stuck(cid, now());
                         if let Some(io) = carriers.remove(&cid) {
                             io.reader.abort();
                             io.writer.abort();
@@ -1112,6 +1188,7 @@ where
     if let Some(h) = dial.take() {
         h.abort();
     }
+    report(&mut s);
     let mut reason = s
         .close_reason()
         .unwrap_or(CloseReason::Reset(code::INTERNAL));
@@ -1483,7 +1560,9 @@ pub async fn run_relay_ctl(
             tasks.finish().await;
             return;
         }
-        let deadline = table.poll_timeout().map(tokio::time::Instant::from_std);
+        let deadline = table
+            .poll_timeout_writable(|cid| carriers.get(&cid).is_some_and(|io| io.tx.capacity() > 0))
+            .map(tokio::time::Instant::from_std);
         let drain = tasks.next_deadline();
         let tm = table.timing();
         let flush = sites
@@ -1512,7 +1591,7 @@ pub async fn run_relay_ctl(
                     Some(CarrierEv::Frame(cid, Ok(f), _)) => table.on_frame(cid, f, t),
                     Some(CarrierEv::Frame(cid, Err(e), _)) => table.on_decode_error(cid, e),
                     Some(CarrierEv::Progress(cid)) => table.on_carrier_progress(cid, t),
-                    Some(CarrierEv::Closed(cid)) => {
+                    Some(CarrierEv::Closed(cid) | CarrierEv::Stuck(cid)) => {
                         if let Some(io) = carriers.remove(&cid) {
                             io.reader.abort();
                             io.writer.abort();

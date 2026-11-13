@@ -142,6 +142,11 @@ struct Session {
     /// ACK so the client sees its carrier alive (see
     /// [`RelayTable::on_carrier_progress`]).
     ka_due: bool,
+    /// The keepalive period: half the shorter of this relay's `t_stall`
+    /// and the one the client announced in its latest OPEN or RESUME
+    /// (r9: with only the relay's, a client with a shorter bound took
+    /// a live carrier for a stalled one).
+    keepalive: std::time::Duration,
 }
 
 // Manual so the resume secret never reaches a log.
@@ -178,6 +183,9 @@ struct CarrierSlot {
     ctrl_since: Option<Instant>,
     ctrl_seen: Option<Instant>,
 }
+
+/// The shortest client stall bound the relay serves keepalives for.
+pub const MIN_CLIENT_STALL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Control frames queued per control stream; PINGs beyond this are not
 /// answered (a peer that never reads cannot grow the queue).
@@ -565,6 +573,7 @@ impl RelayTable {
                     held_fin: None,
                     last_sent: now,
                     ka_due: false,
+                    keepalive: self.keepalive_for(o.t_stall_ms),
                 };
                 self.sessions.insert(sid, s);
                 self.carriers.get_mut(&cid).unwrap().session = Some(sid);
@@ -599,6 +608,10 @@ impl RelayTable {
                 }
                 if r.attach_gen <= s.cur_gen {
                     return self.reject(cid, code::STALE_GEN, r.attach_gen, None);
+                }
+                let ka = self.keepalive_for(r.t_stall_ms);
+                if let Some(s) = self.sessions.get_mut(&sid) {
+                    s.keepalive = ka;
                 }
                 if let Err(e) = self.switch(
                     &sid,
@@ -780,7 +793,6 @@ impl RelayTable {
     /// Next frame for carrier `cid`.
     pub fn poll_transmit(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
         self.clock = self.clock.max(now);
-        let keepalive = self.keepalive();
         let slot = self.carriers.get_mut(&cid)?;
         if let Some(f) = slot.out.take() {
             return Some(f);
@@ -841,7 +853,7 @@ impl RelayTable {
         // would take the quiet carrier (its FIN unacknowledged) for a
         // stalled one. Repeat the current ACK (it moves no offset, so the
         // FIN stays unacknowledged) to show the carrier is alive.
-        if s.ka_due || (s.held_fin.is_some() && now >= s.last_sent + keepalive) {
+        if s.ka_due || (s.held_fin.is_some() && now >= s.last_sent + s.keepalive) {
             s.ka_due = false;
             s.last_sent = now;
             return Some(s.recv.force_ack());
@@ -850,10 +862,23 @@ impl RelayTable {
     }
 
     /// How often a session whose upload FIN waits for the site repeats its
-    /// ACK: twice per `t_stall` (the client's stall bound; the client must
-    /// not use a shorter one than the relay's configuration).
-    fn keepalive(&self) -> std::time::Duration {
-        (self.cfg.timing.t_stall / 2).max(std::time::Duration::from_millis(10))
+    /// ACK: twice per stall bound, the shorter of this relay's `t_stall`
+    /// and the client's announced one (`t_stall_ms`), so a client with a
+    /// shorter bound than the relay's configuration still sees its carrier
+    /// alive. An announced bound below [`MIN_CLIENT_STALL`] is taken as
+    /// that floor (a client cannot make the relay send ACKs in a loop).
+    fn keepalive_for(&self, client_ms: Option<u64>) -> std::time::Duration {
+        let own = self.cfg.timing.t_stall;
+        let stall = match client_ms {
+            Some(ms) => own.min(std::time::Duration::from_millis(ms).max(MIN_CLIENT_STALL)),
+            None => own,
+        };
+        (stall / 2).max(std::time::Duration::from_millis(10))
+    }
+
+    /// The keepalive period of session `sid` (see [`Self::keepalive_for`]).
+    pub fn keepalive(&self, sid: &SessionId) -> Option<std::time::Duration> {
+        self.sessions.get(sid).map(|s| s.keepalive)
     }
 
     /// Bytes of a frame not yet complete arrived on carrier `cid` (the
@@ -865,14 +890,13 @@ impl RelayTable {
     /// a black-holed carrier's socket buffer absorbs writes.
     pub fn on_carrier_progress(&mut self, cid: CarrierId, now: Instant) {
         self.clock = self.clock.max(now);
-        let keepalive = self.keepalive();
         let Some(sid) = self.carriers.get(&cid).and_then(|c| c.session) else {
             return;
         };
         if let Some(s) = self.sessions.get_mut(&sid) {
             if s.carrier == Some(cid)
                 && s.state == SessionState::Active
-                && now >= s.last_sent + keepalive
+                && now >= s.last_sent + s.keepalive
             {
                 s.ka_due = true;
             }
@@ -977,6 +1001,17 @@ impl RelayTable {
     // ---- time ----
 
     pub fn poll_timeout(&self) -> Option<Instant> {
+        self.poll_timeout_writable(|_| true)
+    }
+
+    /// [`poll_timeout`](Self::poll_timeout) for a driver that can tell
+    /// which carriers' writers have room (r9 F3). A deadline that is only
+    /// served by sending (a delayed ACK, the held-FIN keepalive) is left
+    /// out for a carrier that cannot take a frame now: once due it would
+    /// stay in the past and wake the driver in a loop until the writer
+    /// drains. The driver waits for the writer instead (it wakes on every
+    /// message the writer finishes) and calls this again.
+    pub fn poll_timeout_writable(&self, writable: impl Fn(CarrierId) -> bool) -> Option<Instant> {
         let t = &self.cfg.timing;
         let mut d: Option<Instant> = self.tombs.values().map(|x| x.until).min();
         let mut put = |x: Instant| d = Some(d.map_or(x, |d| d.min(x)));
@@ -988,12 +1023,16 @@ impl RelayTable {
             if s.state == SessionState::Active && s.send.unacked() {
                 put(s.last_progress + t.t_live);
             }
-            if s.held_fin.is_some() && s.carrier.is_some() && s.connected {
-                put(s.last_sent + self.keepalive());
+            let sendable = s.connected && s.carrier.is_some_and(&writable);
+            // The keepalive goes out only where `poll_transmit` sends it:
+            // never while DETACHED (r9 F3: the deadline stayed in the past
+            // and the driver spun until T_detached).
+            if s.held_fin.is_some() && sendable && s.state == SessionState::Active {
+                put(s.last_sent + s.keepalive);
             }
             // ACKs go out only once connected (`poll_transmit` holds them
             // back before), so an earlier deadline could never be served.
-            if s.carrier.is_some() && s.connected {
+            if sendable {
                 if let Some(a) = s.recv.ack_deadline() {
                     put(a);
                 }

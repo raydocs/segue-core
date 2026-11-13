@@ -237,6 +237,7 @@ fn open_frame(ticket: Vec<u8>, sid: [u8; 16], secret: [u8; 32]) -> Frame {
         kind: Kind::Tcp,
         target: Target::Domain("echo.test".into(), 80),
         exit_class: 0,
+        t_stall_ms: None,
         first_data: vec![],
     })
 }
@@ -252,6 +253,7 @@ fn resume_frame(ticket: Vec<u8>, sid: [u8; 16], secret: [u8; 32], gen: u32) -> F
         attach_gen: gen,
         recv_offset: 0,
         max_offset: 16 * 1024,
+        t_stall_ms: None,
     })
 }
 

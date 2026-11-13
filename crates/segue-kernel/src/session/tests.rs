@@ -40,6 +40,10 @@ struct Node {
     sites: Arc<AtomicUsize>,
     /// Relay commands (revocation).
     ctrl: mpsc::Sender<RelayCtrl>,
+    /// When non-zero, each new session carrier's downlink delivers only
+    /// this many bytes and then drops everything (control streams are
+    /// spared): a path that answers RESUME and stalls mid-DATA.
+    cut: Arc<AtomicUsize>,
 }
 
 /// Engine stand-in: `dial(Some(carrier), relay)` → a pipe into that
@@ -63,18 +67,38 @@ struct Counted {
 
 type Holes = Arc<Mutex<Vec<(Arc<AtomicBool>, Arc<AtomicBool>)>>>;
 
-/// One direction of a carrier's network path.
-async fn path<R, W>(mut r: R, mut w: W, hole: Arc<AtomicBool>)
-where
+/// One direction of a carrier's network path. With `cut`, it delivers
+/// that many bytes and then turns into a blackhole, unless the carrier
+/// is a control stream.
+async fn path<R, W>(
+    mut r: R,
+    mut w: W,
+    hole: Arc<AtomicBool>,
+    cut: Option<(usize, Arc<AtomicBool>)>,
+) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut buf = vec![0u8; 4096];
+    let mut left = cut.as_ref().map(|c| c.0);
     loop {
-        let n = match r.read(&mut buf).await {
+        let mut n = match r.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        if let (Some(l), Some((_, control))) = (left.as_mut(), &cut) {
+            if !control.load(Ordering::SeqCst) {
+                if *l == 0 {
+                    hole.store(true, Ordering::SeqCst);
+                }
+                n = n.min(*l);
+                *l -= n;
+                if n > 0 {
+                    let _ = w.write_all(&buf[..n]).await;
+                }
+                continue;
+            }
+        }
         if hole.load(Ordering::SeqCst) {
             continue; // dropped
         }
@@ -190,8 +214,12 @@ impl Dialer for Engine {
             .push((hole.clone(), is_control.clone()));
         let (ar, aw) = tokio::io::split(a);
         let (br, bw) = tokio::io::split(b);
-        tokio::spawn(path(ar, bw, hole.clone()));
-        tokio::spawn(path(br, aw, hole));
+        let cut = match node.cut.load(Ordering::SeqCst) {
+            0 => None,
+            n => Some((n, is_control.clone())),
+        };
+        tokio::spawn(path(ar, bw, hole.clone(), None));
+        tokio::spawn(path(br, aw, hole, cut));
         node.accept
             .send(Box::new(relay))
             .await
@@ -240,10 +268,10 @@ fn echo_site(count: Arc<AtomicUsize>) -> SiteConnector {
     })
 }
 
-fn node(auth: Box<dyn Authorizer>, site: Option<SiteConnector>) -> Node {
+fn node(auth: Box<dyn Authorizer>, site: Option<SiteConnector>, cfg: Config) -> Node {
     let (tx, rx) = mpsc::channel(16);
     let sites = Arc::new(AtomicUsize::new(0));
-    let table = RelayTable::new(Config::default(), Pool::new(8 << 20), auth, 9);
+    let table = RelayTable::new(cfg, Pool::new(8 << 20), auth, 9);
     let site = match site {
         Some(f) => {
             let n = sites.clone();
@@ -266,6 +294,7 @@ fn node(auth: Box<dyn Authorizer>, site: Option<SiteConnector>) -> Node {
         controls: Arc::default(),
         holes: Holes::default(),
         sites,
+        cut: Arc::default(),
     }
 }
 
@@ -278,6 +307,7 @@ struct Lab {
     la_sites: Arc<AtomicUsize>,
     la_holes: Holes,
     la_ctrl: mpsc::Sender<RelayCtrl>,
+    la_cut: Arc<AtomicUsize>,
     engine: Arc<Engine>,
 }
 
@@ -298,8 +328,14 @@ fn lab_with(la_auth: Box<dyn Authorizer>) -> Lab {
 }
 
 fn lab_parts(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>) -> Lab {
-    let la = node(la_auth, la_site);
-    let ny = node(Box::new(AllowAll), None);
+    lab_cfg(la_auth, la_site, Config::default())
+}
+
+/// [`lab_parts`] with the la relay's configuration `la_cfg`.
+fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg: Config) -> Lab {
+    let la = node(la_auth, la_site, la_cfg);
+    let ny = node(Box::new(AllowAll), None, Config::default());
+    let la_cut = la.cut.clone();
     let (la_up, ny_up) = (la.up.clone(), ny.up.clone());
     let (la_carriers, ny_carriers) = (la.carriers.clone(), ny.carriers.clone());
     let la_sites = la.sites.clone();
@@ -343,6 +379,7 @@ fn lab_parts(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>) -> La
         la_sites,
         la_holes,
         la_ctrl,
+        la_cut,
         engine,
     }
 }
@@ -722,7 +759,12 @@ fn quick_control() -> ControlTiming {
 }
 
 async fn download_lab() -> (Lab, crate::dial::Stream, u64) {
-    let mut l = lab_parts(Box::new(AllowAll), Some(endless_download()));
+    download_lab_cfg(Config::default()).await
+}
+
+/// [`download_lab`] with the la relay's configuration `la_cfg`.
+async fn download_lab_cfg(la_cfg: Config) -> (Lab, crate::dial::Stream, u64) {
+    let mut l = lab_cfg(Box::new(AllowAll), Some(endless_download()), la_cfg);
     l.d = std::mem::replace(
         &mut l.d,
         KernelDialer::new(
@@ -831,4 +873,146 @@ async fn revoked_on_the_control_stream_resets_sessions_whose_carriers_are_dead()
         refused.is_err_and(|e| e.0.contains("revoked")),
         "new session not refused after REVOKED"
     );
+}
+
+/// Relay timing for the r9 F2/F5 tests: the relay notices a stalled
+/// download (and sends STALL) after 500 ms instead of 3 s.
+fn quick_stall_relay() -> Config {
+    let mut c = Config::default();
+    c.timing.t_live = Duration::from_millis(500);
+    c
+}
+
+/// Read until the stream ends; how it ended, within `limit`.
+async fn read_to_end_within(
+    s: &mut crate::dial::Stream,
+    limit: Duration,
+) -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {
+    let mut buf = vec![0u8; 16 << 10];
+    tokio::time::timeout(limit, async {
+        loop {
+            match s.read(&mut buf).await {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_download_whose_carriers_resume_then_stall_mid_data_is_reset_after_the_bound() {
+    // r9 F2: the client only downloads (nothing of its own outstanding).
+    // Its carrier dies; every carrier after that answers RESUME and then
+    // stalls in the middle of a DATA frame. Each is given up on the
+    // relay's STALL. Before, a lost carrier counted against the bound only
+    // with upload data pending and RESUMED reset the count: the session
+    // redialled for ever. Now each counts, and the MAX_FRUITLESS-th ends
+    // the session with a reset the app sees.
+    use segue_session::client::MAX_FRUITLESS;
+    let (l, mut s, _at) = download_lab_cfg(quick_stall_relay()).await;
+    let before = l.la_carriers.load(Ordering::SeqCst);
+    // RESUMED, a DATA header and part of its body.
+    l.la_cut.store(120, Ordering::SeqCst);
+    l.blackhole_la(false);
+    let t0 = Instant::now();
+    let end = read_to_end_within(&mut s, Duration::from_secs(60))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "session never gave up: {} carrier(s) in 60 s",
+                l.la_carriers.load(Ordering::SeqCst) - before
+            )
+        });
+    let e = end.expect_err("the session ended with a clean EOF");
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+    let dials = l.la_carriers.load(Ordering::SeqCst) - before;
+    println!("gave up after {:?} and {dials} carriers", t0.elapsed());
+    assert_eq!(
+        dials, MAX_FRUITLESS as usize,
+        "carriers dialled after the last progress"
+    );
+}
+
+#[tokio::test]
+async fn ai_is_refused_fast_while_sessions_back_off_and_after_give_up_then_recovers() {
+    // r9 F5: the outer carrier connects fine but the session layer is
+    // broken (every carrier stalls after RESUME). Carrier dials alone said
+    // `Connected`, so a new AI flow went out and waited. Now session
+    // failures make the exit unavailable: AI is refused at once, during
+    // the backoff and after the give-up, and only a valid protocol answer
+    // makes the exit healthy again.
+    let (l, mut s, _at) = download_lab_cfg(quick_stall_relay()).await;
+    // Pinned: with Auto, new flows would rightly move to the other exit.
+    l.d.set_exit("la").unwrap();
+    l.la_cut.store(120, Ordering::SeqCst);
+    l.blackhole_la(false);
+    // Wait for the first failure report (STALL after t_live).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while l.d.posture() == Posture::Connected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("session failures never reached the exit health");
+    let refused_fast = |what: &'static str| {
+        let d = &l.d;
+        async move {
+            let t = Instant::now();
+            let r = d.dial(Some("ai"), &site(), 443).await;
+            let e = match r {
+                Ok(_) => panic!("AI flow opened {what}"),
+                Err(e) => e,
+            };
+            assert!(e.0.contains("strict"), "{what}: {e}");
+            assert!(
+                t.elapsed() < Duration::from_millis(200),
+                "{what}: refused only after {:?}",
+                t.elapsed()
+            );
+        }
+    };
+    // Repeatedly during the backoff, over several redials: the carrier
+    // dials succeed meanwhile, which must not count as recovery.
+    for _ in 0..5 {
+        refused_fast("during the backoff").await;
+        assert_ne!(l.d.posture(), Posture::Connected);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    // A carrier connect is not proof either.
+    l.d.probe().await.unwrap();
+    assert_ne!(
+        l.d.posture(),
+        Posture::Connected,
+        "carrier connect restored health"
+    );
+    refused_fast("after a successful carrier probe").await;
+    // Give-up: the session ends in a reset.
+    let e = read_to_end_within(&mut s, Duration::from_secs(60))
+        .await
+        .expect("session never gave up")
+        .expect_err("clean EOF after the give-up");
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+    refused_fast("right after the give-up").await;
+    assert!(
+        l.engine.other_tcp.lock().unwrap().is_empty(),
+        "an AI flow went direct"
+    );
+    // The path heals: a non-strict flow gets OPENED (a valid answer), the
+    // exit is healthy again and AI flows work.
+    l.la_cut.store(0, Ordering::SeqCst);
+    let mut ok = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    let mut ok_at = 0;
+    ok.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    read_pattern(&mut ok, &mut ok_at, 4096, Duration::from_secs(5)).await;
+    assert_eq!(l.d.posture(), Posture::Connected);
+    let mut ai = l.d.dial(Some("ai"), &site(), 443).await.unwrap();
+    ai.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    let mut b = [0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), ai.read(&mut b))
+        .await
+        .expect("AI flow after recovery got nothing")
+        .unwrap();
+    assert!(n > 0);
 }
