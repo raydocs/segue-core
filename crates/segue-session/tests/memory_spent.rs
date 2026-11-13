@@ -1,9 +1,10 @@
-//! r5 N13: with the pool spent, the client's real allocations stay inside
-//! what the pool charges (plus the fixed per-session cost measured in
-//! `memory.rs`): the buffers a session needs to progress come from what it
-//! reserved at admission, not from memory outside the pool. Same counting
-//! allocator and relay as `memory.rs` (own binary: the counters are
-//! process-wide).
+//! r5 N13 / r6 R6: with the pool spent, the client's real allocations stay
+//! inside what the pool charges (plus the fixed per-session cost measured
+//! in `memory.rs`), at the budget's scale: 256 sessions with their app
+//! pipes admitted into the 8 MiB process pool, every elastic block then
+//! held elsewhere. Sessions own no reserve: what they need to progress
+//! comes from the pool's shared draining regions. Same counting allocator
+//! and relay as `memory.rs` (own binary: the counters are process-wide).
 //!
 //! Every allocation is tagged with the thread that made it, so the client
 //! runtime (one thread: drivers, app pipes, app readers) is counted apart
@@ -102,9 +103,9 @@ fn client_peak() -> isize {
 
 // ---------------------------------------------------------------------------
 
-const SESSIONS: usize = 24;
-const DOWN: usize = 512 * 1024;
-const POOL: usize = 4 << 20;
+const SESSIONS: usize = 256;
+const DOWN: usize = 256 * 1024;
+const POOL: usize = 8 << 20;
 const MIB: f64 = (1 << 20) as f64;
 
 /// Relay and sites on their own thread: each site sends `DOWN` bytes and
@@ -234,7 +235,7 @@ fn a_spent_pool_bounds_real_client_memory() {
     });
     // As in memory.rs: state, tasks, channels, small read buffers and this
     // test's app task, per session.
-    const FIXED: isize = 32 * 1024;
+    const FIXED: isize = 24 * 1024;
     let bound = POOL as isize - phantom + SESSIONS as isize * FIXED;
     println!(
         "{SESSIONS} sessions, pool spent: peak {:.2} MiB, bound {:.2} MiB",

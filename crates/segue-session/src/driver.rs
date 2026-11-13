@@ -10,15 +10,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
-use crate::client::{ClientSession, CloseReason, State};
+use crate::client::{ClientSession, CloseReason, State, Tx};
 use crate::codec::{code, ty, CtrlHello, Frame, FrameDecoder, Kind, SessionId, Target};
-use crate::pool::{Grant as PoolGrant, Loan, Pool, Reserve, FRAME_MAX};
+use crate::pool::{Grant as PoolGrant, Pool, Tier, FRAME_MAX};
 use crate::relay::{Grant, RelayEvent, RelayTable};
 use crate::ProtoError;
 
@@ -112,12 +113,22 @@ pub enum RelayCtrl {
 const WRITE_QUEUE: usize = 8;
 const CHUNK: usize = 16 * 1024;
 
-/// What covers a buffer: blocks from the pool, or a loan from the
-/// session's reserve when the pool is spent (r5 N13: no buffer is outside
-/// the pool, so its size is a real bound).
-enum Charge {
-    Pool(PoolGrant),
-    Loan(Loan),
+/// What covers a buffer (client side): pool blocks, and when they came
+/// from the transport region the session's (or reader's) single slot in
+/// it, so one stuck carrier holds at most one frame there (r6 R5).
+struct Charge {
+    /// Dropped first: a task woken by the returned blocks finds the slot
+    /// free.
+    _slot: Option<Slot>,
+    grant: PoolGrant,
+}
+
+struct Slot(Arc<AtomicBool>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// A message for a writer task, with what covers it until it is written
@@ -139,93 +150,55 @@ impl From<Vec<u8>> for Out {
 
 /// `data` charged with `c`, shrunk to what `data` holds.
 fn charged(data: Vec<u8>, mut c: Charge) -> Out {
-    match &mut c {
-        Charge::Pool(g) => {
-            g.try_resize(data.capacity());
-        }
-        Charge::Loan(l) => l.shrink(data.capacity()),
-    }
+    c.grant.try_resize(data.capacity());
     Out {
         data,
         _charge: Some(c),
     }
 }
 
-/// Cover `bytes` from the pool, else up to `loan_max` of them from
-/// `reserve`. Returns the charge and how many bytes it covers; `None`:
-/// wait for blocks or a returned loan.
-fn try_charge(
+/// Room for one carrier frame of `min..=want` bytes: elastic blocks while
+/// there are any, else the transport region, one frame per `slot` at a
+/// time. `None`: wait for blocks.
+fn take_charge(
     pool: &Arc<Pool>,
-    reserve: &Arc<Reserve>,
-    bytes: usize,
-    loan_max: usize,
-) -> Option<(Charge, usize)> {
-    if let Some(g) = PoolGrant::fixed(pool, bytes) {
-        return Some((Charge::Pool(g), bytes));
+    slot: &Arc<AtomicBool>,
+    min: usize,
+    want: usize,
+) -> Option<Charge> {
+    if let Some(g) = PoolGrant::between(pool, min, want, Tier::Elastic) {
+        return Some(Charge {
+            _slot: None,
+            grant: g,
+        });
     }
-    let n = bytes.min(loan_max);
-    reserve.lend(n).map(|l| (Charge::Loan(l), n))
+    if slot.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let held = Slot(slot.clone());
+    let g = PoolGrant::between(
+        pool,
+        min,
+        want.min(min.max(TRANSPORT_FRAME)),
+        Tier::Transport,
+    )?;
+    Some(Charge {
+        _slot: Some(held),
+        grant: g,
+    })
 }
 
-/// Until blocks or a loan come back. The short timeout only covers a
-/// wake-up missed between the failed attempt and this call.
-async fn freed(pool: &Pool, reserve: &Reserve) {
-    tokio::select! {
-        _ = pool.freed() => {}
-        _ = reserve.returned() => {}
-        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
-    }
-}
+/// Largest frame a session builds from the transport region (DATA is cut
+/// to it; OPEN may need more).
+const TRANSPORT_FRAME: usize = 4 * crate::pool::BLOCK;
 
-async fn wait_charge(
-    pool: &Arc<Pool>,
-    reserve: &Arc<Reserve>,
-    bytes: usize,
-    loan_max: usize,
-) -> (Charge, usize) {
-    loop {
-        if let Some(c) = try_charge(pool, reserve, bytes, loan_max) {
-            return c;
-        }
-        freed(pool, reserve).await;
-    }
-}
-
-/// The decoder's memory: pool blocks as far as they go, the rest lent.
-struct DecoderCover {
-    pool: Arc<Pool>,
-    reserve: Arc<Reserve>,
-    grant: PoolGrant,
-    loan: Option<Loan>,
-}
-
-impl DecoderCover {
-    fn try_cover(&mut self, bytes: usize) -> bool {
-        if self.grant.bytes() > bytes {
-            self.grant.try_resize(bytes);
-        } else {
-            self.grant.grow_towards(bytes);
-        }
-        let short = bytes.saturating_sub(self.grant.bytes());
-        if short == 0 {
-            self.loan = None;
-            return true;
-        }
-        if let Some(l) = &mut self.loan {
-            if l.bytes() >= short {
-                l.shrink(short);
-                return true;
-            }
-        }
-        self.loan = None;
-        self.loan = self.reserve.lend(short);
-        self.loan.is_some()
-    }
-
-    async fn cover(&mut self, bytes: usize) {
-        while !self.try_cover(bytes) {
-            freed(&self.pool, &self.reserve).await;
-        }
+/// Write what `w` takes right now without waiting (`None`: it would
+/// block; the caller then waits on a real write).
+fn try_write<W: AsyncWrite + Unpin>(w: &mut W, buf: &[u8]) -> Option<io::Result<usize>> {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match Pin::new(w).poll_write(&mut cx, buf) {
+        std::task::Poll::Ready(r) => Some(r),
+        std::task::Poll::Pending => None,
     }
 }
 
@@ -240,90 +213,130 @@ enum CarrierEv {
 }
 
 /// Reader task: decode frames until EOF or a decode error. With `pool`
-/// (client side) the decoder and every decoded frame are covered by the
-/// pool or `reserve`: the decoder never holds more than one frame
-/// (reads stop at [`FRAME_MAX`]), and a frame that cannot be covered waits
-/// before it is queued.
+/// (client side) frames are read header first and every frame body is
+/// charged before it is allocated (r6 N13): elastic blocks while there are
+/// any, else one frame at a time from the transport region, which the
+/// driver frees as soon as it handled the frame. The only uncharged
+/// memory is a [`SMALL_READ`] header buffer.
 fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
     cid: u64,
-    mut r: R,
+    r: R,
     tx: mpsc::Sender<CarrierEv>,
-    pool: Option<(Arc<Pool>, Arc<Reserve>)>,
+    pool: Option<Arc<Pool>>,
 ) -> Task {
-    spawn(async move {
-        let mut dec = FrameDecoder::new();
-        let mut cover = pool.as_ref().map(|(p, r)| DecoderCover {
-            pool: p.clone(),
-            reserve: r.clone(),
-            grant: PoolGrant::new(p, false),
-            loan: None,
-        });
-        let mut buf = ReadBuffer::new(pool.as_ref().map(|(p, _)| p.clone()));
-        loop {
-            let mut room = buf.len();
-            if let Some(c) = &mut cover {
-                room = room.min(FRAME_MAX.saturating_sub(dec.buffered())).max(1);
-                // `push` drops consumed bytes, then grows exactly.
-                c.cover(dec.held_bytes().max(dec.buffered() + room)).await;
-            }
-            // A large buffer goes back once the stream has been quiet for
-            // READ_IDLE (cancelling a pending read loses nothing).
-            let idle = buf
-                .idle_at()
-                .or_else(|| (dec.held_bytes() > 0).then_some(buf.last + READ_IDLE));
-            let read = match idle {
-                Some(at) => match tokio::time::timeout_at(at, r.read(&mut buf.get()[..room])).await
-                {
-                    Ok(r) => r,
-                    Err(_) => {
-                        buf.shrink();
-                        dec.release_idle();
-                        if let Some(c) = &mut cover {
-                            c.try_cover(dec.held_bytes());
-                        }
-                        if dec.held_bytes() > 0 {
-                            // A partial frame: wait for the rest.
-                            buf.last = tokio::time::Instant::now();
-                        }
-                        continue;
-                    }
-                },
-                None => r.read(&mut buf.get()[..room]).await,
-            };
-            match read {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    dec.push(&buf.get()[..n]);
-                    // A read cut short by `room` is not a slow stream.
-                    buf.adapt(if n == room { buf.len() } else { n });
+    match pool {
+        Some(p) => spawn(read_charged(cid, r, tx, p)),
+        None => spawn(read_frames(cid, r, tx)),
+    }
+}
+
+async fn read_charged<R: AsyncRead + Unpin>(
+    cid: u64,
+    r: R,
+    tx: mpsc::Sender<CarrierEv>,
+    pool: Arc<Pool>,
+) {
+    let mut r = tokio::io::BufReader::with_capacity(SMALL_READ, r);
+    let slot = Arc::new(AtomicBool::new(false));
+    loop {
+        let mut hdr = [0u8; 10];
+        if r.read_exact(&mut hdr[..3]).await.is_err() {
+            break;
+        }
+        let vlen = 1usize << (hdr[2] >> 6);
+        if r.read_exact(&mut hdr[3..2 + vlen]).await.is_err() {
+            break;
+        }
+        let (len, _) = crate::codec::get_varint(&hdr[2..2 + vlen]).expect("complete varint");
+        if len > crate::codec::MAX_PAYLOAD as u64 {
+            let _ = tx
+                .send(CarrierEv::Frame(cid, Err(ProtoError::FrameTooLong), None))
+                .await;
+            break;
+        }
+        let len = len as usize;
+        let (ty, flags) = (hdr[0], hdr[1]);
+        // DATA keeps the payload's allocation; anything else is decoded
+        // into a copy while the payload is still held.
+        let cover = if ty == ty::DATA { len } else { 2 * len };
+        let charge = if cover == 0 {
+            None
+        } else {
+            Some(
+                pool.wait_for(|| take_charge(&pool, &slot, cover, cover))
+                    .await,
+            )
+        };
+        let mut payload = vec![0u8; len];
+        if r.read_exact(&mut payload).await.is_err() {
+            break;
+        }
+        match Frame::decode_owned(ty, flags, payload) {
+            Ok(Some(f)) => {
+                if tx.send(CarrierEv::Frame(cid, Ok(f), charge)).await.is_err() {
+                    return;
                 }
             }
-            loop {
-                let before = dec.buffered();
-                match dec.next_frame() {
-                    Ok(Some(f)) => {
-                        let charge = match &pool {
-                            Some((p, r)) => {
-                                let bytes = before - dec.buffered();
-                                Some(wait_charge(p, r, bytes, bytes).await.0)
-                            }
-                            None => None,
-                        };
-                        if tx.send(CarrierEv::Frame(cid, Ok(f), charge)).await.is_err() {
-                            return;
-                        }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = tx.send(CarrierEv::Frame(cid, Err(e), None)).await;
+                break;
+            }
+        }
+    }
+    let _ = tx.send(CarrierEv::Closed(cid)).await;
+}
+
+/// Relay side: no pool, a [`FrameDecoder`] over adaptive reads.
+async fn read_frames<R: AsyncRead + Unpin>(cid: u64, mut r: R, tx: mpsc::Sender<CarrierEv>) {
+    let mut dec = FrameDecoder::new();
+    let mut buf = ReadBuffer::new(None);
+    loop {
+        let room = buf.len();
+        // A large buffer goes back once the stream has been quiet for
+        // READ_IDLE (cancelling a pending read loses nothing).
+        let idle = buf
+            .idle_at()
+            .or_else(|| (dec.held_bytes() > 0).then_some(buf.last + READ_IDLE));
+        let read = match idle {
+            Some(at) => match tokio::time::timeout_at(at, r.read(&mut buf.get()[..room])).await {
+                Ok(r) => r,
+                Err(_) => {
+                    buf.shrink();
+                    dec.release_idle();
+                    if dec.held_bytes() > 0 {
+                        // A partial frame: wait for the rest.
+                        buf.last = tokio::time::Instant::now();
                     }
-                    Ok(None) => break,
-                    Err(e) => {
-                        let _ = tx.send(CarrierEv::Frame(cid, Err(e), None)).await;
-                        let _ = tx.send(CarrierEv::Closed(cid)).await;
+                    continue;
+                }
+            },
+            None => r.read(&mut buf.get()[..room]).await,
+        };
+        match read {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                dec.push(&buf.get()[..n]);
+                buf.adapt(n);
+            }
+        }
+        loop {
+            match dec.next_frame() {
+                Ok(Some(f)) => {
+                    if tx.send(CarrierEv::Frame(cid, Ok(f), None)).await.is_err() {
                         return;
                     }
                 }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(CarrierEv::Frame(cid, Err(e), None)).await;
+                    let _ = tx.send(CarrierEv::Closed(cid)).await;
+                    return;
+                }
             }
         }
-        let _ = tx.send(CarrierEv::Closed(cid)).await;
-    })
+    }
+    let _ = tx.send(CarrierEv::Closed(cid)).await;
 }
 
 /// A read buffer that is small while its stream is idle or slow and grows to
@@ -532,12 +545,12 @@ where
         mut cancel,
     } = ctl;
     let writable = Arc::new(Notify::new());
-    let (mut app_r, app_w) = tokio::io::split(app);
-    // The app stopped taking data: the download cannot complete, reset.
-    let (app_err_tx, mut app_err_rx) = tokio::sync::oneshot::channel::<()>();
-    let (app_tx, app_writer) = spawn_writer(app_w, writable.clone(), async move {
-        let _ = app_err_tx.send(());
-    });
+    let (mut app_r, mut app_w) = tokio::io::split(app);
+    // One received byte whose write to the app is pending, and a pending
+    // shutdown of the app's read side (the relay's FIN reached it).
+    let mut probe = [0u8; 1];
+    let mut probe_len = 0usize;
+    let mut shut_pending = false;
     let mut app_failed = false;
     let (ev_tx, mut ev_rx) = mpsc::channel::<CarrierEv>(64);
     let (conn_tx, mut conn_rx) = mpsc::channel::<(u64, io::Result<BoxCarrier>)>(4);
@@ -550,7 +563,7 @@ where
     let mut app_eof = false;
     let mut app_shut = false;
     let pool = s.pool().clone();
-    let reserve = s.reserve().clone();
+    let tx_slot = Arc::new(AtomicBool::new(false));
     let mut abuf = ReadBuffer::new(Some(pool.clone()));
     // A queued message the pool could not cover is waiting for blocks.
     let mut pool_blocked;
@@ -577,51 +590,58 @@ where
         }
         tasks.prune();
         pool_blocked = false;
-        // Carrier output, generated only while the writer has room. Each
-        // queued frame is charged to the pool, or with the pool spent to
-        // the session's reserve (one frame), so the session always
-        // progresses without memory outside the pool.
+        // Carrier output, generated only while the writer has room and
+        // there is something to send. Each queued frame is charged to the
+        // pool before it is built (elastic blocks, else the session's one
+        // slot in the transport region), so the session progresses with a
+        // full pool and no memory of its own outside it (r6 R5/R6).
         if let Some(cid) = s.carrier() {
             if let Some(io) = carriers.get(&cid) {
-                while io.tx.capacity() > 0 {
-                    let Some((g, _)) = try_charge(&pool, &reserve.carrier, FRAME_MAX, FRAME_MAX)
-                    else {
+                let mut min = 1;
+                while io.tx.capacity() > 0 && s.has_transmit(cid, t) {
+                    let Some(c) = take_charge(&pool, &tx_slot, min, FRAME_MAX) else {
                         pool_blocked = true;
                         break;
                     };
-                    match s.poll_transmit(cid, t) {
-                        Some(f) => {
-                            let _ = io.tx.try_send(charged(f.to_bytes(), g));
+                    let mut v = Vec::new();
+                    match s.poll_transmit_into(cid, t, &mut v, c.grant.bytes()) {
+                        Tx::Wrote => {
+                            let _ = io.tx.try_send(charged(v, c));
+                            min = 1;
                         }
-                        None => break,
+                        Tx::Idle => break,
+                        Tx::NeedRoom(n) => min = n,
                     }
                 }
             }
         }
-        // Data for the app, charged the same way.
-        while app_tx.capacity() > 0 && !app_shut && !app_tx.is_closed() {
-            let avail = s.recv_half().buffered().min(CHUNK);
-            if avail > 0 {
-                // Pool short: one reserved block at a time.
-                let Some((g, avail)) = try_charge(&pool, &reserve.app, avail, crate::pool::BLOCK)
-                else {
-                    pool_blocked = true;
-                    break;
-                };
-                let mut v = vec![0u8; avail];
-                let n = s.read(&mut v, t);
-                if n == 0 {
+        // Received bytes go from the receive buffer straight to the app,
+        // with no buffer in between: when the app would block, one byte is
+        // taken out and its write awaited below, which wakes the loop.
+        if probe_len == 0 && !app_failed {
+            loop {
+                let data = s.readable();
+                if data.is_empty() {
+                    let _ = s.read(&mut [], t);
+                    if s.read_eof() && !app_shut {
+                        shut_pending = true;
+                    }
                     break;
                 }
-                v.truncate(n);
-                let _ = app_tx.try_send(charged(v, g));
-            } else {
-                let _ = s.read(&mut [], t);
-                if s.read_eof() {
-                    let _ = app_tx.try_send(Vec::new().into());
-                    app_shut = true;
+                match try_write(&mut app_w, data) {
+                    Some(Ok(n)) if n > 0 => s.consume(n, t),
+                    Some(_) => {
+                        // The app stopped taking data: the download cannot
+                        // complete, reset.
+                        app_failed = true;
+                        s.abort();
+                        break;
+                    }
+                    None => {
+                        probe_len = s.read(&mut probe, t);
+                        break;
+                    }
                 }
-                break;
             }
         }
         if s.state() == State::Active {
@@ -669,7 +689,7 @@ where
                                 cid,
                                 r,
                                 ev_tx.clone(),
-                                Some((pool.clone(), reserve.reader.clone())),
+                                Some(pool.clone()),
                             );
                             let etx = ev_tx.clone();
                             let (tx, writer) = spawn_writer(w, writable.clone(), async move {
@@ -718,18 +738,32 @@ where
                     None => stall = None,
                 }
             }
-            r = &mut app_err_rx, if !app_failed => {
-                app_failed = true;
-                if r.is_ok() {
-                    s.abort();
+            r = async {
+                if probe_len > 0 {
+                    app_w.write_all(&probe[..probe_len]).await
+                } else {
+                    app_w.shutdown().await
+                }
+            }, if !app_failed && (probe_len > 0 || shut_pending) => {
+                match r {
+                    Ok(()) if probe_len > 0 => probe_len = 0,
+                    Ok(()) => {
+                        shut_pending = false;
+                        app_shut = true;
+                    }
+                    Err(_) => {
+                        app_failed = true;
+                        s.abort();
+                    }
                 }
             }
             _ = writable.notified() => {}
+            // The short timeout covers blocks freed between the failed
+            // charge and this wait.
             _ = async {
                 tokio::select! {
                     _ = pool.freed() => {}
-                    _ = reserve.carrier.returned() => {}
-                    _ = reserve.app.returned() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
                 }
             }, if pool_blocked => {}
             _ = tokio::time::sleep_until(abuf_idle.unwrap_or_else(tokio::time::Instant::now)), if abuf_idle.is_some() => {
@@ -752,61 +786,46 @@ where
         if let Some(tx) = closed.take() {
             let _ = tx.send(reason);
         }
-        app_writer.abort();
-    }
-    // A clean close can be learnt from a REJECT(closed) (B6) while received
-    // data is still buffered: it belongs to the app.
-    // Bounded: an app that stopped reading cannot hold the session open.
-    // Clean is only reported once every byte reached the app (r5 N8): a
-    // drain cut short by the deadline is a reset, never a short clean EOF.
-    let until = tokio::time::Instant::now() + DRAIN;
-    if reason == CloseReason::Clean {
-        let mut delivered = app_shut;
-        if !app_shut {
-            delivered = tokio::time::timeout_at(until, async {
-                loop {
-                    let avail = s.recv_half().buffered().min(CHUNK);
-                    if avail == 0 {
-                        break;
+        drop(app_w);
+    } else {
+        // A clean close can be learnt from a REJECT(closed) (B6) while
+        // received data is still buffered: it belongs to the app.
+        // Bounded: an app that stopped reading cannot hold the session
+        // open. Clean is only reported once every byte reached the app
+        // (r5 N8): a drain cut short by the deadline is a reset, never a
+        // short clean EOF.
+        let until = tokio::time::Instant::now() + DRAIN;
+        let delivered = !app_failed
+            && (app_shut
+                || tokio::time::timeout_at(until, async {
+                    if probe_len > 0 {
+                        app_w.write_all(&probe[..probe_len]).await?;
                     }
-                    let (g, avail) =
-                        wait_charge(&pool, &reserve.app, avail, crate::pool::BLOCK).await;
-                    let mut v = vec![0u8; avail];
-                    let n = s.read(&mut v, now());
-                    if n == 0 {
-                        break;
+                    loop {
+                        let data = s.readable();
+                        if data.is_empty() {
+                            break;
+                        }
+                        let n = app_w.write(data).await?;
+                        if n == 0 {
+                            return Err(io::ErrorKind::WriteZero.into());
+                        }
+                        s.consume(n, now());
                     }
-                    v.truncate(n);
-                    if app_tx.send(charged(v, g)).await.is_err() {
-                        return false;
+                    if s.read_eof() {
+                        app_w.shutdown().await?;
                     }
-                }
-                if s.read_eof() {
-                    let _ = app_tx.send(Vec::new().into()).await;
-                }
-                true
-            })
-            .await
-            .unwrap_or(false);
-        }
-        // The writer ends once its queue is flushed (channel closed).
-        drop(app_tx);
-        let mut app_writer = app_writer;
-        let flushed = delivered
-            && tokio::time::timeout_at(until, &mut app_writer.0)
+                    io::Result::Ok(())
+                })
                 .await
-                .is_ok_and(|r| r.is_ok())
-            && app_err_rx.try_recv().is_err();
-        if !flushed {
+                .is_ok_and(|r| r.is_ok()));
+        if !delivered {
             reason = CloseReason::Reset(code::INTERNAL);
         }
         if let Some(tx) = closed.take() {
             let _ = tx.send(reason);
         }
-        // Aborted only after the reason is out (no-op when finished).
-        app_writer.abort();
-    } else {
-        drop(app_tx);
+        drop(app_w);
     }
     // Flush a final RST / ACK on the current carrier, then close everything.
     if let Some(cid) = s.carrier() {
