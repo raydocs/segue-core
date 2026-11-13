@@ -1,5 +1,11 @@
 //! Domain sniffing on the first bytes of a TCP flow (KERNEL_SPEC §5.2a.1).
-//! QUIC Initial SNI for UDP lives in [`crate::quic`].
+//! UDP is not sniffed: QUIC is carried only to a name known for certain
+//! ([`crate::quic`]).
+//!
+//! A ClientHello is read whole (every extension) before it is judged: one
+//! that offers Encrypted Client Hello ([`EXT_ECH`]) is [`Sniff::Hidden`]
+//! wherever the extension sits, because its SNI is the outer,
+//! client-facing name and says nothing about the real server.
 //!
 //! Pure parsers over a byte prefix. They never consume anything from the
 //! socket: the caller keeps the bytes and replays them to the upstream.
@@ -17,7 +23,14 @@ pub enum Sniff {
     NeedMore,
     /// Not TLS/HTTP, or TLS/HTTP without a usable host name. Final.
     None,
+    /// A TLS ClientHello offering ECH: the real name is encrypted and the
+    /// SNI present is only the outer name. Final; never routed by that
+    /// outer name (astra r9 F4).
+    Hidden,
 }
+
+/// `encrypted_client_hello` extension (RFC 9849; draft-ietf-tls-esni).
+pub const EXT_ECH: u16 = 0xfe0d;
 
 /// Look at `buf` as TLS first, then HTTP.
 pub fn sniff(buf: &[u8]) -> Sniff {
@@ -55,7 +68,8 @@ pub fn tls_sni(buf: &[u8]) -> Sniff {
         match buf.get(start..start + len) {
             Some(body) => hs.extend_from_slice(body),
             None => {
-                // Partial record: use what is there; maybe the SNI is early.
+                // Partial record: use what is there; an early ECH or a
+                // malformed hello is final already, a name is not.
                 hs.extend_from_slice(&buf[start.min(buf.len())..]);
                 return match parse_client_hello(&hs) {
                     Sniff::NeedMore => Sniff::NeedMore,
@@ -68,15 +82,6 @@ pub fn tls_sni(buf: &[u8]) -> Sniff {
             return parse_client_hello(&hs);
         }
     }
-}
-
-/// Server name from raw (possibly truncated) TLS handshake bytes, as carried
-/// in QUIC CRYPTO frames (no record layer).
-pub fn client_hello_sni(hs: &[u8]) -> Sniff {
-    if hs.is_empty() {
-        return Sniff::NeedMore;
-    }
-    parse_client_hello(hs)
 }
 
 fn hs_complete(hs: &[u8]) -> bool {
@@ -143,17 +148,22 @@ fn parse_client_hello(hs: &[u8]) -> Sniff {
         c.take(cm)?;
         let ext_len = c.u16()?;
         let ext_end = c.p + ext_len;
+        // Every extension is read: ECH may follow the SNI (browsers shuffle
+        // the order), so a name is only final once the list is complete.
+        let mut name = Sniff::None;
         while c.p + 4 <= ext_end {
             let ty = c.u16()?;
             let len = c.u16()?;
             let body = c.take(len)?;
-            if ty == 0 {
-                return Some(server_name(body));
+            match ty {
+                t if t == usize::from(EXT_ECH) => return Some(Sniff::Hidden),
+                0 => name = server_name(body),
+                _ => {}
             }
         }
-        // Extensions parsed fully with no SNI, or ran out of bytes.
+        // Extensions parsed fully, or ran out of bytes.
         if c.p >= ext_end && ext_end <= c.b.len() {
-            Some(Sniff::None)
+            Some(name)
         } else {
             None
         }
@@ -309,13 +319,49 @@ pub fn client_hello_for_test(sni: Option<&str>, pad: usize) -> Vec<u8> {
         exts.extend_from_slice(&(pad as u16).to_be_bytes());
         exts.extend(std::iter::repeat_n(0u8, pad));
     }
+    hello_record(&exts)
+}
+
+#[doc(hidden)]
+/// Test helper: a ClientHello with an outer SNI `outer` and an
+/// `encrypted_client_hello` extension, before or after the SNI.
+pub fn client_hello_ech_for_test(outer: &str, ech_first: bool) -> Vec<u8> {
+    let n = outer.as_bytes();
+    let mut sn = Vec::new();
+    sn.extend_from_slice(&((n.len() + 3) as u16).to_be_bytes());
+    sn.push(0);
+    sn.extend_from_slice(&(n.len() as u16).to_be_bytes());
+    sn.extend_from_slice(n);
+    let mut sni = 0u16.to_be_bytes().to_vec();
+    sni.extend_from_slice(&(sn.len() as u16).to_be_bytes());
+    sni.extend_from_slice(&sn);
+    // type outer(0), kdf/aead, config id, enc, payload: opaque to us.
+    let body = [
+        &[0u8, 0, 1, 0, 1, 0x2a, 0, 4, 1, 2, 3, 4, 0, 8][..],
+        &[0x55; 8],
+    ]
+    .concat();
+    let mut ech = EXT_ECH.to_be_bytes().to_vec();
+    ech.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    ech.extend_from_slice(&body);
+    // Some other extension (supported_versions) in between.
+    let other = [0u8, 43, 0, 3, 2, 3, 4];
+    let exts = if ech_first {
+        [&ech[..], &other, &sni].concat()
+    } else {
+        [&sni[..], &other, &ech].concat()
+    };
+    hello_record(&exts)
+}
+
+fn hello_record(exts: &[u8]) -> Vec<u8> {
     let mut body = vec![0x03, 0x03];
     body.extend_from_slice(&[7u8; 32]);
     body.push(0); // session id
     body.extend_from_slice(&[0, 2, 0x13, 0x01]); // cipher suites
     body.extend_from_slice(&[1, 0]); // compression
     body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
-    body.extend_from_slice(&exts);
+    body.extend_from_slice(exts);
     let mut hs = vec![0x01];
     hs.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
     hs.extend_from_slice(&body);
@@ -383,6 +429,28 @@ mod tests {
             sniff(&[0x16, 0x03, 0x01, 0x00, 0x05, 0x02, 0, 0, 1, 0]),
             Sniff::None
         );
+    }
+
+    /// r9 F4: ECH anywhere in the extension list hides the name; the outer
+    /// SNI is never reported, and a name before the end of the list is
+    /// not final yet.
+    #[test]
+    fn ech_hides_the_name_wherever_it_sits() {
+        for ech_first in [true, false] {
+            let h = client_hello_ech_for_test("public.example", ech_first);
+            assert_eq!(sniff(&h), Sniff::Hidden, "ech_first={ech_first}");
+            for n in 0..h.len() {
+                let r = sniff(&h[..n]);
+                assert!(
+                    matches!(r, Sniff::NeedMore | Sniff::Hidden),
+                    "ech_first={ech_first} prefix {n}: {r:?}"
+                );
+            }
+        }
+        // Without ECH the same layout gives the name, once complete.
+        let h = client_hello_for_test(Some("a.example"), 0);
+        assert_eq!(sniff(&h), Sniff::Domain("a.example".into()));
+        assert_eq!(sniff(&h[..h.len() - 1]), Sniff::NeedMore);
     }
 
     #[test]

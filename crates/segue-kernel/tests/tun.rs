@@ -14,7 +14,7 @@ use segue_kernel::quic::{
     hex, QUIC_GO_CHATGPT_INITIAL, RFC9001_CLIENT_INITIAL, RFC9369_CLIENT_INITIAL,
 };
 use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
-use segue_kernel::sniff::client_hello_for_test;
+use segue_kernel::sniff::{client_hello_ech_for_test, client_hello_for_test};
 use segue_kernel::socks::{Kernel, SniffSettings};
 use segue_kernel::tun::{
     mss_for, Event, FlowKey, MemoryBudget, Netstack, NetstackConfig, PacketIo, Proto, TunStack,
@@ -1701,6 +1701,54 @@ async fn sniffed_rejected_name_resets_and_never_dials() {
     let rst = e.h.next_meaningful().await;
     assert!(rst.rst, "{rst:?}");
     assert!(e.dialer.dials.lock().unwrap().is_empty());
+}
+
+/// r9 F4: on TUN too, a ClientHello offering ECH is a hidden name: it goes
+/// the AI route to the IP, never by its outer SNI (here a direct name on
+/// a direct IP, and a proxied name on an unmatched IP).
+#[tokio::test]
+async fn ech_hello_goes_the_ai_route_never_by_outer_sni() {
+    for (outer, dst) in [
+        ("x.p2.test", SITE4),
+        ("www.baidu.com", "192.0.2.9:443".parse().unwrap()),
+    ] {
+        let policy = inline().with_hidden_name(Action::Proxy("ai".into()));
+        let mut e = kernel_env(policy, true, false, false, false);
+        let sseq = connect(&mut e.h, dst).await;
+        let hello = client_hello_ech_for_test(outer, false);
+        e.h.send(tcp(CLIENT4, dst, ACK, 101, sseq, &hello)).await;
+        let mut site = e.dialer.site().await;
+        let mut got = vec![0u8; hello.len()];
+        site.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, hello, "{outer}");
+        assert_eq!(
+            e.dialer.dials.lock().unwrap().clone(),
+            vec![(Some("ai".to_string()), TargetAddr::Ip(dst.ip()), 443)],
+            "{outer}"
+        );
+    }
+    // Inline policy without a hidden-name route: refused.
+    let mut e = kernel_env(inline(), true, false, false, false);
+    let sseq = connect(&mut e.h, SITE4).await;
+    let hello = client_hello_ech_for_test("x.p2.test", true);
+    e.h.send(tcp(CLIENT4, SITE4, ACK, 101, sseq, &hello)).await;
+    let rst = e.h.next_meaningful().await;
+    assert!(rst.rst, "{rst:?}");
+    assert!(e.dialer.dials.lock().unwrap().is_empty());
+}
+
+/// r9 F4 (c), accepted boundary: a sniff that times out (the app sends
+/// nothing) keeps the IP rules; on a direct IP the flow goes direct.
+#[tokio::test]
+async fn sniff_timeout_keeps_ip_rules() {
+    let mut e = kernel_env(inline(), true, false, false, false);
+    let dst: SocketAddr = "192.0.2.9:22".parse().unwrap();
+    let _ = connect(&mut e.h, dst).await;
+    let _site = e.dialer.site().await;
+    assert_eq!(
+        e.dialer.dials.lock().unwrap().clone(),
+        vec![(None, TargetAddr::Ip(dst.ip()), 22)]
+    );
 }
 
 #[tokio::test]

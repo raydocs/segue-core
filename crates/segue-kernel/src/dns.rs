@@ -24,6 +24,11 @@
 //! A/AAAA answers are cached by upstream TTL and served stale while a
 //! background refresh runs (optimistic cache, §5.2.1).
 //!
+//! Passed-through answers lose the `ech` SvcParam of every HTTPS / SVCB
+//! record ([`strip_ech`], astra r9 F4): a client that never learns an ECH
+//! config sends its real server name in the clear, so the SNI sniffer
+//! (§5.2a.1) can route by it.
+//!
 //! Not done: ECS, TCP fallback to upstreams on a truncated reply, binding
 //! upstream sockets to a protected interface (the shell's job under TUN).
 
@@ -43,7 +48,14 @@ use crate::rules::{normalize, Action};
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_AAAA: u16 = 28;
+pub const TYPE_SVCB: u16 = 64;
+pub const TYPE_HTTPS: u16 = 65;
+const TYPE_CNAME: u16 = 5;
+const TYPE_OPT: u16 = 41;
 const CLASS_IN: u16 = 1;
+/// SvcParamKey `ech` (RFC 9460 §14.3.2; ECH config list, RFC 9848).
+pub const SVC_KEY_ECH: u16 = 5;
+const SVC_KEY_MANDATORY: u16 = 0;
 
 pub const RCODE_OK: u8 = 0;
 pub const RCODE_FORMERR: u8 = 1;
@@ -323,10 +335,15 @@ impl SmartDns {
         packet[..2].copy_from_slice(&id.to_be_bytes());
         match self.race(packet).await {
             Some(_) if self.policy.current().refuse_all => Some(respond(q, RCODE_REFUSED, &[], 0)),
-            Some(mut reply) => {
-                reply[..2].copy_from_slice(&q.id.to_be_bytes());
-                Some(reply)
-            }
+            Some(reply) => match strip_ech(&reply) {
+                Some(mut reply) => {
+                    reply[..2].copy_from_slice(&q.id.to_be_bytes());
+                    Some(reply)
+                }
+                // A reply that cannot be walked might hide an ECH config
+                // from us but not from the client: not passed on.
+                None => Some(respond(q, RCODE_SERVFAIL, &[], 0)),
+            },
             None => Some(self.after_wait(q, || respond(q, RCODE_SERVFAIL, &[], 0))),
         }
     }
@@ -514,6 +531,207 @@ fn parse_answers(msg: &[u8], qtype: u16) -> Option<(u8, Vec<IpAddr>, u32)> {
         ttl = NEGATIVE_TTL;
     }
     Some((rcode, ips, ttl))
+}
+
+/// `msg` without the `ech` SvcParam in its HTTPS / SVCB records (r9 F4);
+/// None if the message cannot be walked.
+///
+/// A message with no such parameter is returned unchanged. Otherwise it is
+/// rebuilt: header and question as they were; every answer with its owner
+/// name written out in full (no compression) and, for CNAME, its target
+/// too; HTTPS / SVCB data without `ech` (and without `ech` in `mandatory`,
+/// which is dropped once empty); other answer data verbatim (RFC 3597:
+/// only well-known types compress names in their data; CNAME is the one
+/// an HTTPS / SVCB answer chain carries). The authority section and all
+/// additional records but OPT are dropped: a client needs neither to use
+/// the answer, and keeping them would mean rewriting their compressed
+/// names too.
+pub fn strip_ech(msg: &[u8]) -> Option<Vec<u8>> {
+    if msg.len() < 12 {
+        return None;
+    }
+    let count = |i: usize| usize::from(u16::from_be_bytes([msg[i], msg[i + 1]]));
+    let (qd, an, ns, ar) = (count(4), count(6), count(8), count(10));
+    let mut p = 12;
+    for _ in 0..qd {
+        p = skip_name(msg, p)?.checked_add(4)?;
+        msg.get(..p)?;
+    }
+    let question_end = p;
+    struct Rr {
+        name: usize,
+        ty: u16,
+        fixed: usize,
+        data: (usize, usize),
+    }
+    let mut rrs = Vec::with_capacity(an + ns + ar);
+    let mut found = false;
+    for _ in 0..an + ns + ar {
+        let name = p;
+        p = skip_name(msg, p)?;
+        let h = msg.get(p..p + 10)?;
+        let ty = u16::from_be_bytes([h[0], h[1]]);
+        let rdlen = usize::from(u16::from_be_bytes([h[8], h[9]]));
+        let data = (p + 10, p + 10 + rdlen);
+        let rdata = msg.get(data.0..data.1)?;
+        if ty == TYPE_HTTPS || ty == TYPE_SVCB {
+            found |= svc_params(rdata)?.iter().any(|&(k, _)| k == SVC_KEY_ECH);
+        }
+        rrs.push(Rr {
+            name,
+            ty,
+            fixed: p,
+            data,
+        });
+        p = data.1;
+    }
+    if !found {
+        return Some(msg.to_vec());
+    }
+    let mut out = Vec::with_capacity(msg.len());
+    out.extend_from_slice(&msg[..12]);
+    out.extend_from_slice(&msg[12..question_end]);
+    let (mut n_an, mut n_ar) = (0u16, 0u16);
+    for (i, rr) in rrs.iter().enumerate() {
+        let answer = i < an;
+        if !answer && !(i >= an + ns && rr.ty == TYPE_OPT) {
+            continue;
+        }
+        let rdata = &msg[rr.data.0..rr.data.1];
+        let data = match rr.ty {
+            TYPE_HTTPS | TYPE_SVCB if answer => svc_without_ech(rdata)?,
+            TYPE_CNAME if answer => {
+                let mut d = Vec::new();
+                expand_name(msg, rr.data.0, &mut d)?;
+                d
+            }
+            _ => rdata.to_vec(),
+        };
+        expand_name(msg, rr.name, &mut out)?;
+        out.extend_from_slice(&msg[rr.fixed..rr.fixed + 8]);
+        out.extend_from_slice(&u16::try_from(data.len()).ok()?.to_be_bytes());
+        out.extend_from_slice(&data);
+        if answer {
+            n_an += 1;
+        } else {
+            n_ar += 1;
+        }
+    }
+    out[6..8].copy_from_slice(&n_an.to_be_bytes());
+    out[8..10].copy_from_slice(&0u16.to_be_bytes());
+    out[10..12].copy_from_slice(&n_ar.to_be_bytes());
+    if out.len() > msg.len().max(512) {
+        // Names written out grew it past what the upstream sent (and past
+        // the classic UDP size): header and question with TC, so the
+        // client asks again over TCP.
+        out.truncate(question_end);
+        out[2] |= 0x02;
+        out[6..12].fill(0);
+    }
+    (out.len() <= usize::from(u16::MAX)).then_some(out)
+}
+
+/// The SvcParams of SVCB / HTTPS data: (key, value range). None if
+/// malformed (RFC 9460 §2.2: keys strictly increasing).
+fn svc_params(rdata: &[u8]) -> Option<Vec<(u16, std::ops::Range<usize>)>> {
+    rdata.get(..2)?;
+    // TargetName is never compressed (RFC 9460 §2.2).
+    let mut p = 2;
+    loop {
+        let len = usize::from(*rdata.get(p)?);
+        if len == 0 {
+            p += 1;
+            break;
+        }
+        if len > 63 {
+            return None;
+        }
+        p += 1 + len;
+    }
+    let mut params = Vec::new();
+    let mut last: Option<u16> = None;
+    while p < rdata.len() {
+        let h = rdata.get(p..p + 4)?;
+        let key = u16::from_be_bytes([h[0], h[1]]);
+        let len = usize::from(u16::from_be_bytes([h[2], h[3]]));
+        if last.is_some_and(|l| key <= l) {
+            return None;
+        }
+        last = Some(key);
+        rdata.get(p + 4..p + 4 + len)?;
+        params.push((key, p + 4..p + 4 + len));
+        p += 4 + len;
+    }
+    Some(params)
+}
+
+/// SVCB / HTTPS data with `ech` removed (and from `mandatory`).
+fn svc_without_ech(rdata: &[u8]) -> Option<Vec<u8>> {
+    let params = svc_params(rdata)?;
+    let head_end = params.first().map_or(rdata.len(), |(_, r)| r.start - 4);
+    let mut out = rdata[..head_end].to_vec();
+    for (key, range) in params {
+        let value = &rdata[range];
+        match key {
+            SVC_KEY_ECH => {}
+            SVC_KEY_MANDATORY => {
+                if value.len() % 2 != 0 {
+                    return None;
+                }
+                let keys: Vec<u8> = value
+                    .chunks(2)
+                    .filter(|k| u16::from_be_bytes([k[0], k[1]]) != SVC_KEY_ECH)
+                    .flatten()
+                    .copied()
+                    .collect();
+                if !keys.is_empty() {
+                    out.extend_from_slice(&key.to_be_bytes());
+                    out.extend_from_slice(&(keys.len() as u16).to_be_bytes());
+                    out.extend_from_slice(&keys);
+                }
+            }
+            _ => {
+                out.extend_from_slice(&key.to_be_bytes());
+                out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+                out.extend_from_slice(value);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Append the name at `p` of `msg` uncompressed. Pointers must point
+/// backwards (so the walk ends); at most 255 bytes of name.
+fn expand_name(msg: &[u8], mut p: usize, out: &mut Vec<u8>) -> Option<()> {
+    let mut total = 0usize;
+    let mut limit = p;
+    loop {
+        let len = *msg.get(p)?;
+        match len {
+            0 => {
+                out.push(0);
+                return Some(());
+            }
+            l if l & 0xc0 == 0xc0 => {
+                let to = usize::from(u16::from_be_bytes([l & 0x3f, *msg.get(p + 1)?]));
+                if to >= limit {
+                    return None;
+                }
+                limit = to;
+                p = to;
+            }
+            l if l > 63 => return None,
+            l => {
+                let l = usize::from(l);
+                total += l + 1;
+                if total > 255 {
+                    return None;
+                }
+                out.extend_from_slice(msg.get(p..p + 1 + l)?);
+                p += 1 + l;
+            }
+        }
+    }
 }
 
 fn header_only(id: u16, rd: bool, rcode: u8) -> Vec<u8> {
@@ -891,5 +1109,182 @@ mod tests {
             let _ = parse_question(&m);
             let _ = question_bytes(&m);
         }
+    }
+
+    /// An HTTPS answer the way resolvers send it: a CNAME to `cdn.x.test`,
+    /// then HTTPS records whose owner names are compression pointers; an
+    /// authority SOA, an EDNS OPT. `params` per HTTPS record.
+    fn https_reply(params: &[&[(u16, &[u8])]]) -> Vec<u8> {
+        let q = query_for_test(0x4242, "www.x.test", TYPE_HTTPS);
+        let mut m = q.clone();
+        m[2] = 0x81;
+        m[3] = 0x80;
+        m[6..8].copy_from_slice(&(1 + params.len() as u16).to_be_bytes());
+        m[8..10].copy_from_slice(&1u16.to_be_bytes());
+        m[10..12].copy_from_slice(&1u16.to_be_bytes());
+        // CNAME www.x.test -> "cdn" + pointer to "x.test" (offset 16).
+        let cdn = m.len() + 12;
+        m.extend_from_slice(&[0xc0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 6]);
+        m.extend_from_slice(&[3, b'c', b'd', b'n', 0xc0, 16]);
+        for ps in params {
+            m.extend_from_slice(&[0xc0 | (cdn >> 8) as u8, cdn as u8]);
+            let mut rd = vec![0, 1, 0]; // priority 1, TargetName "."
+            for (k, v) in *ps {
+                rd.extend_from_slice(&k.to_be_bytes());
+                rd.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                rd.extend_from_slice(v);
+            }
+            m.extend_from_slice(&[0, 65, 0, 1, 0, 0, 1, 44]);
+            m.extend_from_slice(&(rd.len() as u16).to_be_bytes());
+            m.extend_from_slice(&rd);
+        }
+        // Authority: SOA-ish record owned by x.test (pointer), opaque data.
+        m.extend_from_slice(&[0xc0, 16, 0, 6, 0, 1, 0, 0, 0, 60, 0, 3, 1, 2, 3]);
+        // Additional: OPT.
+        m.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
+        m
+    }
+
+    /// (type, owner, rdata) of the answers, names expanded.
+    fn answers(m: &[u8]) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
+        let an = u16::from_be_bytes([m[6], m[7]]);
+        let mut p = 12;
+        p = skip_name(m, p).unwrap() + 4;
+        let mut out = Vec::new();
+        for _ in 0..an {
+            let mut name = Vec::new();
+            expand_name(m, p, &mut name).unwrap();
+            p = skip_name(m, p).unwrap();
+            let ty = u16::from_be_bytes([m[p], m[p + 1]]);
+            let len = usize::from(u16::from_be_bytes([m[p + 8], m[p + 9]]));
+            out.push((ty, name, m[p + 10..p + 10 + len].to_vec()));
+            p += 10 + len;
+        }
+        assert_eq!(p, m.len() - 11, "only the OPT record follows");
+        out
+    }
+
+    const ALPN: (u16, &[u8]) = (1, b"\x02h2");
+    const HINT: (u16, &[u8]) = (4, &[1, 2, 3, 4]);
+    const ECH: (u16, &[u8]) = (SVC_KEY_ECH, &[0, 4, 0xfe, 0x0d, 0, 0]);
+
+    /// r9 F4 (a): the `ech` SvcParam leaves every HTTPS record (and the
+    /// `mandatory` list), other params stay in order; names come out
+    /// whole; CNAME target intact; authority dropped, OPT kept.
+    #[test]
+    fn strip_ech_removes_only_the_ech_param() {
+        let mandatory: (u16, &[u8]) = (0, &[0, 1, 0, 5]);
+        let m = https_reply(&[&[mandatory, ALPN, HINT, ECH], &[ALPN, ECH]]);
+        let out = strip_ech(&m).unwrap();
+        assert_eq!(&out[..2], &m[..2]);
+        assert_eq!(u16::from_be_bytes([out[8], out[9]]), 0, "authority dropped");
+        assert_eq!(u16::from_be_bytes([out[10], out[11]]), 1, "OPT kept");
+        let a = answers(&out);
+        let full = |s: &str| {
+            let mut v = Vec::new();
+            encode_name(&mut v, s).unwrap();
+            v
+        };
+        assert_eq!(a[0], (TYPE_CNAME, full("www.x.test"), full("cdn.x.test")));
+        let rd = |ps: &[(u16, &[u8])]| {
+            let mut rd = vec![0, 1, 0];
+            for (k, v) in ps {
+                rd.extend_from_slice(&k.to_be_bytes());
+                rd.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                rd.extend_from_slice(v);
+            }
+            rd
+        };
+        let only_alpn: (u16, &[u8]) = (0, &[0, 1]);
+        assert_eq!(
+            a[1],
+            (TYPE_HTTPS, full("cdn.x.test"), rd(&[only_alpn, ALPN, HINT]))
+        );
+        assert_eq!(a[2], (TYPE_HTTPS, full("cdn.x.test"), rd(&[ALPN])));
+        // Nothing left to strip: unchanged.
+        assert_eq!(strip_ech(&out).unwrap(), out);
+        // `mandatory` naming only ech goes away with it.
+        let m = https_reply(&[&[(0, &[0, 5]), ECH]]);
+        assert_eq!(answers(&strip_ech(&m).unwrap())[1].2, rd(&[]));
+    }
+
+    #[test]
+    fn strip_ech_leaves_other_replies_alone_and_never_panics() {
+        let m = https_reply(&[&[ALPN, HINT]]);
+        assert_eq!(strip_ech(&m).unwrap(), m, "no ech: byte for byte");
+        let q = query_for_test(1, "a.b", TYPE_A);
+        let r = respond(
+            &parse_question(&q).ok().unwrap(),
+            RCODE_OK,
+            &["9.9.9.9".parse().unwrap()],
+            5,
+        );
+        assert_eq!(strip_ech(&r).unwrap(), r);
+        // Keys out of order: malformed, not passed on.
+        let bad = https_reply(&[&[HINT, ALPN, ECH]]);
+        assert_eq!(strip_ech(&bad), None);
+        let m = https_reply(&[&[ALPN, ECH]]);
+        for n in 0..m.len() {
+            let _ = strip_ech(&m[..n]);
+        }
+        let mut x: u32 = 99;
+        for _ in 0..20000 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let mut b = m.clone();
+            let i = (x as usize >> 8) % b.len();
+            b[i] = (x >> 16) as u8;
+            if let Some(out) = strip_ech(&b) {
+                // Whatever comes out has no ech left in an HTTPS answer.
+                assert_eq!(strip_ech(&out).as_ref(), Some(&out));
+            }
+        }
+    }
+
+    /// r9 F4 (a) end to end: an HTTPS query for an unmatched name goes to
+    /// the domestic resolver; its ECH config does not reach the client.
+    #[tokio::test]
+    async fn passthrough_https_answer_has_no_ech() {
+        let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = up.local_addr().unwrap();
+        let canned = https_reply(&[&[ALPN, ECH]]);
+        tokio::spawn(async move {
+            let mut b = [0u8; 1500];
+            while let Ok((n, from)) = up.recv_from(&mut b).await {
+                let mut r = canned.clone();
+                r[..2].copy_from_slice(&b[..2]);
+                let _ = up.send_to(&r, from).await;
+                let _ = n;
+            }
+        });
+        let policy = PolicyStore::inline(Policy::inline(
+            crate::rules::RuleSet::new(vec![], Action::Proxy("p".into())),
+            crate::rules::CidrTable::default(),
+        ));
+        let pool = Arc::new(
+            FakeIpPool::new(
+                "198.18.0.0".parse().unwrap(),
+                15,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                [1; 32],
+            )
+            .unwrap(),
+        );
+        let settings = DnsSettings {
+            domestic: vec![addr],
+            query_timeout: Duration::from_millis(500),
+            cache_size: 16,
+        };
+        let dns = Arc::new(SmartDns::new(policy, pool, settings));
+        let reply = dns
+            .handle(&query_for_test(0x4242, "www.x.test", TYPE_HTTPS))
+            .await
+            .unwrap();
+        let a = answers(&reply);
+        assert_eq!(a.len(), 2);
+        assert_eq!(
+            a[1].2,
+            [&[0u8, 1, 0][..], &[0, 1, 0, 3], b"\x02h2"].concat()
+        );
     }
 }

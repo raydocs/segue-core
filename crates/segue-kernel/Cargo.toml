@@ -19,7 +19,6 @@ base64.workspace = true
 bytes.workspace = true
 libc.workspace = true
 rand.workspace = true
-ring = "0.17.14"
 segue-config = { path = "../segue-config" }
 segue-policy = { path = "../segue-policy" }
 segue-engine = { path = "../segue-engine" }
@@ -38,4 +37,6 @@ tokio = { workspace = true, features = ["test-util"] }
 quinn.workspace = true
 quinn-proto.workspace = true
 rcgen.workspace = true
+# Policy tests verify signatures directly.
+ring = "0.17.14"
 rustls.workspace = true

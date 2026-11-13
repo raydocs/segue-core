@@ -158,7 +158,7 @@ async fn handle(mut conn: TcpStream, kernel: &Kernel) -> Result<(), Fail> {
             .await;
         }
         if let Some(settings) = kernel.sniff {
-            return sniffed(conn, kernel, &policy.rules, ip, port, settings).await;
+            return sniffed(conn, kernel, &policy, ip, port, settings).await;
         }
     }
     let action = policy.rules.decide(&addr).clone();
@@ -232,38 +232,23 @@ async fn dial(kernel: &Kernel, tag: Option<&str>, addr: &TargetAddr, port: u16) 
 async fn sniffed(
     mut conn: TcpStream,
     kernel: &Kernel,
-    rules: &RuleSet,
+    policy: &Policy,
     ip: IpAddr,
     port: u16,
     s: SniffSettings,
 ) -> Result<(), Fail> {
-    let by_ip = rules.lookup(&TargetAddr::Ip(ip));
-    if let Some((_, Action::Reject)) = by_ip {
+    if let Some((_, Action::Reject)) = policy.rules.lookup(&TargetAddr::Ip(ip)) {
         // Nothing a sniffed name could do changes this; refuse before the
         // early success so the client gets a proper SOCKS error.
         reply(&mut conn, REP_NOT_ALLOWED).await?;
         return Ok(());
     }
     reply(&mut conn, REP_OK).await?;
-    let (first, domain) = peek_host(&mut conn, s).await?;
-    let by_domain = domain
-        .as_ref()
-        .and_then(|d| rules.lookup(&TargetAddr::Domain(d.clone())));
-    let action = stricter(by_ip, by_domain)
-        .unwrap_or_else(|| rules.default_action())
-        .clone();
-    let (tag, target) = match &action {
-        Action::Reject => return reset(conn),
-        // Direct goes to the address the client asked for, never to a
-        // locally resolved sniffed name (that lookup would leak the name).
-        Action::Direct => (None, TargetAddr::Ip(ip)),
-        // The relay connects by name when there is one, which sidesteps a
-        // polluted or stale IP.
-        Action::Proxy(tag) => (
-            Some(tag.as_str()),
-            domain.map(TargetAddr::Domain).unwrap_or(TargetAddr::Ip(ip)),
-        ),
+    let (first, found) = peek_host(&mut conn, s).await?;
+    let Some((tag, target)) = sniffed_route(policy, ip, &found) else {
+        return reset(conn);
     };
+    let tag = tag.as_deref();
     let Some(mut upstream) = dial(kernel, tag, &target, port).await else {
         return reset(conn);
     };
@@ -294,33 +279,77 @@ pub(crate) fn stricter<'a>(
     }
 }
 
-/// Read the client's first bytes until a host name is found, the data is
-/// clearly not TLS/HTTP, `max_bytes` is reached or the deadline passes.
-/// The bytes are returned for replay; nothing is lost.
-async fn peek_host(
-    conn: &mut TcpStream,
-    s: SniffSettings,
-) -> std::io::Result<(Vec<u8>, Option<String>)> {
+/// Route of a bare-IP TCP flow to `ip` once sniffing is over (§5.2a.1),
+/// SOCKS and TUN alike: (outbound tag, None = direct; target), or None to
+/// refuse. `found` is final: [`Sniff::NeedMore`] (timeout, `max_bytes`)
+/// counts as no name.
+///
+/// - A name: the stricter of its rule and the IP's ([`stricter`]); the
+///   relay connects by that name unless the route is direct.
+/// - No name (not TLS/HTTP, no SNI, server speaks first, sniff timeout):
+///   the IP rules alone (an accepted boundary: such a flow to an AI
+///   service's IP outside the AI CIDRs is routed as that IP says).
+/// - A hidden name (ECH, r9 F4): [`Policy::hidden_name`] (the AI route of
+///   a signed bundle) to the IP, unless the IP is rejected. The outer SNI
+///   is never looked up: it names the client-facing server, which may
+///   front AI and non-AI names alike.
+pub(crate) fn sniffed_route(
+    policy: &Policy,
+    ip: IpAddr,
+    found: &Sniff,
+) -> Option<(Option<String>, TargetAddr)> {
+    let rules = &policy.rules;
+    let by_ip = rules.lookup(&TargetAddr::Ip(ip));
+    let (action, name) = match found {
+        Sniff::Domain(d) => {
+            let by_domain = rules.lookup(&TargetAddr::Domain(d.clone()));
+            let a = stricter(by_ip, by_domain).unwrap_or_else(|| rules.default_action());
+            (a, Some(d))
+        }
+        Sniff::Hidden => match by_ip {
+            Some((_, Action::Reject)) => (&Action::Reject, None),
+            _ => (&policy.hidden_name, None),
+        },
+        Sniff::None | Sniff::NeedMore => (by_ip.map_or(rules.default_action(), |(_, a)| a), None),
+    };
+    match action {
+        Action::Reject => None,
+        // Direct goes to the address the client asked for, never to a
+        // locally resolved sniffed name (that lookup would leak the name).
+        Action::Direct => Some((None, TargetAddr::Ip(ip))),
+        // The relay connects by name when there is one, which sidesteps a
+        // polluted or stale IP.
+        Action::Proxy(tag) => Some((
+            Some(tag.clone()),
+            name.map_or(TargetAddr::Ip(ip), |d| TargetAddr::Domain(d.clone())),
+        )),
+    }
+}
+
+/// Read the client's first bytes until a host name is found (or found
+/// hidden), the data is clearly not TLS/HTTP, `max_bytes` is reached or
+/// the deadline passes. The bytes are returned for replay; nothing is
+/// lost. The result is final: never [`Sniff::NeedMore`].
+async fn peek_host(conn: &mut TcpStream, s: SniffSettings) -> std::io::Result<(Vec<u8>, Sniff)> {
     let deadline = tokio::time::Instant::now() + s.timeout;
     let mut buf = Vec::with_capacity(2048);
     let mut chunk = vec![0u8; 4096];
     loop {
         let want = (s.max_bytes - buf.len()).min(chunk.len());
         if want == 0 {
-            return Ok((buf, None));
+            return Ok((buf, Sniff::None));
         }
         let n = match tokio::time::timeout_at(deadline, conn.read(&mut chunk[..want])).await {
             Ok(r) => r?,
-            Err(_) => return Ok((buf, None)), // server-speaks-first or slow client
+            Err(_) => return Ok((buf, Sniff::None)), // server-speaks-first or slow client
         };
         if n == 0 {
-            return Ok((buf, None));
+            return Ok((buf, Sniff::None));
         }
         buf.extend_from_slice(&chunk[..n]);
         match sniff(&buf) {
-            Sniff::Domain(d) => return Ok((buf, Some(d))),
-            Sniff::None => return Ok((buf, None)),
             Sniff::NeedMore => {}
+            found => return Ok((buf, found)),
         }
     }
 }

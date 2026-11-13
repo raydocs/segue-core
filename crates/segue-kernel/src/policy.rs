@@ -72,6 +72,12 @@ pub struct Policy {
     /// always the bundle's `default`, so a name reaches the same decision by
     /// DNS + fake-IP as by a direct domain CONNECT.
     pub foreign: Action,
+    /// Route for a TLS flow to a real IP whose server name is hidden
+    /// (ClientHello offers ECH, KERNEL_SPEC §5.2a.1): the AI route from a
+    /// signed bundle, so a hidden name is handled as if it were AI and the
+    /// relay's Home whitelist decides (§5.5 item 3). Never the outer SNI's
+    /// route. Reject for the fail-closed policy and, unless set, inline.
+    pub hidden_name: Action,
     /// 0 for an inline (dev) policy and for the fail-closed policy.
     pub version: u64,
     /// None: does not expire (inline dev rules).
@@ -87,6 +93,7 @@ impl Policy {
             rules: RuleSet::new(Vec::new(), Action::Reject),
             chnroute: CidrTable::default(),
             foreign: Action::Reject,
+            hidden_name: Action::Reject,
             version: 0,
             expires_at: None,
             refuse_all: true,
@@ -97,6 +104,7 @@ impl Policy {
     pub fn inline(rules: RuleSet, chnroute: CidrTable) -> Self {
         Self {
             foreign: rules.default_action().clone(),
+            hidden_name: Action::Reject,
             rules,
             chnroute,
             version: 0,
@@ -108,6 +116,13 @@ impl Policy {
     /// Lab only: a `dns.foreign` route different from the default.
     pub fn with_foreign(mut self, foreign: Action) -> Self {
         self.foreign = foreign;
+        self
+    }
+
+    /// Lab / tests: the route for a hidden (ECH) name; see
+    /// [`Policy::hidden_name`].
+    pub fn with_hidden_name(mut self, route: Action) -> Self {
+        self.hidden_name = route;
         self
     }
 
@@ -276,6 +291,7 @@ impl Verifier {
         }
         Ok(Policy {
             foreign: b.default.clone(),
+            hidden_name: Action::Proxy(self.ai_route.clone()),
             rules: set,
             chnroute: CidrTable::new(&cidrs),
             version: b.version,
@@ -588,6 +604,18 @@ mod tests {
 
     fn dom(d: &str) -> TargetAddr {
         TargetAddr::Domain(d.into())
+    }
+
+    /// r9 F4: a hidden (ECH) name goes the signed bundle's AI route;
+    /// fail-closed and inline policies refuse it.
+    #[test]
+    fn hidden_name_takes_the_ai_route() {
+        let k = keys();
+        let (_, p) = verifier(&k).open(&signed(&k, 1, NOW + 100)).unwrap();
+        assert_eq!(p.hidden_name, Action::Proxy("ai".into()));
+        assert_eq!(Policy::fail_closed().hidden_name, Action::Reject);
+        let inline = Policy::inline(RuleSet::new(vec![], Action::Direct), CidrTable::default());
+        assert_eq!(inline.hidden_name, Action::Reject);
     }
 
     /// Review r5 N3: the kernel and the relay read the same signed bytes

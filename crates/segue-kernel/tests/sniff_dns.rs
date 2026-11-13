@@ -19,7 +19,7 @@ use segue_kernel::policy::{
     generate_key, parse_public_key, sign, unix_now, Policy, PolicyStore, Verifier,
 };
 use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
-use segue_kernel::sniff::client_hello_for_test;
+use segue_kernel::sniff::{client_hello_ech_for_test, client_hello_for_test};
 use segue_kernel::socks::{serve, Kernel, SniffSettings, REP_NOT_ALLOWED, REP_OK};
 use segue_routing::TargetAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -290,6 +290,74 @@ async fn silent_client_falls_back_to_ip_rules_after_timeout() {
         roundtrip(&mut c, b"SSH-2.0-x\r\n", 3).await,
         b"SSH-2.0-x\r\n"
     );
+}
+
+/// r9 F4: a ClientHello offering ECH has only an outer name; the flow is
+/// routed as a hidden name (the AI route, here "ai"), dialled by IP, and
+/// the outer SNI is never used, whether it names a direct, proxied or AI
+/// site, and whether ECH comes before or after the SNI. The hello is
+/// replayed unchanged. An IP reject still wins.
+#[tokio::test]
+async fn ech_client_hello_goes_the_ai_route_never_by_outer_sni() {
+    let policy = PolicyStore::inline(
+        Policy::inline(rules(), CidrTable::default()).with_hidden_name(proxy("ai")),
+    );
+    for (outer, ip) in [
+        ("www.baidu.com", "9.9.9.9"),
+        ("cdn.example", "10.1.1.1"),
+        ("x.ads.test", "5.5.1.1"),
+    ] {
+        for ech_first in [true, false] {
+            let fake = Arc::new(Fake::default());
+            let k = start_kernel_with(fake.clone(), None, policy.clone()).await;
+            let (rep, mut c) = connect_ip(k, ip.parse().unwrap(), 443).await;
+            assert_eq!(rep, REP_OK);
+            let hello = client_hello_ech_for_test(outer, ech_first);
+            assert_eq!(roundtrip(&mut c, &hello, 7).await, hello, "{outer}");
+            assert_eq!(
+                fake.calls(),
+                vec![(Some("ai".into()), format!("{ip}:443"))],
+                "{outer} ech_first={ech_first}"
+            );
+        }
+    }
+    // Without a hidden-name route (inline default) the flow is refused.
+    let fake = Arc::new(Fake::default());
+    let k = start_kernel(fake.clone(), None).await;
+    let (_, mut c) = connect_ip(k, "9.9.9.9".parse().unwrap(), 443).await;
+    c.write_all(&client_hello_ech_for_test("www.baidu.com", false))
+        .await
+        .unwrap();
+    expect_reset(c).await;
+    assert!(fake.calls().is_empty());
+    // An IP reject is refused before sniffing, ECH or not.
+    let fake = Arc::new(Fake::default());
+    let k = start_kernel_with(fake.clone(), None, policy).await;
+    let (rep, _c) = connect_ip(k, "10.66.1.1".parse().unwrap(), 443).await;
+    assert_eq!(rep, REP_NOT_ALLOWED);
+}
+
+/// r9 F4 (c), accepted boundary: TLS without SNI keeps the IP rules (here
+/// a direct IP stays direct, an unmatched IP takes the default route).
+#[tokio::test]
+async fn tls_without_sni_uses_ip_rules() {
+    for (ip, want) in [
+        ("10.1.1.1", (None, "10.1.1.1:443")),
+        ("9.9.9.9", (Some("proxy"), "9.9.9.9:443")),
+        ("1.2.3.4", (Some("ai"), "1.2.3.4:443")),
+    ] {
+        let fake = Arc::new(Fake::default());
+        let k = start_kernel(fake.clone(), None).await;
+        let (rep, mut c) = connect_ip(k, ip.parse().unwrap(), 443).await;
+        assert_eq!(rep, REP_OK);
+        let hello = client_hello_for_test(None, 32);
+        assert_eq!(roundtrip(&mut c, &hello, 3).await, hello);
+        assert_eq!(
+            fake.calls(),
+            vec![(want.0.map(String::from), want.1.into())],
+            "{ip}"
+        );
+    }
 }
 
 #[tokio::test]

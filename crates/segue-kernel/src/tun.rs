@@ -1979,9 +1979,10 @@ pub enum UdpRoute {
 /// Decides new TUN flows. Called synchronously on the packet path.
 pub trait TunRouter: Send + Sync {
     fn route_tcp(&self, key: &FlowKey) -> TcpRoute;
-    /// After [`TcpRoute::Sniff`]: the name found (if any). `None` refuses
-    /// (the flow is reset after its handshake).
-    fn sniffed(&self, _key: &FlowKey, _domain: Option<&str>) -> Option<Dial> {
+    /// After [`TcpRoute::Sniff`]: what sniffing found (final:
+    /// [`Sniff::NeedMore`] means the deadline or `max_bytes` came first).
+    /// `None` refuses (the flow is reset after its handshake).
+    fn sniffed(&self, _key: &FlowKey, _found: &Sniff) -> Option<Dial> {
         None
     }
     /// Default: refuse.
@@ -2060,27 +2061,14 @@ impl TunRouter for TunKernel {
         ip_route(rules, key).map_or(TcpRoute::Refuse, TcpRoute::Dial)
     }
 
-    fn sniffed(&self, key: &FlowKey, domain: Option<&str>) -> Option<Dial> {
+    fn sniffed(&self, key: &FlowKey, found: &Sniff) -> Option<Dial> {
         // The policy current now: a bundle installed during the sniff applies.
         let policy = self.kernel.policy.current();
         if policy.refuse_all {
             return None;
         }
-        let rules = &policy.rules;
-        let ip = key.dst.ip();
-        let by_ip = rules.lookup(&TargetAddr::Ip(ip));
-        let by_domain = domain.and_then(|d| rules.lookup(&TargetAddr::Domain(d.to_owned())));
-        let action =
-            crate::socks::stricter(by_ip, by_domain).unwrap_or_else(|| rules.default_action());
-        let target = match action {
-            // Direct goes to the address the app asked for, never to a
-            // locally resolved sniffed name (that lookup would leak it).
-            Action::Direct => TargetAddr::Ip(ip),
-            _ => domain
-                .map(|d| TargetAddr::Domain(d.to_owned()))
-                .unwrap_or(TargetAddr::Ip(ip)),
-        };
-        Dial::from_action(action, target)
+        crate::socks::sniffed_route(&policy, key.dst.ip(), found)
+            .map(|(tag, target)| Dial { tag, target })
     }
 
     fn route_udp(&self, key: &FlowKey) -> UdpRoute {
@@ -2731,7 +2719,7 @@ async fn relay(
         TcpPlan::Dns => return dns_tcp(&ctx, &link, down, up).await,
         TcpPlan::Dial(d) => d,
         TcpPlan::Sniff(s) => {
-            let mut domain = None;
+            let mut found = Sniff::NeedMore;
             let deadline = tokio::time::sleep(s.timeout);
             tokio::pin!(deadline);
             let mut min = 1;
@@ -2743,11 +2731,8 @@ async fn relay(
                     _ = &mut deadline => break,
                 };
                 let Some(c) = c else { break };
-                match sniff(&c.data) {
-                    Sniff::Domain(d) => {
-                        domain = Some(d);
-                        break;
-                    }
+                found = sniff(&c.data);
+                match found {
                     // Shorter than asked: the application finished (or
                     // the pool is short); sniff no further.
                     Sniff::NeedMore if c.data.len() < s.max_bytes && c.data.len() >= min => {
@@ -2757,7 +2742,7 @@ async fn relay(
                 }
             }
             withdraw(&link, &mut down);
-            match ctx.router.sniffed(&key, domain.as_deref()) {
+            match ctx.router.sniffed(&key, &found) {
                 Some(d) => d,
                 None => {
                     send_up(&ctx, &up, Up::Abort).await;
