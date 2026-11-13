@@ -16,7 +16,7 @@
 //! - [`socks5`]: SOCKS5 client (RFC 1928 / RFC 1929) for Decodo lines.
 //! - [`home`]: Home line pool, assignment (D2) and alert-only failover.
 //! - [`dial`]: the site connector: classification, exit checks, dialing.
-//! - [`metrics`], [`log`]: counters and secret-free structured logs.
+//! - [`metrics`], [`mod@log`]: counters and secret-free structured logs.
 //! - [`server`]: wiring, loopback listener, graceful shutdown.
 //!
 //! Not here (control plane deferred): ticket-key / revocation / line

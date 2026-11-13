@@ -875,7 +875,7 @@ impl RelayTable {
         (stall / 2).max(std::time::Duration::from_millis(10))
     }
 
-    /// The keepalive period of session `sid` (see [`Self::keepalive_for`]).
+    /// The keepalive period of session `sid` (see `keepalive_for`).
     pub fn keepalive(&self, sid: &SessionId) -> Option<std::time::Duration> {
         self.sessions.get(sid).map(|s| s.keepalive)
     }
