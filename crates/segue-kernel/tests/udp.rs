@@ -645,3 +645,45 @@ async fn short_header_first_to_bare_ip_is_dropped_plain_udp_passes() {
     assert_eq!(env.fake.calls().len(), plain_firsts().len());
     assert_eq!(env.udp.as_ref().unwrap().dropped(), n);
 }
+
+/// r10 N1, accepted residual (KERNEL_SPEC §5.2a.2), SOCKS side: a bare-IP
+/// flow whose first datagram is a short header with the fixed bit greased
+/// away, or an ordinary datagram, is plain UDP by the IP rules; its later
+/// short headers (fixed bit set or not) are relayed. v4 and v6. Pinned so
+/// that a change is deliberate.
+#[tokio::test]
+async fn residual_greased_or_plain_first_datagram_lets_short_headers_through() {
+    let s = UdpSettings {
+        max_flows: 8,
+        ..settings()
+    };
+    let env = start_max(Some(s), None, 1500).await;
+    let (_, _ctl, relay) = associate(env.socks).await;
+    let c = client(relay).await;
+    let mut port = 8443;
+    for dst in [ip("8.8.8.8"), ip("2001:4860:4860::8888")] {
+        for first in [
+            short_header(0x00, 40),
+            short_header(0x3f, 1200),
+            b"\x12\x34hi".to_vec(),
+        ] {
+            for d in [
+                first,
+                short_header(0x40, 60),
+                short_header(0x1c, 60),
+                short_header(0x7f, 1200),
+            ] {
+                c.send(&packet(&dst, port, &d)).await.unwrap();
+                assert_eq!(
+                    recv(&c, WAIT).await.as_deref(),
+                    Some(&packet(&dst, port, &d)[..]),
+                    "{dst:?}:{port} {:#04x}",
+                    d[0]
+                );
+            }
+            port += 1;
+        }
+    }
+    assert_eq!(env.fake.calls().len(), 6);
+    assert_eq!(env.udp.as_ref().unwrap().dropped(), 0);
+}

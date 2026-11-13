@@ -34,8 +34,9 @@ use tokio::sync::mpsc;
 
 /// How often the server replaces its connection IDs.
 const ROTATE: Duration = Duration::from_millis(200);
-/// The app's address on the TUN.
-const APP: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 40000);
+/// The app's address on the TUN; its port is the client socket's own, so
+/// a client that rebinds starts a new 5-tuple.
+const APP: IpAddr = IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2));
 
 fn configs() -> (quinn::ServerConfig, quinn::ClientConfig) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -215,6 +216,8 @@ struct Seen {
     /// (type, code, time) of every ICMP error.
     icmp: Vec<(u8, u8, Instant)>,
     replies: usize,
+    /// Every client source port seen (one per 5-tuple).
+    app_ports: std::collections::BTreeSet<u16>,
 }
 
 struct World {
@@ -229,7 +232,12 @@ struct World {
 }
 
 async fn world() -> World {
-    let (scfg, client) = configs();
+    world_with(|_| {}).await
+}
+
+async fn world_with(server_cfg: impl FnOnce(&mut quinn::ServerConfig)) -> World {
+    let (mut scfg, client) = configs();
+    server_cfg(&mut scfg);
     let dialer = Arc::new(ToServer {
         server: server(scfg),
         udp_dials: Mutex::new(Vec::new()),
@@ -282,7 +290,8 @@ async fn world() -> World {
                     .unwrap()
                     .first_sent
                     .get_or_insert_with(Instant::now);
-                let pkt = udp_packet(APP, to, &buf[..n]);
+                seen.lock().unwrap().app_ports.insert(from.port());
+                let pkt = udp_packet(SocketAddr::new(APP, from.port()), to, &buf[..n]);
                 if to_stack.send(Bytes::from(pkt)).await.is_err() {
                     return;
                 }
@@ -303,7 +312,11 @@ async fn world() -> World {
                             continue;
                         };
                         seen.lock().unwrap().replies += 1;
-                        let to = *peer.lock().unwrap();
+                        // Back to the client socket the flow came from.
+                        let to = peer
+                            .lock()
+                            .unwrap()
+                            .map(|p| SocketAddr::new(p.ip(), u.dst_port()));
                         if let Some(to) = to {
                             let _ = sock.send_to(u.payload(), to).await;
                         }
@@ -450,4 +463,68 @@ async fn coalesced_first_batch_with_hidden_packet_is_refused() {
         );
         assert!(w.dialer.udp_dials.lock().unwrap().is_empty(), "{name}");
     }
+}
+
+/// r10 N1: a QUIC connection opened after the kernel started goes through
+/// a fake-IP flow and stays on fake-IP flows: the client only ever learns
+/// the fake address. When it migrates (rebinds to a new local port, a new
+/// 5-tuple) the new flow is again a fake-IP flow, routed and dialled by
+/// name, and the connection carries on. A server preferred address (a
+/// real IP inside the encrypted transport parameters, RFC 9000 §9.6) is
+/// not followed by quinn: nothing is ever sent there. No flow is dialled
+/// by IP and no ICMP is sent.
+#[tokio::test]
+async fn quic_via_fake_ip_never_lands_on_a_real_ip_flow_after_migration() {
+    let watch = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    watch.set_nonblocking(true).unwrap();
+    let preferred = match watch.local_addr().unwrap() {
+        SocketAddr::V4(a) => a,
+        SocketAddr::V6(_) => unreachable!(),
+    };
+    let w = world_with(|c| {
+        c.preferred_address_v4(Some(preferred));
+    })
+    .await;
+    let ip = w.pool.assign("localhost", 0).unwrap();
+    *w.dst.lock().unwrap() = Some(SocketAddr::new(IpAddr::V4(ip), 443));
+    let ep = w.client();
+    let conn = tokio::time::timeout(
+        Duration::from_secs(5),
+        ep.connect(w.bridge, "localhost").unwrap(),
+    )
+    .await
+    .expect("handshake timed out")
+    .expect("handshake");
+    for round in 0..3u8 {
+        for i in 0..4u8 {
+            let msg = [round * 16 + i; 64];
+            let got = tokio::time::timeout(Duration::from_secs(3), echo(&conn, &msg))
+                .await
+                .unwrap_or_else(|_| panic!("round {round} request {i} timed out"))
+                .unwrap_or_else(|e| panic!("round {round} request {i}: {e}"));
+            assert_eq!(got, msg);
+        }
+        // Migrate: a new local socket, so a new 5-tuple on the TUN.
+        ep.rebind(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+            .unwrap();
+    }
+    let mut b = [0u8; 2048];
+    assert!(
+        watch.recv_from(&mut b).is_err(),
+        "nothing sent to the preferred address"
+    );
+    let dials = w.dialer.udp_dials.lock().unwrap().clone();
+    assert!(dials.len() >= 3, "one flow per 5-tuple: {dials:?}");
+    assert!(
+        dials.iter().all(|d| *d
+            == (
+                Some("p1".to_string()),
+                TargetAddr::Domain("localhost".into()),
+                443
+            )),
+        "every flow dialled by name: {dials:?}"
+    );
+    let s = w.seen.lock().unwrap();
+    assert!(s.app_ports.len() >= 3, "{:?}", s.app_ports);
+    assert!(s.icmp.is_empty());
 }

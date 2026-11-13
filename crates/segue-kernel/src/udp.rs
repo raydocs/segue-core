@@ -34,6 +34,9 @@
 //! no per-datagram error: the client sees nothing and waits for its own
 //! QUIC handshake (or idle) timeout before it gives up or tries TCP. Other
 //! UDP to a bare IP goes by the IP rules.
+//! This does not stop a QUIC connection that reaches a new bare-IP flow
+//! behind a greased or ordinary first datagram (see [`crate::quic`],
+//! astra r10 N1).
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

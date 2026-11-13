@@ -2236,6 +2236,66 @@ async fn tun_plain_udp_protocols_to_real_ip_pass() {
     assert_eq!(e.dialer.udp_dials.lock().unwrap().len(), cases.len());
 }
 
+/// r10 N1, accepted residual (KERNEL_SPEC §5.2a.2): migration protection
+/// on real-IP UDP is not complete. A QUIC connection established before
+/// the kernel started, or moved onto a new real-IP 5-tuple, gets through
+/// when that flow's first datagram is not QUIC-shaped: a short header with
+/// the fixed bit greased away (RFC 9287; first byte 0x00..=0x3F), or any
+/// ordinary leading datagram. The flow is then plain UDP routed by the IP
+/// rules, and later short headers, fixed bit set or not, are carried:
+/// only long headers are refused mid-flow. v4 and v6. This test pins the
+/// behaviour so that a change to it is deliberate.
+#[tokio::test]
+async fn tun_residual_greased_or_plain_first_datagram_lets_short_headers_through() {
+    let e = kernel_env_with(
+        inline(),
+        false,
+        true,
+        false,
+        FakeDialer {
+            udp_max: 1500,
+            ..Default::default()
+        },
+    );
+    let mut expect = Vec::new();
+    let mut port = 8443;
+    for dst_ip in ["8.8.8.8", "2001:4860:4860::8888"] {
+        let src = if dst_ip.contains(':') {
+            client6()
+        } else {
+            CLIENT4
+        };
+        for first in [
+            short_header(0x00, 40),
+            short_header(0x3f, 1200),
+            b"\x12\x34hello".to_vec(),
+        ] {
+            let dst = SocketAddr::new(dst_ip.parse().unwrap(), port);
+            port += 1;
+            let later = [
+                short_header(0x40, 60),
+                short_header(0x1c, 60),
+                short_header(0x7f, 1200),
+            ];
+            e.h.send(udp(src, dst, &first)).await;
+            expect.push(first);
+            for d in later {
+                e.h.send(udp(src, dst, &d)).await;
+                expect.push(d);
+            }
+        }
+    }
+    let mut sent = udp_sent(&e, expect.len()).await;
+    sent.sort();
+    expect.sort();
+    assert_eq!(sent, expect, "every datagram carried");
+    let dials = e.dialer.udp_dials.lock().unwrap().clone();
+    assert_eq!(dials.len(), 6);
+    assert!(dials
+        .iter()
+        .all(|(tag, a, _)| tag.as_deref() == Some("p1") && matches!(a, TargetAddr::Ip(_))));
+}
+
 /// The demultiplexing an OS stack does with an ICMP error for UDP (BSD
 /// `udp_ctlinput` / `udp6_ctlinput`, Linux `__udp4_lib_err` /
 /// `__udp6_lib_err`): the outer ICMP must verify and be addressed to the

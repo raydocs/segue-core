@@ -165,7 +165,7 @@ impl SmartDns {
     ///
     /// Over UDP the reply is cut to the client's EDNS size (512 without
     /// OPT) and the path's `cap`: header, question and OPT with TC
-    /// ([`truncate_udp`]); over TCP it is whole (r10 N8).
+    /// (`truncate_udp`); over TCP it is whole (r10 N8).
     pub async fn handle(self: &Arc<Self>, query: &[u8], via: Transport) -> Option<Vec<u8>> {
         let reply = self.answer(query).await?;
         Some(match via {
@@ -739,7 +739,7 @@ fn lower_name(msg: &[u8], p: usize) -> Option<Vec<u8>> {
 /// - RRSIG records covering an HTTPS / SVCB RRset that was rewritten are
 ///   dropped: they no longer verify. Other signatures stay;
 /// - data of the other known types verbatim (their names are never
-///   compressed: [`NO_COMPRESSED_NAMES`]).
+///   compressed: `NO_COMPRESSED_NAMES`).
 ///
 /// A record of any other (unknown) type makes it None: its data might hold
 /// a compressed name we cannot find, and removing just the HTTPS / SVCB

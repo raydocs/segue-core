@@ -19,6 +19,17 @@
 //! Two stateless tests, applied to datagrams of a real-IP flow:
 //! [`looks_quic_first`] to its first datagram, [`looks_quic`] to every
 //! later one.
+//!
+//! This is a heuristic, not complete migration protection (astra r10 N1,
+//! KERNEL_SPEC §5.2a.2). Every QUIC connection opened after the kernel
+//! started goes through a fake-IP flow and is pinned there, and new
+//! real-IP long-header QUIC is refused. But a connection set up before the
+//! kernel started, or moved onto a new real-IP 5-tuple, continues on that
+//! flow as plain UDP by the IP rules when the flow's first datagram is not
+//! QUIC-shaped: a short header with the fixed bit greased away (RFC 9287,
+//! first byte `0x00..=0x3F`), or any ordinary leading datagram. Later short
+//! headers on such a flow are carried. Refusing all unknown real-IP UDP
+//! instead would break WebRTC, games and VPNs.
 
 const V1: u32 = 0x0000_0001;
 const V2: u32 = 0x6b33_43cf;
