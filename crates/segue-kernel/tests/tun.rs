@@ -2096,7 +2096,11 @@ async fn tun_unknown_cid_flows_until_another_route_claims_the_server() {
         .expect("the refused flow gets ICMP");
     assert_eq!((t, code), (3, 13));
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(e.dialer.udp_sent.lock().unwrap().len(), 5, "moved never sent");
+    assert_eq!(
+        e.dialer.udp_sent.lock().unwrap().len(),
+        5,
+        "moved never sent"
+    );
 }
 
 // ---------------------------------------------------------------------------

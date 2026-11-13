@@ -80,16 +80,12 @@ impl InitialSniffer {
     pub fn push(&mut self, dgram: &[u8]) -> Quic {
         self.seen += 1;
         let first = self.seen == 1;
-        let quic_shaped = dgram.first().is_some_and(|b| b & 0xc0 == 0xc0) && dgram.len() >= 7;
-        if !quic_shaped {
+        if !long_quic(dgram) {
             return if first { Quic::NotQuic } else { self.verdict() };
         }
         let mut rest = dgram;
         // Coalesced packets (RFC 9000 §12.2): walk every long-header packet.
-        while let Some(&b) = rest.first() {
-            if b & 0xc0 != 0xc0 {
-                break;
-            }
+        while long_quic(rest) {
             match packet(rest) {
                 Some((used, Pkt::Initial(dcid, crypto))) => {
                     match &self.dcid {
@@ -386,7 +382,7 @@ enum Verdict {
 fn server_scid(p: &[u8]) -> Option<&[u8]> {
     let mut c = Cur { b: p, p: 0 };
     let b0 = c.u8()?;
-    if b0 & 0xc0 != 0xc0 {
+    if b0 & 0x80 == 0 {
         return None;
     }
     let version = u32::from_be_bytes(c.take(4)?.try_into().ok()?);
@@ -519,7 +515,9 @@ impl<T> ConnGuard<T> {
         let Some(c) = &mut self.claim else {
             return;
         };
-        if c.touched.is_some_and(|t| now.saturating_duration_since(t) < TOUCH_EVERY) {
+        if c.touched
+            .is_some_and(|t| now.saturating_duration_since(t) < TOUCH_EVERY)
+        {
             return;
         }
         c.touched = Some(now);
@@ -558,8 +556,7 @@ impl<T> ConnGuard<T> {
             // Short header (or not QUIC at all on an ordinary UDP flow).
             return step(self.short(bytes, now), d);
         }
-        let quic_shaped = b0 & 0x40 != 0 && bytes.len() >= 7;
-        if !quic_shaped && !self.quic {
+        if !long_quic(bytes) && !self.quic {
             // Not QUIC-shaped, as at flow start: ordinary UDP.
             return Step::Forward(vec![d]);
         }
@@ -661,9 +658,9 @@ impl<T> ConnGuard<T> {
     /// coalesce packets of different connections (RFC 9000 §12.2), but
     /// the guard does not rely on it.
     fn coalesced(&mut self, dgram: &[u8], own: Option<&[u8]>, now: Instant) -> Verdict {
-        let Some(rest) = self.long_packets(dgram, |g, dcid| {
-            own == Some(dcid) || g.associated(dcid)
-        }) else {
+        let Some(rest) =
+            self.long_packets(dgram, |g, dcid| own == Some(dcid) || g.associated(dcid))
+        else {
             return Verdict::Drop;
         };
         if padding(rest) {
@@ -700,6 +697,16 @@ impl<T> ConnGuard<T> {
     }
 }
 
+/// A QUIC long-header packet starts `b`: the fixed bit set, or a version
+/// we read with the fixed bit greased away (RFC 9287; quinn, for one,
+/// greases by default and its servers accept such Initials, so a cleared
+/// bit must not make a QUIC packet "ordinary UDP").
+fn long_quic(b: &[u8]) -> bool {
+    b.len() >= 7
+        && b[0] & 0x80 != 0
+        && (b[0] & 0x40 != 0 || matches!(u32::from_be_bytes([b[1], b[2], b[3], b[4]]), V1 | V2))
+}
+
 /// Zero bytes after a datagram's packets (some stacks pad that way; no
 /// QUIC packet starts with a zero byte unless the peer greased the fixed
 /// bit, which the server would then have to have accepted).
@@ -726,7 +733,7 @@ enum Initial {
 fn client_initial(dgram: &[u8]) -> Initial {
     let mut out: Option<(Vec<u8>, Crypto)> = None;
     let mut rest = dgram;
-    while rest.len() >= 7 && rest[0] & 0xc0 == 0xc0 {
+    while long_quic(rest) {
         match packet(rest) {
             Some((used, Pkt::Initial(dcid, crypto))) => {
                 match &mut out {
@@ -1006,6 +1013,13 @@ pub fn hex(s: &str) -> Vec<u8> {
 /// one CRYPTO frame (`off`, `data`) (tests: new connections on a flow).
 #[doc(hidden)]
 pub fn seal_initial_for_test(dcid: &[u8], off: u64, data: &[u8]) -> Vec<u8> {
+    seal_initial_b0_for_test(0xc3, dcid, off, data)
+}
+
+/// [`seal_initial_for_test`] with first byte `b0` (e.g. the fixed bit
+/// greased away, RFC 9287).
+#[doc(hidden)]
+pub fn seal_initial_b0_for_test(b0: u8, dcid: &[u8], off: u64, data: &[u8]) -> Vec<u8> {
     fn varint(out: &mut Vec<u8>, v: u64) {
         match v {
             0..=63 => out.push(v as u8),
@@ -1018,7 +1032,7 @@ pub fn seal_initial_for_test(dcid: &[u8], off: u64, data: &[u8]) -> Vec<u8> {
     varint(&mut plain, off);
     varint(&mut plain, data.len() as u64);
     plain.extend_from_slice(data);
-    let mut hdr = vec![0xc3];
+    let mut hdr = vec![b0];
     hdr.extend_from_slice(&V1.to_be_bytes());
     hdr.push(dcid.len() as u8);
     hdr.extend_from_slice(dcid);
@@ -1441,6 +1455,32 @@ mod tests {
         d.extend_from_slice(&[0x40, 7, 7, 7, 7, 0]);
         assert_eq!(g.push(7, &d, ok), Step::Drop(vec![7]));
         assert_eq!(g.push(8, &fresh, ok), Step::Forward(vec![8]));
+    }
+
+    /// R7 #2: a QUIC Initial with the fixed bit greased away (RFC 9287;
+    /// quinn servers accept them) is QUIC, not ordinary UDP: classified at
+    /// flow start, and on a plain flow it starts QUIC mode.
+    #[test]
+    fn greased_fixed_bit_is_still_quic() {
+        let rec = crate::sniff::client_hello_for_test(Some("chatgpt.com"), 0);
+        let ai = seal_initial_b0_for_test(0x83, &[9; 8], 0, &rec[5..]);
+        assert_eq!(initial_sni(&ai), Quic::Domain("chatgpt.com".into()));
+        let mut g: ConnGuard<u8> = ConnGuard::new(None, false);
+        let allow = |q: &Quic| q == &Quic::Domain("example.com".into());
+        assert_eq!(g.push(1, &ai, allow), Step::Drop(vec![1]));
+        let rec = crate::sniff::client_hello_for_test(Some("example.com"), 0);
+        let ok = seal_initial_b0_for_test(0x83, &[1; 8], 0, &rec[5..]);
+        assert_eq!(g.push(2, &ok, allow), Step::Forward(vec![2]));
+        // A greased reply teaches the server's ID.
+        g.observe_reply(&long_for_test(0xa0, &[], &[7; 4], 40));
+        assert_eq!(
+            g.push(3, &[0x00, 7, 7, 7, 7, 1], allow),
+            Step::Forward(vec![3])
+        );
+        assert_eq!(
+            g.push(4, &[0x00, 8, 8, 8, 8, 1], allow),
+            Step::Drop(vec![4])
+        );
     }
 
     /// The route table stays bounded and, when full of live claims,

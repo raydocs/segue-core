@@ -141,6 +141,7 @@ fn rules() -> RuleSet {
             rule(Matcher::DomainSuffix("broken.test".into()), proxy("broken")),
             rule(Matcher::DomainSuffix("ads.test".into()), Action::Reject),
             rule(Matcher::DomainSuffix("slow.test".into()), proxy("slow")),
+            rule(Matcher::DomainSuffix("p2.test".into()), proxy("p2")),
             rule(
                 Matcher::Cidr(Cidr::parse("10.0.0.0/8").unwrap()),
                 Action::Direct,
@@ -588,4 +589,51 @@ async fn second_quic_connection_on_same_flow_is_classified() {
         assert_eq!(env.fake.calls().len(), 1);
         assert_eq!(env.udp.as_ref().unwrap().dropped(), 5);
     }
+}
+
+/// R7 #2/#3 over SOCKS. The echo server reflects the client Initial, so
+/// the reply path learns a zero-length "server ID": that must not make
+/// every short header the allowed connection's. A short header to an
+/// unknown ID rides the flow only while no other outbound carries QUIC to
+/// the same server (the client switched to a CID issued inside the
+/// encryption); once another association reaches that server through
+/// another outbound, it is dropped (SOCKS cannot signal a refusal).
+#[tokio::test]
+async fn unknown_short_header_needs_an_uncontested_route() {
+    let env = start_max(Some(settings()), None, 1500).await;
+    let dst = ip("8.8.8.8");
+    let (_, _ctl_a, relay_a) = associate(env.socks).await;
+    let a = client(relay_a).await;
+    a.send(&packet(
+        &dst,
+        443,
+        &initial_for_test(&[1; 8], "example.com"),
+    ))
+    .await
+    .unwrap();
+    assert!(recv(&a, WAIT).await.is_some(), "first connection");
+    let rotated = b"\x40\x31\x31\x31\x31\x31\x31\x31\x31 rotated".to_vec();
+    a.send(&packet(&dst, 443, &rotated)).await.unwrap();
+    assert!(recv(&a, WAIT).await.is_some(), "rotated CID keeps flowing");
+    let (_, _ctl_b, relay_b) = associate(env.socks).await;
+    let b = client(relay_b).await;
+    b.send(&packet(
+        &dst,
+        443,
+        &initial_for_test(&[2; 8], "www.p2.test"),
+    ))
+    .await
+    .unwrap();
+    assert!(recv(&b, WAIT).await.is_some(), "other route's connection");
+    assert_eq!(
+        env.fake.calls(),
+        vec![
+            (Some("proxy".into()), "example.com:443".into()),
+            (Some("p2".into()), "www.p2.test:443".into()),
+        ]
+    );
+    let moved = b"\x40\x32\x32\x32\x32\x32\x32\x32\x32 moved".to_vec();
+    a.send(&packet(&dst, 443, &moved)).await.unwrap();
+    assert_eq!(recv(&a, QUIET).await, None, "contested unknown ID dropped");
+    assert_eq!(env.udp.as_ref().unwrap().dropped(), 1);
 }
