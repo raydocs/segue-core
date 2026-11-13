@@ -1239,3 +1239,48 @@ async fn cancelling_serve_stops_its_tasks() {
     );
     client.abort();
 }
+
+/// Review r7 #9: the upload drain bounds come from the relay config
+/// (`limits.site_flush_idle_secs` / `site_flush_max_secs`) into every
+/// session table, with the session defaults when unset; nonsense is
+/// refused.
+#[test]
+fn site_flush_bounds_are_configurable() {
+    let e = env("127.0.0.1:1", false, "");
+    let d = segue_session::Timing::default();
+    let t = e.relay.table();
+    assert_eq!(t.timing().site_flush_idle, d.site_flush_idle);
+    assert_eq!(t.timing().site_flush_max, d.site_flush_max);
+
+    let pk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let (_, policy_pub) = segue_policy::generate_key();
+    let dir = tempdir("flush");
+    let json = |limits: &str| {
+        format!(
+            r#"{{
+            "listen": "127.0.0.1:7443",
+            "node_id": 1,
+            "ticket_keys": [{{"key_id": 3, "public_key": "{pk}"}}],
+            "policy": {{"public_keys": [{{"key_id": 1, "public_key": "{policy_pub}"}}], "bundle": "policy.bundle"}},
+            "limits": {{{limits}}}
+        }}"#
+        )
+    };
+    let cfg = Config::parse_in(
+        &json(r#""site_flush_idle_secs": 5, "site_flush_max_secs": 40"#),
+        &dir.0,
+    )
+    .unwrap();
+    assert_eq!(cfg.limits.site_flush_idle, Duration::from_secs(5));
+    assert_eq!(cfg.limits.site_flush_max, Duration::from_secs(40));
+    let relay = Relay::new(cfg, system_clock(), Some(resolver()), None).unwrap();
+    let t = relay.table();
+    assert_eq!(t.timing().site_flush_idle, Duration::from_secs(5));
+    assert_eq!(t.timing().site_flush_max, Duration::from_secs(40));
+    for bad in [
+        r#""site_flush_idle_secs": 0"#,
+        r#""site_flush_idle_secs": 50, "site_flush_max_secs": 40"#,
+    ] {
+        assert!(Config::parse_in(&json(bad), &dir.0).is_err(), "{bad}");
+    }
+}

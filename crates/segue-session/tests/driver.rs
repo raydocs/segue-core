@@ -891,3 +891,339 @@ fn the_8mb_pool_admits_hundreds_of_flows() {
     assert!(sessions >= 280, "{sessions} session flows");
     assert!(tun_flows >= 220, "{tun_flows} TUN flows");
 }
+
+// ---- Review r7 #9 / #11: the upload drain after a client's FIN ----
+
+/// A relay with `tune` applied to its timing, the device site connector
+/// `site_conn`, and its notices; one client session bridging `app`.
+fn flush_pair(
+    tune: impl FnOnce(&mut segue_session::Timing),
+    site_conn: segue_session::driver::DeviceSiteConnector,
+) -> (
+    DuplexStream,
+    tokio::task::JoinHandle<CloseReason>,
+    tokio::task::JoinHandle<()>,
+    mpsc::UnboundedReceiver<segue_session::driver::RelayNotice>,
+) {
+    let mut cfg = Config::default();
+    // Only the drain bounds may end these sessions.
+    cfg.timing.t_stall = Duration::from_secs(60);
+    cfg.timing.t_live = Duration::from_secs(60);
+    cfg.timing.t_attach = Duration::from_secs(60);
+    tune(&mut cfg.timing);
+    let pool = Pool::new(8 << 20);
+    let table = RelayTable::new(cfg.clone(), pool.clone(), Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(4);
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let relay = tokio::spawn(segue_session::driver::run_relay_ctl(
+        table,
+        accept_rx,
+        site_conn,
+        Some(note_tx),
+        None,
+    ));
+    let connector: Connector = Arc::new(move || {
+        let accept_tx = accept_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(256 << 10);
+            accept_tx
+                .send(Box::new(b))
+                .await
+                .map_err(|_| std::io::Error::other("gone"))?;
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+    let (app, far) = tokio::io::duplex(512 << 10);
+    let client = tokio::spawn(run_client(s, far, connector));
+    (app, client, relay, note_rx)
+}
+
+/// Write `up` and FIN it, wait for the client to end; returns how it
+/// ended and how long after the FIN.
+async fn upload_and_fin(
+    mut app: DuplexStream,
+    up: &[u8],
+    client: tokio::task::JoinHandle<CloseReason>,
+) -> (CloseReason, Duration) {
+    app.write_all(up).await.unwrap();
+    app.shutdown().await.unwrap();
+    let fin = Instant::now();
+    // Keep reading so the app side never blocks the session.
+    tokio::spawn(async move {
+        let mut sink = Vec::new();
+        let _ = app.read_to_end(&mut sink).await;
+    });
+    let reason = tokio::time::timeout(Duration::from_secs(30), client)
+        .await
+        .expect("client did not end")
+        .unwrap();
+    (reason, fin.elapsed())
+}
+
+/// The relay's report of how the session ended: written by the same
+/// `finish` that writes the tombstone, so this is the tombstone's code
+/// (the tombstone itself: `review.rs`).
+async fn closed_code(
+    notes: &mut mpsc::UnboundedReceiver<segue_session::driver::RelayNotice>,
+) -> u8 {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), notes.recv())
+            .await
+            .expect("no Closed notice")
+            .expect("relay gone")
+        {
+            segue_session::driver::RelayNotice::Closed { close_code, .. } => return close_code,
+            _ => continue,
+        }
+    }
+}
+
+/// A site that accepts the connection and then never reads; it keeps its
+/// end open (the relay must not wait for it to go away).
+fn deaf_site(keep: Arc<Mutex<Vec<DuplexStream>>>) -> segue_session::driver::DeviceSiteConnector {
+    Arc::new(move |_r| {
+        let keep = keep.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(1024);
+            keep.lock().unwrap().push(b);
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
+/// A site that reads `step` bytes every `every` until EOF, then reports
+/// what it got.
+fn slow_site(
+    step: usize,
+    every: Duration,
+    got: Arc<Mutex<Option<oneshot::Sender<Vec<u8>>>>>,
+) -> segue_session::driver::DeviceSiteConnector {
+    Arc::new(move |_r| {
+        let got = got.lock().unwrap().take();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(1024);
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(b);
+                let _ = w.shutdown().await;
+                let mut up = Vec::new();
+                let mut buf = vec![0u8; step];
+                loop {
+                    tokio::time::sleep(every).await;
+                    match r.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => up.extend_from_slice(&buf[..n]),
+                    }
+                }
+                if let Some(tx) = got {
+                    let _ = tx.send(up);
+                }
+                // Hold the write half until the relay is done with it.
+                std::future::pending::<()>().await;
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
+/// A site whose write side fails: writes after `ok_bytes` and/or the
+/// shutdown return an error. Reads never end.
+struct FailingSite {
+    inner: DuplexStream,
+    ok_bytes: usize,
+    fail_shutdown: bool,
+}
+
+impl AsyncRead for FailingSite {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
+impl AsyncWrite for FailingSite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.ok_bytes == 0 {
+            return std::task::Poll::Ready(Err(std::io::Error::other("forced write error")));
+        }
+        let n = buf.len().min(self.ok_bytes);
+        let r = std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..n]));
+        if let Ok(k) = r {
+            self.ok_bytes -= k;
+        }
+        std::task::Poll::Ready(r)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.fail_shutdown {
+            return std::task::Poll::Ready(Err(std::io::Error::other("forced shutdown error")));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+fn failing_site(
+    ok_bytes: usize,
+    fail_shutdown: bool,
+) -> segue_session::driver::DeviceSiteConnector {
+    Arc::new(move |_r| {
+        Box::pin(async move {
+            let (a, mut b) = tokio::io::duplex(1 << 20);
+            // Take what the relay writes, so only the forced error stops it.
+            tokio::spawn(async move {
+                let mut sink = vec![0u8; 64 << 10];
+                while b.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+            });
+            Ok(Box::new(FailingSite {
+                inner: a,
+                ok_bytes,
+                fail_shutdown,
+            }) as BoxCarrier)
+        })
+    })
+}
+
+/// #9 (writer queue full): the site never reads and the upload (112 KiB)
+/// is more than the blocked site write plus the full writer queue hold, so
+/// when the client's FIN arrives ~16 KiB still sit in the relay's receive
+/// buffer and the shutdown cannot even be queued (checked by
+/// instrumenting the driver: queue capacity 0, shutdown not queued, at
+/// both drain start and reset). Before, the 30 s timer started only once the shutdown was
+/// queued, i.e. never: the session hung. Now it is reset after
+/// `site_flush_idle` without progress, never CLEAN, and the relay's
+/// record (tombstone code) says `site_reset`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_site_that_never_reads_resets_the_drain_even_with_a_full_writer_queue() {
+    use segue_session::codec::code;
+    let keep = Arc::new(Mutex::new(Vec::new()));
+    let (app, client, relay, mut notes) = flush_pair(
+        |t| {
+            t.site_flush_idle = Duration::from_secs(1);
+            t.site_flush_max = Duration::from_secs(60);
+        },
+        deaf_site(keep.clone()),
+    );
+    let (reason, took) = upload_and_fin(app, &pattern(112 << 10, 1), client).await;
+    assert_eq!(reason, CloseReason::Reset(code::SITE_RESET));
+    assert_eq!(closed_code(&mut notes).await, code::SITE_RESET);
+    assert!(
+        took >= Duration::from_millis(900),
+        "reset before the idle bound: {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(20),
+        "idle bound not applied: {took:?}"
+    );
+    assert_eq!(keep.lock().unwrap().len(), 1);
+    relay.abort();
+}
+
+/// #9 (progress): a site that keeps taking the upload, slowly, for many
+/// times `site_flush_idle` is never cut: the bound is on no progress, not
+/// on total time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_but_progressing_drain_outlives_the_idle_bound() {
+    const UP: usize = 24 << 10;
+    let (got_tx, got_rx) = oneshot::channel();
+    let site = slow_site(
+        2048,
+        Duration::from_millis(250),
+        Arc::new(Mutex::new(Some(got_tx))),
+    );
+    let (app, client, relay, mut notes) = flush_pair(
+        |t| {
+            t.site_flush_idle = Duration::from_millis(800);
+            t.site_flush_max = Duration::from_secs(60);
+        },
+        site,
+    );
+    let up = pattern(UP, 2);
+    let (reason, took) = upload_and_fin(app, &up, client).await;
+    assert_eq!(reason, CloseReason::Clean, "a progressing site was reset");
+    assert_eq!(
+        closed_code(&mut notes).await,
+        segue_session::codec::code::CLEAN
+    );
+    assert!(
+        took > Duration::from_millis(1600),
+        "drain did not outlast twice the idle bound ({took:?}): the test proves nothing"
+    );
+    let got = tokio::time::timeout(Duration::from_secs(10), got_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(got == up, "site got {} of {UP} bytes", got.len());
+    relay.abort();
+}
+
+/// #9 (overall cap): progress does not extend the drain past
+/// `site_flush_max`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_progressing_drain_is_still_capped() {
+    use segue_session::codec::code;
+    let (got_tx, _got_rx) = oneshot::channel();
+    let site = slow_site(
+        1024,
+        Duration::from_millis(200),
+        Arc::new(Mutex::new(Some(got_tx))),
+    );
+    let (app, client, relay, mut notes) = flush_pair(
+        |t| {
+            t.site_flush_idle = Duration::from_secs(1);
+            t.site_flush_max = Duration::from_secs(2);
+        },
+        site,
+    );
+    // ~10 s of upload at 5 KiB/s.
+    let (reason, took) = upload_and_fin(app, &pattern(48 << 10, 3), client).await;
+    assert_eq!(reason, CloseReason::Reset(code::SITE_RESET));
+    assert_eq!(closed_code(&mut notes).await, code::SITE_RESET);
+    assert!(took >= Duration::from_millis(1900), "{took:?}");
+    assert!(took < Duration::from_secs(8), "cap not applied: {took:?}");
+    relay.abort();
+}
+
+/// #11: a site write that fails mid-upload resets the session (never
+/// CLEAN), with `site_reset` on record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_site_write_resets_not_clean() {
+    use segue_session::codec::code;
+    let (app, client, relay, mut notes) = flush_pair(|_| {}, failing_site(8 << 10, false));
+    let (reason, _) = upload_and_fin(app, &pattern(24 << 10, 4), client).await;
+    assert_eq!(reason, CloseReason::Reset(code::SITE_RESET));
+    assert_eq!(closed_code(&mut notes).await, code::SITE_RESET);
+    relay.abort();
+}
+
+/// #11: every upload byte written but the site's shutdown fails: the FIN
+/// never reached the site, so the session is reset, not CLEAN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_site_shutdown_resets_not_clean() {
+    use segue_session::codec::code;
+    let (app, client, relay, mut notes) = flush_pair(|_| {}, failing_site(usize::MAX, true));
+    let (reason, took) = upload_and_fin(app, &pattern(24 << 10, 5), client).await;
+    assert_eq!(reason, CloseReason::Reset(code::SITE_RESET));
+    assert_eq!(closed_code(&mut notes).await, code::SITE_RESET);
+    assert!(
+        took < Duration::from_secs(10),
+        "waited for a timer: {took:?}"
+    );
+    relay.abort();
+}
