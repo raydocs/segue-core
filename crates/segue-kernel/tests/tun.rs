@@ -1534,40 +1534,29 @@ fn default_memory_budget_is_well_under_20_mib() {
     println!("default TUN memory budget: {b:?}");
     assert_eq!(
         b.total,
-        b.tcp_pool + b.tcp_flows + b.packet_queues + b.udp_flows + b.dns + b.quic_routes
+        b.tcp_pool + b.tcp_flows + b.packet_queues + b.udp_flows + b.dns
     );
     // r7 #8: every term is the worst case the code can hold, computed here
-    // from the defaults independently of `memory_budget`.
+    // from the defaults independently of `memory_budget`. QUIC keeps no
+    // per-flow or kernel-wide state (r8 N1–N3: no guard, no route table).
     let cfg = NetstackConfig::default();
     let mtu = cfg.mtu;
     assert_eq!(mtu, 1500);
-    let kept = segue_kernel::quic::GUARD_KEPT;
-    assert!(kept >= 2 * (3072 + 64) + 8 * (20 + 32) + 128);
-    // 3 held datagrams + their CRYPTO copies + 256 × (offset, Vec) + DCID.
-    let sniff = 3 * mtu + 3 * mtu + 256 * 32 + 20;
-    assert_eq!(segue_kernel::tun::sniff_state(mtu), sniff);
-    let per_udp = (8 + 1) * mtu + 1024 + kept + sniff;
+    let per_udp = (8 + 1) * mtu + 1024;
     let want = MemoryBudget {
         tcp_pool: cfg.buffer_pool / 4096 * 4096,
         tcp_flows: 512 * 4096,
         packet_queues: (512 + 2 * 256 + 1) * mtu,
         udp_flows: 256 * per_udp,
         dns: 32 * 2 * mtu,
-        quic_routes: segue_kernel::quic::ROUTES_KEPT,
         total: 0,
     };
     let want = MemoryBudget {
-        total: want.tcp_pool
-            + want.tcp_flows
-            + want.packet_queues
-            + want.udp_flows
-            + want.dns
-            + want.quic_routes,
+        total: want.tcp_pool + want.tcp_flows + want.packet_queues + want.udp_flows + want.dns,
         ..want
     };
     assert_eq!(b, want);
-    // The route table: hashbrown slack doubles its ~270 KiB of entries.
-    assert!(b.quic_routes <= 1 << 20, "{}", b.quic_routes);
+    assert_eq!(b.total, 13_740_252);
     assert!(b.total < 20 * 1024 * 1024, "{b:?}");
     // The pool, not the flow count, bounds TCP buffering.
     assert!(b.tcp_pool < cfg.max_tcp_flows * (cfg.tcp_rx_buffer + cfg.tcp_tx_buffer) / 4);

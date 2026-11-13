@@ -27,7 +27,9 @@
 //! Refusal semantics (§5.4): a refused flow never falls back to anything.
 //! A refused SYN gets a RST, an accepted flow whose dial fails (or whose
 //! sniffed name is rejected) is reset after the local handshake, a refused
-//! UDP flow gets ICMP unreachable, and a UDP flow whose relay fails is
+//! UDP flow gets ICMP unreachable (port unreachable for QUIC to a bare IP,
+//! §5.2a.2; administratively prohibited otherwise), and a UDP flow whose
+//! relay fails is
 //! answered with ICMP unreachable until it expires. Private, loopback and
 //! link-local destinations that reach the TUN are refused before the router
 //! is asked (DNS on port 53 excepted, which is answered locally when the
@@ -59,15 +61,13 @@
 //!   bytes and its charge to the 2-block minimum.
 //!
 //! [`TunStack::memory_budget`] states the worst case for a configuration;
-//! with the defaults it is 19 891 420 bytes ≈ 19.0 MiB: TCP pool 6 MiB,
+//! with the defaults it is 13 740 252 bytes ≈ 13.1 MiB: TCP pool 6 MiB,
 //! 512 TCP flows × 4 KiB bookkeeping = 2 MiB, packet queues 1.5 MiB
-//! ((512 out + 2 × 256 UDP + 1) × 1500), 256 UDP flows × 38 552 B
-//! = 9.4 MiB, 32 DNS queries in flight 94 KiB (test
-//! `default_memory_budget_is_well_under_20_mib`). A UDP flow's 38 552 B:
-//! 9 × 1500 queue and reply buffer, 1 KiB bookkeeping, the QUIC guard's
-//! kept hellos and server IDs (`quic::GUARD_KEPT`, 6 816 B) and one
-//! connection being classified ([`sniff_state`], 17 212 B: 3 held
-//! datagrams, their CRYPTO copies, 256 piece entries, the DCID). The PR #14 layout reserved
+//! ((512 out + 2 × 256 UDP + 1) × 1500), 256 UDP flows × 14 524 B
+//! = 3.5 MiB (9 × 1500 queue and reply buffer, 1 KiB bookkeeping), 32 DNS
+//! queries in flight 94 KiB (test
+//! `default_memory_budget_is_well_under_20_mib`). QUIC keeps no
+//! state of its own (§5.2a.2). The PR #14 layout reserved
 //! 128 KiB per TCP flow up front: 64 MiB at 512 flows.
 //! Outbound transport state (TLS/QUIC buffers inside the dialer) is not part
 //! of the TUN budget.
@@ -116,7 +116,7 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 use crate::dial::{Dialer, UdpSession};
 use crate::dns::SmartDns;
 use crate::policy::Policy;
-use crate::quic::{ConnGuard, InitialSniffer, Quic, QuicRoutes, Step};
+use crate::quic::looks_quic;
 use crate::rules::{Action, RuleSet};
 use crate::sniff::{sniff, Sniff};
 use crate::socks::{Kernel, SniffSettings};
@@ -385,10 +385,20 @@ pub enum Verdict {
     /// Accept; the value is an opaque outbound tag carried with the flow
     /// (`None` = direct or decided later).
     Accept(Option<String>),
+    /// [`Verdict::Accept`] for ordinary UDP only: the first later datagram
+    /// that looks like QUIC ([`looks_quic`]) refuses the flow with ICMP
+    /// port unreachable, it and every datagram after it (§5.2a.2). For TCP
+    /// the same as `Accept`.
+    AcceptPlain(Option<String>),
     /// Answered inside the process (hijacked DNS). Exempt from the
     /// reserved-destination refusal; UDP gets no flow-table entry.
     Local,
     Refuse,
+    /// Refuse a UDP flow with ICMP port unreachable rather than
+    /// "administratively prohibited": QUIC to a destination whose name is
+    /// not known for certain (§5.2a.2). Apps take it as "no QUIC here" and
+    /// fall back to TCP at once. For TCP the same as `Refuse`.
+    Unreachable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -505,9 +515,10 @@ pub struct NetstackStats {
     pub udp_refused_reserved: u64,
     pub udp_refused_full: u64,
     pub udp_refused_upstream: u64,
-    /// Datagrams of a further QUIC connection on a routed UDP flow that
-    /// would not route like the flow (or could not be classified).
-    pub udp_dropped_quic_conn: u64,
+    /// UDP flows refused as QUIC to a destination whose name is not known
+    /// for certain (§5.2a.2): at the first datagram, or later on a flow
+    /// admitted as ordinary UDP.
+    pub udp_refused_quic: u64,
     pub icmp_sent: u64,
     pub icmp_too_big: u64,
     pub icmp_suppressed: u64,
@@ -785,6 +796,8 @@ fn build_udp(from: SocketAddr, to: SocketAddr, payload: &[u8]) -> Vec<u8> {
 enum IcmpError {
     /// Destination unreachable, administratively prohibited (§5.4).
     Prohibited,
+    /// Destination (port) unreachable: QUIC refused (§5.2a.2).
+    PortUnreachable,
     /// IPv4 "fragmentation needed and DF set" / ICMPv6 "packet too big",
     /// carrying the largest packet that fits (RFC 1191, RFC 8201).
     TooBig(usize),
@@ -805,6 +818,7 @@ fn build_icmp_error(
             let data = &parsed.ip_payload[..parsed.ip_payload.len().min(8)];
             let reason = match kind {
                 IcmpError::Prohibited => Icmpv4DstUnreachable::CommProhibited,
+                IcmpError::PortUnreachable => Icmpv4DstUnreachable::PortUnreachable,
                 IcmpError::TooBig(_) => Icmpv4DstUnreachable::FragRequired,
             };
             let repr = Icmpv4Repr::DstUnreachable {
@@ -839,6 +853,11 @@ fn build_icmp_error(
             let repr = match kind {
                 IcmpError::Prohibited => Icmpv6Repr::DstUnreachable {
                     reason: Icmpv6DstUnreachable::AdminProhibit,
+                    header: orig,
+                    data,
+                },
+                IcmpError::PortUnreachable => Icmpv6Repr::DstUnreachable {
+                    reason: Icmpv6DstUnreachable::PortUnreachable,
                     header: orig,
                     data,
                 },
@@ -989,8 +1008,11 @@ struct TcpEntry {
 struct UdpEntry {
     tag: Option<String>,
     last_seen: Instant,
-    /// The relay failed: answer with ICMP until the flow expires.
-    refused: bool,
+    /// Refused (the relay failed, or QUIC on a plain flow): answer with
+    /// this ICMP until the flow expires.
+    refused: Option<IcmpError>,
+    /// Ordinary UDP only ([`Verdict::AcceptPlain`]).
+    plain: bool,
     /// Largest payload the relay can carry, once known.
     limit: Option<usize>,
 }
@@ -1264,9 +1286,9 @@ impl Netstack {
             return;
         }
         let tag = match verdict.unwrap_or_else(|| policy(key)) {
-            Verdict::Accept(tag) => tag,
+            Verdict::Accept(tag) | Verdict::AcceptPlain(tag) => tag,
             Verdict::Local => None,
-            Verdict::Refuse => {
+            Verdict::Refuse | Verdict::Unreachable => {
                 self.stats.tcp_refused_policy += 1;
                 self.emit(build_rst(key, &meta));
                 return;
@@ -1334,11 +1356,20 @@ impl Netstack {
     ) {
         let key = parsed.key;
         let tag = if let Some(entry) = self.udp.get_mut(&key) {
-            if entry.refused {
-                self.emit_icmp(pkt, parsed, now, IcmpError::Prohibited);
+            if let Some(kind) = entry.refused {
+                self.emit_icmp(pkt, parsed, now, kind);
                 return;
             }
             entry.last_seen = now;
+            if entry.plain && looks_quic(&payload) {
+                // QUIC on a flow admitted as ordinary UDP: refuse it, now
+                // and for the rest of its life, and end its relay.
+                entry.refused = Some(IcmpError::PortUnreachable);
+                self.stats.udp_refused_quic += 1;
+                self.events.push_back(Event::UdpClosed { key });
+                self.emit_icmp(pkt, parsed, now, IcmpError::PortUnreachable);
+                return;
+            }
             if let Some(limit) = entry.limit.filter(|l| payload.len() > *l) {
                 self.stats.dropped_oversize += 1;
                 let hdr = parsed.ip_header_len + UDP_HEADER_LEN;
@@ -1380,6 +1411,7 @@ impl Netstack {
                     policy(&key, &payload)
                 }
             };
+            let plain = matches!(verdict, Verdict::AcceptPlain(_));
             match verdict {
                 Verdict::Local => {
                     self.push_udp(UdpDatagram {
@@ -1390,22 +1422,30 @@ impl Netstack {
                     });
                     return;
                 }
-                Verdict::Accept(_) if self.udp.len() >= self.cfg.max_udp_flows => {
+                Verdict::Accept(_) | Verdict::AcceptPlain(_)
+                    if self.udp.len() >= self.cfg.max_udp_flows =>
+                {
                     self.stats.udp_refused_full += 1;
                     self.emit_icmp(pkt, parsed, now, IcmpError::Prohibited);
                     return;
                 }
-                Verdict::Accept(tag) => {
+                Verdict::Accept(tag) | Verdict::AcceptPlain(tag) => {
                     self.udp.insert(
                         key,
                         UdpEntry {
                             tag: tag.clone(),
                             last_seen: now,
-                            refused: false,
+                            refused: None,
+                            plain,
                             limit: None,
                         },
                     );
                     tag
+                }
+                Verdict::Unreachable => {
+                    self.stats.udp_refused_quic += 1;
+                    self.emit_icmp(pkt, parsed, now, IcmpError::PortUnreachable);
+                    return;
                 }
                 Verdict::Refuse => {
                     self.stats.udp_refused_policy += 1;
@@ -1835,21 +1875,10 @@ impl Netstack {
 
     /// The relay of a UDP flow failed (refused, never retried direct): its
     /// datagrams are answered with ICMP until the flow expires.
-    /// Refuse a flow the router accepted for classification: this and later
-    /// datagrams get the ICMP refusal.
-    pub fn udp_refuse_policy(&mut self, key: &FlowKey) {
-        if let Some(e) = self.udp.get_mut(key) {
-            if !e.refused {
-                e.refused = true;
-                self.stats.udp_refused_policy += 1;
-            }
-        }
-    }
-
     pub fn udp_refuse(&mut self, key: &FlowKey) {
         if let Some(e) = self.udp.get_mut(key) {
-            if !e.refused {
-                e.refused = true;
+            if e.refused.is_none() {
+                e.refused = Some(IcmpError::Prohibited);
                 self.stats.udp_refused_upstream += 1;
             }
         }
@@ -1935,10 +1964,13 @@ pub enum TcpRoute {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UdpRoute {
+    /// Anything, QUIC included: the destination's name is known for certain
+    /// (fake IP), and the flow stays on this outbound for its life.
     Dial(Dial),
-    /// Classify the flow's first datagrams (QUIC Initial SNI, §5.2a.2),
-    /// then ask [`TunRouter::udp_sniffed`]. Datagrams are held meanwhile.
-    Sniff,
+    /// Ordinary UDP only (a bare IP, §5.2a.2): UDP/443 or a first datagram
+    /// that looks like QUIC is refused with ICMP port unreachable at once,
+    /// and so is the flow at the first later datagram that does.
+    Plain(Dial),
     /// Answered by the stack's [`SmartDns`].
     Dns,
     Refuse,
@@ -1955,16 +1987,6 @@ pub trait TunRouter: Send + Sync {
     /// Default: refuse.
     fn route_udp(&self, _key: &FlowKey) -> UdpRoute {
         UdpRoute::Refuse
-    }
-    /// After [`UdpRoute::Sniff`]: what the datagrams were. `None` refuses.
-    fn udp_sniffed(&self, _key: &FlowKey, _quic: &Quic) -> Option<Dial> {
-        None
-    }
-    /// Where flows routed by sniffing record their QUIC routes (see
-    /// [`QuicRoutes`]). None: no claims, so a short header to an ID the
-    /// server issued inside the encryption is dropped.
-    fn quic_routes(&self) -> Option<QuicRoutes> {
-        None
     }
 }
 
@@ -2069,30 +2091,14 @@ impl TunRouter for TunKernel {
             return UdpRoute::Refuse;
         };
         let ip = key.dst.ip();
-        if crate::udp::sniffs(&self.kernel, ip) {
-            return UdpRoute::Sniff;
-        }
         let addr = TargetAddr::Ip(ip);
-        match crate::udp::route(&self.kernel, &udp.settings, &addr, key.dst.port()) {
-            Some((tag, target)) => UdpRoute::Dial(Dial { tag, target }),
+        let dial = crate::udp::route(&self.kernel, &udp.settings, &addr, key.dst.port())
+            .map(|(tag, target)| Dial { tag, target });
+        match dial {
             None => UdpRoute::Refuse,
+            Some(d) if crate::udp::plain(&self.kernel, ip) => UdpRoute::Plain(d),
+            Some(d) => UdpRoute::Dial(d),
         }
-    }
-
-    fn quic_routes(&self) -> Option<QuicRoutes> {
-        self.kernel.udp.as_ref().map(|u| u.quic_routes.clone())
-    }
-
-    fn udp_sniffed(&self, key: &FlowKey, quic: &Quic) -> Option<Dial> {
-        let udp = self.kernel.udp.as_ref()?;
-        crate::udp::route_sniffed(
-            &self.kernel,
-            &udp.settings,
-            key.dst.ip(),
-            key.dst.port(),
-            quic,
-        )
-        .map(|(tag, target)| Dial { tag, target })
     }
 }
 
@@ -2152,47 +2158,10 @@ enum TcpPlan {
     Dns,
 }
 
-enum UdpPlan {
-    /// With the guard of a flow routed by sniffing (see [`UdpLive`]).
-    Dial(Dial, Option<Box<ConnGuard<Bytes>>>),
-    /// Datagrams held while the QUIC ClientHello is incomplete. `skip`:
-    /// datagrams already fed to the sniffer (the first one, at admission).
-    Sniff {
-        sniffer: InitialSniffer,
-        held: Vec<Bytes>,
-        skip: usize,
-    },
-}
-
 /// A UDP flow with its relay task.
 struct UdpLive {
     tx: mpsc::Sender<Bytes>,
-    dial: Dial,
-    /// For a flow routed by sniffing: every further QUIC connection on the
-    /// flow is classified too, and allowed only if it routes like `dial`.
-    guard: Option<Box<ConnGuard<Bytes>>>,
 }
-
-/// The per-connection guard of a flow routed after `sniffer` said `q`,
-/// going by `dial`.
-fn quic_guard(
-    router: &dyn TunRouter,
-    sniffer: &InitialSniffer,
-    q: &Quic,
-    key: &FlowKey,
-    dial: &Dial,
-) -> Box<ConnGuard<Bytes>> {
-    let guard = ConnGuard::new(
-        matches!(q, Quic::Domain(_)).then_some(sniffer),
-        key.dst.port() == QUIC_PORT,
-    );
-    Box::new(match router.quic_routes() {
-        Some(routes) => guard.with_route(routes, key.dst, dial.tag.clone()),
-        None => guard,
-    })
-}
-
-const QUIC_PORT: u16 = 443;
 
 enum UdpMsg {
     Reply { key: FlowKey, payload: Bytes },
@@ -2211,22 +2180,6 @@ struct Ctx {
     dial_timeout: Duration,
 }
 
-/// CRYPTO pieces an [`InitialSniffer`] keeps at most (`quic::Crypto`'s
-/// cap).
-const SNIFF_PARTS: usize = 256;
-/// Longest QUIC v1/v2 connection ID.
-const MAX_CID: usize = 20;
-
-/// Worst case of one QUIC connection being classified (a flow sniffing at
-/// start, or a guard's pending connection): up to `MAX_DATAGRAMS - 1` held
-/// datagrams (the next one gives the final verdict), the sniffer's copies of
-/// their CRYPTO data (never more than the datagrams carried), its piece
-/// list at the cap and the bound DCID (r7 #8).
-pub fn sniff_state(mtu: usize) -> usize {
-    let held = crate::quic::MAX_DATAGRAMS - 1;
-    held * mtu + held * mtu + SNIFF_PARTS * std::mem::size_of::<(usize, Vec<u8>)>() + MAX_CID
-}
-
 /// Worst-case memory of one [`TunStack`], in bytes. Outbound transport
 /// state (inside the dialer) is not included.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2241,8 +2194,6 @@ pub struct MemoryBudget {
     pub udp_flows: usize,
     /// Hijacked DNS queries and answers in flight.
     pub dns: usize,
-    /// The kernel-wide QUIC route table (`quic::ROUTES_KEPT`).
-    pub quic_routes: usize,
     pub total: usize,
 }
 
@@ -2306,23 +2257,18 @@ impl TunStack {
         // the device's one-packet receive slot.
         let packet_queues = (c.out_queue + 2 * c.udp_queue + 1) * mtu;
         // Per flow: queued datagrams, one receive buffer of a reply's size,
-        // bookkeeping; the QUIC guard's kept hellos and, for the one
-        // connection being classified, its held datagrams and its sniffer
-        // (the same state a flow still sniffing at start holds, in place of
-        // the guard).
-        let guard = sniff_state(mtu) + crate::quic::GUARD_KEPT;
-        let udp_flows = c.max_udp_flows * ((self.udp_flow_queue + 1) * mtu + 1024 + guard);
+        // bookkeeping. QUIC needs no per-flow state (§5.2a.2: a flow is
+        // pinned by its 5-tuple, nothing held or tracked inside it).
+        let udp_flows = c.max_udp_flows * ((self.udp_flow_queue + 1) * mtu + 1024);
         // A query and its answer (TCP answers live in the pool).
         let dns = self.max_dns_in_flight * 2 * mtu;
-        let quic_routes = crate::quic::ROUTES_KEPT;
         MemoryBudget {
             tcp_pool,
             tcp_flows,
             packet_queues,
             udp_flows,
             dns,
-            quic_routes,
-            total: tcp_pool + tcp_flows + packet_queues + udp_flows + dns + quic_routes,
+            total: tcp_pool + tcp_flows + packet_queues + udp_flows + dns,
         }
     }
 
@@ -2339,7 +2285,7 @@ impl TunStack {
         });
         let mut pipes: HashMap<FlowId, Pipe> = HashMap::new();
         let mut tcp_plans: HashMap<FlowKey, TcpPlan> = HashMap::new();
-        let mut udp_plans: HashMap<FlowKey, UdpPlan> = HashMap::new();
+        let mut udp_plans: HashMap<FlowKey, Dial> = HashMap::new();
         let mut udp_flows: HashMap<FlowKey, UdpLive> = HashMap::new();
         let (msg_tx, mut msg_rx) = mpsc::channel::<UdpMsg>(self.config.udp_queue.max(1));
         let dns_slots = Arc::new(Semaphore::new(self.max_dns_in_flight));
@@ -2414,105 +2360,26 @@ impl TunStack {
                     });
                     continue;
                 }
-                let (live, held) = match udp_flows.entry(d.key) {
-                    std::collections::hash_map::Entry::Occupied(e) => (e.into_mut(), None),
+                let live = match udp_flows.entry(d.key) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        let (dial, held, guard) = match udp_plans.remove(&d.key) {
-                            None => continue,
-                            Some(UdpPlan::Dial(dial, guard)) => (dial, Vec::new(), guard),
-                            Some(UdpPlan::Sniff {
-                                mut sniffer,
-                                mut held,
-                                skip,
-                            }) => {
-                                let q = if skip > 0 {
-                                    Quic::NeedMore
-                                } else {
-                                    sniffer.push(&d.payload)
-                                };
-                                if q == Quic::NeedMore {
-                                    held.push(d.payload);
-                                    let skip = skip.saturating_sub(1);
-                                    udp_plans.insert(
-                                        d.key,
-                                        UdpPlan::Sniff {
-                                            sniffer,
-                                            held,
-                                            skip,
-                                        },
-                                    );
-                                    continue;
-                                }
-                                match router.udp_sniffed(&d.key, &q) {
-                                    Some(dial) => {
-                                        let guard =
-                                            quic_guard(&*router, &sniffer, &q, &d.key, &dial);
-                                        (dial, held, Some(guard))
-                                    }
-                                    None => {
-                                        // Unconfirmed QUIC or a refused name:
-                                        // later datagrams get the ICMP refusal.
-                                        stack.udp_refuse_policy(&d.key);
-                                        continue;
-                                    }
-                                }
-                            }
+                        let Some(dial) = udp_plans.remove(&d.key) else {
+                            continue;
                         };
-                        let (tx, rx) = mpsc::channel(self.udp_flow_queue.max(held.len() + 1));
+                        let (tx, rx) = mpsc::channel(self.udp_flow_queue.max(1));
                         tokio::spawn(udp_flow(
                             ctx.clone(),
                             d.key,
-                            dial.clone(),
+                            dial,
                             rx,
                             msg_tx.clone(),
                             stack.max_udp_reply(&d.key),
                         ));
-                        let live = UdpLive { tx, dial, guard };
-                        // Datagrams that classified the flow go out as is.
-                        (e.insert(live), Some(held))
+                        e.insert(UdpLive { tx })
                     }
                 };
-                let mut refuse = false;
-                let out = if let Some(mut held) = held {
-                    held.push(d.payload);
-                    held
-                } else {
-                    match &mut live.guard {
-                        None => vec![d.payload],
-                        Some(g) => {
-                            let dial = &live.dial;
-                            let payload = d.payload.clone();
-                            let same =
-                                |q: &Quic| router.udp_sniffed(&d.key, q).as_ref() == Some(dial);
-                            match g.push(d.payload, &payload, same) {
-                                Step::Forward(ds) => ds,
-                                Step::Hold => Vec::new(),
-                                Step::Drop(ds) => {
-                                    stack.stats.udp_dropped_quic_conn += ds.len() as u64;
-                                    Vec::new()
-                                }
-                                Step::Refuse(ds) => {
-                                    // A connection that may have moved here
-                                    // from another route: refuse the flow, so
-                                    // this and later datagrams get ICMP and
-                                    // the app leaves QUIC at once (R7 #3).
-                                    stack.stats.udp_dropped_quic_conn += ds.len() as u64;
-                                    refuse = true;
-                                    Vec::new()
-                                }
-                            }
-                        }
-                    }
-                };
-                if refuse {
-                    stack.udp_refuse_policy(&d.key);
-                    udp_flows.remove(&d.key);
-                    continue;
-                }
-                for p in out {
-                    if live.tx.try_send(p).is_err() {
-                        stack.stats.dropped_udp_queue_full += 1;
-                    }
+                if live.tx.try_send(d.payload).is_err() {
+                    stack.stats.dropped_udp_queue_full += 1;
                 }
             }
             while let Some(pkt) = stack.pop_output() {
@@ -2541,10 +2408,6 @@ impl TunStack {
                     while let Some(m) = msg.take() {
                         match m {
                             UdpMsg::Reply { key, payload } => {
-                                // The QUIC guard learns server IDs (R7).
-                                if let Some(UdpLive { guard: Some(g), .. }) = udp_flows.get(&key) {
-                                    g.observe_reply(&payload);
-                                }
                                 stack.send_udp(&key, &payload);
                             }
                             UdpMsg::Dns { key, payload } => {
@@ -2575,7 +2438,7 @@ fn policy(
     router: &dyn TunRouter,
     has_dns: bool,
     tcp_plans: &mut HashMap<FlowKey, TcpPlan>,
-    udp_plans: &mut HashMap<FlowKey, UdpPlan>,
+    udp_plans: &mut HashMap<FlowKey, Dial>,
     key: &FlowKey,
     first: &[u8],
 ) -> Verdict {
@@ -2601,36 +2464,18 @@ fn policy(
             UdpRoute::Refuse => Verdict::Refuse,
             UdpRoute::Dns if !has_dns => Verdict::Refuse,
             UdpRoute::Dns => Verdict::Local,
-            UdpRoute::Sniff => {
-                // Classified here when the first datagram is enough, so a
-                // refusal gets its ICMP at once.
-                let mut sniffer = InitialSniffer::default();
-                let q = sniffer.push(first);
-                if q == Quic::NeedMore {
-                    udp_plans.insert(
-                        *key,
-                        UdpPlan::Sniff {
-                            sniffer,
-                            held: Vec::new(),
-                            skip: 1,
-                        },
-                    );
-                    return Verdict::Accept(None);
-                }
-                match router.udp_sniffed(key, &q) {
-                    Some(d) => {
-                        let tag = d.tag.clone();
-                        let guard = quic_guard(router, &sniffer, &q, key, &d);
-                        udp_plans.insert(*key, UdpPlan::Dial(d, Some(guard)));
-                        Verdict::Accept(tag)
-                    }
-                    None => Verdict::Refuse,
-                }
-            }
             UdpRoute::Dial(d) => {
                 let tag = d.tag.clone();
-                udp_plans.insert(*key, UdpPlan::Dial(d, None));
+                udp_plans.insert(*key, d);
                 Verdict::Accept(tag)
+            }
+            UdpRoute::Plain(_) if key.dst.port() == crate::udp::QUIC_PORT || looks_quic(first) => {
+                Verdict::Unreachable
+            }
+            UdpRoute::Plain(d) => {
+                let tag = d.tag.clone();
+                udp_plans.insert(*key, d);
+                Verdict::AcceptPlain(tag)
             }
         },
     }

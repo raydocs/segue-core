@@ -23,19 +23,16 @@
 //! (`max_associations`). Datagrams over the path's payload limit,
 //! over a full queue, or with FRAG ≠ 0 are dropped and counted.
 //!
-//! A bare-IP destination (not fake) is classified by its first datagrams
-//! (§5.2a.2): a QUIC client Initial is decrypted for its SNI and the name
-//! routed like a TCP sniff (the stricter of the IP and the name rule, so an
-//! AI name is refused); QUIC whose name cannot be confirmed (ClientHello
-//! not complete within [`crate::quic::MAX_DATAGRAMS`] datagrams, unknown
-//! version, no SNI), and anything to UDP/443 that is not a readable QUIC
-//! Initial, is refused so the app falls back to TCP. Other UDP goes by the
-//! IP rules. Datagrams are held (counted in the association budget) while
-//! the ClientHello is incomplete and released to the flow once routed.
-//! Later datagrams of a sniffed flow pass its [`ConnGuard`]: a new QUIC
-//! connection is classified on its own, and QUIC that belongs to no allowed
-//! connection (unknown version, unknown connection ID) is dropped; replies
-//! teach the guard the server's connection IDs.
+//! QUIC (§5.2a.2) is carried only to a destination whose name is known for
+//! certain: a domain in the request or a fake-IP address. The flow is
+//! routed by that name and pinned to that outbound for its life. To a
+//! bare IP that is not fake, UDP/443 is refused outright, and every datagram
+//! that looks like QUIC ([`crate::quic::looks_quic`], checked on each
+//! datagram, not just the first) is dropped: the client never completes a
+//! QUIC handshake and falls back to TCP, where the TLS SNI routes it by
+//! name. SOCKS5 has no per-datagram error, so that fallback waits for the
+//! client's own QUIC handshake timeout. Other UDP to a bare IP goes by the
+//! IP rules.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -46,12 +43,12 @@ use std::time::Duration;
 use segue_routing::TargetAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::dial::{Dialer, UdpSession};
-use crate::quic::{ConnGuard, InitialSniffer, Quic, QuicRoutes, ReplyWatch, Step};
+use crate::quic::looks_quic;
 use crate::rules::Action;
 use crate::socks::{Kernel, REP_GENERAL, REP_OK};
 
@@ -99,9 +96,6 @@ impl Default for UdpSettings {
 /// UDP state shared by every association of one kernel.
 pub struct Udp {
     pub settings: UdpSettings,
-    /// Which outbounds carry QUIC to which servers, for every UDP flow of
-    /// the kernel, SOCKS and TUN (see [`QuicRoutes`]).
-    pub quic_routes: QuicRoutes,
     slots: Arc<Semaphore>,
     dropped: Arc<AtomicU64>,
 }
@@ -111,7 +105,6 @@ impl Udp {
         Self {
             slots: Arc::new(Semaphore::new(settings.max_associations)),
             settings,
-            quic_routes: QuicRoutes::default(),
             dropped: Arc::default(),
         }
     }
@@ -130,52 +123,10 @@ impl Udp {
 type Key = (TargetAddr, u16);
 
 /// A destination of one association.
-enum Slot {
-    Live {
-        tx: mpsc::Sender<Vec<u8>>,
-        /// For a flow routed by sniffing: every further QUIC connection on
-        /// it is classified too (N7).
-        guard: Option<Box<Guarded>>,
-    },
-    /// Waiting for the rest of a QUIC ClientHello.
-    Held {
-        sniffer: InitialSniffer,
-        datagrams: Vec<Vec<u8>>,
-        since: Instant,
-    },
-}
-
-impl Slot {
-    fn stale(&self, idle: Duration) -> bool {
-        match self {
-            Slot::Live { tx, .. } => tx.is_closed(),
-            Slot::Held { since, .. } => since.elapsed() >= idle,
-        }
-    }
-}
-
-struct Guarded {
-    guard: ConnGuard<Vec<u8>>,
-    /// The flow's route; a new connection must route the same way.
-    route: (Option<String>, TargetAddr),
-}
-
-fn release(queued: &AtomicUsize, slot: &Slot) {
-    let held: &[Vec<u8>] = match slot {
-        Slot::Held { datagrams, .. } => datagrams,
-        Slot::Live { guard: Some(g), .. } => g.guard.held(),
-        Slot::Live { .. } => &[],
-    };
-    let n: usize = held.iter().map(Vec::len).sum();
-    queued.fetch_sub(n, Ordering::Relaxed);
-}
-
-fn drop_all(udp: &Udp, queued: &AtomicUsize, ds: &[Vec<u8>]) {
-    let n: usize = ds.iter().map(Vec::len).sum();
-    queued.fetch_sub(n, Ordering::Relaxed);
-    for _ in ds {
-        udp.drop_one();
-    }
+struct Slot {
+    tx: mpsc::Sender<Vec<u8>>,
+    /// A bare-IP flow: ordinary UDP only, never QUIC.
+    plain: bool,
 }
 
 /// Serve one UDP ASSOCIATE request. `client_port` is the port the client
@@ -223,13 +174,7 @@ pub(crate) async fn associate(
                 uplink(kernel, udp, &mut flows, &queued, &socket, from, &buf[..n]);
             }
             _ = tokio::time::sleep_until(last + idle) => {
-                flows.retain(|_, f| {
-                    let stale = f.stale(idle);
-                    if stale {
-                        release(&queued, f);
-                    }
-                    !stale
-                });
+                flows.retain(|_, f| !f.tx.is_closed());
                 if flows.is_empty() {
                     break;
                 }
@@ -254,156 +199,47 @@ fn uplink(
         return udp.drop_one();
     };
     let key = (addr, port);
-    // Reserve the payload's bytes in the association budget; whoever takes
-    // the datagram off the queue (or drops it) gives them back.
-    let budget = udp.settings.queue_bytes;
-    let reserve = |q: &AtomicUsize| {
-        q.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-            (used + payload.len() <= budget).then_some(used + payload.len())
-        })
-        .is_ok()
-    };
-    let mut held = None;
-    match flows.get_mut(&key) {
-        Some(Slot::Live { tx, guard }) => {
-            if !reserve(queued) {
+    if let Some(f) = flows.get(&key) {
+        if f.plain && looks_quic(payload) {
+            // QUIC to a bare IP: refused (dropped) on every datagram.
+            return udp.drop_one();
+        }
+        if !f.tx.is_closed() {
+            if !reserve(queued, payload.len(), udp.settings.queue_bytes) {
                 return udp.drop_one();
             }
-            let batch = match (guard, &key.0) {
-                (Some(g), TargetAddr::Ip(ip)) => {
-                    let Guarded { guard, route } = &mut **g;
-                    let same = |q: &Quic| {
-                        route_sniffed(kernel, &udp.settings, *ip, port, q).as_ref() == Some(route)
-                    };
-                    match guard.push(payload.to_vec(), payload, same) {
-                        Step::Hold => return,
-                        // SOCKS has no way to signal a refusal to the
-                        // client: drop, as for any refused datagram.
-                        Step::Drop(ds) | Step::Refuse(ds) => return drop_all(udp, queued, &ds),
-                        Step::Forward(ds) => ds,
-                    }
-                }
-                _ => vec![payload.to_vec()],
-            };
-            let single = batch.len() == 1;
-            let mut batch = batch.into_iter();
-            for d in batch.by_ref() {
-                let n = d.len();
-                match tx.try_send(d) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        queued.fetch_sub(n, Ordering::Relaxed);
-                        udp.drop_one();
-                    }
-                    Err(TrySendError::Closed(_)) => {
-                        queued.fetch_sub(n, Ordering::Relaxed);
-                        let rest: Vec<_> = batch.by_ref().collect();
-                        drop_all(udp, queued, &rest);
-                        if let Some(old) = flows.remove(&key) {
-                            release(queued, &old);
-                        }
-                        if !single {
-                            return udp.drop_one();
-                        }
-                        // Went idle (or broke): route afresh below.
-                        break;
-                    }
-                }
+            if f.tx.try_send(payload.to_vec()).is_err() {
+                queued.fetch_sub(payload.len(), Ordering::Relaxed);
+                udp.drop_one();
             }
-            if flows.contains_key(&key) {
-                return;
-            }
+            return;
         }
-        Some(Slot::Held { .. }) => held = flows.remove(&key),
-        None => {}
+        // Went idle (or broke): route afresh.
+        flows.remove(&key);
     }
-    if held.is_none() && flows.len() >= udp.settings.max_flows {
-        flows.retain(|_, f| {
-            let stale = f.stale(udp.settings.idle_timeout);
-            if stale {
-                release(queued, f);
-            }
-            !stale
-        });
+    if flows.len() >= udp.settings.max_flows {
+        flows.retain(|_, f| !f.tx.is_closed());
         if flows.len() >= udp.settings.max_flows {
             return udp.drop_one();
         }
     }
-    if !reserve(queued) {
-        if let Some(h) = &held {
-            release(queued, h);
-        }
+    let plain = match &key.0 {
+        TargetAddr::Ip(ip) => plain(kernel, *ip),
+        TargetAddr::Domain(_) => false,
+    };
+    if plain && (port == QUIC_PORT || looks_quic(payload)) {
+        // QUIC needs a name known for certain (a domain or a fake IP);
+        // UDP/443 to a bare IP is taken for QUIC whatever it carries.
         return udp.drop_one();
     }
-    let decided = match (held, &key.0) {
-        (
-            Some(Slot::Held {
-                mut sniffer,
-                mut datagrams,
-                since,
-            }),
-            TargetAddr::Ip(ip),
-        ) => {
-            datagrams.push(payload.to_vec());
-            match sniffer.push(payload) {
-                Quic::NeedMore => {
-                    flows.insert(
-                        key,
-                        Slot::Held {
-                            sniffer,
-                            datagrams,
-                            since,
-                        },
-                    );
-                    return;
-                }
-                q => (
-                    route_sniffed(kernel, &udp.settings, *ip, port, &q),
-                    datagrams,
-                    Some(guard_for(&sniffer, &q, port)),
-                ),
-            }
-        }
-        (_, TargetAddr::Ip(ip)) if sniffs(kernel, *ip) => {
-            let mut sniffer = InitialSniffer::default();
-            match sniffer.push(payload) {
-                Quic::NeedMore => {
-                    flows.insert(
-                        key,
-                        Slot::Held {
-                            sniffer,
-                            datagrams: vec![payload.to_vec()],
-                            since: Instant::now(),
-                        },
-                    );
-                    return;
-                }
-                q => (
-                    route_sniffed(kernel, &udp.settings, *ip, port, &q),
-                    vec![payload.to_vec()],
-                    Some(guard_for(&sniffer, &q, port)),
-                ),
-            }
-        }
-        _ => (
-            route(kernel, &udp.settings, &key.0, port),
-            vec![payload.to_vec()],
-            None,
-        ),
+    let Some((tag, target)) = route(kernel, &udp.settings, &key.0, port) else {
+        return udp.drop_one();
     };
-    let (route, datagrams, guard) = decided;
-    let Some((tag, target)) = route.clone() else {
-        let n: usize = datagrams.iter().map(Vec::len).sum();
-        queued.fetch_sub(n, Ordering::Relaxed);
-        for _ in &datagrams {
-            udp.drop_one();
-        }
-        return;
-    };
-    let (tx, rx) = mpsc::channel(udp.settings.queue.max(datagrams.len()));
-    for d in datagrams {
-        let _ = tx.try_send(d);
+    if !reserve(queued, payload.len(), udp.settings.queue_bytes) {
+        return udp.drop_one();
     }
+    let (tx, rx) = mpsc::channel(udp.settings.queue.max(1));
+    let _ = tx.try_send(payload.to_vec());
     tokio::spawn(flow(
         Flow {
             dialer: kernel.dialer.clone(),
@@ -417,85 +253,30 @@ fn uplink(
             idle: udp.settings.idle_timeout,
             dropped: udp.dropped.clone(),
             queued: queued.clone(),
-            watch: guard.as_ref().map(ConnGuard::watch),
         },
         rx,
     ));
-    let guard = guard.map(|guard| {
-        let route = route.expect("routed");
-        let guard = match &key.0 {
-            TargetAddr::Ip(ip) => guard.with_route(
-                udp.quic_routes.clone(),
-                SocketAddr::new(*ip, port),
-                route.0.clone(),
-            ),
-            TargetAddr::Domain(_) => guard,
-        };
-        Box::new(Guarded { guard, route })
-    });
-    flows.insert(key, Slot::Live { tx, guard });
+    flows.insert(key, Slot { tx, plain });
 }
 
-/// The per-connection guard of a flow routed after `sniffer` said `q`.
-fn guard_for(sniffer: &InitialSniffer, q: &Quic, port: u16) -> ConnGuard<Vec<u8>> {
-    ConnGuard::new(
-        matches!(q, Quic::Domain(_)).then_some(sniffer),
-        port == QUIC_PORT,
-    )
+/// Reserve `n` payload bytes in the association budget; whoever takes the
+/// datagram off the queue (or drops it) gives them back.
+fn reserve(queued: &AtomicUsize, n: usize, budget: usize) -> bool {
+    queued
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            (used + n <= budget).then_some(used + n)
+        })
+        .is_ok()
 }
 
-/// Whether a new flow to this bare IP is classified by its datagrams first
-/// (not a fake address, and not already refused by an IP rule).
-pub(crate) fn sniffs(kernel: &Kernel, ip: IpAddr) -> bool {
-    if kernel.fake_ip.as_ref().is_some_and(|p| p.contains(ip)) {
-        return false;
-    }
-    let policy = kernel.policy.current();
-    !policy.refuse_all
-        && !matches!(
-            policy.rules.lookup(&TargetAddr::Ip(ip)),
-            Some((_, Action::Reject))
-        )
+/// Whether a new TUN flow to this IP is a bare-IP flow: not a fake address,
+/// so ordinary UDP only (QUIC refused, §5.2a.2).
+pub(crate) fn plain(kernel: &Kernel, ip: IpAddr) -> bool {
+    !kernel.fake_ip.as_ref().is_some_and(|p| p.contains(ip))
 }
 
-/// Route a bare-IP flow once its first datagrams are classified (§5.2a.2).
-/// The policy current now applies.
-pub(crate) fn route_sniffed(
-    kernel: &Kernel,
-    s: &UdpSettings,
-    ip: IpAddr,
-    port: u16,
-    quic: &Quic,
-) -> Option<(Option<String>, TargetAddr)> {
-    let policy = kernel.policy.current();
-    if policy.refuse_all {
-        return None;
-    }
-    match quic {
-        // UDP/443 is QUIC's port: anything there that is not a readable
-        // client Initial (a short-header packet of a connection we never saw
-        // start, a QUIC version we cannot read) cannot be confirmed non-AI.
-        Quic::NotQuic if port != QUIC_PORT => route(kernel, s, &TargetAddr::Ip(ip), port),
-        Quic::Domain(d) => {
-            let rules = &policy.rules;
-            let by_ip = rules.lookup(&TargetAddr::Ip(ip));
-            let by_domain = rules.lookup(&TargetAddr::Domain(d.clone()));
-            let action = crate::socks::stricter(by_ip, by_domain)
-                .unwrap_or_else(|| rules.default_action())
-                .clone();
-            let target = match action {
-                // Direct goes to the address the app asked for (resolving
-                // the sniffed name locally would leak it).
-                Action::Direct => TargetAddr::Ip(ip),
-                _ => TargetAddr::Domain(d.clone()),
-            };
-            finish(s, action, target, port)
-        }
-        _ => None,
-    }
-}
-
-const QUIC_PORT: u16 = 443;
+/// QUIC's port; UDP to it on a bare IP is refused.
+pub(crate) const QUIC_PORT: u16 = 443;
 
 /// The outbound (None: direct) and the address to dial, or None: refused.
 pub(crate) fn route(
@@ -550,9 +331,6 @@ struct Flow {
     idle: Duration,
     dropped: Arc<AtomicU64>,
     queued: Arc<AtomicUsize>,
-    /// The flow's QUIC guard learns the server's connection IDs from
-    /// replies (R7).
-    watch: Option<ReplyWatch>,
 }
 
 async fn flow(f: Flow, mut rx: mpsc::Receiver<Vec<u8>>) {
@@ -598,15 +376,11 @@ async fn run_flow(f: &Flow, rx: &mut mpsc::Receiver<Vec<u8>>) {
         let (socket, client, reply_as, port) =
             (f.socket.clone(), f.client, f.reply_as.clone(), f.port);
         let by_name = matches!(f.target, TargetAddr::Domain(_));
-        let watch = f.watch.clone();
         async move {
             let mut buf = Vec::new();
             let mut out = Vec::new();
             while let Ok((src, sport)) = session.recv(&mut buf).await {
                 last_down.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
-                if let Some(w) = &watch {
-                    w.observe(&buf);
-                }
                 let (src, sport) = if by_name {
                     (&reply_as, port)
                 } else {
