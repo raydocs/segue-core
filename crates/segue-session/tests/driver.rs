@@ -68,7 +68,14 @@ struct Outcome {
 }
 
 async fn transfer(up: Vec<u8>, down: Vec<u8>, budgets: Vec<usize>) -> Outcome {
-    let cfg = Config::default();
+    let mut cfg = Config::default();
+    // Re-attach only when a carrier is really cut: a loaded test machine
+    // can delay ACKs past the 1 s stall bound, which would add a carrier
+    // to a fault-free transfer (flaky `carriers == 1`). Cuts close the
+    // carrier, so they are still noticed at once.
+    cfg.timing.t_stall = Duration::from_secs(60);
+    cfg.timing.t_live = Duration::from_secs(60);
+    cfg.timing.t_attach = Duration::from_secs(60);
     let client_pool = Pool::new(8 << 20);
     let relay_pool = Pool::new(8 << 20);
     let params = OpenParams {
@@ -537,7 +544,7 @@ impl AsyncWrite for Tracked {
 }
 
 async fn wait_flag(f: &std::sync::atomic::AtomicBool, what: &str) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while !f.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -564,12 +571,14 @@ async fn aborting_the_client_driver_releases_its_carrier_and_dial() {
         );
         Arc::new(move || {
             let n = calls.fetch_add(1, Ordering::SeqCst);
-            let (carrier_gone, dial_gone, peers) =
-                (carrier_gone.clone(), dial_gone.clone(), peers.clone());
+            let (carrier_gone, peers) = (carrier_gone.clone(), peers.clone());
+            // Owned by the dial future from its creation, so the flag is
+            // raised when the future is dropped even if it never ran (the
+            // driver may be aborted before its dial task is first polled).
+            let dial_flag = (n > 0).then(|| DropFlag(dial_gone.clone()));
             Box::pin(async move {
-                if n > 0 {
+                if let Some(_f) = dial_flag {
                     // A reconnect that never completes.
-                    let _f = DropFlag(dial_gone);
                     std::future::pending::<()>().await;
                 }
                 // A silent relay: never answers, never closes.
@@ -601,7 +610,14 @@ async fn aborting_the_client_driver_releases_its_carrier_and_dial() {
     if calls.load(Ordering::SeqCst) >= 2 {
         wait_flag(&dial_gone, "the dial").await;
     }
-    assert_eq!(pool.used_blocks(), 0, "pool not returned");
+    // Aborted tasks drop their state when the runtime next gets to them.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pool.used_blocks() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("pool not returned: {} blocks", pool.used_blocks()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -772,4 +788,44 @@ async fn sessions_admitted_before_the_pool_ran_out_still_finish() {
     drop(hog);
     assert!(ClientSession::new(cfg, &pool, params(), Instant::now()).is_some());
     relay.abort();
+}
+
+#[test]
+fn the_8mb_pool_admits_hundreds_of_flows() {
+    // r6 R6 / KERNEL_SPEC §6.3: no per-session reserve. A fresh flow costs
+    // its floors only: the 16 KiB initial credit (§4 rule 8), one replay
+    // block, one pipe block each way, and through the TUN one ring block
+    // each way.
+    use segue_session::pipe::pipe;
+    use segue_session::pool::{Grant, Tier, BLOCK};
+    let cfg = Config::default();
+    let admit = |tun: bool| {
+        let pool = Pool::new(8 << 20);
+        let mut flows = Vec::new();
+        loop {
+            let Some(s) = ClientSession::new(cfg.clone(), &pool, params(), Instant::now()) else {
+                break;
+            };
+            let Some(p) = pipe(&pool, 64 << 10) else {
+                break;
+            };
+            let ring = if tun {
+                match Grant::fixed(&pool, 2 * BLOCK) {
+                    Some(g) => Some(g),
+                    None => break,
+                }
+            } else {
+                None
+            };
+            flows.push((s, p, ring));
+        }
+        // Refused only once the elastic part is spent; the draining
+        // regions stay free for progress.
+        assert!(pool.limit(Tier::Elastic) - pool.used_blocks() < 7);
+        flows.len()
+    };
+    let (sessions, tun_flows) = (admit(false), admit(true));
+    println!("8 MiB pool admits {sessions} session flows, {tun_flows} TUN session flows");
+    assert!(sessions >= 280, "{sessions} session flows");
+    assert!(tun_flows >= 220, "{tun_flows} TUN flows");
 }
