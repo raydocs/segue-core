@@ -2168,8 +2168,7 @@ impl TunStack {
         let packet_queues = (c.out_queue + 2 * c.udp_queue + 1) * mtu;
         // Per flow: queued datagrams, one receive buffer of a reply's size,
         // bookkeeping; the QUIC guard's held datagrams and kept hellos.
-        let guard = (crate::quic::MAX_DATAGRAMS - 1) * mtu
-            + crate::quic::MAX_CONNS * crate::quic::MAX_HELLO;
+        let guard = (crate::quic::MAX_DATAGRAMS - 1) * mtu + crate::quic::GUARD_KEPT;
         let udp_flows = c.max_udp_flows * ((self.udp_flow_queue + 1) * mtu + 1024 + guard);
         // A query and its answer (TCP answers live in the pool).
         let dns = self.max_dns_in_flight * 2 * mtu;
@@ -2379,7 +2378,13 @@ impl TunStack {
                     let mut msg = Some(msg);
                     while let Some(m) = msg.take() {
                         match m {
-                            UdpMsg::Reply { key, payload } => stack.send_udp(&key, &payload),
+                            UdpMsg::Reply { key, payload } => {
+                                // The QUIC guard learns server IDs (R7).
+                                if let Some(UdpLive { guard: Some(g), .. }) = udp_flows.get(&key) {
+                                    g.observe_reply(&payload);
+                                }
+                                stack.send_udp(&key, &payload);
+                            }
                             UdpMsg::Dns { key, payload } => {
                                 if let Some(p) = truncate_dns(&payload, stack.max_udp_reply(&key)) {
                                     stack.send_udp(&key, &p);

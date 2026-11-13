@@ -564,12 +564,28 @@ async fn second_quic_connection_on_same_flow_is_classified() {
         for d in [QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2] {
             c.send(&packet(&dst, port, &hex(d))).await.unwrap();
         }
-        assert_eq!(recv(&c, QUIET).await, None, "{port}: AI Initials echoed");
+        // R7: QUIC the guard cannot attribute to the allowed connection (an
+        // unknown version, a Handshake to an ID nobody chose) never rides
+        // the flow, on any port.
+        let mut other_version = hex(RFC9001_CLIENT_INITIAL);
+        other_version[1..5].copy_from_slice(&[0xff, 0, 0, 0x1d]);
+        let mut handshake = vec![0xe0, 0, 0, 0, 1, 8];
+        handshake.extend_from_slice(&[8; 8]);
+        handshake.extend_from_slice(&[0, 4, 0, 0, 0, 0]);
+        for d in [other_version, handshake] {
+            c.send(&packet(&dst, port, &d)).await.unwrap();
+        }
+        // (Within the 300 ms idle timeout of the first connection.)
+        assert_eq!(
+            recv(&c, QUIET).await,
+            None,
+            "{port}: AI or unattributed QUIC echoed"
+        );
         let short = b"\x40short header".to_vec();
         c.send(&packet(&dst, port, &short)).await.unwrap();
         assert!(recv(&c, WAIT).await.is_some(), "{port}: first still flows");
         assert_eq!(*env.fake.sent.lock().unwrap(), vec![first.clone(), short]);
         assert_eq!(env.fake.calls().len(), 1);
-        assert_eq!(env.udp.as_ref().unwrap().dropped(), 3);
+        assert_eq!(env.udp.as_ref().unwrap().dropped(), 5);
     }
 }

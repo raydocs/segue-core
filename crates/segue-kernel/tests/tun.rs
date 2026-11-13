@@ -730,7 +730,12 @@ struct FakeDialer {
     udp_max: usize,
     /// Every datagram a UDP session was asked to send.
     udp_sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// UDP sessions answer a QUIC v1 long-header datagram like a server:
+    /// a Handshake packet whose SCID is [`SERVER_CID`].
+    quic_server: bool,
 }
+
+const SERVER_CID: [u8; 8] = [0x5e; 8];
 
 #[async_trait]
 impl Dialer for FakeDialer {
@@ -788,6 +793,7 @@ impl Dialer for FakeDialer {
                 self.udp_max
             },
             sent: self.udp_sent.clone(),
+            quic_server: self.quic_server,
         }))
     }
 }
@@ -799,6 +805,7 @@ struct EchoSession {
     from: (TargetAddr, u16),
     max: usize,
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    quic_server: bool,
 }
 
 #[async_trait]
@@ -808,8 +815,17 @@ impl UdpSession for EchoSession {
     }
     async fn send(&self, _: &TargetAddr, _: u16, p: &[u8]) -> Result<(), DialError> {
         self.sent.lock().unwrap().push(p.to_vec());
-        let mut v = b"echo:".to_vec();
-        v.extend_from_slice(p);
+        let v =
+            if self.quic_server && p.len() >= 5 && p[0] & 0xc0 == 0xc0 && p[1..5] == [0, 0, 0, 1] {
+                let mut v = vec![0xe0, 0, 0, 0, 1, 0, SERVER_CID.len() as u8];
+                v.extend_from_slice(&SERVER_CID);
+                v.extend_from_slice(&[4, 0, 0, 0, 0]);
+                v
+            } else {
+                let mut v = b"echo:".to_vec();
+                v.extend_from_slice(p);
+                v
+            };
         self.tx.send(v).await.map_err(|e| DialError(e.to_string()))
     }
     async fn recv(&self, buf: &mut Vec<u8>) -> Result<(TargetAddr, u16), DialError> {
@@ -1961,29 +1977,44 @@ async fn tun_second_quic_connection_on_same_tuple_is_classified() {
             false,
             FakeDialer {
                 udp_max: 1500,
+                quic_server: true,
                 ..Default::default()
             },
         );
         let dst: SocketAddr = dst.parse().unwrap();
         e.h.send(udp(CLIENT4, dst, &first)).await;
         assert_eq!(udp_sent(&e, 1).await, vec![first.clone()], "{dst}");
+        // The server's reply (its connection ID) reaches the client.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let ai = initial_for_test(&[9; 8], "chatgpt.com");
         e.h.send(udp(CLIENT4, dst, &ai)).await;
         let (a, b) = (hex(QUIC_GO_CHATGPT_INITIAL), hex(QUIC_GO_CHATGPT_INITIAL_2));
         e.h.send(udp(CLIENT4, dst, &a)).await;
         e.h.send(udp(CLIENT4, dst, &b)).await;
+        // R7: an unknown QUIC version never rides the flow, on any port.
+        let mut other_version = hex(RFC9001_CLIENT_INITIAL);
+        other_version[1..5].copy_from_slice(&[0xff, 0, 0, 0x1d]);
+        e.h.send(udp(CLIENT4, dst, &other_version)).await;
+        // R7: on the QUIC flow a short header to an ID the server never
+        // chose is dropped; on the plain-UDP flow it is ordinary UDP.
+        let unknown = b"\x40\x01\x02\x03\x04\x05\x06\x07\x08 unknown".to_vec();
+        e.h.send(udp(CLIENT4, dst, &unknown)).await;
         // The first connection still flows.
-        let short = b"\x40short header".to_vec();
+        let mut short = vec![0x40];
+        short.extend_from_slice(&SERVER_CID);
+        short.extend_from_slice(b"short header");
         e.h.send(udp(CLIENT4, dst, &short)).await;
-        let sent = udp_sent(&e, 2).await;
+        let quic_flow = dst.port() == 443;
+        let want = if quic_flow {
+            vec![first.clone(), short]
+        } else {
+            vec![first.clone(), unknown, short]
+        };
+        let sent = udp_sent(&e, want.len()).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let sent2 = e.dialer.udp_sent.lock().unwrap().clone();
         assert_eq!(sent, sent2);
-        assert_eq!(
-            sent,
-            vec![first.clone(), short],
-            "{dst}: AI Initials not sent"
-        );
+        assert_eq!(sent, want, "{dst}: AI Initials not sent");
         assert_eq!(e.dialer.udp_dials.lock().unwrap().len(), 1);
     }
 }

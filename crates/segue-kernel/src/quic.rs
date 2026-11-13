@@ -98,7 +98,7 @@ impl InitialSniffer {
                     }
                     rest = &rest[used..];
                 }
-                Some((used, Pkt::Other)) => rest = &rest[used..],
+                Some((used, Pkt::Other(_))) => rest = &rest[used..],
                 None => break,
             }
         }
@@ -109,7 +109,13 @@ impl InitialSniffer {
         if self.initials == 0 || self.foreign {
             return Quic::Unclassified;
         }
-        match sniff::client_hello_sni(&self.crypto.contiguous()) {
+        let hello = self.crypto.contiguous();
+        match sniff::client_hello_sni(&hello) {
+            // A name later than the guard can keep could not be checked
+            // against retransmissions (R11): refused up front instead.
+            Sniff::Domain(_) if named_len(&hello).is_none_or(|n| n > MAX_HELLO) => {
+                Quic::Unclassified
+            }
             Sniff::Domain(d) => Quic::Domain(d),
             Sniff::NeedMore if self.seen < MAX_DATAGRAMS => Quic::NeedMore,
             _ => Quic::Unclassified,
@@ -121,32 +127,44 @@ impl InitialSniffer {
     fn conn(&self) -> Option<Conn> {
         let dcid = self.dcid.clone()?;
         let mut hello = self.crypto.contiguous();
-        // Shortest prefix that names the server (a prefix of a hello is
-        // NeedMore until the name is in, then the name).
-        let is_named = |n: usize| matches!(sniff::client_hello_sni(&hello[..n]), Sniff::Domain(_));
-        if !is_named(hello.len()) {
-            return None;
-        }
-        let (mut lo, mut hi) = (0, hello.len());
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if is_named(mid) {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        let named = hi;
-        hello.truncate(named.min(MAX_HELLO));
+        let named = named_len(&hello).filter(|&n| n <= MAX_HELLO)?;
+        hello.truncate(named);
         hello.shrink_to_fit();
-        Some(Conn { dcid, hello, named })
+        Some(Conn { dcid, hello })
     }
+}
+
+/// Shortest prefix of `hello` that names the server (a prefix of a hello
+/// is NeedMore until the name is in, then the name), or None if unnamed.
+fn named_len(hello: &[u8]) -> Option<usize> {
+    let is_named = |n: usize| matches!(sniff::client_hello_sni(&hello[..n]), Sniff::Domain(_));
+    if !is_named(hello.len()) {
+        return None;
+    }
+    let (mut lo, mut hi) = (0, hello.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if is_named(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(hi)
 }
 
 /// Connections a [`ConnGuard`] remembers per flow, each way.
 pub const MAX_CONNS: usize = 2;
-/// ClientHello bytes a [`ConnGuard`] keeps per connection.
-pub const MAX_HELLO: usize = 2048;
+/// ClientHello bytes a [`ConnGuard`] keeps per connection: everything up
+/// to the end of the server name, so any retransmission of those bytes can
+/// be checked. A hello naming its server later than this is refused at
+/// classification ([`Quic::Unclassified`]).
+pub const MAX_HELLO: usize = 3072;
+/// Server-chosen connection IDs a [`ConnGuard`] remembers per flow.
+pub const MAX_SERVER_CIDS: usize = 8;
+/// Upper bound of what a [`ConnGuard`] keeps besides held datagrams: the
+/// kept hellos and server IDs (with their allocation overhead).
+pub const GUARD_KEPT: usize = MAX_CONNS * (MAX_HELLO + 64) + MAX_SERVER_CIDS * (20 + 32) + 128;
 
 /// What to do with a datagram of a routed UDP flow (see [`ConnGuard`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -161,24 +179,96 @@ pub enum Step<T> {
 }
 
 /// A classified connection: its DCID and the ClientHello prefix that
-/// decided its name (`named` bytes, of which up to [`MAX_HELLO`] are kept).
+/// decided its name (at most [`MAX_HELLO`] bytes, all kept).
 struct Conn {
     dcid: Vec<u8>,
     hello: Vec<u8>,
-    named: usize,
 }
 
 impl Conn {
     /// A later Initial with this DCID may only repeat the bytes that named
-    /// the server (retransmission) or carry later parts of the hello; any
-    /// other byte there is another ClientHello. Bytes not kept (a name past
-    /// [`MAX_HELLO`]) cannot be checked and count as different.
+    /// the server (retransmission, however the CRYPTO data is split) or
+    /// carry later parts of the hello; any other byte there is another
+    /// ClientHello.
     fn consistent(&self, c: &Crypto) -> bool {
         c.parts.iter().all(|(off, data)| {
-            let end = (off + data.len()).min(self.named);
-            *off >= end || (end <= self.hello.len() && self.hello[*off..end] == data[..end - off])
+            let end = (off + data.len()).min(self.hello.len());
+            *off >= end || self.hello[*off..end] == data[..end - off]
         })
     }
+}
+
+/// Connection IDs the server of a guarded flow chose (the Source
+/// Connection ID of its long-header replies), shared with the task that
+/// carries the flow's replies (see [`ConnGuard::watch`]).
+#[derive(Clone, Default)]
+pub struct ReplyWatch(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+impl ReplyWatch {
+    /// Look at one reply datagram before it is delivered to the client:
+    /// a QUIC v1/v2 long-header packet's SCID becomes a connection ID the
+    /// client may address. The server only answers packets the guard
+    /// forwarded, i.e. connections it allowed.
+    pub fn observe(&self, dgram: &[u8]) {
+        let Some(scid) = server_scid(dgram) else {
+            return;
+        };
+        let mut ids = self.0.lock().expect("reply watch lock");
+        if !ids.iter().any(|c| c == scid) {
+            if ids.len() >= MAX_SERVER_CIDS {
+                ids.remove(0);
+            }
+            ids.push(scid.to_vec());
+        }
+    }
+
+    fn knows(&self, dcid: &[u8]) -> bool {
+        self.0
+            .lock()
+            .expect("reply watch lock")
+            .iter()
+            .any(|c| c == dcid)
+    }
+
+    /// A short-header packet addressed to one of the server's IDs (its
+    /// length is not in the packet: compare each). A server that chose a
+    /// zero-length ID tells its connection by the address pair, which this
+    /// flow is, so then any short header is that connection's.
+    fn knows_short(&self, pkt: &[u8]) -> bool {
+        self.0
+            .lock()
+            .expect("reply watch lock")
+            .iter()
+            .any(|c| pkt.get(1..1 + c.len()) == Some(c.as_slice()))
+    }
+}
+
+/// The SCID of a server's QUIC v1/v2 long-header packet (Initial,
+/// Handshake or Retry).
+fn server_scid(p: &[u8]) -> Option<&[u8]> {
+    let mut c = Cur { b: p, p: 0 };
+    let b0 = c.u8()?;
+    if b0 & 0xc0 != 0xc0 {
+        return None;
+    }
+    let version = u32::from_be_bytes(c.take(4)?.try_into().ok()?);
+    let ptype = (b0 >> 4) & 0x03;
+    // 0-RTT (v1 type 1, v2 type 2) is the client's only.
+    match (version, ptype) {
+        (V1, 1) | (V2, 2) => return None,
+        (V1 | V2, _) => {}
+        _ => return None,
+    }
+    let dcid_len = c.u8()? as usize;
+    if dcid_len > 20 {
+        return None;
+    }
+    c.take(dcid_len)?;
+    let scid_len = c.u8()? as usize;
+    if scid_len > 20 {
+        return None;
+    }
+    c.take(scid_len)
 }
 
 struct Pending<T> {
@@ -198,31 +288,59 @@ struct Pending<T> {
 ///
 /// A new connection is recognized by its client Initial decrypting under
 /// keys derived from its own DCID: that is what a server accepts as a new
-/// connection. Later Initials of a running connection (after the server's
-/// reply the client addresses the server-chosen ID, under the original
-/// keys) do not decrypt that way and are forwarded, as are short-header
-/// and Handshake packets. An Initial reusing a known DCID must repeat the
-/// ClientHello bytes that connection was classified by.
+/// connection. An Initial reusing a known DCID must repeat the ClientHello
+/// bytes that connection was classified by.
 ///
-/// `strict` (UDP/443): a long-header packet of a QUIC version we cannot
-/// read is dropped too, as at flow start.
+/// Every other packet must belong to an allowed connection (R7): a QUIC
+/// long-header packet (fixed bit set) that is not such an Initial is
+/// forwarded only when its DCID is an allowed connection's (0-RTT) or one
+/// the server chose ([`ReplyWatch`]; later Initials and Handshake
+/// packets); one of a QUIC version we cannot read, or that does not parse,
+/// is dropped, on every port, as at flow start. On a QUIC flow (`strict`,
+/// UDP/443, or one routed by a QUIC connection) a short-header packet must
+/// be addressed to a server-chosen ID too. A client that switches to an ID
+/// the server issued inside the encrypted connection (NEW_CONNECTION_ID)
+/// is dropped from then on and falls back to TCP; that is the price of not
+/// letting an unclassified connection ride the flow.
 pub struct ConnGuard<T> {
     conns: Vec<Conn>,
     refused: Vec<Vec<u8>>,
     pending: Option<Pending<T>>,
-    strict: bool,
+    /// Short-header packets need a known server ID.
+    quic: bool,
+    server: ReplyWatch,
 }
 
 impl<T> ConnGuard<T> {
     /// For a flow routed after `sniffer` (None: routed without a QUIC
     /// connection, e.g. ordinary UDP on another port).
     pub fn new(sniffer: Option<&InitialSniffer>, strict: bool) -> Self {
+        let conns: Vec<Conn> = sniffer.and_then(InitialSniffer::conn).into_iter().collect();
         Self {
-            conns: sniffer.and_then(InitialSniffer::conn).into_iter().collect(),
+            quic: strict || !conns.is_empty(),
+            conns,
             refused: Vec::new(),
             pending: None,
-            strict,
+            server: ReplyWatch::default(),
         }
+    }
+
+    /// The handle the flow's reply path feeds every reply datagram to
+    /// ([`ReplyWatch::observe`]) before delivering it.
+    pub fn watch(&self) -> ReplyWatch {
+        self.server.clone()
+    }
+
+    /// [`ReplyWatch::observe`] for a reply path that owns the guard.
+    pub fn observe_reply(&self, dgram: &[u8]) {
+        self.server.observe(dgram);
+    }
+
+    /// Whether a QUIC packet with this DCID belongs to an allowed
+    /// connection.
+    fn associated(&self, dcid: &[u8]) -> bool {
+        !self.refused.iter().any(|r| r == dcid)
+            && (self.conns.iter().any(|c| c.dcid == dcid) || self.server.knows(dcid))
     }
 
     /// Datagrams held for a connection being classified.
@@ -233,10 +351,22 @@ impl<T> ConnGuard<T> {
     /// Classify `bytes` (the payload of `d`). `allow` is asked, once a new
     /// connection's ClientHello is read, whether it routes like the flow.
     pub fn push(&mut self, d: T, bytes: &[u8], allow: impl FnOnce(&Quic) -> bool) -> Step<T> {
-        if self.strict
-            && bytes.len() >= 5
-            && bytes[0] & 0x80 != 0
-            && !matches!(
+        let b0 = bytes.first().copied().unwrap_or(0);
+        if b0 & 0x80 == 0 {
+            // Short header (or not QUIC at all on an ordinary UDP flow).
+            return if !self.quic || self.server.knows_short(bytes) {
+                Step::Forward(vec![d])
+            } else {
+                Step::Drop(vec![d])
+            };
+        }
+        let quic_shaped = b0 & 0x40 != 0 && bytes.len() >= 7;
+        if !quic_shaped && !self.quic {
+            // Not QUIC-shaped, as at flow start: ordinary UDP.
+            return Step::Forward(vec![d]);
+        }
+        if bytes.len() < 5
+            || !matches!(
                 u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]),
                 V1 | V2
             )
@@ -248,7 +378,13 @@ impl<T> ConnGuard<T> {
             Initial::One(dcid, crypto) => Some((dcid, crypto)),
             Initial::Mixed => return Step::Drop(vec![d]),
         }) else {
-            return Step::Forward(vec![d]);
+            // No new client Initial: every packet must be an allowed
+            // connection's.
+            return if self.all_associated(bytes) {
+                Step::Forward(vec![d])
+            } else {
+                Step::Drop(vec![d])
+            };
         };
         if self.refused.contains(&dcid) {
             return Step::Drop(vec![d]);
@@ -299,6 +435,29 @@ impl<T> ConnGuard<T> {
     }
 }
 
+impl<T> ConnGuard<T> {
+    /// Every long-header packet in `dgram` parses and is addressed to an
+    /// allowed connection (a trailing short-header packet shares the DCID
+    /// of the packets before it, RFC 9000 §12.2).
+    fn all_associated(&self, dgram: &[u8]) -> bool {
+        let mut rest = dgram;
+        let mut any = false;
+        while rest.first().is_some_and(|b| b & 0x80 != 0) {
+            match packet(rest) {
+                Some((used, Pkt::Other(dcid) | Pkt::Initial(dcid, _))) => {
+                    if !self.associated(dcid) {
+                        return false;
+                    }
+                    any = true;
+                    rest = &rest[used..];
+                }
+                None => return false,
+            }
+        }
+        any
+    }
+}
+
 enum Initial {
     None,
     One(Vec<u8>, Crypto),
@@ -320,7 +479,7 @@ fn client_initial(dgram: &[u8]) -> Initial {
                 }
                 rest = &rest[used..];
             }
-            Some((used, Pkt::Other)) => rest = &rest[used..],
+            Some((used, Pkt::Other(_))) => rest = &rest[used..],
             None => break,
         }
     }
@@ -333,7 +492,8 @@ fn client_initial(dgram: &[u8]) -> Initial {
 enum Pkt<'a> {
     /// A client Initial that decrypted; its DCID and CRYPTO data.
     Initial(&'a [u8], Crypto),
-    Other,
+    /// Any other v1/v2 long-header packet; its DCID.
+    Other(&'a [u8]),
 }
 
 /// Parse one long-header packet at the start of `p`. Returns the bytes it
@@ -375,12 +535,12 @@ fn packet(p: &[u8]) -> Option<(usize, Pkt<'_>)> {
         return None;
     }
     if ptype != initial_type {
-        return Some((end, Pkt::Other));
+        return Some((end, Pkt::Other(dcid)));
     }
     let mut crypto = Crypto::default();
     let pkt = match decrypt_initial(&p[..end], pn_off, dcid, salt, label_v2, &mut crypto) {
         Some(()) => Pkt::Initial(dcid, crypto),
-        None => Pkt::Other,
+        None => Pkt::Other(dcid),
     };
     Some((end, pkt))
 }
@@ -773,8 +933,10 @@ mod tests {
         let first = initial_for_test(&[1; 8], "example.com");
         let mut g = guard_after(&first);
         let allow = |q: &Quic| q == &Quic::Domain("example.com".into());
-        // Retransmission of the classified Initial, a short-header packet.
+        // Retransmission of the classified Initial; a short-header packet
+        // to the ID the server chose.
         assert_eq!(g.push(1, &first, allow), Step::Forward(vec![1]));
+        g.observe_reply(&long_for_test(0xe0, &[], &[1, 2, 3, 4], 40));
         assert_eq!(
             g.push(2, &[0x40, 1, 2, 3, 4, 5, 6, 7], allow),
             Step::Forward(vec![2])
@@ -804,7 +966,7 @@ mod tests {
     }
 
     /// A flow routed as ordinary UDP (not QUIC at first) still classifies a
-    /// QUIC Initial that shows up later.
+    /// QUIC Initial that shows up later, and refuses QUIC it cannot read.
     #[test]
     fn guard_on_plain_udp_flow() {
         let mut g: ConnGuard<u8> = ConnGuard::new(None, false);
@@ -814,9 +976,140 @@ mod tests {
         );
         let ai = initial_for_test(&[9; 8], "chatgpt.com");
         assert_eq!(g.push(2, &ai, |_| false), Step::Drop(vec![2]));
-        // Not strict: unknown long-header versions pass on other ports.
+        // R7: an unknown QUIC version is refused on every port, as at flow
+        // start; the classifier is never skipped.
         let mut junk = vec![0xc0u8; 40];
         junk[1..5].copy_from_slice(&[0xff, 0, 0, 0x1d]);
-        assert_eq!(g.push(3, &junk, |_| false), Step::Forward(vec![3]));
+        assert_eq!(g.push(3, &junk, |_| true), Step::Drop(vec![3]));
+        // A v1 Handshake packet of a connection never seen to start.
+        let hs = long_for_test(0xe0, &[5; 8], &[], 40);
+        assert_eq!(g.push(4, &hs, |_| true), Step::Drop(vec![4]));
+        // Ordinary UDP (short-header shaped) still goes by the IP rules.
+        assert_eq!(
+            g.push(5, &[0x40, 9, 9, 9], |_| true),
+            Step::Forward(vec![5])
+        );
+        assert_eq!(g.push(6, &[0x80, 9], |_| true), Step::Forward(vec![6]));
+    }
+
+    /// A v1 long-header packet (first byte `b0`) with this DCID/SCID and a
+    /// `len`-byte opaque body; its header is all a guard reads.
+    fn long_for_test(b0: u8, dcid: &[u8], scid: &[u8], len: u8) -> Vec<u8> {
+        let mut p = vec![b0];
+        p.extend_from_slice(&V1.to_be_bytes());
+        p.push(dcid.len() as u8);
+        p.extend_from_slice(dcid);
+        p.push(scid.len() as u8);
+        p.extend_from_slice(scid);
+        if b0 & 0x30 == 0 {
+            p.push(0); // Initial: empty token
+        }
+        p.push(len);
+        p.extend(std::iter::repeat_n(0x5a, len.into()));
+        p
+    }
+
+    /// R7: on a routed QUIC flow nothing rides along unclassified: not an
+    /// unknown QUIC version, not a long-header packet or short-header
+    /// packet addressed to an ID no allowed connection has.
+    #[test]
+    fn guard_refuses_unassociated_packets() {
+        let first = initial_for_test(&[1; 8], "example.com");
+        for strict in [true, false] {
+            let mut s = InitialSniffer::default();
+            assert!(matches!(s.push(&first), Quic::Domain(_)));
+            let mut g: ConnGuard<u8> = ConnGuard::new(Some(&s), strict);
+            let ok = |_: &Quic| true;
+            // Unknown version, also with a known DCID.
+            let mut v = first.clone();
+            v[1..5].copy_from_slice(&[0xff, 0, 0, 0x1d]);
+            assert_eq!(g.push(1, &v, ok), Step::Drop(vec![1]));
+            // Before the server answered, no short-header ID is known.
+            assert_eq!(g.push(2, &[0x40, 7, 7, 7, 7, 0], ok), Step::Drop(vec![2]));
+            // 0-RTT of the allowed connection (its own DCID).
+            let zero_rtt = long_for_test(0xd0, &[1; 8], &[], 40);
+            assert_eq!(g.push(3, &zero_rtt, ok), Step::Forward(vec![3]));
+            // The server's Initial names its ID; replies of other types
+            // and versions teach nothing.
+            g.observe_reply(&long_for_test(0xc0, &[], &[7, 7, 7, 7], 40));
+            g.observe_reply(&long_for_test(0xd0, &[], &[8, 8, 8, 8], 40));
+            g.observe_reply(&[0x40, 8, 8, 8, 8, 0]);
+            // Client Initial and Handshake to the server's ID; short header.
+            let later = long_for_test(0xc0, &[7, 7, 7, 7], &[], 40);
+            assert_eq!(g.push(4, &later, ok), Step::Forward(vec![4]));
+            let hs = long_for_test(0xe0, &[7, 7, 7, 7], &[], 40);
+            assert_eq!(g.push(5, &hs, ok), Step::Forward(vec![5]));
+            let mut both = hs.clone();
+            both.extend_from_slice(&[0x40, 7, 7, 7, 7, 1, 2]);
+            assert_eq!(g.push(6, &both, ok), Step::Forward(vec![6]));
+            assert_eq!(
+                g.push(7, &[0x40, 7, 7, 7, 7, 0], ok),
+                Step::Forward(vec![7])
+            );
+            // Unknown IDs: dropped.
+            assert_eq!(g.push(8, &[0x40, 8, 8, 8, 8, 0], ok), Step::Drop(vec![8]));
+            let other = long_for_test(0xe0, &[8, 8, 8, 8], &[], 40);
+            assert_eq!(g.push(9, &other, ok), Step::Drop(vec![9]));
+            let mut mixed = hs.clone();
+            mixed.extend_from_slice(&other);
+            assert_eq!(g.push(10, &mixed, ok), Step::Drop(vec![10]));
+            // Truncated or unparsable long headers.
+            assert_eq!(g.push(11, &hs[..20], ok), Step::Drop(vec![11]));
+            assert_eq!(g.push(12, &[0xc0, 0, 0, 0], ok), Step::Drop(vec![12]));
+            // Version 1 Retry (the client never sends one).
+            let retry = long_for_test(0xf0, &[7, 7, 7, 7], &[], 40);
+            assert_eq!(g.push(13, &retry, ok), Step::Drop(vec![13]));
+        }
+    }
+
+    /// The CRYPTO data of `hello` split over Initials of `dcid` with at
+    /// most `chunk` bytes each.
+    fn split_initials(dcid: &[u8], hello: &[u8], chunk: usize) -> Vec<Vec<u8>> {
+        hello
+            .chunks(chunk)
+            .enumerate()
+            .map(|(i, c)| seal_initial_for_test(dcid, (i * chunk) as u64, c))
+            .collect()
+    }
+
+    /// R11: a ClientHello naming its server after 2048 bytes is allowed,
+    /// and so are its retransmissions, verbatim or split differently.
+    #[test]
+    fn guard_allows_retransmits_of_a_late_name() {
+        let rec = crate::sniff::client_hello_for_test(Some("example.com"), 2600);
+        let hello = &rec[5..];
+        assert!(named_len(hello).unwrap() > 2600);
+        let first = split_initials(&[1; 8], hello, 1000);
+        assert_eq!(first.len(), 3);
+        let mut s = InitialSniffer::default();
+        assert_eq!(s.push(&first[0]), Quic::NeedMore);
+        assert_eq!(s.push(&first[1]), Quic::NeedMore);
+        assert_eq!(s.push(&first[2]), Quic::Domain("example.com".into()));
+        let mut g: ConnGuard<u8> = ConnGuard::new(Some(&s), true);
+        let never = |_: &Quic| false;
+        for (i, d) in first.iter().enumerate() {
+            assert_eq!(g.push(i as u8, d, never), Step::Forward(vec![i as u8]));
+        }
+        for (i, d) in split_initials(&[1; 8], hello, 700).iter().enumerate() {
+            assert_eq!(g.push(i as u8, d, never), Step::Forward(vec![i as u8]));
+        }
+        let all = seal_initial_for_test(&[1; 8], 0, hello);
+        assert_eq!(g.push(9, &all, never), Step::Forward(vec![9]));
+        // The same DCID with another name there is still refused.
+        let ai = crate::sniff::client_hello_for_test(Some("chatgpt.com"), 2600);
+        let late = seal_initial_for_test(&[1; 8], 2000, &ai[5 + 2000..]);
+        assert_eq!(g.push(10, &late, |_| true), Step::Drop(vec![10]));
+    }
+
+    /// R11: a name later than the guard can keep is refused up front, not
+    /// allowed and then broken on its first retransmission.
+    #[test]
+    fn name_past_kept_hello_is_unclassified() {
+        let rec = crate::sniff::client_hello_for_test(Some("example.com"), MAX_HELLO);
+        let pkt = seal_initial_for_test(&[1; 8], 0, &rec[5..]);
+        assert_eq!(initial_sni(&pkt), Quic::Unclassified);
+        let rec = crate::sniff::client_hello_for_test(Some("example.com"), MAX_HELLO - 100);
+        let pkt = seal_initial_for_test(&[1; 8], 0, &rec[5..]);
+        assert_eq!(initial_sni(&pkt), Quic::Domain("example.com".into()));
     }
 }

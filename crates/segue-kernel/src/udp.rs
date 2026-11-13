@@ -32,6 +32,10 @@
 //! Initial, is refused so the app falls back to TCP. Other UDP goes by the
 //! IP rules. Datagrams are held (counted in the association budget) while
 //! the ClientHello is incomplete and released to the flow once routed.
+//! Later datagrams of a sniffed flow pass its [`ConnGuard`]: a new QUIC
+//! connection is classified on its own, and QUIC that belongs to no allowed
+//! connection (unknown version, unknown connection ID) is dropped; replies
+//! teach the guard the server's connection IDs.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -47,7 +51,7 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::dial::{Dialer, UdpSession};
-use crate::quic::{ConnGuard, InitialSniffer, Quic, Step};
+use crate::quic::{ConnGuard, InitialSniffer, Quic, ReplyWatch, Step};
 use crate::rules::Action;
 use crate::socks::{Kernel, REP_GENERAL, REP_OK};
 
@@ -407,6 +411,7 @@ fn uplink(
             idle: udp.settings.idle_timeout,
             dropped: udp.dropped.clone(),
             queued: queued.clone(),
+            watch: guard.as_ref().map(ConnGuard::watch),
         },
         rx,
     ));
@@ -533,6 +538,9 @@ struct Flow {
     idle: Duration,
     dropped: Arc<AtomicU64>,
     queued: Arc<AtomicUsize>,
+    /// The flow's QUIC guard learns the server's connection IDs from
+    /// replies (R7).
+    watch: Option<ReplyWatch>,
 }
 
 async fn flow(f: Flow, mut rx: mpsc::Receiver<Vec<u8>>) {
@@ -578,11 +586,15 @@ async fn run_flow(f: &Flow, rx: &mut mpsc::Receiver<Vec<u8>>) {
         let (socket, client, reply_as, port) =
             (f.socket.clone(), f.client, f.reply_as.clone(), f.port);
         let by_name = matches!(f.target, TargetAddr::Domain(_));
+        let watch = f.watch.clone();
         async move {
             let mut buf = Vec::new();
             let mut out = Vec::new();
             while let Ok((src, sport)) = session.recv(&mut buf).await {
                 last_down.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                if let Some(w) = &watch {
+                    w.observe(&buf);
+                }
                 let (src, sport) = if by_name {
                     (&reply_as, port)
                 } else {

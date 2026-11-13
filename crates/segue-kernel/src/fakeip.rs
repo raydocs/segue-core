@@ -182,7 +182,13 @@ impl FakeIpPool {
     ) -> Result<Self, String> {
         Ok(Self {
             ttl,
-            core: Arc::new(Core::new(base, prefix, ttl + grace, key, DEFAULT_MAX_ENTRIES)?),
+            core: Arc::new(Core::new(
+                base,
+                prefix,
+                ttl + grace,
+                key,
+                DEFAULT_MAX_ENTRIES,
+            )?),
             jobs: None,
         })
     }
@@ -414,7 +420,12 @@ impl FakeIpPool {
 
     /// Tracked addresses.
     pub fn tracked(&self) -> usize {
-        self.core.inner.lock().expect("fake-ip lock").by_offset.len()
+        self.core
+            .inner
+            .lock()
+            .expect("fake-ip lock")
+            .by_offset
+            .len()
     }
 
     #[cfg(test)]
@@ -460,7 +471,11 @@ impl Writer {
         }
         #[cfg(test)]
         std::thread::sleep(*self.core.slow_append.lock().unwrap());
-        if j.file.write_all(&line).and_then(|()| j.file.sync_data()).is_err() {
+        if j.file
+            .write_all(&line)
+            .and_then(|()| j.file.sync_data())
+            .is_err()
+        {
             self.journal = None;
             self.core.dirty.store(true, Ordering::Release);
             return None;
@@ -645,9 +660,7 @@ impl Core {
         // Early after boot `now - idle` may not exist: treat as just used
         // (the address stays live a little longer, never another domain's).
         let now = Instant::now();
-        let last_used = now
-            .checked_sub(Duration::from_secs(idle))
-            .unwrap_or(now);
+        let last_used = now.checked_sub(Duration::from_secs(idle)).unwrap_or(now);
         inner.by_domain.insert(domain.clone(), off);
         inner.by_offset.insert(
             off,
@@ -663,7 +676,6 @@ impl Core {
     fn range(&self) -> String {
         format!("{}/{}", Ipv4Addr::from(self.base), self.prefix)
     }
-
 
     /// Serialized key + every binding.
     fn snapshot(&self) -> Vec<u8> {
@@ -1073,8 +1085,12 @@ mod tests {
         // Same key: a new name lands where the old process would put it.
         assert_eq!(b.assign("c.com", 4), a.assign("c.com", 4));
         // A restart long after: nothing live, but nothing rebound either.
-        let (c, n) = restore_at(&bytes, DEFAULT_MAX_ENTRIES, crate::policy::unix_now() + 1_000_000)
-            .unwrap();
+        let (c, n) = restore_at(
+            &bytes,
+            DEFAULT_MAX_ENTRIES,
+            crate::policy::unix_now() + 1_000_000,
+        )
+        .unwrap();
         assert_eq!(n, 2, "bindings survive any downtime");
         assert_eq!(c.lookup(x.into()), None);
         assert_ne!(c.assign("z.com", 0), Some(x));
@@ -1102,17 +1118,32 @@ mod tests {
             ("range", tamper(&ok, |v| v["range"] = "10.0.0.0/8".into())),
             ("unknown field", tamper(&ok, |v| v["x"] = 1.into())),
             ("offset 0", tamper(&ok, |v| v["entries"][0][0] = 0.into())),
-            ("offset past end", tamper(&ok, |v| v["entries"][0][0] = (1u32 << 17).into())),
-            ("bad name", tamper(&ok, |v| v["entries"][0][1] = "a\nb".into())),
-            ("empty name", tamper(&ok, |v| v["entries"][0][1] = "".into())),
-            ("same offset twice", tamper(&ok, |v| {
-                let o = v["entries"][0][0].clone();
-                v["entries"][1][0] = o;
-            })),
-            ("same name twice", tamper(&ok, |v| {
-                let d = v["entries"][0][1].clone();
-                v["entries"][1][1] = d;
-            })),
+            (
+                "offset past end",
+                tamper(&ok, |v| v["entries"][0][0] = (1u32 << 17).into()),
+            ),
+            (
+                "bad name",
+                tamper(&ok, |v| v["entries"][0][1] = "a\nb".into()),
+            ),
+            (
+                "empty name",
+                tamper(&ok, |v| v["entries"][0][1] = "".into()),
+            ),
+            (
+                "same offset twice",
+                tamper(&ok, |v| {
+                    let o = v["entries"][0][0].clone();
+                    v["entries"][1][0] = o;
+                }),
+            ),
+            (
+                "same name twice",
+                tamper(&ok, |v| {
+                    let d = v["entries"][0][1].clone();
+                    v["entries"][1][1] = d;
+                }),
+            ),
         ];
         for (what, bytes) in cases {
             assert!(
@@ -1120,7 +1151,10 @@ mod tests {
                 "{what} accepted"
             );
         }
-        assert!(restore_at(&ok, 1, now).is_err(), "more entries than the cap");
+        assert!(
+            restore_at(&ok, 1, now).is_err(),
+            "more entries than the cap"
+        );
         assert!(restore_at(&ok, 2, now).is_ok());
     }
 
@@ -1189,7 +1223,10 @@ mod tests {
         let x = p.assign("a.com", 1).unwrap();
         std::mem::forget(p); // no save, no drop: like a crash
         let (q, log) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
-        assert!(log.iter().any(|l| l.contains("1 entries from the journal")), "{log:?}");
+        assert!(
+            log.iter().any(|l| l.contains("1 entries from the journal")),
+            "{log:?}"
+        );
         assert_eq!(q.lookup(x.into()).unwrap().domain, "a.com");
         assert_ne!(q.assign("b.com", 1), Some(x));
         // A torn last line (crash mid-append) is ignored.
@@ -1245,7 +1282,10 @@ mod tests {
         // Oversized.
         put(&journal_path(&path), b"");
         let mut big = good.clone();
-        big.resize(STATE_SLACK as usize + 2 * BYTES_PER_ENTRY as usize + 1, b' ');
+        big.resize(
+            STATE_SLACK as usize + 2 * BYTES_PER_ENTRY as usize + 1,
+            b' ',
+        );
         put(&path, &big);
         let e = open_at(&path, 2).err().unwrap();
         assert!(e.contains("larger than"), "{e}");
@@ -1261,7 +1301,11 @@ mod tests {
         drop(p);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "state is owner-only");
-        let jmode = std::fs::metadata(journal_path(&path)).unwrap().permissions().mode() & 0o777;
+        let jmode = std::fs::metadata(journal_path(&path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(jmode, 0o600, "journal is owner-only");
         // Readable by others.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -1305,13 +1349,19 @@ mod tests {
         std::os::unix::fs::symlink(&victim, d.0.join("fakeip.state.tmp")).unwrap();
         write_atomic(&path, b"{}").unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         // A state path that is a link is replaced, not written through.
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&victim, &path).unwrap();
         write_atomic(&path, b"{}").unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
-        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     /// R4: the journal is durable before the first state names it, so a
@@ -1322,7 +1372,10 @@ mod tests {
         let d = private_dir();
         let path = d.0.join("fakeip.state");
         let (p, _) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
-        assert!(journal_path(&path).exists(), "journal exists before any address");
+        assert!(
+            journal_path(&path).exists(),
+            "journal exists before any address"
+        );
         let x = p.assign("a.com", 1).unwrap();
         assert!(p.save().unwrap(), "folded into the state");
         drop(p);
@@ -1348,11 +1401,21 @@ mod tests {
         let path = d.0.join("fakeip.state");
         let max = 64;
         let names: Vec<String> = (0..max)
-            .map(|i| format!("{i:02}{}", if i % 2 == 0 { "\"" } else { "\\" }.repeat(MAX_DOMAIN - 2)))
+            .map(|i| {
+                format!(
+                    "{i:02}{}",
+                    if i % 2 == 0 { "\"" } else { "\\" }.repeat(MAX_DOMAIN - 2)
+                )
+            })
             .collect();
-        assert!(names.iter().all(|n| valid_domain(n) && n.len() == MAX_DOMAIN));
+        assert!(names
+            .iter()
+            .all(|n| valid_domain(n) && n.len() == MAX_DOMAIN));
         let (p, _) = open_at(&path, max).unwrap();
-        let ips: Vec<_> = names.iter().map(|n| p.assign(n, u64::MAX).unwrap()).collect();
+        let ips: Vec<_> = names
+            .iter()
+            .map(|n| p.assign(n, u64::MAX).unwrap())
+            .collect();
         // Crash before any save: everything is in the journal.
         std::mem::forget(p);
         let (q, _) = open_at(&path, max).expect("journal within the read limit");
