@@ -152,7 +152,10 @@ impl SmartDns {
             return self.passthrough(query, &q).await;
         }
         match (classify(&policy, &q.name), q.qtype) {
-            (Class::Fake, TYPE_A) => Some(self.fake_answer(&q, &policy).await),
+            (Class::Fake, TYPE_A) => Some(
+                self.fake_answer(&q, &policy, |p| matches!(classify(p, &q.name), Class::Fake))
+                    .await,
+            ),
             // The pool is IPv4 only; AAAA for proxied names is NODATA so
             // clients use the fake A record (§5.2.6).
             (Class::Fake, _) => Some(respond(&q, RCODE_OK, &[], 0)),
@@ -162,16 +165,31 @@ impl SmartDns {
         }
     }
 
-    /// A new binding is durable (persistence thread) before this answers.
-    async fn fake_answer(&self, q: &Question<'_>, policy: &Policy) -> Vec<u8> {
-        match self.pool.assign_durable(&q.name, policy.version).await {
-            Some(ip) => respond(
+    /// A new binding is durable (persistence thread) before this answers;
+    /// that wait is bounded ([`crate::fakeip::DURABLE_TIMEOUT`], SERVFAIL
+    /// past it). The policy is read again after it (r7 #5): REFUSED if it
+    /// went away, SERVFAIL (the client asks again and gets the new
+    /// policy's answer) if the policy now in force no longer gives this
+    /// name a fake address (`still_fake`).
+    async fn fake_answer(
+        &self,
+        q: &Question<'_>,
+        policy: &Policy,
+        still_fake: impl Fn(&Policy) -> bool,
+    ) -> Vec<u8> {
+        let ip = self.pool.assign_durable(&q.name, policy.version).await;
+        let now = self.policy.current();
+        if now.refuse_all {
+            return respond(q, RCODE_REFUSED, &[], 0);
+        }
+        match ip {
+            Some(ip) if now.version == policy.version || still_fake(&now) => respond(
                 q,
                 RCODE_OK,
                 &[IpAddr::V4(ip)],
                 self.pool.ttl.as_secs().max(1) as u32,
             ),
-            None => respond(q, RCODE_SERVFAIL, &[], 0),
+            _ => respond(q, RCODE_SERVFAIL, &[], 0),
         }
     }
 
@@ -216,7 +234,7 @@ impl SmartDns {
         if policy.refuse_all {
             return respond(q, RCODE_REFUSED, &[], 0);
         }
-        let foreign = match classify(&policy, &q.name) {
+        let foreign = |policy: &Policy| match classify(policy, &q.name) {
             // The policy changed while we waited and now proxies the name.
             Class::Fake => true,
             Class::Domestic => false,
@@ -224,9 +242,9 @@ impl SmartDns {
                 !value.ips.is_empty() && !value.ips.iter().all(|ip| policy.chnroute.contains(*ip))
             }
         };
-        match (foreign, q.qtype) {
+        match (foreign(&policy), q.qtype) {
             (false, _) => respond(q, value.rcode, &value.ips, ttl),
-            (true, TYPE_A) => self.fake_answer(q, &policy).await,
+            (true, TYPE_A) => self.fake_answer(q, &policy, foreign).await,
             (true, _) => respond(q, RCODE_OK, &[], 0),
         }
     }
@@ -548,12 +566,25 @@ fn respond(q: &Question<'_>, rcode: u8, ips: &[IpAddr], ttl: u32) -> Vec<u8> {
 const MAX_UPSTREAM_IN_FLIGHT: usize = 256;
 /// Most DNS-over-TCP connections at once; further accepts wait.
 const MAX_TCP_CONNS: usize = 256;
+/// Most UDP queries being answered at once (r7 #5). Each is bounded in time
+/// (upstream timeout, fake-IP durable timeout); over this a query is
+/// answered SERVFAIL at once instead of spawning another task.
+pub const MAX_UDP_IN_FLIGHT: usize = 512;
 
 /// Serve DNS over UDP on `sock`. Per-datagram errors (e.g. an ICMP
 /// port-unreachable from a client that went away, which some platforms
 /// report on the next receive) do not stop the listener.
 pub async fn serve_udp(sock: UdpSocket, dns: Arc<SmartDns>) -> std::io::Result<()> {
+    serve_udp_limited(sock, dns, MAX_UDP_IN_FLIGHT).await
+}
+
+async fn serve_udp_limited(
+    sock: UdpSocket,
+    dns: Arc<SmartDns>,
+    limit: usize,
+) -> std::io::Result<()> {
     let sock = Arc::new(sock);
+    let limit = Arc::new(tokio::sync::Semaphore::new(limit));
     let mut buf = vec![0u8; 4096];
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
@@ -561,9 +592,20 @@ pub async fn serve_udp(sock: UdpSocket, dns: Arc<SmartDns>) -> std::io::Result<(
             Err(e) if transient(&e) => continue,
             Err(e) => return Err(e),
         };
+        let Ok(permit) = limit.clone().try_acquire_owned() else {
+            // Overloaded: a header-only SERVFAIL, never queued.
+            let reply = match parse_question(&buf[..n]) {
+                Ok(q) => respond(&q, RCODE_SERVFAIL, &[], 0),
+                Err(Some((id, rd))) => header_only(id, rd, RCODE_FORMERR),
+                Err(None) => continue,
+            };
+            let _ = sock.try_send_to(&reply, peer);
+            continue;
+        };
         let msg = buf[..n].to_vec();
         let (sock, dns) = (sock.clone(), dns.clone());
         tokio::spawn(async move {
+            let _permit = permit;
             if let Some(reply) = dns.handle(&msg).await {
                 let _ = sock.send_to(&reply, peer).await;
             }
@@ -649,6 +691,155 @@ pub fn answers_for_test(msg: &[u8]) -> Option<(u16, u8, Vec<IpAddr>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{generate_key, parse_public_key, sign, unix_now, Verifier};
+
+    struct Persisted {
+        dir: std::path::PathBuf,
+        pool: Arc<FakeIpPool>,
+    }
+    impl Drop for Persisted {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A journaled pool whose every append takes `slow`.
+    fn slow_pool(slow: Duration) -> Persisted {
+        let dir = std::env::temp_dir().join(format!("dns-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let (pool, _) = FakeIpPool::open(
+            "198.18.0.0".parse().unwrap(),
+            15,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            1024,
+            Some(&dir.join("fakeip.state")),
+        )
+        .unwrap();
+        pool.set_slow_append(slow);
+        Persisted {
+            dir,
+            pool: Arc::new(pool),
+        }
+    }
+
+    fn signed() -> (impl Fn(u64, &str) -> Vec<u8>, Arc<PolicyStore>) {
+        let (key, pubkey) = generate_key();
+        let verifier = Verifier::new(
+            [(1, parse_public_key(&pubkey).unwrap())].into(),
+            "ai".into(),
+            ["ai", "overseas"].map(String::from).into(),
+            ["ai".to_string()].into(),
+        )
+        .unwrap();
+        let bundle = move |v: u64, rules: &str| {
+            let body = format!(
+                r#"{{"version":{v},"expires_at":{},"ai_domains":[],
+                    "rules":{rules},"default":{{"type":"proxy","outbound":"overseas"}},
+                    "chnroute":[]}}"#,
+                unix_now() + 3600
+            );
+            sign(&key, 1, body.as_bytes()).unwrap().into_bytes()
+        };
+        (bundle, Arc::new(PolicyStore::signed(verifier, None)))
+    }
+
+    const PROXY_X: &str =
+        r#"[{"domain_suffix":"x.example","action":{"type":"proxy","outbound":"overseas"}}]"#;
+    const DIRECT_X: &str = r#"[{"domain_suffix":"x.example","action":{"type":"direct"}}]"#;
+
+    /// r7 #5: a fake-IP answer that waited on the disk is rendered under
+    /// the policy in force when it is sent: a policy that now resolves the
+    /// name for real gets no stale fake address, and an expired / removed
+    /// one gets REFUSED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fake_answer_rechecks_policy_after_durable_wait() {
+        let (bundle, store) = signed();
+        store.install(&bundle(1, PROXY_X)).unwrap();
+        let p = slow_pool(Duration::from_millis(300));
+        let settings = DnsSettings {
+            domestic: vec![],
+            query_timeout: Duration::from_millis(100),
+            cache_size: 16,
+        };
+        let dns = Arc::new(SmartDns::new(store.clone(), p.pool.clone(), settings));
+        let ask = |name: &'static str| {
+            let dns = dns.clone();
+            tokio::spawn(async move {
+                let r = dns.handle(&query_for_test(1, name, TYPE_A)).await.unwrap();
+                answers_for_test(&r).unwrap()
+            })
+        };
+        // Unchanged policy: the address is answered after the wait.
+        let (_, rc, ips) = ask("a.x.example").await.unwrap();
+        assert_eq!((rc, ips.len()), (RCODE_OK, 1));
+        // The policy turns the name direct while the binding is on disk.
+        let pending = ask("b.x.example");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        store.install(&bundle(2, DIRECT_X)).unwrap();
+        let (_, rc, ips) = pending.await.unwrap();
+        assert_eq!(rc, RCODE_SERVFAIL, "stale fake answer: {ips:?}");
+        // A new policy that still proxies it: answered.
+        store.install(&bundle(3, PROXY_X)).unwrap();
+        let pending = ask("c.x.example");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        store.install(&bundle(4, PROXY_X)).unwrap();
+        let (_, rc, ips) = pending.await.unwrap();
+        assert_eq!((rc, ips.len()), (RCODE_OK, 1));
+    }
+
+    /// r7 #5: queries over the UDP in-flight limit are answered SERVFAIL at
+    /// once (no task, no job), and a stuck disk answers within its bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn udp_overload_is_servfail_not_queued() {
+        let (bundle, store) = signed();
+        store.install(&bundle(1, PROXY_X)).unwrap();
+        let p = slow_pool(Duration::from_secs(30));
+        let settings = DnsSettings {
+            domestic: vec![],
+            query_timeout: Duration::from_millis(100),
+            cache_size: 16,
+        };
+        let dns = Arc::new(SmartDns::new(store, p.pool.clone(), settings));
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(serve_udp_limited(sock, dns, 2));
+        let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let start = Instant::now();
+        for i in 0..6u16 {
+            let name = format!("n{i}.x.example");
+            c.send_to(&query_for_test(i, &name, TYPE_A), addr)
+                .await
+                .unwrap();
+        }
+        let mut got = Vec::new();
+        let mut b = [0u8; 512];
+        while got.len() < 6 {
+            let n = tokio::time::timeout(Duration::from_secs(5), c.recv(&mut b))
+                .await
+                .expect("every query answered within the durable timeout")
+                .unwrap();
+            let (id, rc, _) = answers_for_test(&b[..n]).unwrap();
+            got.push((id, rc, start.elapsed()));
+        }
+        assert!(
+            got.iter().all(|&(_, rc, _)| rc == RCODE_SERVFAIL),
+            "{got:?}"
+        );
+        let fast = got
+            .iter()
+            .filter(|&&(_, _, t)| t < Duration::from_millis(500))
+            .count();
+        assert_eq!(fast, 4, "over the limit answered at once: {got:?}");
+        assert!(got
+            .iter()
+            .all(|&(_, _, t)| t < crate::fakeip::DURABLE_TIMEOUT + Duration::from_secs(1)));
+    }
 
     #[test]
     fn question_parse_and_formerr() {

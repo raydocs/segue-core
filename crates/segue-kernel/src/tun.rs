@@ -112,7 +112,7 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 use crate::dial::{Dialer, UdpSession};
 use crate::dns::SmartDns;
 use crate::policy::Policy;
-use crate::quic::{ConnGuard, InitialSniffer, Quic, Step};
+use crate::quic::{ConnGuard, InitialSniffer, Quic, QuicRoutes, Step};
 use crate::rules::{Action, RuleSet};
 use crate::sniff::{sniff, Sniff};
 use crate::socks::{Kernel, SniffSettings};
@@ -1956,6 +1956,12 @@ pub trait TunRouter: Send + Sync {
     fn udp_sniffed(&self, _key: &FlowKey, _quic: &Quic) -> Option<Dial> {
         None
     }
+    /// Where flows routed by sniffing record their QUIC routes (see
+    /// [`QuicRoutes`]). None: no claims, so a short header to an ID the
+    /// server issued inside the encryption is dropped.
+    fn quic_routes(&self) -> Option<QuicRoutes> {
+        None
+    }
 }
 
 fn ip_route(rules: &RuleSet, key: &FlowKey) -> Option<Dial> {
@@ -2069,6 +2075,10 @@ impl TunRouter for TunKernel {
         }
     }
 
+    fn quic_routes(&self) -> Option<QuicRoutes> {
+        self.kernel.udp.as_ref().map(|u| u.quic_routes.clone())
+    }
+
     fn udp_sniffed(&self, key: &FlowKey, quic: &Quic) -> Option<Dial> {
         let udp = self.kernel.udp.as_ref()?;
         crate::udp::route_sniffed(
@@ -2159,12 +2169,23 @@ struct UdpLive {
     guard: Option<Box<ConnGuard<Bytes>>>,
 }
 
-/// The per-connection guard of a flow routed after `sniffer` said `q`.
-fn quic_guard(sniffer: &InitialSniffer, q: &Quic, key: &FlowKey) -> Box<ConnGuard<Bytes>> {
-    Box::new(ConnGuard::new(
+/// The per-connection guard of a flow routed after `sniffer` said `q`,
+/// going by `dial`.
+fn quic_guard(
+    router: &dyn TunRouter,
+    sniffer: &InitialSniffer,
+    q: &Quic,
+    key: &FlowKey,
+    dial: &Dial,
+) -> Box<ConnGuard<Bytes>> {
+    let guard = ConnGuard::new(
         matches!(q, Quic::Domain(_)).then_some(sniffer),
         key.dst.port() == QUIC_PORT,
-    ))
+    );
+    Box::new(match router.quic_routes() {
+        Some(routes) => guard.with_route(routes, key.dst, dial.tag.clone()),
+        None => guard,
+    })
 }
 
 const QUIC_PORT: u16 = 443;
@@ -2397,7 +2418,8 @@ impl TunStack {
                                 }
                                 match router.udp_sniffed(&d.key, &q) {
                                     Some(dial) => {
-                                        let guard = quic_guard(&sniffer, &q, &d.key);
+                                        let guard =
+                                            quic_guard(&*router, &sniffer, &q, &d.key, &dial);
                                         (dial, held, Some(guard))
                                     }
                                     None => {
@@ -2423,6 +2445,7 @@ impl TunStack {
                         (e.insert(live), Some(held))
                     }
                 };
+                let mut refuse = false;
                 let out = if let Some(mut held) = held {
                     held.push(d.payload);
                     held
@@ -2441,10 +2464,24 @@ impl TunStack {
                                     stack.stats.udp_dropped_quic_conn += ds.len() as u64;
                                     Vec::new()
                                 }
+                                Step::Refuse(ds) => {
+                                    // A connection that may have moved here
+                                    // from another route: refuse the flow, so
+                                    // this and later datagrams get ICMP and
+                                    // the app leaves QUIC at once (R7 #3).
+                                    stack.stats.udp_dropped_quic_conn += ds.len() as u64;
+                                    refuse = true;
+                                    Vec::new()
+                                }
                             }
                         }
                     }
                 };
+                if refuse {
+                    stack.udp_refuse_policy(&d.key);
+                    udp_flows.remove(&d.key);
+                    continue;
+                }
                 for p in out {
                     if live.tx.try_send(p).is_err() {
                         stack.stats.dropped_udp_queue_full += 1;
@@ -2556,7 +2593,7 @@ fn policy(
                 match router.udp_sniffed(key, &q) {
                     Some(d) => {
                         let tag = d.tag.clone();
-                        let guard = quic_guard(&sniffer, &q, key);
+                        let guard = quic_guard(router, &sniffer, &q, key, &d);
                         udp_plans.insert(*key, UdpPlan::Dial(d, Some(guard)));
                         Verdict::Accept(tag)
                     }

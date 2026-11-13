@@ -13,6 +13,11 @@
 //! cannot be confirmed is refused by the caller, so the app falls back to
 //! TCP, where the name is always sniffable.
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use ring::aead::{self, quic, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::hkdf;
 
@@ -75,16 +80,12 @@ impl InitialSniffer {
     pub fn push(&mut self, dgram: &[u8]) -> Quic {
         self.seen += 1;
         let first = self.seen == 1;
-        let quic_shaped = dgram.first().is_some_and(|b| b & 0xc0 == 0xc0) && dgram.len() >= 7;
-        if !quic_shaped {
+        if !long_quic(dgram) {
             return if first { Quic::NotQuic } else { self.verdict() };
         }
         let mut rest = dgram;
         // Coalesced packets (RFC 9000 §12.2): walk every long-header packet.
-        while let Some(&b) = rest.first() {
-            if b & 0xc0 != 0xc0 {
-                break;
-            }
+        while long_quic(rest) {
             match packet(rest) {
                 Some((used, Pkt::Initial(dcid, crypto))) => {
                     match &self.dcid {
@@ -164,7 +165,10 @@ pub const MAX_HELLO: usize = 3072;
 pub const MAX_SERVER_CIDS: usize = 8;
 /// Upper bound of what a [`ConnGuard`] keeps besides held datagrams: the
 /// kept hellos and server IDs (with their allocation overhead).
-pub const GUARD_KEPT: usize = MAX_CONNS * (MAX_HELLO + 64) + MAX_SERVER_CIDS * (20 + 32) + 128;
+pub const GUARD_KEPT: usize =
+    MAX_CONNS * (MAX_HELLO + 64) + MAX_SERVER_CIDS * (20 + 32) + 128 + ROUTE_CLAIM_KEPT;
+/// The route claim a QUIC flow holds (its tag name, inline bookkeeping).
+const ROUTE_CLAIM_KEPT: usize = 192;
 
 /// What to do with a datagram of a routed UDP flow (see [`ConnGuard`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -176,6 +180,11 @@ pub enum Step<T> {
     Hold,
     /// Refused: drop these.
     Drop(Vec<T>),
+    /// A packet of a connection this flow cannot vouch for, to a server
+    /// another route also carries QUIC to (see [`QuicRoutes`]): drop these
+    /// and refuse the flow where the front end can signal it (ICMP on TUN),
+    /// so the app gives up on QUIC at once instead of timing out.
+    Refuse(Vec<T>),
 }
 
 /// A classified connection: its DCID and the ClientHello prefix that
@@ -230,17 +239,142 @@ impl ReplyWatch {
             .any(|c| c == dcid)
     }
 
-    /// A short-header packet addressed to one of the server's IDs (its
-    /// length is not in the packet: compare each). A server that chose a
-    /// zero-length ID tells its connection by the address pair, which this
-    /// flow is, so then any short header is that connection's.
+    /// A short-header packet addressed to one of the server's non-empty IDs
+    /// (its length is not in the packet: compare each). A zero-length ID
+    /// matches no packet here: it would match every packet, of every
+    /// connection, forever (R7 #2); such a server's packets go by the
+    /// route check of [`ConnGuard`] instead.
     fn knows_short(&self, pkt: &[u8]) -> bool {
         self.0
             .lock()
             .expect("reply watch lock")
             .iter()
-            .any(|c| pkt.get(1..1 + c.len()) == Some(c.as_slice()))
+            .any(|c| !c.is_empty() && pkt.get(1..1 + c.len()) == Some(c.as_slice()))
     }
+
+    /// Remember the ID a short-header packet is addressed to, taking the
+    /// length of the server's latest non-empty ID (a server uses one length
+    /// for its IDs in practice; a wrong guess only costs another check).
+    fn learn_short(&self, pkt: &[u8]) {
+        let mut ids = self.0.lock().expect("reply watch lock");
+        let Some(len) = ids.iter().rev().map(Vec::len).find(|&n| n > 0) else {
+            return;
+        };
+        let Some(cid) = pkt.get(1..1 + len) else {
+            return;
+        };
+        if ids.len() >= MAX_SERVER_CIDS {
+            ids.remove(0);
+        }
+        ids.push(cid.to_vec());
+    }
+}
+
+/// How long a QUIC route claim outlives the last packet its flow carried:
+/// longer than the idle timeout of the QUIC stacks in use (Chrome 30 s
+/// to 5 min, quic-go 30 s, quinn 30 s), so a connection that went quiet
+/// and then moved is still known.
+pub const MIGRATION_WINDOW: Duration = Duration::from_secs(600);
+/// Server addresses [`QuicRoutes`] tracks. When all are recent, it stops
+/// vouching for anything until the window passes (fails closed).
+pub const MAX_ROUTES: usize = 1024;
+/// A flow refreshes its claim at most this often.
+const TOUCH_EVERY: Duration = Duration::from_secs(1);
+
+/// Which routes (outbound tags) carried an allowed QUIC connection to each
+/// server address recently, across all flows of one kernel (R7 #3).
+///
+/// A QUIC connection only comes into existence with a client Initial, and
+/// every Initial on every routed flow is classified by a [`ConnGuard`], so
+/// a connection that a short-header packet can address was allowed on some
+/// flow. On a QUIC flow, a short header to an ID the guard never saw is
+/// therefore either the flow's own connection after the client switched to
+/// an ID the server issued inside the encryption (NEW_CONNECTION_ID,
+/// preferred_address; RFC 9000 §5.1.1, §9.6), or a connection that moved
+/// here from another flow to the same server (migration, NAT rebinding;
+/// RFC 9000 §9). Only the latter can change a connection's route, and only
+/// when that other flow went by another outbound. So a flow carries such a
+/// packet when no other route carried QUIC to its server within
+/// [`MIGRATION_WINDOW`], and refuses (fails fast) otherwise: established
+/// connections survive CID rotation, and no connection changes route.
+///
+/// Bounded: at most [`MAX_ROUTES`] addresses, two routes each (two distinct
+/// routes are enough to tell any route "someone else"); about 100 KiB.
+#[derive(Clone, Default)]
+pub struct QuicRoutes(Arc<Mutex<Routes>>);
+
+#[derive(Default)]
+struct Routes {
+    by_dst: HashMap<SocketAddr, Vec<(Option<String>, Instant)>>,
+    /// Table was full of recent claims: vouch for nothing until then.
+    blind_until: Option<Instant>,
+}
+
+impl QuicRoutes {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Routes> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record that `tag` carries an allowed QUIC connection to `dst`.
+    fn claim(&self, dst: SocketAddr, tag: &Option<String>, now: Instant) {
+        let mut r = self.lock();
+        if !r.by_dst.contains_key(&dst) && r.by_dst.len() >= MAX_ROUTES {
+            r.by_dst.retain(|_, v| {
+                v.iter()
+                    .any(|(_, t)| now.saturating_duration_since(*t) < MIGRATION_WINDOW)
+            });
+            if r.by_dst.len() >= MAX_ROUTES {
+                r.blind_until = Some(now + MIGRATION_WINDOW);
+                return;
+            }
+        }
+        let v = r.by_dst.entry(dst).or_default();
+        if let Some(e) = v.iter_mut().find(|(t, _)| t == tag) {
+            e.1 = e.1.max(now);
+            return;
+        }
+        if v.len() >= 2 {
+            // Drop the older of the two.
+            let old = usize::from(v[1].1 < v[0].1);
+            v.remove(old);
+        }
+        v.push((tag.clone(), now));
+    }
+
+    /// Whether another route carried QUIC to `dst` recently (or the table
+    /// cannot tell).
+    fn contested(&self, dst: SocketAddr, tag: &Option<String>, now: Instant) -> bool {
+        let r = self.lock();
+        r.blind_until.is_some_and(|t| now < t)
+            || r.by_dst.get(&dst).is_some_and(|v| {
+                v.iter().any(|(t, at)| {
+                    t != tag && now.saturating_duration_since(*at) < MIGRATION_WINDOW
+                })
+            })
+    }
+
+    /// Addresses tracked (for tests and stats).
+    pub fn len(&self) -> usize {
+        self.lock().by_dst.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A flow's claim in [`QuicRoutes`].
+struct Claim {
+    routes: QuicRoutes,
+    dst: SocketAddr,
+    tag: Option<String>,
+    touched: Option<Instant>,
+}
+
+enum Verdict {
+    Ok,
+    Drop,
+    Refuse,
 }
 
 /// The SCID of a server's QUIC v1/v2 long-header packet (Initial,
@@ -248,7 +382,7 @@ impl ReplyWatch {
 fn server_scid(p: &[u8]) -> Option<&[u8]> {
     let mut c = Cur { b: p, p: 0 };
     let b0 = c.u8()?;
-    if b0 & 0xc0 != 0xc0 {
+    if b0 & 0x80 == 0 {
         return None;
     }
     let version = u32::from_be_bytes(c.take(4)?.try_into().ok()?);
@@ -291,17 +425,25 @@ struct Pending<T> {
 /// connection. An Initial reusing a known DCID must repeat the ClientHello
 /// bytes that connection was classified by.
 ///
-/// Every other packet must belong to an allowed connection (R7): a QUIC
-/// long-header packet (fixed bit set) that is not such an Initial is
+/// Every packet of a datagram is checked, not just the first (R7 #2): a
+/// QUIC long-header packet (fixed bit set) that is not such an Initial is
 /// forwarded only when its DCID is an allowed connection's (0-RTT) or one
 /// the server chose ([`ReplyWatch`]; later Initials and Handshake
 /// packets); one of a QUIC version we cannot read, or that does not parse,
-/// is dropped, on every port, as at flow start. On a QUIC flow (`strict`,
-/// UDP/443, or one routed by a QUIC connection) a short-header packet must
-/// be addressed to a server-chosen ID too. A client that switches to an ID
-/// the server issued inside the encrypted connection (NEW_CONNECTION_ID)
-/// is dropped from then on and falls back to TCP; that is the price of not
-/// letting an unclassified connection ride the flow.
+/// is dropped, on every port, as at flow start. A datagram carrying a new
+/// connection's Initial carries nothing else but that connection's long
+/// packets.
+///
+/// On a QUIC flow (`strict`, UDP/443, or one that carried an allowed QUIC
+/// connection, including an ordinary UDP flow on which a client Initial
+/// later appeared) a short-header packet, alone or trailing long ones,
+/// must be addressed to a non-empty server-chosen ID. Failing that, a
+/// flow with a route claim ([`ConnGuard::with_route`]) carries it when no
+/// other route carried QUIC to the same server recently (the client moved
+/// to an ID issued inside the encryption: the connection keeps working),
+/// and refuses the flow ([`Step::Refuse`]) when one did (the packet may be
+/// a connection that migrated from that route's flow). Without a claim it
+/// is dropped.
 pub struct ConnGuard<T> {
     conns: Vec<Conn>,
     refused: Vec<Vec<u8>>,
@@ -309,6 +451,7 @@ pub struct ConnGuard<T> {
     /// Short-header packets need a known server ID.
     quic: bool,
     server: ReplyWatch,
+    claim: Option<Box<Claim>>,
 }
 
 impl<T> ConnGuard<T> {
@@ -322,7 +465,22 @@ impl<T> ConnGuard<T> {
             refused: Vec::new(),
             pending: None,
             server: ReplyWatch::default(),
+            claim: None,
         }
+    }
+
+    /// The flow goes to `dst` by outbound `tag` (None: direct); its QUIC
+    /// connections are recorded in `routes`, and it may carry short headers
+    /// of rotated IDs as [`QuicRoutes`] describes.
+    pub fn with_route(mut self, routes: QuicRoutes, dst: SocketAddr, tag: Option<String>) -> Self {
+        self.claim = Some(Box::new(Claim {
+            routes,
+            dst,
+            tag,
+            touched: None,
+        }));
+        self.touch(Instant::now());
+        self
     }
 
     /// The handle the flow's reply path feeds every reply datagram to
@@ -348,20 +506,57 @@ impl<T> ConnGuard<T> {
         self.pending.as_ref().map_or(&[], |p| &p.held)
     }
 
+    /// Refresh the claim (at most every [`TOUCH_EVERY`]) while the flow
+    /// carries an allowed connection.
+    fn touch(&mut self, now: Instant) {
+        if self.conns.is_empty() {
+            return;
+        }
+        let Some(c) = &mut self.claim else {
+            return;
+        };
+        if c.touched
+            .is_some_and(|t| now.saturating_duration_since(t) < TOUCH_EVERY)
+        {
+            return;
+        }
+        c.touched = Some(now);
+        c.routes.claim(c.dst, &c.tag, now);
+    }
+
     /// Classify `bytes` (the payload of `d`). `allow` is asked, once a new
     /// connection's ClientHello is read, whether it routes like the flow.
     pub fn push(&mut self, d: T, bytes: &[u8], allow: impl FnOnce(&Quic) -> bool) -> Step<T> {
+        self.push_at(d, bytes, allow, Instant::now())
+    }
+
+    fn push_at(
+        &mut self,
+        d: T,
+        bytes: &[u8],
+        allow: impl FnOnce(&Quic) -> bool,
+        now: Instant,
+    ) -> Step<T> {
+        let step = self.classify(d, bytes, allow, now);
+        if matches!(step, Step::Forward(_)) {
+            self.touch(now);
+        }
+        step
+    }
+
+    fn classify(
+        &mut self,
+        d: T,
+        bytes: &[u8],
+        allow: impl FnOnce(&Quic) -> bool,
+        now: Instant,
+    ) -> Step<T> {
         let b0 = bytes.first().copied().unwrap_or(0);
         if b0 & 0x80 == 0 {
             // Short header (or not QUIC at all on an ordinary UDP flow).
-            return if !self.quic || self.server.knows_short(bytes) {
-                Step::Forward(vec![d])
-            } else {
-                Step::Drop(vec![d])
-            };
+            return step(self.short(bytes, now), d);
         }
-        let quic_shaped = b0 & 0x40 != 0 && bytes.len() >= 7;
-        if !quic_shaped && !self.quic {
+        if !long_quic(bytes) && !self.quic {
             // Not QUIC-shaped, as at flow start: ordinary UDP.
             return Step::Forward(vec![d]);
         }
@@ -380,21 +575,22 @@ impl<T> ConnGuard<T> {
         }) else {
             // No new client Initial: every packet must be an allowed
             // connection's.
-            return if self.all_associated(bytes) {
-                Step::Forward(vec![d])
-            } else {
-                Step::Drop(vec![d])
-            };
+            return step(self.coalesced(bytes, None, now), d);
         };
         if self.refused.contains(&dcid) {
             return Step::Drop(vec![d]);
         }
         if let Some(c) = self.conns.iter().find(|c| c.dcid == dcid) {
-            return if c.consistent(&crypto) {
-                Step::Forward(vec![d])
-            } else {
-                Step::Drop(vec![d])
-            };
+            if !c.consistent(&crypto) {
+                return Step::Drop(vec![d]);
+            }
+            // The Initial is this connection's; so must the rest be.
+            return step(self.coalesced(bytes, Some(&dcid), now), d);
+        }
+        // A new connection: its datagrams carry its own packets only (no
+        // short header can exist before its handshake).
+        if !self.only_own(bytes, &dcid) {
+            return Step::Drop(vec![d]);
         }
         let mut p = match self.pending.take() {
             Some(p) if p.dcid == dcid => p,
@@ -422,6 +618,9 @@ impl<T> ConnGuard<T> {
                     self.conns.remove(0);
                 }
                 self.conns.push(conn);
+                // An ordinary UDP flow that now carries QUIC is a QUIC flow
+                // from here on (R7 #2).
+                self.quic = true;
                 Step::Forward(p.held)
             }
             _ => {
@@ -433,28 +632,93 @@ impl<T> ConnGuard<T> {
             }
         }
     }
-}
 
-impl<T> ConnGuard<T> {
-    /// Every long-header packet in `dgram` parses and is addressed to an
-    /// allowed connection (a trailing short-header packet shares the DCID
-    /// of the packets before it, RFC 9000 §12.2).
-    fn all_associated(&self, dgram: &[u8]) -> bool {
+    /// A short-header packet (alone, or after a datagram's long packets).
+    fn short(&mut self, pkt: &[u8], now: Instant) -> Verdict {
+        if !self.quic || self.server.knows_short(pkt) {
+            return Verdict::Ok;
+        }
+        let Some(c) = &self.claim else {
+            return Verdict::Drop;
+        };
+        if self.conns.is_empty() {
+            // No connection of this flow it could be.
+            return Verdict::Drop;
+        }
+        if c.routes.contested(c.dst, &c.tag, now) {
+            return Verdict::Refuse;
+        }
+        self.server.learn_short(pkt);
+        Verdict::Ok
+    }
+
+    /// Every long-header packet in `dgram` parses and is addressed to
+    /// `own` or an allowed connection, and what follows them is padding or
+    /// a short-header packet that passes [`Self::short`]. Senders must not
+    /// coalesce packets of different connections (RFC 9000 §12.2), but
+    /// the guard does not rely on it.
+    fn coalesced(&mut self, dgram: &[u8], own: Option<&[u8]>, now: Instant) -> Verdict {
+        let Some(rest) =
+            self.long_packets(dgram, |g, dcid| own == Some(dcid) || g.associated(dcid))
+        else {
+            return Verdict::Drop;
+        };
+        if padding(rest) {
+            Verdict::Ok
+        } else {
+            self.short(rest, now)
+        }
+    }
+
+    /// Every packet of a new connection's datagram is its own long packet.
+    fn only_own(&self, dgram: &[u8], own: &[u8]) -> bool {
+        self.long_packets(dgram, |_, dcid| dcid == own)
+            .is_some_and(padding)
+    }
+
+    /// Walk the long-header packets at the start of `dgram`, each passing
+    /// `ok`; the bytes after them. None: one does not parse or fails.
+    fn long_packets<'a>(
+        &self,
+        dgram: &'a [u8],
+        ok: impl Fn(&Self, &[u8]) -> bool,
+    ) -> Option<&'a [u8]> {
         let mut rest = dgram;
         let mut any = false;
         while rest.first().is_some_and(|b| b & 0x80 != 0) {
-            match packet(rest) {
-                Some((used, Pkt::Other(dcid) | Pkt::Initial(dcid, _))) => {
-                    if !self.associated(dcid) {
-                        return false;
-                    }
-                    any = true;
-                    rest = &rest[used..];
-                }
-                None => return false,
+            let (used, Pkt::Other(dcid) | Pkt::Initial(dcid, _)) = packet(rest)?;
+            if !ok(self, dcid) {
+                return None;
             }
+            any = true;
+            rest = &rest[used..];
         }
-        any
+        any.then_some(rest)
+    }
+}
+
+/// A QUIC long-header packet starts `b`: the fixed bit set, or a version
+/// we read with the fixed bit greased away (RFC 9287; quinn, for one,
+/// greases by default and its servers accept such Initials, so a cleared
+/// bit must not make a QUIC packet "ordinary UDP").
+fn long_quic(b: &[u8]) -> bool {
+    b.len() >= 7
+        && b[0] & 0x80 != 0
+        && (b[0] & 0x40 != 0 || matches!(u32::from_be_bytes([b[1], b[2], b[3], b[4]]), V1 | V2))
+}
+
+/// Zero bytes after a datagram's packets (some stacks pad that way; no
+/// QUIC packet starts with a zero byte unless the peer greased the fixed
+/// bit, which the server would then have to have accepted).
+fn padding(rest: &[u8]) -> bool {
+    rest.iter().all(|&b| b == 0)
+}
+
+fn step<T>(v: Verdict, d: T) -> Step<T> {
+    match v {
+        Verdict::Ok => Step::Forward(vec![d]),
+        Verdict::Drop => Step::Drop(vec![d]),
+        Verdict::Refuse => Step::Refuse(vec![d]),
     }
 }
 
@@ -469,7 +733,7 @@ enum Initial {
 fn client_initial(dgram: &[u8]) -> Initial {
     let mut out: Option<(Vec<u8>, Crypto)> = None;
     let mut rest = dgram;
-    while rest.len() >= 7 && rest[0] & 0xc0 == 0xc0 {
+    while long_quic(rest) {
         match packet(rest) {
             Some((used, Pkt::Initial(dcid, crypto))) => {
                 match &mut out {
@@ -749,6 +1013,13 @@ pub fn hex(s: &str) -> Vec<u8> {
 /// one CRYPTO frame (`off`, `data`) (tests: new connections on a flow).
 #[doc(hidden)]
 pub fn seal_initial_for_test(dcid: &[u8], off: u64, data: &[u8]) -> Vec<u8> {
+    seal_initial_b0_for_test(0xc3, dcid, off, data)
+}
+
+/// [`seal_initial_for_test`] with first byte `b0` (e.g. the fixed bit
+/// greased away, RFC 9287).
+#[doc(hidden)]
+pub fn seal_initial_b0_for_test(b0: u8, dcid: &[u8], off: u64, data: &[u8]) -> Vec<u8> {
     fn varint(out: &mut Vec<u8>, v: u64) {
         match v {
             0..=63 => out.push(v as u8),
@@ -761,7 +1032,7 @@ pub fn seal_initial_for_test(dcid: &[u8], off: u64, data: &[u8]) -> Vec<u8> {
     varint(&mut plain, off);
     varint(&mut plain, data.len() as u64);
     plain.extend_from_slice(data);
-    let mut hdr = vec![0xc3];
+    let mut hdr = vec![b0];
     hdr.extend_from_slice(&V1.to_be_bytes());
     hdr.push(dcid.len() as u8);
     hdr.extend_from_slice(dcid);
@@ -1059,6 +1330,184 @@ mod tests {
             // Version 1 Retry (the client never sends one).
             let retry = long_for_test(0xf0, &[7, 7, 7, 7], &[], 40);
             assert_eq!(g.push(13, &retry, ok), Step::Drop(vec![13]));
+        }
+    }
+
+    fn dst() -> SocketAddr {
+        "192.0.2.1:443".parse().unwrap()
+    }
+
+    fn claimed(first: &[u8], routes: &QuicRoutes, tag: &str) -> ConnGuard<u8> {
+        let mut s = InitialSniffer::default();
+        assert!(matches!(s.push(first), Quic::Domain(_)));
+        ConnGuard::new(Some(&s), true).with_route(routes.clone(), dst(), Some(tag.into()))
+    }
+
+    /// R7 #3: the client moves to an ID the server issued inside the
+    /// encryption. With no other route carrying QUIC to the server, the
+    /// flow keeps carrying the connection (and learns the ID); once
+    /// another route does, the unknown ID refuses the flow (fail fast),
+    /// never silently drops it.
+    #[test]
+    fn rotated_cid_keeps_flowing_unless_route_is_contested() {
+        let routes = QuicRoutes::default();
+        let first = initial_for_test(&[1; 8], "example.com");
+        let mut g = claimed(&first, &routes, "p1");
+        assert_eq!(routes.len(), 1);
+        g.observe_reply(&long_for_test(0xe0, &[], &[7; 8], 40));
+        let ok = |_: &Quic| true;
+        let rotated = [0x40, 3, 3, 3, 3, 3, 3, 3, 3, 0xaa];
+        assert_eq!(g.push(1, &rotated, ok), Step::Forward(vec![1]));
+        // Another flow carries QUIC to the same server by another route.
+        let other = claimed(&initial_for_test(&[2; 8], "example.org"), &routes, "p2");
+        // The learned ID still flows; a further unknown ID refuses.
+        assert_eq!(g.push(2, &rotated, ok), Step::Forward(vec![2]));
+        let next = [0x40, 4, 4, 4, 4, 4, 4, 4, 4, 0xaa];
+        assert_eq!(g.push(3, &next, ok), Step::Refuse(vec![3]));
+        drop(other);
+        // The other route's claim ages out after the window.
+        let later = Instant::now() + MIGRATION_WINDOW + Duration::from_secs(1);
+        assert_eq!(g.push_at(4, &next, ok, later), Step::Forward(vec![4]));
+        // Same route on another flow (another source port) is no conflict.
+        let routes = QuicRoutes::default();
+        let mut g = claimed(&first, &routes, "p1");
+        let _same = claimed(&initial_for_test(&[2; 8], "example.org"), &routes, "p1");
+        assert_eq!(g.push(5, &next, ok), Step::Forward(vec![5]));
+    }
+
+    /// R7 #2: a server that chose a zero-length ID is no wildcard for
+    /// short headers: they go by the route check like any unknown ID.
+    #[test]
+    fn zero_length_server_cid_is_not_a_wildcard() {
+        let first = initial_for_test(&[1; 8], "example.com");
+        let ok = |_: &Quic| true;
+        let pkt = [0x40, 9, 9, 9, 9, 9, 9, 9, 9, 0];
+        // No claim: dropped (it used to match every packet).
+        let mut g = guard_after(&first);
+        g.observe_reply(&long_for_test(0xe0, &[], &[], 40));
+        assert_eq!(g.push(1u32, &pkt, ok), Step::Drop(vec![1]));
+        // Long headers to the empty ID are the connection's.
+        let hs = long_for_test(0xe0, &[], &[], 40);
+        assert_eq!(g.push(2, &hs, ok), Step::Forward(vec![2]));
+        // With a claim: contested refuses.
+        let routes = QuicRoutes::default();
+        let mut g = claimed(&first, &routes, "p1");
+        g.observe_reply(&long_for_test(0xe0, &[], &[], 40));
+        let _other = claimed(&initial_for_test(&[2; 8], "example.org"), &routes, "p2");
+        assert_eq!(g.push(3, &pkt, ok), Step::Refuse(vec![3]));
+    }
+
+    /// R7 #2: an ordinary UDP flow that later carries an allowed QUIC
+    /// connection is a QUIC flow from then on.
+    #[test]
+    fn plain_flow_turns_quic_after_an_allowed_initial() {
+        let routes = QuicRoutes::default();
+        let mut g: ConnGuard<u8> =
+            ConnGuard::new(None, false).with_route(routes.clone(), dst(), Some("p1".into()));
+        assert!(routes.is_empty(), "no claim without a connection");
+        let pkt = [0x40, 9, 9, 9, 9, 9, 9, 9, 9, 0];
+        assert_eq!(g.push(1, &pkt, |_| true), Step::Forward(vec![1]));
+        let first = initial_for_test(&[1; 8], "example.com");
+        assert_eq!(g.push(2, &first, |_| true), Step::Forward(vec![2]));
+        assert_eq!(routes.len(), 1, "claimed once it carries QUIC");
+        let _other = claimed(&initial_for_test(&[2; 8], "example.org"), &routes, "p2");
+        assert_eq!(g.push(3, &pkt, |_| true), Step::Refuse(vec![3]));
+        // Without a claim: dropped, no longer ordinary UDP.
+        let mut g: ConnGuard<u8> = ConnGuard::new(None, false);
+        assert_eq!(g.push(4, &first, |_| true), Step::Forward(vec![4]));
+        assert_eq!(g.push(5, &pkt, |_| true), Step::Drop(vec![5]));
+    }
+
+    /// R7 #2: every packet of a coalesced datagram is checked, whatever
+    /// the first one is.
+    #[test]
+    fn coalesced_packets_are_each_checked() {
+        let first = initial_for_test(&[1; 8], "example.com");
+        let ok = |_: &Quic| true;
+        let mut g = guard_after(&first);
+        g.observe_reply(&long_for_test(0xe0, &[], &[7; 4], 40));
+        let stranger = long_for_test(0xe0, &[8; 4], &[], 40);
+        // Known Initial + another connection's Handshake.
+        let mut d = first.clone();
+        d.extend_from_slice(&stranger);
+        assert_eq!(g.push(1u32, &d, ok), Step::Drop(vec![1]));
+        // Known Initial + trailing short header to an unknown ID.
+        let mut d = first.clone();
+        d.extend_from_slice(&[0x40, 8, 8, 8, 8, 0]);
+        assert_eq!(g.push(2, &d, ok), Step::Drop(vec![2]));
+        // ... to the server's ID, or zero padding: fine.
+        let mut d = first.clone();
+        d.extend_from_slice(&[0x40, 7, 7, 7, 7, 0]);
+        assert_eq!(g.push(3, &d, ok), Step::Forward(vec![3]));
+        let mut d = first.clone();
+        d.extend_from_slice(&[0; 32]);
+        assert_eq!(g.push(4, &d, ok), Step::Forward(vec![4]));
+        // Handshake of the connection + trailing unknown short header.
+        let mut d = long_for_test(0xe0, &[7; 4], &[], 40);
+        d.extend_from_slice(&[0x40, 8, 8, 8, 8, 0]);
+        assert_eq!(g.push(5, &d, ok), Step::Drop(vec![5]));
+        // A new connection's Initial carries nothing else.
+        let fresh = initial_for_test(&[2; 8], "example.org");
+        let mut d = fresh.clone();
+        d.extend_from_slice(&long_for_test(0xe0, &[7; 4], &[], 40));
+        assert_eq!(g.push(6, &d, ok), Step::Drop(vec![6]));
+        let mut d = fresh.clone();
+        d.extend_from_slice(&[0x40, 7, 7, 7, 7, 0]);
+        assert_eq!(g.push(7, &d, ok), Step::Drop(vec![7]));
+        assert_eq!(g.push(8, &fresh, ok), Step::Forward(vec![8]));
+    }
+
+    /// R7 #2: a QUIC Initial with the fixed bit greased away (RFC 9287;
+    /// quinn servers accept them) is QUIC, not ordinary UDP: classified at
+    /// flow start, and on a plain flow it starts QUIC mode.
+    #[test]
+    fn greased_fixed_bit_is_still_quic() {
+        let rec = crate::sniff::client_hello_for_test(Some("chatgpt.com"), 0);
+        let ai = seal_initial_b0_for_test(0x83, &[9; 8], 0, &rec[5..]);
+        assert_eq!(initial_sni(&ai), Quic::Domain("chatgpt.com".into()));
+        let mut g: ConnGuard<u8> = ConnGuard::new(None, false);
+        let allow = |q: &Quic| q == &Quic::Domain("example.com".into());
+        assert_eq!(g.push(1, &ai, allow), Step::Drop(vec![1]));
+        let rec = crate::sniff::client_hello_for_test(Some("example.com"), 0);
+        let ok = seal_initial_b0_for_test(0x83, &[1; 8], 0, &rec[5..]);
+        assert_eq!(g.push(2, &ok, allow), Step::Forward(vec![2]));
+        // A greased reply teaches the server's ID.
+        g.observe_reply(&long_for_test(0xa0, &[], &[7; 4], 40));
+        assert_eq!(
+            g.push(3, &[0x00, 7, 7, 7, 7, 1], allow),
+            Step::Forward(vec![3])
+        );
+        assert_eq!(
+            g.push(4, &[0x00, 8, 8, 8, 8, 1], allow),
+            Step::Drop(vec![4])
+        );
+    }
+
+    /// The route table stays bounded and, when full of live claims,
+    /// vouches for nothing (fails closed) until they age out.
+    #[test]
+    fn quic_routes_bounded_and_fail_closed() {
+        let r = QuicRoutes::default();
+        let now = Instant::now();
+        let p1 = Some("p1".to_string());
+        for i in 0..MAX_ROUTES {
+            let a = SocketAddr::new(std::net::Ipv4Addr::from(i as u32 + 1).into(), 443);
+            r.claim(a, &p1, now);
+        }
+        assert!(!r.contested(dst(), &p1, now));
+        r.claim(dst(), &p1, now);
+        assert_eq!(r.len(), MAX_ROUTES);
+        assert!(r.contested(dst(), &p1, now));
+        let later = now + MIGRATION_WINDOW;
+        assert!(!r.contested(dst(), &p1, later));
+        r.claim(dst(), &p1, later);
+        assert_eq!(r.len(), 1, "aged-out claims pruned");
+        // Three routes to one server: every one of them sees another.
+        for t in ["a", "b", "c"] {
+            r.claim(dst(), &Some(t.into()), later);
+        }
+        for t in ["a", "b", "c", "p1"] {
+            assert!(r.contested(dst(), &Some(t.into()), later), "{t}");
         }
     }
 

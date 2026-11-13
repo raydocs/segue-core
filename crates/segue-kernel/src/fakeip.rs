@@ -70,8 +70,18 @@ const STATE_SLACK: u64 = 4096;
 /// Format 3: the journal was created (and its directory entry synced)
 /// before this state was first written, so a missing journal next to it
 /// means bindings were lost. Formats 1 and 2 have the same fields and are
-/// still read.
+/// still read, but only together with their journal: they could not
+/// promise one, so without it the pool cannot tell "never had bindings
+/// since the snapshot" from "lost them" (r7 #4), and refuses to start.
 const STATE_FORMAT: u32 = 3;
+
+/// Persistence jobs queued at most; a new name over this is refused (the
+/// DNS answers SERVFAIL) instead of queuing behind a slow disk (r7 #5).
+pub const MAX_PENDING_JOBS: usize = 64;
+/// Longest a DNS answer waits for its binding to become durable. Past it the
+/// name gets no address now (SERVFAIL); the job, if it still runs, only
+/// makes a binding the next query for the name is answered from.
+pub const DURABLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Largest state or journal (bytes) a pool of `max_entries` writes or reads.
 fn size_limit(max_entries: usize) -> u64 {
@@ -123,7 +133,9 @@ pub struct FakeIpPool {
     /// journal, adds new bindings and writes the state, so the network
     /// runtime never waits on the disk and a binding is never both missing
     /// from a snapshot and dropped from the journal.
-    jobs: Option<Mutex<mpsc::Sender<Job>>>,
+    jobs: Option<Mutex<mpsc::SyncSender<Job>>>,
+    /// See [`DURABLE_TIMEOUT`].
+    durable_timeout: Duration,
 }
 
 enum Job {
@@ -190,6 +202,7 @@ impl FakeIpPool {
                 DEFAULT_MAX_ENTRIES,
             )?),
             jobs: None,
+            durable_timeout: DURABLE_TIMEOUT,
         })
     }
 
@@ -252,11 +265,19 @@ impl FakeIpPool {
                 let (core, n, format) =
                     Core::restore(base, prefix, lifetime, max_entries, &bytes, now)
                         .map_err(refuse)?;
-                if format >= 3 && journal.is_none() {
-                    // The journal is made durable before such a state is
-                    // ever written: its loss may have taken bindings with it.
+                if journal.is_none() {
+                    // Format 3: the journal is made durable before such a
+                    // state is ever written, so its loss may have taken
+                    // bindings with it. Formats 1 and 2: there is no way to
+                    // tell a journal that never existed from one that was
+                    // lost, so they are never migrated without it.
+                    let why = if format >= 3 {
+                        String::new()
+                    } else {
+                        format!(" (format {format} state; cannot be migrated without it)")
+                    };
                     return Err(refuse(format!(
-                        "its journal {} is missing",
+                        "its journal {} is missing{why}",
                         jpath.display()
                     )));
                 }
@@ -286,7 +307,7 @@ impl FakeIpPool {
         };
         core.dirty.store(true, Ordering::Release);
         writer.save().map_err(|e| refuse(e.to_string()))?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(MAX_PENDING_JOBS);
         std::thread::Builder::new()
             .name("fake-ip-persist".into())
             .spawn(move || writer.run(rx))
@@ -296,6 +317,7 @@ impl FakeIpPool {
                 ttl,
                 core,
                 jobs: Some(Mutex::new(tx)),
+                durable_timeout: DURABLE_TIMEOUT,
             },
             log,
         ))
@@ -317,14 +339,17 @@ impl FakeIpPool {
                 ttl,
                 core: Arc::new(core),
                 jobs: None,
+                durable_timeout: DURABLE_TIMEOUT,
             },
             n,
         ))
     }
 
+    /// Queue a job; false when the queue is full (the disk is behind) or
+    /// the thread is gone. Never waits.
     fn send(&self, job: Job) -> bool {
         let jobs = self.jobs.as_ref().expect("persistent pool");
-        jobs.lock().expect("fake-ip jobs").send(job).is_ok()
+        jobs.lock().expect("fake-ip jobs").try_send(job).is_ok()
     }
 
     /// Serialized key + every binding.
@@ -338,7 +363,9 @@ impl FakeIpPool {
     /// name), the name cannot be stored, or the binding could not be made
     /// durable. A new binding of a persistent pool is journaled and synced
     /// on the persistence thread before this returns; the caller's task
-    /// yields meanwhile, so the network runtime keeps running.
+    /// yields meanwhile, so the network runtime keeps running. The wait is
+    /// bounded: with [`MAX_PENDING_JOBS`] already queued, or no durable
+    /// answer within [`DURABLE_TIMEOUT`], this is None at once / then.
     pub async fn assign_durable(&self, domain: &str, version: u64) -> Option<Ipv4Addr> {
         if self.jobs.is_none() {
             return self.core.assign_mem(domain, version);
@@ -354,7 +381,11 @@ impl FakeIpPool {
         }) {
             return None;
         }
-        rx.await.ok().flatten()
+        tokio::time::timeout(self.durable_timeout, rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
     }
 
     /// [`Self::assign_durable`] for callers outside an async runtime
@@ -388,7 +419,9 @@ impl FakeIpPool {
         }
         let (reply, rx) = oneshot::channel();
         if !self.send(Job::Save { reply }) {
-            return Err(std::io::Error::other("fake-ip persistence thread gone"));
+            return Err(std::io::Error::other(
+                "fake-ip persistence busy or gone; saved next time",
+            ));
         }
         rx.await
             .unwrap_or_else(|_| Err(std::io::Error::other("fake-ip persistence thread gone")))
@@ -400,7 +433,14 @@ impl FakeIpPool {
             return Ok(false);
         }
         let (reply, rx) = oneshot::channel();
-        if !self.send(Job::Save { reply }) {
+        let jobs = self.jobs.as_ref().expect("persistent pool");
+        // Blocking: may wait for room behind queued bindings.
+        let sent = jobs
+            .lock()
+            .expect("fake-ip jobs")
+            .clone()
+            .send(Job::Save { reply });
+        if sent.is_err() {
             return Err(std::io::Error::other("fake-ip persistence thread gone"));
         }
         rx.blocking_recv()
@@ -429,8 +469,13 @@ impl FakeIpPool {
     }
 
     #[cfg(test)]
-    fn set_slow_append(&self, d: Duration) {
+    pub(crate) fn set_slow_append(&self, d: Duration) {
         *self.core.slow_append.lock().unwrap() = d;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_durable_timeout(&mut self, d: Duration) {
+        self.durable_timeout = d;
     }
 }
 
@@ -443,6 +488,11 @@ impl Writer {
                     version,
                     reply,
                 } => {
+                    // Its asker gave up (timed out or cancelled): nobody
+                    // would get the address, so no binding is made.
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let _ = reply.send(self.assign(&domain, version));
                 }
                 Job::Save { reply } => {
@@ -1379,18 +1429,55 @@ mod tests {
         let x = p.assign("a.com", 1).unwrap();
         assert!(p.save().unwrap(), "folded into the state");
         drop(p);
-        let state = std::fs::read(&path).unwrap();
         // The journal's directory entry was lost (power cut before it
         // reached the disk): refuse instead of starting with an empty log.
         std::fs::remove_file(journal_path(&path)).unwrap();
         let e = open_at(&path, DEFAULT_MAX_ENTRIES).err().unwrap();
         assert!(e.contains("journal") && e.contains("missing"), "{e}");
         assert!(!journal_path(&path).exists(), "nothing recreated");
-        // A legacy (format 2) state could not promise a journal: accepted.
-        put(&path, &tamper(&state, |v| v["format"] = 2.into()));
-        let (q, _) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
-        assert_eq!(q.lookup(x.into()).unwrap().domain, "a.com");
-        assert!(journal_path(&path).exists());
+        let _ = x;
+    }
+
+    /// r7 #4: a legacy (format 1 or 2) state whose journal is gone is never
+    /// migrated: a binding that only that journal held would be lost and
+    /// its address handed to another name. With its journal it migrates.
+    #[test]
+    fn legacy_state_without_journal_refuses_to_start() {
+        for format in [1u32, 2] {
+            let d = private_dir();
+            let path = d.0.join("fakeip.state");
+            let (p, _) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
+            let a = p.assign("a.com", 1).unwrap();
+            assert!(p.save().unwrap());
+            // Handed out after the last snapshot: only the journal has it.
+            let b = p.assign("b.com", 1).unwrap();
+            drop(p);
+            let legacy = tamper(&std::fs::read(&path).unwrap(), |v| {
+                v["format"] = format.into();
+            });
+            put(&path, &legacy);
+            assert!(!String::from_utf8_lossy(&legacy).contains("b.com"));
+            let journal = std::fs::read(journal_path(&path)).unwrap();
+            assert!(String::from_utf8_lossy(&journal).contains("b.com"));
+            // The journal's directory entry was lost: refuse, recreate nothing.
+            std::fs::remove_file(journal_path(&path)).unwrap();
+            let e = open_at(&path, DEFAULT_MAX_ENTRIES).err().unwrap();
+            assert!(
+                e.contains("journal") && e.contains("missing") && e.contains("format"),
+                "{e}"
+            );
+            assert!(!journal_path(&path).exists(), "nothing recreated");
+            assert_eq!(std::fs::read(&path).unwrap(), legacy, "state untouched");
+            // With its journal, the legacy state migrates and keeps both.
+            put(&journal_path(&path), &journal);
+            let (q, _) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
+            assert_eq!(q.lookup(a.into()).unwrap().domain, "a.com");
+            assert_eq!(q.lookup(b.into()).unwrap().domain, "b.com");
+            drop(q);
+            let st: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(st["format"], STATE_FORMAT);
+        }
     }
 
     /// R9: every name the pool accepts can be saved and read back, even
@@ -1463,6 +1550,57 @@ mod tests {
         drop(p);
         let (q, _) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
         assert_eq!(q.lookup(ip.into()).unwrap().domain, "a.com");
+    }
+
+    /// r7 #5: a disk that stops answering neither grows the job queue
+    /// without bound nor holds a DNS answer forever: over
+    /// [`MAX_PENDING_JOBS`] a new name is refused at once, and a queued one
+    /// gives up after the durable timeout. A job whose asker gave up makes
+    /// no binding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stuck_disk_bounds_queue_and_wait() {
+        let d = private_dir();
+        let path = d.0.join("fakeip.state");
+        let (mut p, _) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
+        p.set_slow_append(Duration::from_millis(400));
+        p.set_durable_timeout(Duration::from_millis(150));
+        let p = Arc::new(p);
+        let start = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..MAX_PENDING_JOBS + 8 {
+            let p = p.clone();
+            set.spawn(async move {
+                let r = p.assign_durable(&format!("n{i}.com"), 1).await;
+                (r, Instant::now())
+            });
+        }
+        let mut early = 0;
+        while let Some(r) = set.join_next().await {
+            let (r, at) = r.unwrap();
+            assert_eq!(r, None, "no answer from a stuck disk");
+            let waited = at - start;
+            assert!(waited < Duration::from_millis(1000), "{waited:?}");
+            if waited < Duration::from_millis(100) {
+                early += 1;
+            }
+        }
+        assert!(early >= 7, "over the queue refused at once: {early}");
+        // Only the job already on the disk completes; the abandoned ones
+        // are skipped, not journaled one by one.
+        p.set_slow_append(Duration::ZERO);
+        tokio::time::sleep_until((start + Duration::from_millis(600)).into()).await;
+        let t = Instant::now();
+        assert!(p.assign_durable("late.com", 1).await.is_some());
+        assert!(
+            t.elapsed() < Duration::from_millis(1000),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(
+            p.tracked() <= 2,
+            "abandoned jobs bound nothing: {}",
+            p.tracked()
+        );
     }
 
     #[test]
