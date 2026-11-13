@@ -131,6 +131,10 @@ struct Session {
     rst: Option<u8>,
     /// When OPEN created the session; fixed for its whole life.
     created: Instant,
+    /// The client's FIN offset, received but not yet acknowledged because
+    /// the site has not taken the upload yet (see
+    /// [`RelayTable::confirm_site_flush`]).
+    held_fin: Option<u64>,
 }
 
 // Manual so the resume secret never reaches a log.
@@ -208,6 +212,8 @@ pub struct RelayTable {
     to_close: Vec<CarrierId>,
     /// Latest `now` seen; used for tombstone expiry.
     clock: Instant,
+    /// See [`RelayTable::confirm_site_flush`].
+    hold_fin: bool,
 }
 
 impl RelayTable {
@@ -223,7 +229,24 @@ impl RelayTable {
             events: VecDeque::new(),
             to_close: Vec::new(),
             clock: Instant::now(),
+            hold_fin: false,
         }
+    }
+
+    /// With `on`, the client's FIN is acknowledged (and a session can end
+    /// CLEAN) only after [`site_flushed`]: the driver reports that the site
+    /// took every uploaded byte and its write side was shut down. Until
+    /// then [`read_eof`] already reports the end, so the driver can shut
+    /// the site down. A site that fails or never finishes is reset
+    /// ([`site_reset`]), so a truncated upload is never reported clean
+    /// (review r6, relay upload drain). Off: FIN is acknowledged on
+    /// arrival (state-machine tests that have no site writer).
+    ///
+    /// [`site_flushed`]: Self::site_flushed
+    /// [`read_eof`]: Self::read_eof
+    /// [`site_reset`]: Self::site_reset
+    pub fn confirm_site_flush(&mut self, on: bool) {
+        self.hold_fin = on;
     }
 
     pub fn instance_id(&self) -> u64 {
@@ -519,6 +542,7 @@ impl RelayTable {
                     recv,
                     rst: None,
                     created: now,
+                    held_fin: None,
                 };
                 self.sessions.insert(sid, s);
                 self.carriers.get_mut(&cid).unwrap().session = Some(sid);
@@ -612,11 +636,23 @@ impl RelayTable {
         frame: Frame,
         now: Instant,
     ) -> Result<(), ProtoError> {
+        let hold = self.hold_fin;
         let s = self.sessions.get_mut(sid).unwrap();
         match frame {
             Frame::Data { offset, data, .. } => {
+                if s.held_fin.is_some_and(|f| offset + data.len() as u64 > f) {
+                    return Err(ProtoError::Violation("data after fin"));
+                }
                 s.recv.on_data(offset, &data, now)?;
             }
+            Frame::Fin { offset } if hold && !s.recv.fin_received() => match s.held_fin {
+                Some(f) if f == offset => {}
+                Some(_) => return Err(ProtoError::Violation("fin moved")),
+                None if offset != s.recv.recv_offset() => {
+                    return Err(ProtoError::Violation("fin not at recv_offset"))
+                }
+                None => s.held_fin = Some(offset),
+            },
             Frame::Fin { offset } => s.recv.on_fin(offset, now)?,
             Frame::Ack {
                 recv_offset,
@@ -812,7 +848,26 @@ impl RelayTable {
 
     /// The client's FIN has been reached by `read`.
     pub fn read_eof(&self, sid: &SessionId) -> bool {
-        self.sessions.get(sid).is_some_and(|s| s.recv.eof())
+        self.sessions.get(sid).is_some_and(|s| {
+            s.recv.eof() || (s.held_fin == Some(s.recv.consumed()) && s.recv.buffered() == 0)
+        })
+    }
+
+    /// The site writer flushed the whole upload and shut the site's write
+    /// side down (see [`confirm_site_flush`]): acknowledge the client's FIN.
+    ///
+    /// [`confirm_site_flush`]: Self::confirm_site_flush
+    pub fn site_flushed(&mut self, sid: &SessionId, now: Instant) {
+        self.clock = self.clock.max(now);
+        let Some(s) = self.sessions.get_mut(sid) else {
+            return;
+        };
+        let Some(f) = s.held_fin.take() else {
+            return;
+        };
+        if let Err(e) = s.recv.on_fin(f, now) {
+            self.fail(sid, e);
+        }
     }
 
     /// Revocation / admin: RST every session of `device`.

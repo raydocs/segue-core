@@ -843,6 +843,53 @@ struct SiteIo {
     outstanding: bool,
     shut: bool,
     eof: bool,
+    /// Resets the session if the site writer has not flushed the upload
+    /// and shut down within [`SITE_FLUSH`] of the client's FIN.
+    flush_timer: Option<Task>,
+}
+
+/// How long the site writer may take, after the client's FIN, to hand the
+/// rest of the upload to the site and shut its write side down. Only then
+/// is the FIN acknowledged and the session can end CLEAN (r6: a truncated
+/// upload must never be reported clean); past this it is reset.
+const SITE_FLUSH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The site's write half: reports once its shutdown completed, i.e. every
+/// byte before it was written and the FIN went out.
+struct SiteWrite<W> {
+    inner: W,
+    sid: SessionId,
+    flushed: Option<mpsc::UnboundedSender<SessionId>>,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for SiteWrite<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let r = std::task::ready!(Pin::new(&mut self.inner).poll_shutdown(cx));
+        if r.is_ok() {
+            if let Some(tx) = self.flushed.take() {
+                let _ = tx.send(self.sid);
+            }
+        }
+        std::task::Poll::Ready(r)
+    }
 }
 
 /// What the relay driver reports besides carrying data.
@@ -884,6 +931,10 @@ pub async fn run_relay_ctl(
     let writable = Arc::new(Notify::new());
     let (ev_tx, mut ev_rx) = mpsc::channel::<CarrierEv>(64);
     let (site_tx, mut site_rx) = mpsc::channel::<SiteEv>(64);
+    let (flushed_tx, mut flushed_rx) = mpsc::unbounded_channel::<SessionId>();
+    // The client's FIN is acknowledged only once the site writer flushed
+    // (see `SITE_FLUSH`).
+    table.confirm_site_flush(true);
     let mut carriers: HashMap<u64, CarrierIo> = HashMap::new();
     let mut sites: HashMap<SessionId, SiteIo> = HashMap::new();
     // Site connects in flight, cancelled when their session ends.
@@ -943,8 +994,9 @@ pub async fn run_relay_ctl(
                     if let Some(io) = sites.remove(&session_id) {
                         io.reader.abort();
                         if close_code == code::CLEAN {
-                            // Everything was delivered to the relay; let the
-                            // writer finish handing it to the site, bounded.
+                            // CLEAN needs the client's FIN acknowledged, which
+                            // waits for the site writer to flush and shut down
+                            // (`SITE_FLUSH`): it is done, only exiting.
                             drop(io.tx);
                             tasks.drain(io.writer);
                         } else {
@@ -993,9 +1045,13 @@ pub async fn run_relay_ctl(
                 if n > 0 {
                     let _ = io.tx.try_send(buf[..n].to_vec().into());
                 } else {
-                    if table.read_eof(sid) {
-                        let _ = io.tx.try_send(Vec::new().into());
+                    if table.read_eof(sid) && io.tx.try_send(Vec::new().into()).is_ok() {
                         io.shut = true;
+                        let (stx, sid) = (site_tx.clone(), *sid);
+                        io.flush_timer = Some(spawn(async move {
+                            tokio::time::sleep(SITE_FLUSH).await;
+                            let _ = stx.send(SiteEv::Error(sid)).await;
+                        }));
                     }
                     break;
                 }
@@ -1059,6 +1115,7 @@ pub async fn run_relay_ctl(
                             continue;
                         }
                         let (mut r, w) = tokio::io::split(stream);
+                        let w = SiteWrite { inner: w, sid, flushed: Some(flushed_tx.clone()) };
                         let etx = site_tx.clone();
                         let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                             let _ = etx.send(SiteEv::Error(sid)).await;
@@ -1075,7 +1132,7 @@ pub async fn run_relay_ctl(
                                 }
                             }
                         });
-                        sites.insert(sid, SiteIo { tx, req, reader, writer, outstanding: false, shut: false, eof: false });
+                        sites.insert(sid, SiteIo { tx, req, reader, writer, outstanding: false, shut: false, eof: false, flush_timer: None });
                         table.connect_done(&sid, Ok(()), t);
                     }
                     Some(SiteEv::Connected(sid, Err(e))) => {
@@ -1097,6 +1154,12 @@ pub async fn run_relay_ctl(
                     Some(SiteEv::Error(sid)) => table.site_reset(&sid),
                     None => {}
                 }
+            }
+            Some(sid) = flushed_rx.recv() => {
+                if let Some(io) = sites.get_mut(&sid) {
+                    io.flush_timer = None;
+                }
+                table.site_flushed(&sid, now());
             }
             c = async { ctrl.as_mut().unwrap().recv().await }, if ctrl.is_some() => match c {
                 Some(RelayCtrl::ResetDevice { device, close_code }) => table.reset_device(device, close_code),
