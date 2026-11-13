@@ -32,9 +32,19 @@
 //! frames in size and shared by every session, so admission costs only the
 //! per-flow floors (§4 rule 8: 16 KB initial credit, one replay block, one
 //! pipe block each way).
+//!
+//! The transport region is disjoint (r7 #1): it is counted on its own, so
+//! frames of carriers that stopped moving can never take the relay region,
+//! and nothing else can take it. Its blocks are handed out in arrival
+//! order to [`Ticket`] holders, so a session whose carrier is healthy gets
+//! the next freed frame instead of racing every waiter for it; the driver
+//! bounds how long a frame may hold transport blocks (a carrier that does
+//! not move it in time is dropped and its data replayed on a new one).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::Notify;
 
@@ -44,8 +54,10 @@ pub fn blocks_for(bytes: usize) -> usize {
     bytes.div_ceil(BLOCK)
 }
 
-/// Who may take blocks how far (see the module docs). Ordered: a higher
-/// tier may use everything a lower one may, plus its own region.
+/// Who may take blocks how far (see the module docs). Ordered: the relay
+/// tier may use everything the elastic one may, plus its own region; the
+/// transport tier has only its own, disjoint region (a frame first tries
+/// elastic blocks, see the driver).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     /// Grants that may be held indefinitely, and admission.
@@ -58,15 +70,28 @@ pub enum Tier {
 
 /// Default regions on top of the elastic part, in blocks: two full
 /// frames for carriers, four 16 KiB chunks for the TUN relay.
+/// Default [`Pool::transport_hold`]: well above a frame's write time on a
+/// working carrier, short enough that carriers that stopped moving cannot
+/// keep the region from healthy ones for long.
+pub const TRANSPORT_HOLD: Duration = Duration::from_secs(2);
 pub const TRANSPORT_REGION: usize = 2 * FRAME_MAX.div_ceil(BLOCK);
 pub const RELAY_REGION: usize = 16;
 
 #[derive(Debug)]
 pub struct Pool {
     blocks: usize,
-    /// Highest `used` each [`Tier`] may reach, ascending.
+    /// Highest `used` each [`Tier`] may reach, ascending (the transport
+    /// entry is the pool size, for [`limit`](Self::limit)).
     limits: [usize; 3],
+    /// Blocks taken outside the transport region.
     used: AtomicUsize,
+    /// Size of the transport region, and the blocks taken from it.
+    transport: usize,
+    transport_used: AtomicUsize,
+    /// Tickets waiting for the transport region, oldest first.
+    queue: Mutex<TicketQueue>,
+    /// How long a frame may hold transport blocks (milliseconds).
+    hold_ms: AtomicU64,
     sessions: AtomicUsize,
     waiters: AtomicUsize,
     freed: Notify,
@@ -91,6 +116,10 @@ impl Pool {
             blocks,
             limits: [elastic, relay_top, blocks],
             used: AtomicUsize::new(0),
+            transport: blocks - relay_top,
+            transport_used: AtomicUsize::new(0),
+            queue: Mutex::new(TicketQueue::default()),
+            hold_ms: AtomicU64::new(TRANSPORT_HOLD.as_millis() as u64),
             sessions: AtomicUsize::new(0),
             waiters: AtomicUsize::new(0),
             freed: Notify::new(),
@@ -114,7 +143,17 @@ impl Pool {
 
     /// Blocks in use.
     pub fn used_blocks(&self) -> usize {
-        self.used.load(Ordering::Acquire)
+        self.used.load(Ordering::Acquire) + self.transport_used.load(Ordering::Acquire)
+    }
+
+    /// Size of the transport region in blocks.
+    pub fn transport_blocks(&self) -> usize {
+        self.transport
+    }
+
+    /// Blocks taken from the transport region.
+    pub fn transport_used_blocks(&self) -> usize {
+        self.transport_used.load(Ordering::Acquire)
     }
 
     pub fn capacity_bytes(&self) -> usize {
@@ -122,13 +161,13 @@ impl Pool {
     }
 
     pub fn used_bytes(&self) -> usize {
-        self.used.load(Ordering::Acquire) * BLOCK
+        self.used_blocks() * BLOCK
     }
 
     /// Fewer than 25 % of the elastic blocks free.
     pub fn under_pressure(&self) -> bool {
         let elastic = self.limit(Tier::Elastic);
-        let used = self.used.load(Ordering::Acquire);
+        let used = self.used_blocks();
         (elastic - used.min(elastic)) * 4 < elastic
     }
 
@@ -139,28 +178,61 @@ impl Pool {
     }
 
     fn try_take(&self, n: usize, tier: Tier) -> bool {
-        n == 0 || self.take_blocks(n, n, self.limit(tier)) == n
+        n == 0
+            || match tier {
+                Tier::Transport => self.take_transport(n, n, None) == n,
+                _ => self.take_blocks(n, n, self.limit(tier)) == n,
+            }
     }
 
-    fn give(&self, n: usize) {
-        self.give_blocks(n);
+    fn give(&self, n: usize, tier: Tier) {
+        match tier {
+            Tier::Transport => self.give_counter(&self.transport_used, n),
+            _ => self.give_blocks(n),
+        }
     }
 
     /// Take up to `want` blocks (at least `min`, else none) while the pool
     /// stays at or under `limit` blocks in use. Returns the blocks taken;
     /// the caller returns them with [`give_blocks`](Self::give_blocks).
+    /// Never reaches into the transport region.
     pub fn take_blocks(&self, want: usize, min: usize, limit: usize) -> usize {
-        let limit = limit.min(self.blocks);
-        let mut cur = self.used.load(Ordering::Acquire);
+        self.take_counter(
+            &self.used,
+            want,
+            min,
+            limit.min(self.blocks - self.transport),
+        )
+    }
+
+    /// Take from the transport region. The oldest waiting [`Ticket`] has
+    /// what it last asked for reserved: everyone else takes only what
+    /// leaves that much free, so blocks given back go to the first in line
+    /// as soon as they cover it, however many others retry (r7 #1).
+    fn take_transport(&self, want: usize, min: usize, ticket: Option<&Ticket>) -> usize {
+        let reserve = {
+            let mut q = self.queue.lock().unwrap();
+            let head_id = q.ids.front().map(|(id, _)| *id);
+            match head_id {
+                None => 0,
+                Some(h) if ticket.is_some_and(|t| t.id == h) => {
+                    q.need = min.min(self.transport);
+                    0
+                }
+                Some(_) => q.need,
+            }
+        };
+        self.take_counter(&self.transport_used, want, min, self.transport - reserve)
+    }
+
+    fn take_counter(&self, c: &AtomicUsize, want: usize, min: usize, limit: usize) -> usize {
+        let mut cur = c.load(Ordering::Acquire);
         loop {
             let n = want.min(limit.saturating_sub(cur));
             if n == 0 || n < min {
                 return 0;
             }
-            match self
-                .used
-                .compare_exchange_weak(cur, cur + n, Ordering::AcqRel, Ordering::Acquire)
-            {
+            match c.compare_exchange_weak(cur, cur + n, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return n,
                 Err(v) => cur = v,
             }
@@ -170,13 +242,62 @@ impl Pool {
     /// Return blocks taken with [`take_blocks`](Self::take_blocks) and wake
     /// whoever waits in [`freed`](Self::freed).
     pub fn give_blocks(&self, n: usize) {
+        self.give_counter(&self.used, n);
+    }
+
+    fn give_counter(&self, c: &AtomicUsize, n: usize) {
         if n == 0 {
             return;
         }
-        self.used.fetch_sub(n, Ordering::AcqRel);
+        c.fetch_sub(n, Ordering::AcqRel);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        self.wake_head();
         if self.waiters.load(Ordering::Acquire) > 0 {
             self.freed.notify_waiters();
         }
+    }
+
+    fn wake_head(&self) {
+        if let Some((_, w)) = self.queue.lock().unwrap().ids.front() {
+            w.notify_one();
+        }
+    }
+
+    /// A place in line for the transport region (see [`Grant::transport`]).
+    /// Dropping it leaves the line.
+    pub fn ticket(self: &Arc<Self>) -> Ticket {
+        let mut q = self.queue.lock().unwrap();
+        q.next += 1;
+        let id = q.next;
+        let wake = Arc::new(Notify::new());
+        if q.ids.is_empty() {
+            q.need = 1;
+        }
+        q.ids.push_back((id, wake.clone()));
+        Ticket {
+            pool: self.clone(),
+            id,
+            wake,
+        }
+    }
+
+    /// How long a frame may hold transport-region blocks before its
+    /// carrier is given up (its data is replayed on the next one).
+    pub fn transport_hold(&self) -> Duration {
+        Duration::from_millis(self.hold_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn set_transport_hold(&self, d: Duration) {
+        self.hold_ms
+            .store(d.as_millis().max(1) as u64, Ordering::Relaxed);
+    }
+
+    /// Tickets waiting for the transport region.
+    pub fn queued(&self) -> usize {
+        self.queue.lock().unwrap().ids.len()
     }
 
     /// Resolves when blocks are returned (or spuriously).
@@ -184,6 +305,17 @@ impl Pool {
         self.waiters.fetch_add(1, Ordering::AcqRel);
         let _w = Waiting(&self.waiters);
         self.freed.notified().await;
+    }
+
+    /// Listen for blocks (or a turn for the transport region) given back
+    /// from now on; await with [`Armed::wait`]. Take it before the last
+    /// attempt, so nothing given in between is missed.
+    pub fn armed(&self) -> Armed<'_> {
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+        let _w = Waiting(&self.waiters);
+        let mut n = Box::pin(self.freed.notified());
+        n.as_mut().enable();
+        Armed { n, _w }
     }
 
     /// Run `f` until it returns `Some`, waiting for blocks to be returned
@@ -203,6 +335,64 @@ impl Pool {
             }
             freed.await;
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TicketQueue {
+    next: u64,
+    /// Blocks reserved for the first in line (what it last asked for).
+    need: usize,
+    ids: VecDeque<(u64, Arc<Notify>)>,
+}
+
+/// A waiter's place in line for the transport region; see [`Pool::ticket`].
+#[derive(Debug)]
+pub struct Ticket {
+    pool: Arc<Pool>,
+    id: u64,
+    wake: Arc<Notify>,
+}
+
+impl Ticket {
+    /// Resolves once this ticket may have a turn: it became first in line,
+    /// or blocks were given back while it was. Only the first in line is
+    /// woken (no herd of every waiter), and a wake that comes before this is
+    /// awaited is kept, so none is missed.
+    pub async fn ready(&self) {
+        self.wake.notified().await
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        let head = {
+            let mut q = self.pool.queue.lock().unwrap();
+            let head = q.ids.front().is_some_and(|(i, _)| *i == self.id);
+            q.ids.retain(|(i, _)| *i != self.id);
+            if head {
+                // Unknown until the new first in line asks.
+                q.need = 1;
+            }
+            head
+        };
+        if head {
+            // The next in line may take now.
+            self.pool.wake_head();
+        }
+    }
+}
+
+/// See [`Pool::armed`].
+pub struct Armed<'a> {
+    n: std::pin::Pin<Box<tokio::sync::futures::Notified<'a>>>,
+    _w: Waiting<'a>,
+}
+
+impl Armed<'_> {
+    pub async fn wait(self) {
+        let Armed { n, _w } = self;
+        n.await;
     }
 }
 
@@ -263,12 +453,30 @@ impl Grant {
     /// within `tier`, as much as is free; `None` below `min`.
     pub fn between(pool: &Arc<Pool>, min: usize, want: usize, tier: Tier) -> Option<Self> {
         let min = blocks_for(min).max(1);
-        let n = pool.take_blocks(blocks_for(want).max(min), min, pool.limit(tier));
+        let want = blocks_for(want).max(min);
+        let n = match tier {
+            Tier::Transport => pool.take_transport(want, min, None),
+            _ => pool.take_blocks(want, min, pool.limit(tier)),
+        };
         (n > 0).then(|| Self {
             pool: pool.clone(),
             blocks: n,
             counted: false,
             tier,
+        })
+    }
+
+    /// Between `min` and `want` bytes from the transport region, for the
+    /// holder of `ticket` when it is first in line (or nobody is queued).
+    pub fn transport(pool: &Arc<Pool>, min: usize, want: usize, ticket: &Ticket) -> Option<Self> {
+        debug_assert!(Arc::ptr_eq(pool, &ticket.pool));
+        let min = blocks_for(min).max(1);
+        let n = pool.take_transport(blocks_for(want).max(min), min, Some(ticket));
+        (n > 0).then(|| Self {
+            pool: pool.clone(),
+            blocks: n,
+            counted: false,
+            tier: Tier::Transport,
         })
     }
 
@@ -289,7 +497,7 @@ impl Grant {
     pub fn try_resize(&mut self, bytes: usize) -> bool {
         let want = blocks_for(bytes);
         if want <= self.blocks {
-            self.pool.give(self.blocks - want);
+            self.pool.give(self.blocks - want, self.tier);
             self.blocks = want;
             true
         } else if self.pool.try_take(want - self.blocks, self.tier) {
@@ -314,7 +522,7 @@ impl Grant {
 
 impl Drop for Grant {
     fn drop(&mut self) {
-        self.pool.give(self.blocks);
+        self.pool.give(self.blocks, self.tier);
         if self.counted {
             self.pool.sessions.fetch_sub(1, Ordering::AcqRel);
         }
@@ -384,6 +592,66 @@ mod tests {
         assert!(pool.under_pressure());
         assert_eq!(pool.fair_share_bytes(), 12 * BLOCK);
         drop(hog);
+        assert_eq!(pool.used_bytes(), 0);
+    }
+
+    #[test]
+    fn transport_frames_cannot_take_the_relay_region() {
+        // r7 #1: the transport region is disjoint. Frames stuck on carriers
+        // fill it and no more; relay chunks keep their own region, and
+        // giving transport blocks back frees transport room only.
+        let pool = Pool::with_regions(20 * BLOCK, 4, 4);
+        let mut hog = Grant::new(&pool, true);
+        hog.grow_towards(1 << 20);
+        let stuck = Grant::up_to(&pool, 1 << 20, Tier::Transport).unwrap();
+        assert_eq!(stuck.bytes(), 4 * BLOCK);
+        assert_eq!(pool.transport_used_blocks(), 4);
+        assert!(Grant::up_to(&pool, BLOCK, Tier::Transport).is_none());
+        let relay = Grant::up_to(&pool, 1 << 20, Tier::Relay).unwrap();
+        assert_eq!(relay.bytes(), 4 * BLOCK, "relay region taken by frames");
+        assert_eq!(pool.used_blocks(), 20);
+        drop(relay);
+        assert_eq!(pool.transport_used_blocks(), 4);
+        assert!(Grant::up_to(&pool, BLOCK, Tier::Transport).is_none());
+        drop(stuck);
+        assert_eq!(pool.transport_used_blocks(), 0);
+        drop(hog);
+        assert_eq!(pool.used_bytes(), 0);
+    }
+
+    #[test]
+    fn the_first_in_line_has_its_frame_reserved() {
+        // r7 #1: once someone waits for the transport region, what it asked
+        // for is kept for it: others (with a later ticket or none) take
+        // only beyond that, so freed blocks cannot be raced away from it.
+        let pool = Pool::with_regions(16 * BLOCK, 0, 8);
+        let held = Grant::up_to(&pool, 8 * BLOCK, Tier::Transport).unwrap();
+        let first = pool.ticket();
+        let second = pool.ticket();
+        assert_eq!(pool.queued(), 2);
+        assert!(Grant::transport(&pool, 4 * BLOCK, 4 * BLOCK, &first).is_none());
+        drop(held);
+        // Four of eight blocks are the first's; the rest is anyone's.
+        let other = Grant::transport(&pool, BLOCK, 8 * BLOCK, &second).unwrap();
+        assert_eq!(other.bytes(), 4 * BLOCK);
+        assert!(Grant::up_to(&pool, BLOCK, Tier::Transport).is_none());
+        let a = Grant::transport(&pool, 4 * BLOCK, 4 * BLOCK, &first).unwrap();
+        drop(first);
+        assert_eq!(pool.transport_used_blocks(), 8);
+        drop((a, other));
+        // The next in line inherits the turn; a ticket leaving the line
+        // passes it on.
+        let third = pool.ticket();
+        assert!(
+            Grant::transport(&pool, 8 * BLOCK, 8 * BLOCK, &second).is_some_and(|g| {
+                drop(g);
+                true
+            })
+        );
+        drop(second);
+        let g = Grant::transport(&pool, 8 * BLOCK, 8 * BLOCK, &third).unwrap();
+        drop((g, third));
+        assert_eq!(pool.queued(), 0);
         assert_eq!(pool.used_bytes(), 0);
     }
 

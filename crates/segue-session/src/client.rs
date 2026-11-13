@@ -712,6 +712,16 @@ impl ClientSession {
         }
     }
 
+    /// Bytes the app may write now, at most `max`; holds no read-ahead
+    /// beyond that (see [`SendHalf::write_capacity_for`]).
+    pub fn write_capacity_for(&mut self, max: usize) -> usize {
+        if self.is_closed() {
+            0
+        } else {
+            self.send.write_capacity_for(max)
+        }
+    }
+
     pub fn write(&mut self, data: &[u8]) -> usize {
         if self.is_closed() {
             return 0;

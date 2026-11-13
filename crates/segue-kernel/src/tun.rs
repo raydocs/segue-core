@@ -59,11 +59,15 @@
 //!   bytes and its charge to the 2-block minimum.
 //!
 //! [`TunStack::memory_budget`] states the worst case for a configuration;
-//! with the defaults it is 13 740 252 bytes ≈ 13.1 MiB: TCP pool 6 MiB,
+//! with the defaults it is 19 891 420 bytes ≈ 19.0 MiB: TCP pool 6 MiB,
 //! 512 TCP flows × 4 KiB bookkeeping = 2 MiB, packet queues 1.5 MiB
-//! ((512 out + 2 × 256 UDP) × 1500), 256 UDP flows × (9 × 1500 + 1 KiB)
-//! = 3.5 MiB, 32 DNS queries in flight 94 KiB (test
-//! `default_memory_budget_is_well_under_20_mib`). The PR #14 layout reserved
+//! ((512 out + 2 × 256 UDP + 1) × 1500), 256 UDP flows × 38 552 B
+//! = 9.4 MiB, 32 DNS queries in flight 94 KiB (test
+//! `default_memory_budget_is_well_under_20_mib`). A UDP flow's 38 552 B:
+//! 9 × 1500 queue and reply buffer, 1 KiB bookkeeping, the QUIC guard's
+//! kept hellos and server IDs (`quic::GUARD_KEPT`, 6 816 B) and one
+//! connection being classified ([`sniff_state`], 17 212 B: 3 held
+//! datagrams, their CRYPTO copies, 256 piece entries, the DCID). The PR #14 layout reserved
 //! 128 KiB per TCP flow up front: 64 MiB at 512 flows.
 //! Outbound transport state (TLS/QUIC buffers inside the dialer) is not part
 //! of the TUN budget.
@@ -2207,6 +2211,22 @@ struct Ctx {
     dial_timeout: Duration,
 }
 
+/// CRYPTO pieces an [`InitialSniffer`] keeps at most (`quic::Crypto`'s
+/// cap).
+const SNIFF_PARTS: usize = 256;
+/// Longest QUIC v1/v2 connection ID.
+const MAX_CID: usize = 20;
+
+/// Worst case of one QUIC connection being classified (a flow sniffing at
+/// start, or a guard's pending connection): up to `MAX_DATAGRAMS - 1` held
+/// datagrams (the next one gives the final verdict), the sniffer's copies of
+/// their CRYPTO data (never more than the datagrams carried), its piece
+/// list at the cap and the bound DCID (r7 #8).
+pub fn sniff_state(mtu: usize) -> usize {
+    let held = crate::quic::MAX_DATAGRAMS - 1;
+    held * mtu + held * mtu + SNIFF_PARTS * std::mem::size_of::<(usize, Vec<u8>)>() + MAX_CID
+}
+
 /// Worst-case memory of one [`TunStack`], in bytes. Outbound transport
 /// state (inside the dialer) is not included.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2221,6 +2241,8 @@ pub struct MemoryBudget {
     pub udp_flows: usize,
     /// Hijacked DNS queries and answers in flight.
     pub dns: usize,
+    /// The kernel-wide QUIC route table (`quic::ROUTES_KEPT`).
+    pub quic_routes: usize,
     pub total: usize,
 }
 
@@ -2284,18 +2306,23 @@ impl TunStack {
         // the device's one-packet receive slot.
         let packet_queues = (c.out_queue + 2 * c.udp_queue + 1) * mtu;
         // Per flow: queued datagrams, one receive buffer of a reply's size,
-        // bookkeeping; the QUIC guard's held datagrams and kept hellos.
-        let guard = (crate::quic::MAX_DATAGRAMS - 1) * mtu + crate::quic::GUARD_KEPT;
+        // bookkeeping; the QUIC guard's kept hellos and, for the one
+        // connection being classified, its held datagrams and its sniffer
+        // (the same state a flow still sniffing at start holds, in place of
+        // the guard).
+        let guard = sniff_state(mtu) + crate::quic::GUARD_KEPT;
         let udp_flows = c.max_udp_flows * ((self.udp_flow_queue + 1) * mtu + 1024 + guard);
         // A query and its answer (TCP answers live in the pool).
         let dns = self.max_dns_in_flight * 2 * mtu;
+        let quic_routes = crate::quic::ROUTES_KEPT;
         MemoryBudget {
             tcp_pool,
             tcp_flows,
             packet_queues,
             udp_flows,
             dns,
-            total: tcp_pool + tcp_flows + packet_queues + udp_flows + dns,
+            quic_routes,
+            total: tcp_pool + tcp_flows + packet_queues + udp_flows + dns + quic_routes,
         }
     }
 

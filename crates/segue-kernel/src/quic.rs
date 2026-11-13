@@ -278,6 +278,20 @@ pub const MIGRATION_WINDOW: Duration = Duration::from_secs(600);
 /// Server addresses [`QuicRoutes`] tracks. When all are recent, it stops
 /// vouching for anything until the window passes (fails closed).
 pub const MAX_ROUTES: usize = 1024;
+
+/// Worst-case bytes of [`QuicRoutes`]: [`MAX_ROUTES`] map entries (key,
+/// Vec header, hashbrown control byte and slack), each with two routes whose
+/// tag is counted at [`ROUTE_TAG_BUDGET`] bytes. Outbound tags longer than
+/// that are shared `String`s from the config, so only their copies count.
+pub const ROUTES_KEPT: usize = MAX_ROUTES
+    * 2
+    * (std::mem::size_of::<SocketAddr>()
+        + std::mem::size_of::<Vec<(Option<String>, Instant)>>()
+        + 1
+        + 2 * (std::mem::size_of::<(Option<String>, Instant)>() + ROUTE_TAG_BUDGET));
+
+/// Tag bytes counted per stored route in [`ROUTES_KEPT`].
+pub const ROUTE_TAG_BUDGET: usize = 64;
 /// A flow refreshes its claim at most this often.
 const TOUCH_EVERY: Duration = Duration::from_secs(1);
 
@@ -299,7 +313,7 @@ const TOUCH_EVERY: Duration = Duration::from_secs(1);
 /// connections survive CID rotation, and no connection changes route.
 ///
 /// Bounded: at most [`MAX_ROUTES`] addresses, two routes each (two distinct
-/// routes are enough to tell any route "someone else"); about 100 KiB.
+/// routes are enough to tell any route "someone else"); see [`ROUTES_KEPT`].
 #[derive(Clone, Default)]
 pub struct QuicRoutes(Arc<Mutex<Routes>>);
 
