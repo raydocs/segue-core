@@ -511,9 +511,10 @@ impl ClientSession {
     /// by the callers that know the carrier owed us something (a stall
     /// timer, a STALL hint, a hold timeout, an unanswered attach); besides
     /// that, anything of ours outstanding, or a frame that was arriving
-    /// and never completed, counts. Only end-to-end progress (new data
-    /// received, or new bytes acknowledged) resets the count; an answered
-    /// RESUME does not.
+    /// and never completed (its header or its body), counts. End-to-end
+    /// progress (new data received, or new bytes acknowledged) resets the
+    /// count, and so does the session's one OPENED; an answered RESUME
+    /// does not.
     fn carrier_lost(&mut self, now: Instant, expected: bool) {
         if self.is_closed() || self.carrier.is_none() {
             return;
@@ -640,6 +641,13 @@ impl ClientSession {
                 self.send.on_ack(o.recv_offset, o.max_offset)?;
                 self.instance_id = o.instance_id;
                 self.established(now);
+                // OPENED proves the path (the relay reached the site), so
+                // OPEN retries lost before it no longer count (r10 N5).
+                // It is not progress: the carrier that brought it still
+                // counts if it is then lost with something expected, and
+                // OPENED comes once per session, so it cannot reset the
+                // budget in a loop (RESUMED never resets it).
+                self.fruitless = 0;
                 self.health = Some(Health::Up);
             }
             Frame::Resumed(r) => {

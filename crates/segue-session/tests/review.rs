@@ -3,7 +3,9 @@
 use std::time::Instant;
 
 use segue_session::client::{ClientSession, OpenParams};
-use segue_session::codec::{code, Frame, FrameDecoder, Kind, Open, Opened, Resume, Target, VERSION};
+use segue_session::codec::{
+    code, Frame, FrameDecoder, Kind, Open, Opened, Resume, Target, VERSION,
+};
 use segue_session::pool::Pool;
 use segue_session::relay::{AllowAll, RelayTable};
 use segue_session::Config;

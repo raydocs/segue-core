@@ -408,13 +408,16 @@ async fn read_charged<R: AsyncRead + Unpin>(
     let mut progress = Progress::new(cid, tx.clone());
     loop {
         let mut hdr = [0u8; 10];
-        if r.read_exact(&mut hdr[..3]).await.is_err() {
-            break;
-        }
-        let vlen = 1usize << (hdr[2] >> 6);
-        if r.read_exact(&mut hdr[3..2 + vlen]).await.is_err() {
-            break;
-        }
+        let vlen = match read_header(&mut r, &mut hdr, &mut progress).await {
+            Header::Read(vlen) => vlen,
+            Header::Eof => break,
+            // r10 N5: a carrier that ends inside a frame header owed us
+            // the rest of the frame, as one that ends inside a body does.
+            Header::Cut => {
+                let _ = tx.send(CarrierEv::Stuck(cid)).await;
+                return;
+            }
+        };
         let (len, _) = crate::codec::get_varint(&hdr[2..2 + vlen]).expect("complete varint");
         if len > crate::codec::MAX_PAYLOAD as u64 {
             let _ = tx
@@ -450,6 +453,44 @@ async fn read_charged<R: AsyncRead + Unpin>(
         }
     }
     let _ = tx.send(CarrierEv::Closed(cid)).await;
+}
+
+enum Header {
+    /// A whole header; the length varint takes this many bytes.
+    Read(usize),
+    /// The carrier ended (or failed) on a frame boundary.
+    Eof,
+    /// The carrier ended (or failed) after part of a header: the type
+    /// byte, the flags, or part of the length varint.
+    Cut,
+}
+
+/// Read `type:u8 flags:u8 length:varint` into `hdr`. Bytes of a header
+/// still arriving are reported as [`Progress`] (the peer is alive), as a
+/// body's are; a header already buffered whole reports nothing.
+async fn read_header<R: AsyncRead + Unpin>(
+    r: &mut tokio::io::BufReader<R>,
+    hdr: &mut [u8; 10],
+    progress: &mut Progress,
+) -> Header {
+    match r.read(&mut hdr[..1]).await {
+        Ok(1) => {}
+        _ => return Header::Eof,
+    }
+    if r.buffer().len() < 2 {
+        progress.report();
+    }
+    if r.read_exact(&mut hdr[1..3]).await.is_err() {
+        return Header::Cut;
+    }
+    let vlen = 1usize << (hdr[2] >> 6);
+    if r.buffer().len() < vlen - 1 {
+        progress.report();
+    }
+    if r.read_exact(&mut hdr[3..2 + vlen]).await.is_err() {
+        return Header::Cut;
+    }
+    Header::Read(vlen)
 }
 
 /// Read a frame body of `len` bytes whose memory (with what decoding it
@@ -626,7 +667,13 @@ async fn read_frames<R: AsyncRead + Unpin>(cid: u64, mut r: R, tx: mpsc::Sender<
             progress.reset();
         }
     }
-    let _ = tx.send(CarrierEv::Closed(cid)).await;
+    // Ended inside a frame (header or body): it owed us the rest (r10 N5).
+    let ev = if dec.held_bytes() > 0 {
+        CarrierEv::Stuck(cid)
+    } else {
+        CarrierEv::Closed(cid)
+    };
+    let _ = tx.send(ev).await;
 }
 
 /// A read buffer that is small while its stream is idle or slow and grows to

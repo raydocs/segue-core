@@ -207,7 +207,10 @@ mod stall_field {
         // OPEN flagged as carrying the field but ending right after
         // exit_class.
         let (t, fl, p) = split(&Frame::Open(open(VERSION, Some(5), b"")).to_bytes());
-        assert_eq!(Frame::decode(t, fl, &p[..p.len() - 1]), Err(ProtoError::Malformed));
+        assert_eq!(
+            Frame::decode(t, fl, &p[..p.len() - 1]),
+            Err(ProtoError::Malformed)
+        );
         // RESUME with a byte after the field.
         let (t, fl, mut p) = split(&Frame::Resume(resume(VERSION, Some(5))).to_bytes());
         p.push(0);

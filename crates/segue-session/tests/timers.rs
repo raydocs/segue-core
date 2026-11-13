@@ -561,9 +561,64 @@ fn client_stall_below_the_relay_floor_is_refused() {
     t.t_stall = MIN_CLIENT_STALL;
     assert_eq!(t.validate_client(), Ok(()));
     t.t_stall = MIN_CLIENT_STALL - Duration::from_millis(1);
-    assert_eq!(t.validate_client(), Err(TimingError::StallTooShort(t.t_stall)));
+    assert_eq!(
+        t.validate_client(),
+        Err(TimingError::StallTooShort(t.t_stall))
+    );
     t.t_stall = Duration::ZERO;
     assert!(t.validate_client().is_err());
     t.t_stall = Duration::MAX;
-    assert_eq!(t.validate_client(), Err(TimingError::StallTooLong(t.t_stall)));
+    assert_eq!(
+        t.validate_client(),
+        Err(TimingError::StallTooLong(t.t_stall))
+    );
+}
+
+/// r10 N5: OPENED proves the path, so OPEN attempts lost before it no
+/// longer count; RESUMED does not reset the count.
+#[test]
+fn opened_resets_the_recovery_budget_and_resumed_does_not() {
+    use segue_session::codec::{Opened, Resumed};
+    let t0 = Instant::now();
+    let mut c = client(t0);
+    c.attach(1, t0);
+    let _ = c.poll_transmit(1, t0);
+    c.on_carrier_closed(1, t0);
+    assert_eq!(c.fruitless_carriers(), 1, "an unanswered OPEN counts");
+    let t = t0 + Duration::from_secs(5);
+    assert!(c.wants_attach(t));
+    c.attach(2, t);
+    while c.poll_transmit(2, t).is_some() {}
+    c.on_frame(
+        2,
+        Frame::Opened(Opened {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            recv_offset: 0,
+            max_offset: 1 << 16,
+            window_cap: 1 << 16,
+            ack_bytes: 0,
+        }),
+        t,
+    )
+    .unwrap();
+    assert_eq!(c.fruitless_carriers(), 0, "OPENED resets the budget");
+    // Lost with a frame expected: counts again; RESUMED keeps it.
+    c.on_carrier_stuck(2, t);
+    assert_eq!(c.fruitless_carriers(), 1);
+    let t = t + Duration::from_secs(5);
+    c.attach(3, t);
+    while c.poll_transmit(3, t).is_some() {}
+    c.on_frame(
+        3,
+        Frame::Resumed(Resumed {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            recv_offset: 0,
+            max_offset: 1 << 16,
+        }),
+        t,
+    )
+    .unwrap();
+    assert_eq!(c.fruitless_carriers(), 1, "RESUMED is not progress");
 }
