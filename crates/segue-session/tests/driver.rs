@@ -2247,3 +2247,84 @@ async fn relay_does_not_spin_with_a_held_fin_and_a_blocked_writer() {
     client.abort();
     relay.abort();
 }
+
+/// A site that takes the whole upload, sends nothing, and closes after
+/// the upload's end.
+fn sink_site() -> SiteConnector {
+    Arc::new(|_t, _k| {
+        Box::pin(async {
+            let (a, mut b) = tokio::io::duplex(64 << 10);
+            tokio::spawn(async move {
+                let mut sink = vec![0u8; 16 << 10];
+                while b.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+                let _ = b.shutdown().await;
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
+/// r9 (write side cap): a frame charged to the transport region waits in
+/// the carrier's writer queue behind frames queued before it (charged to
+/// the elastic part while it lasted). The carrier moves bytes steadily,
+/// only slowly: the frames ahead take longer than the hold cap, the frame
+/// itself much less. Before, the cap counted from when the frame was
+/// queued, so the healthy carrier was given up; now it counts from when
+/// the writer starts on the frame. (Scaled: cap 2.5 s, hold 1 s, 10 KB/s,
+/// so one 16 KiB frame takes 1.6 s and the ~16 KiB send window queued
+/// ahead of it about as much again.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_write_hold_cap_counts_from_the_frame_start_not_its_enqueue() {
+    use segue_session::pool::{Grant, BLOCK};
+    let cfg = Config::default();
+    let pool = Pool::new(8 << 20);
+    pool.set_transport_hold(Duration::from_secs(1));
+    pool.set_transport_hold_max(Duration::from_millis(2500));
+    let table = RelayTable::new(
+        cfg.clone(),
+        Pool::new(8 << 20),
+        Box::new(AllowAll),
+        INSTANCE,
+    );
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(16);
+    let (note_tx, mut notes) = mpsc::unbounded_channel();
+    let relay = tokio::spawn(run_relay(table, accept_rx, sink_site(), Some(note_tx)));
+    let dials = Arc::new(AtomicUsize::new(0));
+    let connector = throttled_connector(accept_tx, dials.clone(), 1000, Duration::from_millis(100));
+    let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+    let (mut app, far) = tokio::io::duplex(512 << 10);
+    let client = tokio::spawn(run_client(s, far, connector));
+    const UP: usize = 64 << 10;
+    app.write_all(&pattern(UP, 8)).await.unwrap();
+    app.shutdown().await.unwrap();
+    // The send window's worth of elastic frames is queued; then the
+    // elastic part runs out and the next frame is charged to the
+    // transport region, behind them.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hog = tokio::spawn({
+        let (pool, done) = (pool.clone(), done.clone());
+        async move {
+            let mut hog = Vec::new();
+            while !done.load(Ordering::SeqCst) {
+                while let Some(g) = Grant::fixed(&pool, BLOCK) {
+                    hog.push(g);
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            hog.len()
+        }
+    });
+    let reason = tokio::time::timeout(Duration::from_secs(30), client)
+        .await
+        .expect("client did not end")
+        .unwrap();
+    done.store(true, Ordering::SeqCst);
+    assert!(hog.await.unwrap() > 100, "the pool was never spent");
+    let n = dials.load(Ordering::SeqCst);
+    println!("write hold behind queued frames: {reason:?}, {n} dial(s)");
+    assert_eq!(reason, CloseReason::Clean);
+    let _ = notes.try_recv();
+    assert_eq!(n, 1, "a carrier that kept moving was given up");
+    relay.abort();
+}
