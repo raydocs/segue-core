@@ -368,12 +368,16 @@ expected_rust="$(cat <<'EXPECTED'
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Keep build outputs on the root disk
+      - name: Keep build outputs on a disk with room
         run: |
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          dir="$HOME/.cache/segue-target"
+          if [ ! -d "$dir" ]; then
+            dir=/opt/segue-target
+            sudo install -d -o "$(id -u)" -g "$(id -g)" "$dir"
+          fi
           mkdir -p target
-          sudo mount --bind /opt/segue-target target
-          df -h / target
+          sudo mount --bind "$dir" target
+          df -h / "$dir"
       - name: Check repository scripts
         run: |
           for script in scripts/*.sh scripts/tests/*.sh; do

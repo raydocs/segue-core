@@ -283,14 +283,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Instabox runs the workspace on a 20 GiB /data disk, which a full
-      # workspace test build fills. The root disk has the room, so build there.
-      - name: Keep build outputs on the root disk
+      # A fresh Instabox machine runs the workspace on a 20 GiB /data disk,
+      # which a full workspace test build fills, so build on the root disk.
+      # The segue-warm snapshot keeps warm outputs in ~/.cache/segue-target on
+      # a larger /data (scripts/ci/refresh-instabox-snapshot.sh). A bind mount
+      # after checkout, because checkout's clean would delete target/.
+      - name: Keep build outputs on a disk with room
         run: |
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          dir="$HOME/.cache/segue-target"
+          if [ ! -d "$dir" ]; then
+            dir=/opt/segue-target
+            sudo install -d -o "$(id -u)" -g "$(id -g)" "$dir"
+          fi
           mkdir -p target
-          sudo mount --bind /opt/segue-target target
-          df -h / target
+          sudo mount --bind "$dir" target
+          df -h / "$dir"
 
       - name: Check repository scripts
         run: |
@@ -419,14 +426,21 @@ jobs:
         with:
           persist-credentials: false
 
-      # Instabox runs the workspace on a 20 GiB /data disk, which a full
-      # workspace test build fills. The root disk has the room, so build there.
-      - name: Keep build outputs on the root disk
+      # A fresh Instabox machine runs the workspace on a 20 GiB /data disk,
+      # which a full workspace test build fills, so build on the root disk.
+      # The segue-warm snapshot keeps warm outputs in ~/.cache/segue-target on
+      # a larger /data (scripts/ci/refresh-instabox-snapshot.sh). A bind mount
+      # after checkout, because checkout's clean would delete target/.
+      - name: Keep build outputs on a disk with room
         run: |
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          dir="$HOME/.cache/segue-target"
+          if [ ! -d "$dir" ]; then
+            dir=/opt/segue-target
+            sudo install -d -o "$(id -u)" -g "$(id -g)" "$dir"
+          fi
           mkdir -p target
-          sudo mount --bind /opt/segue-target target
-          df -h / target
+          sudo mount --bind "$dir" target
+          df -h / "$dir"
 
       # The pinned Xray-core v26.11.9 source requires Go 1.27.
       # Use one exact toolchain for all oracle and interoperability checks.
@@ -900,14 +914,21 @@ jobs:
         with:
           persist-credentials: false
 
-      # Instabox runs the workspace on a 20 GiB /data disk, which a full
-      # workspace test build fills. The root disk has the room, so build there.
-      - name: Keep build outputs on the root disk
+      # A fresh Instabox machine runs the workspace on a 20 GiB /data disk,
+      # which a full workspace test build fills, so build on the root disk.
+      # The segue-warm snapshot keeps warm outputs in ~/.cache/segue-target on
+      # a larger /data (scripts/ci/refresh-instabox-snapshot.sh). A bind mount
+      # after checkout, because checkout's clean would delete target/.
+      - name: Keep build outputs on a disk with room
         run: |
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          dir="$HOME/.cache/segue-target"
+          if [ ! -d "$dir" ]; then
+            dir=/opt/segue-target
+            sudo install -d -o "$(id -u)" -g "$(id -g)" "$dir"
+          fi
           mkdir -p target
-          sudo mount --bind /opt/segue-target target
-          df -h / target
+          sudo mount --bind "$dir" target
+          df -h / "$dir"
 
       - name: Select JDK 17
         run: |

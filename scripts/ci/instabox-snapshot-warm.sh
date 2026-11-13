@@ -46,10 +46,13 @@ log "Android SDK components"
 export JAVA_HOME="$JAVA_HOME_17_X64" PATH="$JAVA_HOME_17_X64/bin:$PATH"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$android_ndk" ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$android_ndk"
 
-log "Build outputs on the root disk, as the CI jobs mount them"
-sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
-mkdir -p target
-mountpoint -q target || sudo mount --bind /opt/segue-target target
+# The jobs bind-mount this directory over target/ after checkout (whose clean
+# would delete a target/ inside the workspace). It lives on /data, which
+# refresh-instabox-snapshot.sh grows; the 79 GiB root disk is too small for it.
+target_dir="$HOME/.cache/segue-target"
+log "Build outputs in $target_dir, as the CI jobs mount them"
+mkdir -p "$target_dir" target
+mountpoint -q target || sudo mount --bind "$target_dir" target
 
 log "rust job"
 cargo fetch --locked
@@ -99,5 +102,5 @@ sudo umount target
 rmdir target
 rm -f ~/.bash_history ~/.git-credentials
 df -h / /data
-du -sh /opt/segue-target ~/.cargo ~/.cache/go-build ~/go/pkg/mod 2>/dev/null || true
+du -sh "$target_dir" ~/.cargo ~/.cache/go-build ~/go/pkg/mod 2>/dev/null || true
 echo "warm: done ($failed go-oracles steps failed)"

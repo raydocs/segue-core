@@ -34,6 +34,9 @@ commit="$(git -C "$repo" rev-parse "$ref^{commit}")"
 
 echo "creating $machine (ci template, 8 vCPU / 16 GiB, the instabox-large size)"
 "$ib" create --name "$machine" --template ci --vcpus 8 --mem-mib 16384 --auto-suspend 0 >/dev/null
+# The warm target (~80 GiB) lives on /data; jobs from the snapshot get at
+# least this disk size.
+"$ib" resize "$machine" --disk 160 >/dev/null
 trap 'echo "machine $machine kept for inspection; remove it with: $ib rm $machine" >&2' ERR
 
 "$ib" push "$machine" "$bundle" /data/home/segue.bundle >/dev/null
