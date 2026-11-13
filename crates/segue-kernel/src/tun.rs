@@ -46,7 +46,15 @@
 //!   full and the pool is under high water;
 //! * relay chunks may use the pool up to 100 %, so the 20 % above high water
 //!   is always left for moving bytes, and a flow that cannot get a chunk
-//!   waits instead of failing;
+//!   waits instead of failing. With a shared session pool (the kernel's)
+//!   ring growth and admission stay in its elastic part and chunks use its
+//!   relay region ([`segue_session::pool::Tier`]). A chunk is only made for
+//!   a transfer that completes without waiting (r6 R5): uplink bytes are a
+//!   copy of the receive ring's head, dequeued once the site took them (a
+//!   site that would block keeps one byte, not a chunk); downlink chunks
+//!   are cut to transmit ring room the stack published. No chunk is held
+//!   across a wait on the network or the application, so a full pool still
+//!   moves every flow;
 //! * a flow idle for `buffer_idle` with empty rings drops both rings to zero
 //!   bytes and its charge to the 2-block minimum.
 //!
