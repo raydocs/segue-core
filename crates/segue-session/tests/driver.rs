@@ -2014,9 +2014,11 @@ async fn dead_carriers_are_redialled_with_backoff_and_a_bound() {
     );
 }
 
-/// Checklist r8 #3: admission measured after real sessions ran to steady
-/// state (a burst each way, then idle), not on fresh pools: the 8 MiB
-/// pool still admits as many flows as fresh.
+/// Checklist r8 #3: what a burst each way leaves held once sessions go
+/// idle, then how many more *fresh* sessions (and pipes) the pool takes
+/// on top. Only 24 of them ran, so its 260+ is not a steady-state
+/// capacity: that is ~181 (at least 170) sessions that all ran
+/// (`each_session_reaches_steady_state_before_the_next_is_admitted`, r10).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admission_is_measured_after_sessions_reach_steady_state() {
     use segue_session::pipe::pipe;
@@ -2113,8 +2115,9 @@ async fn admission_is_measured_after_sessions_reach_steady_state() {
         more.len()
     );
     // Fresh pools admit at least 280 (the_8mb_pool_admits_hundreds_of_
-    // flows); sessions that ran keep at most one more window each.
-    assert!(total >= 260, "{total} flows after steady state");
+    // flows); the 24 that ran keep at most one more window each. With
+    // every session having run, the figure is ~181 (see above).
+    assert!(total >= 260, "{total} flows (24 that ran, the rest fresh)");
     drop(more);
     drop(done);
     for c in clients {
