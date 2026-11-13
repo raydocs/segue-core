@@ -5,12 +5,12 @@
   "inputs": [
     {
       "bytes": 109466832,
-      "path": "build/cargo-ios/aarch64-apple-ios/release/libsegue_ffi.a",
+      "path": "build/cargo-ios/aarch64-apple-ios/release/libxray_ffi.a",
       "sha256": "009620607322e40944ef798660935569516d4e3752749fe745ecf8314c607a43"
     },
     {
       "bytes": 41918048,
-      "path": "build/ios-slice/libsegue_ffi.a",
+      "path": "build/ios-slice/libxray_ffi.a",
       "sha256": "721964484cb6713b12be9542bb423520e4418593a67e4ce6f58db04b9220274c"
     },
     {

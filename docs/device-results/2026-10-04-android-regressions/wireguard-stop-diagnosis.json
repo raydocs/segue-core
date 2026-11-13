@@ -16,13 +16,13 @@
   ],
   "sourceComparison": [
     {
-      "path": "crates/segue-wireguard/src/client.rs",
+      "path": "crates/xray-wireguard/src/client.rs",
       "v070Blob": "fd2a9bdc1dd26269efe698c3f00f16c40de6e3db",
       "measuredBlob": "fd2a9bdc1dd26269efe698c3f00f16c40de6e3db",
       "identical": true
     },
     {
-      "path": "crates/segue-wireguard/src/stack.rs",
+      "path": "crates/xray-wireguard/src/stack.rs",
       "v070Blob": "44265b741b992639920bd487a0a7a1cdd74bc354",
       "measuredBlob": "44265b741b992639920bd487a0a7a1cdd74bc354",
       "identical": true

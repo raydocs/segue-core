@@ -25,7 +25,7 @@ env:
 jobs:
   release-metadata:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 5
     outputs:
       artifact_name: ${{ steps.release.outputs.artifact_name }}
@@ -130,7 +130,7 @@ jobs:
   release-evidence:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: release-metadata
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 10
     permissions:
       actions: read
@@ -181,7 +181,7 @@ jobs:
             "$archive" "$CANDIDATE_COMMIT" "$CANDIDATE_TREE"
 
   secrets:
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 15
     steps:
       - name: Check out complete history
@@ -240,7 +240,7 @@ jobs:
       - release-metadata
       - release-evidence
       - secrets
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 10
     permissions:
       actions: read
@@ -268,7 +268,7 @@ jobs:
 
   rust:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 45
     steps:
       - name: Check out repository
@@ -277,6 +277,15 @@ jobs:
           # The promotion tests verify the immutable published v0.7 policy.
           fetch-depth: 0
           persist-credentials: false
+
+      # Instabox runs the workspace on a 20 GiB /data disk, which a full
+      # workspace test build fills. The root disk has the room, so build there.
+      - name: Keep build outputs on the root disk
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          mkdir -p target
+          sudo mount --bind /opt/segue-target target
+          df -h / target
 
       - name: Check repository scripts
         run: |
@@ -327,11 +336,6 @@ jobs:
       - name: Replay fuzz seed corpora
         run: bash scripts/replay-fuzz-corpus.sh
 
-      - name: Verify Linux transparent TCP and UDP interception
-        run: |
-          test_binary="$(cargo test --locked -p segue-engine --test tproxy_tests --no-run --message-format=json | python3 -c 'import json,sys; print(next(v["executable"] for v in map(json.loads,sys.stdin) if v.get("reason")=="compiler-artifact" and v.get("executable")))')"
-          sudo env XRAY_TPROXY_ISOLATED_NETWORK=1 XRAY_TPROXY_TEST_BINARY="$test_binary" unshare --net bash scripts/check-tproxy-linux.sh
-
       - name: Build public API documentation
         env:
           RUSTDOCFLAGS: -D warnings
@@ -350,9 +354,34 @@ jobs:
       - name: Test mobile build-script guards
         run: bash scripts/tests/check-mobile-toolchains.test.sh
 
-  go-oracles:
+  tproxy-linux:
+    # Moved out of the rust job on 2026-11-13. The Instabox kernel
+    # (6.18.60-instabox) is built without TPROXY (CONFIG_NETFILTER_XT_TARGET_TPROXY
+    # and CONFIG_NFT_TPROXY are unset and it loads no modules), so this check
+    # needs a GitHub-hosted runner. Stable promotion still requires it.
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.96.0
+
+      - name: Verify Linux transparent TCP and UDP interception
+        run: |
+          test_binary="$(cargo test --locked -p segue-engine --test tproxy_tests --no-run --message-format=json | python3 -c 'import json,sys; print(next(v["executable"] for v in map(json.loads,sys.stdin) if v.get("reason")=="compiler-artifact" and v.get("executable")))')"
+          sudo env XRAY_TPROXY_ISOLATED_NETWORK=1 XRAY_TPROXY_TEST_BINARY="$test_binary" unshare --net bash scripts/check-tproxy-linux.sh
+
+  go-oracles:
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: instabox-medium
     # The pinned-interop steps run about 31 minutes (29 on main dbf1360f, 23-27
     # on the v26.11.9 stack before it); leave room for a slow runner.
     timeout-minutes: 45
@@ -367,6 +396,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Instabox runs the workspace on a 20 GiB /data disk, which a full
+      # workspace test build fills. The root disk has the room, so build there.
+      - name: Keep build outputs on the root disk
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          mkdir -p target
+          sudo mount --bind /opt/segue-target target
+          df -h / target
 
       # The pinned Xray-core v26.11.9 source requires Go 1.27.
       # Use one exact toolchain for all oracle and interoperability checks.
@@ -505,7 +543,7 @@ jobs:
   rc-interop:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 45
     steps:
       - name: Check out release candidate
@@ -540,7 +578,7 @@ jobs:
 
   scheduled-pinned-interop:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 90
     steps:
       - name: Check out scheduled xray-rust revision
@@ -575,7 +613,7 @@ jobs:
 
   xray-core-main-smoke:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 30
     continue-on-error: true
     steps:
@@ -628,7 +666,7 @@ jobs:
   host-hardening:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 60
     steps:
       - name: Check out release candidate
@@ -656,7 +694,7 @@ jobs:
   fuzz-smoke:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 60
     steps:
       - name: Check out release candidate
@@ -688,7 +726,7 @@ jobs:
   controlled-network:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 45
     steps:
       - name: Check out release candidate
@@ -737,7 +775,12 @@ jobs:
           retention-days: 14
 
   apple:
-    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    # disabled: no macOS runner, owner 2026-11-13. GitHub-hosted macos-15 is
+    # blocked on billing and Instabox has no macOS runs-on label. Restore
+    # this condition to re-enable:
+    # github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    # publish-prerelease still needs this job, so RC prereleases wait for it.
+    if: false
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -827,13 +870,22 @@ jobs:
 
   android:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 75
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Instabox runs the workspace on a 20 GiB /data disk, which a full
+      # workspace test build fills. The root disk has the room, so build there.
+      - name: Keep build outputs on the root disk
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          mkdir -p target
+          sudo mount --bind /opt/segue-target target
+          df -h / target
 
       - name: Select JDK 17
         run: |
@@ -889,7 +941,7 @@ jobs:
 
   supply-chain:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 45
     steps:
       - name: Check out repository
@@ -944,6 +996,7 @@ jobs:
       - release-evidence
       - secrets
       - rust
+      - tproxy-linux
       - go-oracles
       - rc-interop
       - host-hardening
@@ -952,7 +1005,7 @@ jobs:
       - apple
       - android
       - supply-chain
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 10
     permissions:
       contents: write

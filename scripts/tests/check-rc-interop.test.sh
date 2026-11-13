@@ -91,7 +91,7 @@ case "${1:-}" in
     exit 0
     ;;
   build)
-    [[ "$*" == *"--locked --release -p segue-cli --bin xray-rust"* ]] || {
+    [[ "$*" == *"--locked --release -p segue-cli --bin segue"* ]] || {
       printf 'unexpected xray-rust build command: %s\n' "$*" >&2
       exit 92
     }

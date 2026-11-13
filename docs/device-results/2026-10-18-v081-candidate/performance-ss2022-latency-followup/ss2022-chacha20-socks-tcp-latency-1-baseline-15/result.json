@@ -9,7 +9,7 @@
   "concurrent_flows": 1,
   "connections": 1,
   "cpu_millis": 40,
-  "engine_binary": "<campaign>/baseline-cargo/release/segue",
+  "engine_binary": "<campaign>/baseline-cargo/release/xray-rust",
   "engine_sha256": "80f8d485f4c6913edfeb359af0ddc35e6744bb28bdc2334df6eefae4eeb98c3b",
   "idle_connections": 0,
   "iterations": 1000,

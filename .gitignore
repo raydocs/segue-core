@@ -1,6 +1,7 @@
-# External reference implementation.
-Xray-core
-Xray-core/
+# External reference implementation (anchored: case-insensitive filesystems
+# would otherwise also ignore committed docs/**/xray-core/ evidence).
+/Xray-core
+/Xray-core/
 
 # Local implementation worktrees.
 .worktrees/
@@ -61,6 +62,8 @@ AGENT_CONTEXT.md
 
 # Logs and temporary files.
 *.log
+# Committed benchmark and device evidence logs.
+!docs/**/*.log
 tmp/
 temp/
 

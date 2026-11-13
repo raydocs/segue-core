@@ -224,6 +224,7 @@ expected_job_headers="$(cat <<'EXPECTED'
   secrets:
   candidate-ci:
   rust:
+  tproxy-linux:
   go-oracles:
   rc-interop:
   scheduled-pinned-interop:
@@ -242,7 +243,7 @@ expected_rc_interop="$(cat <<'EXPECTED'
   rc-interop:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 45
     steps:
       - name: Check out release candidate
@@ -275,7 +276,7 @@ EXPECTED
 expected_scheduled_pinned="$(cat <<'EXPECTED'
   scheduled-pinned-interop:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 90
     steps:
       - name: Check out scheduled xray-rust revision
@@ -308,7 +309,7 @@ EXPECTED
 expected_main_smoke="$(cat <<'EXPECTED'
   xray-core-main-smoke:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 30
     continue-on-error: true
     steps:
@@ -356,7 +357,7 @@ EXPECTED
 expected_rust="$(cat <<'EXPECTED'
   rust:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 45
     steps:
       - name: Check out repository
@@ -364,6 +365,12 @@ expected_rust="$(cat <<'EXPECTED'
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Keep build outputs on the root disk
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          mkdir -p target
+          sudo mount --bind /opt/segue-target target
+          df -h / target
       - name: Check repository scripts
         run: |
           for script in scripts/*.sh scripts/tests/*.sh; do
@@ -404,10 +411,6 @@ expected_rust="$(cat <<'EXPECTED'
         run: cargo test --workspace --exclude segue-fuzz --all-targets --locked
       - name: Replay fuzz seed corpora
         run: bash scripts/replay-fuzz-corpus.sh
-      - name: Verify Linux transparent TCP and UDP interception
-        run: |
-          test_binary="$(cargo test --locked -p segue-engine --test tproxy_tests --no-run --message-format=json | python3 -c 'import json,sys; print(next(v["executable"] for v in map(json.loads,sys.stdin) if v.get("reason")=="compiler-artifact" and v.get("executable")))')"
-          sudo env XRAY_TPROXY_ISOLATED_NETWORK=1 XRAY_TPROXY_TEST_BINARY="$test_binary" unshare --net bash scripts/check-tproxy-linux.sh
       - name: Build public API documentation
         env:
           RUSTDOCFLAGS: -D warnings
@@ -432,6 +435,7 @@ expected_publish_needs="$(cat <<'EXPECTED'
       - release-evidence
       - secrets
       - rust
+      - tproxy-linux
       - go-oracles
       - rc-interop
       - host-hardening
@@ -446,7 +450,7 @@ EXPECTED
 expected_publish_fields="$(cat <<'EXPECTED'
     if: needs.release-metadata.outputs.is_rc == 'true'
     needs:
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 10
     permissions:
     steps:

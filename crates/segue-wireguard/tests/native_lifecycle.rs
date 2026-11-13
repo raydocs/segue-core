@@ -276,12 +276,20 @@ async fn native_persistent_keepalive_and_timed_rekey_preserve_the_live_flow() {
             relay.initiations > initiations,
             "the client must initiate the timed rekey"
         );
-        relay.exchange(&session, b"after timed rekey", 0).await;
-        assert_ne!(
-            &relay.last_reply[4..8],
-            &old[4..8],
-            "new WireGuard receiver index"
-        );
+        // The relay counts the handshake when it forwards the response, which
+        // can be before the client has processed it, so the first packet may
+        // still use the previous keypair (WireGuard keeps it valid for exactly
+        // this). The flow must move to the new session within a few round trips.
+        let mut round_trips = 0;
+        loop {
+            relay.exchange(&session, b"after timed rekey", 0).await;
+            round_trips += 1;
+            if relay.last_reply[4..8] != old[4..8] {
+                break;
+            }
+            assert!(round_trips < 5, "new WireGuard receiver index");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         relay.inject(0, &old).await;
         no_delivery(&session).await;
         relay
