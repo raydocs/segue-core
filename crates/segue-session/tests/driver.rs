@@ -2328,3 +2328,120 @@ async fn the_write_hold_cap_counts_from_the_frame_start_not_its_enqueue() {
     assert_eq!(n, 1, "a carrier that kept moving was given up");
     relay.abort();
 }
+
+/// r9 F7: admission measured one session at a time, each driven to its
+/// steady state by a real transfer (a burst each way through its app pipe
+/// and carrier, then idle until the pool stops changing) before the next
+/// is admitted; until the 8 MiB pool refuses. Every admitted session then
+/// still moves data (the first and the last), with the pool full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_session_reaches_steady_state_before_the_next_is_admitted() {
+    use segue_session::pipe::pipe;
+    use segue_session::pool::BLOCK;
+    const BURST: usize = 32 << 10;
+    const MAX: usize = 1000;
+    let cfg = Config::default();
+    let pool = Pool::new(8 << 20);
+    let table = RelayTable::new(
+        cfg.clone(),
+        Pool::new(256 << 20),
+        Box::new(AllowAll),
+        INSTANCE,
+    );
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(64);
+    let relay = tokio::spawn(run_relay(table, accept_rx, echo_site(), None));
+    let connector: Connector = Arc::new(move || {
+        let accept_tx = accept_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(64 << 10);
+            accept_tx
+                .send(Box::new(b))
+                .await
+                .map_err(|_| std::io::Error::other("gone"))?;
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    async fn echo_burst<A: AsyncRead + AsyncWrite + Unpin>(app: &mut A, salt: u8) {
+        let up = pattern(BURST, salt);
+        let (mut r, mut w) = tokio::io::split(app);
+        let (_, down) = tokio::join!(async { w.write_all(&up).await.unwrap() }, async {
+            let mut d = vec![0u8; BURST];
+            r.read_exact(&mut d).await.unwrap();
+            d
+        });
+        assert!(down == up, "echo differs");
+    }
+    async fn steady(pool: &Pool) -> usize {
+        let mut last = usize::MAX;
+        let mut since = Instant::now();
+        let t0 = Instant::now();
+        while since.elapsed() < Duration::from_millis(80) && t0.elapsed() < Duration::from_secs(3) {
+            let u = pool.used_bytes();
+            if u != last {
+                last = u;
+                since = Instant::now();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pool.used_bytes()
+    }
+    let mut apps = Vec::new();
+    let mut clients = Vec::new();
+    let mut worst = 0usize;
+    let mut refused = "";
+    while apps.len() < MAX {
+        let before = pool.used_bytes();
+        let Some(s) = ClientSession::new(cfg.clone(), &pool, params(), Instant::now()) else {
+            refused = "session";
+            break;
+        };
+        let Some((mut app, far)) = pipe(&pool, 64 << 10) else {
+            refused = "pipe";
+            break;
+        };
+        clients.push(tokio::spawn(run_client(s, far, connector.clone())));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            echo_burst(&mut app, apps.len() as u8),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("session {} stalled in its burst", apps.len()));
+        let after = steady(&pool).await;
+        worst = worst.max(after.saturating_sub(before));
+        apps.push(app);
+    }
+    let n = apps.len();
+    let held = pool.used_bytes();
+    println!(
+        "{n} sessions admitted one by one after a {} KiB echo each ({refused} refused): \
+         {:.1} KiB each idle, worst {:.1} KiB",
+        BURST >> 10,
+        held as f64 / n as f64 / 1024.0,
+        worst as f64 / 1024.0
+    );
+    assert!(n < MAX, "the pool never refused");
+    // Steady state per session: its floors (initial credit, a replay
+    // block, a pipe block each way) plus the credit it advertised and the
+    // peer has not used (at most one more initial window, r7 #7), and a
+    // read buffer block. Measured: about 45 KiB each, so the 8 MiB pool
+    // holds ~180 sessions that ran (fresh ones: 280+). Raising that is
+    // the protocol v0.5 item (initial credit), not this test's.
+    let per = 2 * cfg.limits.initial_credit + 4 * BLOCK;
+    assert!(
+        held <= n * per,
+        "{n} sessions hold {held} bytes at steady state, over {per} each"
+    );
+    assert!(n >= 170, "only {n} sessions at steady state");
+    // The pool is full; earlier and later sessions still move data.
+    let last = n - 1;
+    for i in [0, last] {
+        tokio::time::timeout(Duration::from_secs(20), echo_burst(&mut apps[i], 0x33))
+            .await
+            .unwrap_or_else(|_| panic!("session {i} stalled with the pool full"));
+    }
+    drop(apps);
+    for c in clients {
+        let _ = tokio::time::timeout(Duration::from_secs(10), c).await;
+    }
+    relay.abort();
+}
