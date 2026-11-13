@@ -1575,6 +1575,14 @@ fn kernel_rules() -> RuleSet {
                 matcher: Matcher::Cidr(Cidr::parse("198.51.100.0/24").unwrap()),
                 action: Action::Proxy("ai".into()),
             },
+            Rule {
+                matcher: Matcher::DomainSuffix("p2.test".into()),
+                action: Action::Proxy("p2".into()),
+            },
+            Rule {
+                matcher: Matcher::Cidr(Cidr::parse("192.0.2.0/24").unwrap()),
+                action: Action::Direct,
+            },
         ],
         Action::Proxy("p1".into()),
     )
@@ -1998,8 +2006,10 @@ async fn tun_second_quic_connection_on_same_tuple_is_classified() {
         let mut other_version = hex(RFC9001_CLIENT_INITIAL);
         other_version[1..5].copy_from_slice(&[0xff, 0, 0, 0x1d]);
         e.h.send(udp(CLIENT4, dst, &other_version)).await;
-        // R7: on the QUIC flow a short header to an ID the server never
-        // chose is dropped; on the plain-UDP flow it is ordinary UDP.
+        // On the QUIC flow a short header to an ID the reply path never
+        // saw is the connection after a CID change (no other route carries
+        // QUIC to this server: R7 #3); on the plain-UDP flow it is
+        // ordinary UDP.
         let unknown = b"\x40\x01\x02\x03\x04\x05\x06\x07\x08 unknown".to_vec();
         e.h.send(udp(CLIENT4, dst, &unknown)).await;
         // The first connection still flows.
@@ -2007,12 +2017,7 @@ async fn tun_second_quic_connection_on_same_tuple_is_classified() {
         short.extend_from_slice(&SERVER_CID);
         short.extend_from_slice(b"short header");
         e.h.send(udp(CLIENT4, dst, &short)).await;
-        let quic_flow = dst.port() == 443;
-        let want = if quic_flow {
-            vec![first.clone(), short]
-        } else {
-            vec![first.clone(), unknown, short]
-        };
+        let want = vec![first.clone(), unknown, short];
         let sent = udp_sent(&e, want.len()).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let sent2 = e.dialer.udp_sent.lock().unwrap().clone();
@@ -2020,6 +2025,78 @@ async fn tun_second_quic_connection_on_same_tuple_is_classified() {
         assert_eq!(sent, want, "{dst}: AI Initials not sent");
         assert_eq!(e.dialer.udp_dials.lock().unwrap().len(), 1);
     }
+}
+
+/// The next ICMP the stack sends, skipping datagrams (QUIC replies).
+async fn next_icmp(h: &mut Harness) -> (u8, u8, Vec<u8>) {
+    loop {
+        let p = h.next().await;
+        if out(&p).proto == IpProtocol::Icmp {
+            return icmpv4(&p);
+        }
+    }
+}
+
+/// R7 #2 + #3 over TUN. An ordinary UDP flow (direct by IP) on which an
+/// allowed QUIC connection starts is a QUIC flow from then on. While no
+/// other route carries QUIC to that server, a short header to an ID the
+/// guard never saw (a CID the server issued inside the encryption) keeps
+/// flowing; once another flow carries QUIC to the same server by another
+/// outbound, such a packet may be a connection that migrated from there,
+/// so the flow is refused with ICMP (fail fast, never a silent black hole).
+#[tokio::test]
+async fn tun_unknown_cid_flows_until_another_route_claims_the_server() {
+    let mut e = kernel_env_with(
+        inline(),
+        false,
+        true,
+        false,
+        FakeDialer {
+            udp_max: 1500,
+            quic_server: true,
+            ..Default::default()
+        },
+    );
+    let dst: SocketAddr = "192.0.2.1:8443".parse().unwrap();
+    let plain = b"\x12\x34plain".to_vec();
+    e.h.send(udp(CLIENT4, dst, &plain)).await;
+    let first = initial_for_test(&[1; 8], "example.com");
+    e.h.send(udp(CLIENT4, dst, &first)).await;
+    assert_eq!(udp_sent(&e, 2).await, vec![plain.clone(), first.clone()]);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A rotated ID: carried.
+    let rotated = b"\x40\x31\x31\x31\x31\x31\x31\x31\x31 rotated".to_vec();
+    e.h.send(udp(CLIENT4, dst, &rotated)).await;
+    assert_eq!(udp_sent(&e, 3).await.last(), Some(&rotated));
+    // Another app socket: QUIC to the same server through outbound p2.
+    let other_src: SocketAddr = "172.19.0.2:40001".parse().unwrap();
+    let p2 = initial_for_test(&[2; 8], "www.p2.test");
+    e.h.send(udp(other_src, dst, &p2)).await;
+    assert_eq!(udp_sent(&e, 4).await.last(), Some(&p2));
+    assert_eq!(
+        e.dialer
+            .udp_dials
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.0.clone())
+            .collect::<Vec<_>>(),
+        vec![None, Some("p2".to_string())]
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The first flow's learned ID still flows; a new unknown ID now
+    // refuses the flow: never sent, and the app gets ICMP.
+    e.h.send(udp(CLIENT4, dst, &rotated)).await;
+    assert_eq!(udp_sent(&e, 5).await.last(), Some(&rotated));
+    let moved = b"\x40\x32\x32\x32\x32\x32\x32\x32\x32 moved".to_vec();
+    e.h.send(udp(CLIENT4, dst, &moved)).await;
+    e.h.send(udp(CLIENT4, dst, &moved)).await;
+    let (t, code, _) = tokio::time::timeout(Duration::from_secs(2), next_icmp(&mut e.h))
+        .await
+        .expect("the refused flow gets ICMP");
+    assert_eq!((t, code), (3, 13));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(e.dialer.udp_sent.lock().unwrap().len(), 5, "moved never sent");
 }
 
 // ---------------------------------------------------------------------------

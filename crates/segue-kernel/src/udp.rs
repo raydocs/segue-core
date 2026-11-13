@@ -51,7 +51,7 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::dial::{Dialer, UdpSession};
-use crate::quic::{ConnGuard, InitialSniffer, Quic, ReplyWatch, Step};
+use crate::quic::{ConnGuard, InitialSniffer, Quic, QuicRoutes, ReplyWatch, Step};
 use crate::rules::Action;
 use crate::socks::{Kernel, REP_GENERAL, REP_OK};
 
@@ -99,6 +99,9 @@ impl Default for UdpSettings {
 /// UDP state shared by every association of one kernel.
 pub struct Udp {
     pub settings: UdpSettings,
+    /// Which outbounds carry QUIC to which servers, for every UDP flow of
+    /// the kernel, SOCKS and TUN (see [`QuicRoutes`]).
+    pub quic_routes: QuicRoutes,
     slots: Arc<Semaphore>,
     dropped: Arc<AtomicU64>,
 }
@@ -108,6 +111,7 @@ impl Udp {
         Self {
             slots: Arc::new(Semaphore::new(settings.max_associations)),
             settings,
+            quic_routes: QuicRoutes::default(),
             dropped: Arc::default(),
         }
     }
@@ -273,7 +277,9 @@ fn uplink(
                     };
                     match guard.push(payload.to_vec(), payload, same) {
                         Step::Hold => return,
-                        Step::Drop(ds) => return drop_all(udp, queued, &ds),
+                        // SOCKS has no way to signal a refusal to the
+                        // client: drop, as for any refused datagram.
+                        Step::Drop(ds) | Step::Refuse(ds) => return drop_all(udp, queued, &ds),
                         Step::Forward(ds) => ds,
                     }
                 }
@@ -416,10 +422,16 @@ fn uplink(
         rx,
     ));
     let guard = guard.map(|guard| {
-        Box::new(Guarded {
-            guard,
-            route: route.expect("routed"),
-        })
+        let route = route.expect("routed");
+        let guard = match &key.0 {
+            TargetAddr::Ip(ip) => guard.with_route(
+                udp.quic_routes.clone(),
+                SocketAddr::new(*ip, port),
+                route.0.clone(),
+            ),
+            TargetAddr::Domain(_) => guard,
+        };
+        Box::new(Guarded { guard, route })
     });
     flows.insert(key, Slot::Live { tx, guard });
 }
