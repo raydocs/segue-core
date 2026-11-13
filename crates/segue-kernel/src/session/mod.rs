@@ -150,6 +150,10 @@ struct SessionMark {
     failing: bool,
     /// When it last proved the path (OPENED, or data moving end to end).
     ok_at: Option<Instant>,
+    /// When bytes from the relay last arrived on its carrier without
+    /// moving data end to end ([`SessionHealth::Alive`], r11 R4): part of
+    /// a large frame on a slow path, a keepalive ACK during an upload.
+    alive_at: Option<Instant>,
 }
 
 /// A session's proof of the path counts this long for its exit (it is
@@ -178,12 +182,13 @@ impl Health {
         self.sessions.values().filter(|m| m.failing).count()
     }
 
-    /// A live session, not failing, proved the path within
-    /// [`PROOF_FRESH`].
+    /// A live session, not failing, proved the path or showed it alive
+    /// (bytes arriving, r11 R4) within [`PROOF_FRESH`].
     fn proven(&self, now: Instant) -> bool {
+        let fresh = |t: Option<Instant>| t.is_some_and(|t| now.duration_since(t) < PROOF_FRESH);
         self.sessions
             .values()
-            .any(|m| !m.failing && m.ok_at.is_some_and(|t| now.duration_since(t) < PROOF_FRESH))
+            .any(|m| !m.failing && (fresh(m.ok_at) || fresh(m.alive_at)))
     }
 }
 
@@ -785,10 +790,15 @@ fn refusal_fails_exit(c: u8) -> bool {
 /// budgets:
 ///
 /// - `Up` (a valid protocol answer) proves the exit: `Connected`.
+/// - `Alive` (bytes arriving without data moving end to end: a large
+///   frame on a slow path, keepalive ACKs during an upload; r11 R4) is
+///   path liveness: it counts like proof below, restores nothing.
 /// - `Failed` / `GaveUp` takes it down (`Reconnecting`, or `Error` if it
-///   never worked) only when no other live session proved the path
-///   within [`PROOF_FRESH`]: one bad session among good ones blocks
-///   nothing, and does not flip the exit back and forth.
+///   never worked) only when no other live, non-failing session proved
+///   the path or showed it alive within [`PROOF_FRESH`]: one bad session
+///   beside a working one blocks nothing. Sessions that were idle for
+///   the whole window give no evidence either way, so a failure then
+///   does take the exit down (until a valid answer).
 /// - A failed carrier connect (the exit's probe) takes it down at once.
 ///
 /// While down, new strict (AI) flows are refused at once while sessions
@@ -803,6 +813,15 @@ fn session_health(h: &mut Health, id: u64, r: SessionHealth, now: Instant) {
             h.last_fail = None;
             h.ks.on_event(Event::ChannelUp);
         }
+        // Liveness keeps the session's path counted for the exit (another
+        // session's failure does not take it down), but restores nothing:
+        // bytes arriving are not a valid protocol answer. It does not clear
+        // the session's own failing mark either (a failing session's next
+        // carrier has to bring proof).
+        SessionHealth::Alive => {
+            let m = h.sessions.entry(id).or_default();
+            m.alive_at = Some(now);
+        }
         SessionHealth::Failed | SessionHealth::GaveUp => {
             if r == SessionHealth::GaveUp {
                 // It is ending: nothing of it counts any more.
@@ -811,6 +830,7 @@ fn session_health(h: &mut Health, id: u64, r: SessionHealth, now: Instant) {
                 let m = h.sessions.entry(id).or_default();
                 m.failing = true;
                 m.ok_at = None;
+                m.alive_at = None;
             }
             if !h.proven(now) {
                 h.unproven = true;

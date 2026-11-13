@@ -49,6 +49,9 @@ struct Node {
     /// Checked before `drop_next`: each new carrier takes the next entry
     /// (true: it drops everything from the start).
     drop_plan: Arc<Mutex<std::collections::VecDeque<bool>>>,
+    /// When non-zero, the next carrier's downlink is throttled to this
+    /// many bytes per second (control streams are spared); then reset.
+    slow_next: Arc<AtomicUsize>,
 }
 
 /// Engine stand-in: `dial(Some(carrier), relay)` → a pipe into that
@@ -80,6 +83,7 @@ async fn path<R, W>(
     mut w: W,
     hole: Arc<AtomicBool>,
     cut: Option<(usize, Arc<AtomicBool>)>,
+    slow: Option<(usize, Arc<AtomicBool>)>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -87,7 +91,15 @@ async fn path<R, W>(
     let mut buf = vec![0u8; 4096];
     let mut left = cut.as_ref().map(|c| c.0);
     loop {
-        let mut n = match r.read(&mut buf).await {
+        // Throttled: at most rate/10 bytes per 100 ms.
+        let lim = match &slow {
+            Some((rate, control)) if !control.load(Ordering::SeqCst) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                (rate / 10).clamp(1, buf.len())
+            }
+            _ => buf.len(),
+        };
+        let mut n = match r.read(&mut buf[..lim]).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
@@ -229,8 +241,12 @@ impl Dialer for Engine {
             0 => None,
             n => Some((n, is_control.clone())),
         };
-        tokio::spawn(path(ar, bw, hole.clone(), None));
-        tokio::spawn(path(br, aw, hole, cut));
+        let slow = match node.slow_next.swap(0, Ordering::SeqCst) {
+            0 => None,
+            n => Some((n, is_control.clone())),
+        };
+        tokio::spawn(path(ar, bw, hole.clone(), None, None));
+        tokio::spawn(path(br, aw, hole, cut, slow));
         node.accept
             .send(Box::new(relay))
             .await
@@ -308,6 +324,7 @@ fn node(auth: Box<dyn Authorizer>, site: Option<SiteConnector>, cfg: Config) -> 
         cut: Arc::default(),
         drop_next: Arc::default(),
         drop_plan: Arc::default(),
+        slow_next: Arc::default(),
     }
 }
 
@@ -324,6 +341,7 @@ struct Lab {
     la_drop_next: Arc<AtomicUsize>,
     la_controls: Arc<AtomicUsize>,
     la_drop_plan: Arc<Mutex<std::collections::VecDeque<bool>>>,
+    la_slow_next: Arc<AtomicUsize>,
     engine: Arc<Engine>,
 }
 
@@ -355,6 +373,7 @@ fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg:
     let la_drop_next = la.drop_next.clone();
     let la_controls = la.controls.clone();
     let la_drop_plan = la.drop_plan.clone();
+    let la_slow_next = la.slow_next.clone();
     let (la_up, ny_up) = (la.up.clone(), ny.up.clone());
     let (la_carriers, ny_carriers) = (la.carriers.clone(), ny.carriers.clone());
     let la_sites = la.sites.clone();
@@ -402,6 +421,7 @@ fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg:
         la_drop_next,
         la_controls,
         la_drop_plan,
+        la_slow_next,
         engine,
     }
 }
@@ -1183,6 +1203,76 @@ mod exit_health {
         drop(a);
         assert!(st.lock().unwrap().health[0].sessions.is_empty());
     }
+
+    /// r11 R4: path liveness (bytes arriving, no data moving end to end)
+    /// keeps a session's path counted for its exit, with the same window
+    /// as proof, on both sides of it.
+    #[test]
+    fn liveness_counts_within_the_window_and_not_after() {
+        let t = Instant::now();
+        let mut h = exit();
+        feed(&mut h, 1, S::Up, t);
+        feed(&mut h, 2, S::Up, t);
+        // B's proof is old; B shows liveness at t + 4 s (a large frame
+        // still crossing).
+        let alive = t + Duration::from_secs(4);
+        assert_eq!(feed(&mut h, 2, S::Alive, alive), Posture::Connected);
+        let edge = alive + PROOF_FRESH;
+        assert_eq!(
+            feed(&mut h, 1, S::Failed, edge - Duration::from_millis(1)),
+            Posture::Connected,
+            "fresh liveness did not count"
+        );
+        assert_eq!(
+            feed(&mut h, 1, S::Failed, edge),
+            Posture::Reconnecting,
+            "stale liveness counted"
+        );
+    }
+
+    /// r11 R4: liveness restores nothing and does not count for a session
+    /// that is failing; that session's own failure drops it.
+    #[test]
+    fn liveness_restores_nothing_and_a_failing_session_has_none() {
+        let t = Instant::now();
+        let mut h = exit();
+        feed(&mut h, 1, S::Up, t);
+        let t = t + PROOF_FRESH;
+        assert_eq!(feed(&mut h, 1, S::Failed, t), Posture::Reconnecting);
+        // Down: bytes arriving on another session do not bring it back.
+        assert_eq!(feed(&mut h, 2, S::Alive, t), Posture::Reconnecting);
+        assert!(h.unproven);
+        // A failing session's liveness does not outweigh a failure.
+        let mut h = exit();
+        feed(&mut h, 1, S::Up, t);
+        feed(&mut h, 2, S::Up, t);
+        feed(&mut h, 2, S::Alive, t + Duration::from_secs(1));
+        assert_eq!(
+            feed(&mut h, 2, S::Failed, t + Duration::from_secs(2)),
+            Posture::Connected,
+            "1's proof still fresh"
+        );
+        feed(&mut h, 2, S::Alive, t + Duration::from_secs(3));
+        assert_eq!(
+            feed(&mut h, 1, S::Failed, t + PROOF_FRESH),
+            Posture::Reconnecting,
+            "a failing session's liveness counted"
+        );
+    }
+
+    /// r11 R4 boundary: a session idle for the whole window gives no
+    /// evidence; a failure then takes the exit down, until a valid
+    /// answer (the next OPENED or data moving).
+    #[test]
+    fn an_idle_session_gives_no_evidence() {
+        let t = Instant::now();
+        let mut h = exit();
+        feed(&mut h, 1, S::Up, t);
+        feed(&mut h, 2, S::Up, t);
+        let t = t + PROOF_FRESH;
+        assert_eq!(feed(&mut h, 1, S::Failed, t), Posture::Reconnecting);
+        assert_eq!(feed(&mut h, 2, S::Up, t), Posture::Connected);
+    }
 }
 
 /// r10 N6, end to end: on one exit, a good session keeps downloading
@@ -1616,4 +1706,156 @@ async fn a_manual_exit_change_during_the_attempt_voids_the_pin() {
     );
     assert_eq!(l.la_sites.load(Ordering::SeqCst), 0, "opened on la");
     assert_eq!(d.status().current_exit.as_deref(), Some("ny"));
+}
+
+/// A site that sends `n` bytes in one write as soon as it is connected
+/// (the relay then sends full frames), then holds the stream open.
+fn burst_site(n: usize) -> SiteConnector {
+    Arc::new(move |_t, _k| {
+        Box::pin(async move {
+            let (a, mut b) = tokio::io::duplex(256 << 10);
+            tokio::spawn(async move {
+                let _ = b.write_all(&vec![7u8; n]).await;
+                std::future::pending::<()>().await;
+                drop(b);
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
+/// A site that never reads (its buffer takes 1 KiB): an upload's FIN
+/// stays held at the relay, which repeats its ACK to show it is alive.
+fn deaf_site() -> SiteConnector {
+    let keep = Arc::new(Mutex::new(Vec::new()));
+    Arc::new(move |_t, _k| {
+        let keep = keep.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(1024);
+            keep.lock().unwrap().push(b);
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
+/// Open a session on la, then lose its carrier and every carrier after
+/// it (a bad session beside the others on the same exit); it keeps
+/// failing in the background.
+async fn start_bad_session(l: &Lab) -> tokio::task::JoinHandle<()> {
+    let mut bad = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    l.la_drop_next.store(1000, Ordering::SeqCst);
+    {
+        let holes = l.la_holes.lock().unwrap();
+        let (hole, _) = holes
+            .iter()
+            .rev()
+            .find(|(_, c)| !c.load(Ordering::SeqCst))
+            .expect("no session carrier");
+        hole.store(true, Ordering::SeqCst);
+    }
+    tokio::spawn(async move {
+        let _ = bad.write_all(b"ping").await;
+        let _ = read_to_end_within(&mut bad, Duration::from_secs(120)).await;
+    })
+}
+
+/// Watch la for `dur`: it must stay `Connected`; returns whether some
+/// session on it was failing meanwhile (the bad one did fail).
+async fn la_stays_connected(l: &Lab, dur: Duration, what: &str) -> bool {
+    let end = Instant::now() + dur;
+    let mut saw_failing = false;
+    while Instant::now() < end {
+        {
+            let st = l.d.state.lock().unwrap();
+            let h = &st.health[0];
+            assert_eq!(h.ks.posture(), Posture::Connected, "{what}: la taken down");
+            saw_failing |= h.failing() > 0;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    saw_failing
+}
+
+/// Open la's control stream first, so the next carrier is a session's.
+async fn warm(l: &Lab) {
+    l.d.set_exit("la").unwrap();
+    let mut s = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    let mut one = [0u8; 1];
+    s.read_exact(&mut one).await.unwrap();
+    drop(s);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while l.la_controls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no control stream");
+}
+
+/// r11 R4: session B receives a 16 KiB frame at 1 KB/s (about 16 s, no
+/// whole frame for far longer than PROOF_FRESH) while session A on the
+/// same exit keeps failing. B's bytes arriving are path liveness: the
+/// exit stays `Connected`, and B gets its frame.
+#[tokio::test]
+async fn a_slow_frame_keeps_the_exit_up_beside_a_failing_session() {
+    let l = lab_parts(Box::new(AllowAll), Some(burst_site(64 << 10)));
+    warm(&l).await;
+    l.la_slow_next.store(1024, Ordering::SeqCst);
+    let mut b = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    let bad = start_bad_session(&l).await;
+    let t0 = Instant::now();
+    let failed =
+        la_stays_connected(&l, PROOF_FRESH * 2 + Duration::from_secs(1), "slow frame").await;
+    assert!(failed, "the bad session never failed");
+    // No whole frame reached B meanwhile (the test's premise) ...
+    let mut buf = vec![0u8; 64 << 10];
+    let n = tokio::time::timeout(Duration::from_secs(15), b.read(&mut buf))
+        .await
+        .expect("B's frame never arrived")
+        .unwrap();
+    assert!(n > 0);
+    assert!(
+        t0.elapsed() > PROOF_FRESH * 2,
+        "frame arrived early: {:?}",
+        t0.elapsed()
+    );
+    bad.abort();
+}
+
+/// r11 R4: an upload-only session B (its FIN held at the relay, which only
+/// repeats its ACK) beside a failing session A: the keepalive ACKs are
+/// path liveness, the exit stays `Connected`.
+#[tokio::test]
+async fn an_upload_only_session_keeps_the_exit_up_beside_a_failing_session() {
+    let l = lab_parts(Box::new(AllowAll), Some(deaf_site()));
+    l.d.set_exit("la").unwrap();
+    l.d.probe().await.unwrap();
+    let mut b = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    b.write_all(&vec![1u8; 8 << 10]).await.unwrap();
+    b.shutdown().await.unwrap();
+    // B's last data moved now (its upload acknowledged).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let bad = start_bad_session(&l).await;
+    let failed = la_stays_connected(&l, PROOF_FRESH * 2, "upload only").await;
+    assert!(failed, "the bad session never failed");
+    bad.abort();
+    drop(b);
+}
+
+/// r11 R4: an exit whose only session sat idle well past PROOF_FRESH is
+/// still `Connected` (idle is no evidence against it), and the first AI
+/// request after the idle period opens.
+#[tokio::test]
+async fn the_first_request_after_idle_opens() {
+    let l = lab();
+    l.d.set_exit("la").unwrap();
+    let s = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    tokio::time::sleep(PROOF_FRESH + Duration::from_secs(1)).await;
+    assert_eq!(l.d.posture(), Posture::Connected);
+    let ai =
+        l.d.dial(Some("ai"), &site(), 443)
+            .await
+            .expect("AI refused after idle");
+    roundtrip(ai).await;
+    roundtrip(s).await;
 }
