@@ -495,7 +495,10 @@ async fn quic_via_fake_ip_never_lands_on_a_real_ip_flow_after_migration() {
     .await
     .expect("handshake timed out")
     .expect("handshake");
-    for round in 0..3u8 {
+    // Traffic on the first path and after each of three migrations (r11
+    // checklist 4: the round after the third rebind must carry data too).
+    let mut ports = vec![ep.local_addr().unwrap().port()];
+    for round in 0..4u8 {
         for i in 0..4u8 {
             let msg = [round * 16 + i; 64];
             let got = tokio::time::timeout(Duration::from_secs(3), echo(&conn, &msg))
@@ -504,17 +507,27 @@ async fn quic_via_fake_ip_never_lands_on_a_real_ip_flow_after_migration() {
                 .unwrap_or_else(|e| panic!("round {round} request {i}: {e}"));
             assert_eq!(got, msg);
         }
-        // Migrate: a new local socket, so a new 5-tuple on the TUN.
-        ep.rebind(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
-            .unwrap();
+        if round < 3 {
+            // Migrate: a new local socket, so a new 5-tuple on the TUN.
+            ep.rebind(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+                .unwrap();
+            ports.push(ep.local_addr().unwrap().port());
+        }
     }
+    // A large transfer on the last path as well, both ways.
+    let big: Vec<u8> = (0..60_000u32).map(|i| i as u8).collect();
+    let got = tokio::time::timeout(Duration::from_secs(10), echo(&conn, &big))
+        .await
+        .expect("bulk echo after the third rebind timed out")
+        .expect("bulk echo after the third rebind");
+    assert_eq!(got, big);
     let mut b = [0u8; 2048];
     assert!(
         watch.recv_from(&mut b).is_err(),
         "nothing sent to the preferred address"
     );
     let dials = w.dialer.udp_dials.lock().unwrap().clone();
-    assert!(dials.len() >= 3, "one flow per 5-tuple: {dials:?}");
+    assert!(dials.len() >= 4, "one flow per 5-tuple: {dials:?}");
     assert!(
         dials.iter().all(|d| *d
             == (
@@ -525,6 +538,13 @@ async fn quic_via_fake_ip_never_lands_on_a_real_ip_flow_after_migration() {
         "every flow dialled by name: {dials:?}"
     );
     let s = w.seen.lock().unwrap();
-    assert!(s.app_ports.len() >= 3, "{:?}", s.app_ports);
+    assert_eq!(ports.len(), 4);
+    for p in &ports {
+        assert!(
+            s.app_ports.contains(p),
+            "path {p} not seen: {:?}",
+            s.app_ports
+        );
+    }
     assert!(s.icmp.is_empty());
 }
