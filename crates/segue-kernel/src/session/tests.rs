@@ -316,6 +316,7 @@ struct Lab {
     la_ctrl: mpsc::Sender<RelayCtrl>,
     la_cut: Arc<AtomicUsize>,
     la_drop_next: Arc<AtomicUsize>,
+    la_controls: Arc<AtomicUsize>,
     engine: Arc<Engine>,
 }
 
@@ -345,6 +346,7 @@ fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg:
     let ny = node(Box::new(AllowAll), None, Config::default());
     let la_cut = la.cut.clone();
     let la_drop_next = la.drop_next.clone();
+    let la_controls = la.controls.clone();
     let (la_up, ny_up) = (la.up.clone(), ny.up.clone());
     let (la_carriers, ny_carriers) = (la.carriers.clone(), ny.carriers.clone());
     let la_sites = la.sites.clone();
@@ -390,6 +392,7 @@ fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg:
         la_ctrl,
         la_cut,
         la_drop_next,
+        la_controls,
         engine,
     }
 }
@@ -770,6 +773,20 @@ fn quick_control() -> ControlTiming {
 
 async fn download_lab() -> (Lab, crate::dial::Stream, u64) {
     download_lab_cfg(Config::default()).await
+}
+
+/// Give `l`'s dialer the quick control timing.
+fn quicken(l: &mut Lab) {
+    l.d = std::mem::replace(
+        &mut l.d,
+        KernelDialer::new(
+            Arc::new(Engine::default()),
+            vec![],
+            Default::default(),
+            Default::default(),
+        ),
+    )
+    .with_control_timing(quick_control());
 }
 
 /// [`download_lab`] with the la relay's configuration `la_cfg`.
@@ -1302,4 +1319,51 @@ async fn a_fresh_session_after_unknown_session_stays_on_the_exit_that_answered()
     assert_eq!(l.ny_carriers.load(Ordering::SeqCst), 0, "moved to ny");
     assert_eq!(l.d.posture(), Posture::Connected);
     assert_eq!(l.d.status().current_exit.as_deref(), Some("la"));
+}
+
+/// Opens sessions, refuses every control stream (RESUME / CTRL_HELLO)
+/// with `code`.
+struct NoControl(u8);
+
+impl Authorizer for NoControl {
+    fn open(&self, _: &[u8], _: &Target, _: Kind) -> Result<segue_session::relay::Grant, u8> {
+        Ok(segue_session::relay::Grant::all(0))
+    }
+    fn resume(&self, _: &[u8]) -> Result<u64, u8> {
+        Err(self.0)
+    }
+}
+
+/// r11 R3, through the kernel: a relay that refuses the control stream
+/// for good (here: the ticket) gets one CTRL_HELLO, no redial loop and no
+/// dead-channel resume storm; the refusal shows in the status; later
+/// sessions do not restart it; a new connect does.
+#[tokio::test]
+async fn a_control_stream_refused_for_good_is_not_redialled() {
+    let mut l = lab_with(Box::new(NoControl(code::AUTH)));
+    quicken(&mut l);
+    l.d.set_exit("la").unwrap();
+    let s = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while l.d.status().control_refused.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("refusal never reported");
+    assert_eq!(l.d.status().control_refused, vec![("la".to_string(), code::AUTH)]);
+    let carriers = l.la_carriers.load(Ordering::SeqCst);
+    roundtrip(s).await;
+    for _ in 0..3 {
+        roundtrip(l.d.dial(Some("overseas"), &site(), 443).await.unwrap()).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(l.la_controls.load(Ordering::SeqCst), 1, "control stream redialled");
+    assert_eq!(
+        l.la_carriers.load(Ordering::SeqCst),
+        carriers + 3,
+        "sessions reattached (a Dead resume storm)"
+    );
+    assert_eq!(l.d.posture(), Posture::Connected);
+    assert_eq!(l.d.status().revoked, None);
 }

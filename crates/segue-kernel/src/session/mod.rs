@@ -241,6 +241,10 @@ struct Channel {
     /// Live sessions on this exit, for `STALL` hints.
     sessions: Arc<Mutex<HashMap<SessionId, mpsc::UnboundedSender<u32>>>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// The relay refused this exit's CTRL_HELLO for good (r11 R3): the
+    /// code. The control stream is not restarted until the user connects
+    /// again (new credentials); sessions on the exit run without hints.
+    rejected: Arc<Mutex<Option<u8>>>,
 }
 
 impl Channel {
@@ -261,6 +265,10 @@ pub struct Status {
     pub exits: Vec<String>,
     /// Set when the relay revoked this device: its code.
     pub revoked: Option<u8>,
+    /// Exits whose relay refused the control stream for good, with the
+    /// `REJECT` code (r11 R3: `version` after a mixed-version deploy,
+    /// or refused credentials).
+    pub control_refused: Vec<(String, u8)>,
 }
 
 /// Engine outbounds plus session routes.
@@ -353,7 +361,8 @@ impl KernelDialer {
     fn ensure_channel(&self, i: usize, ticket: &[u8]) {
         let ch = &self.channels[i];
         let mut task = ch.task.lock().unwrap();
-        if task.as_ref().is_some_and(|h| !h.is_finished()) {
+        if task.as_ref().is_some_and(|h| !h.is_finished()) || ch.rejected.lock().unwrap().is_some()
+        {
             return;
         }
         let hello = CtrlHello {
@@ -369,6 +378,7 @@ impl KernelDialer {
         let name = self.exits[i].name.clone();
         let state = self.state.clone();
         let revoked = self.revoked.clone();
+        let rejected = ch.rejected.clone();
         *task = Some(tokio::spawn(async move {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let hints = async move {
@@ -394,6 +404,19 @@ impl KernelDialer {
                             eprintln!("segue-kernel: exit {name}: device revoked (code {c})");
                             state.lock().unwrap().revoked = Some(c);
                             revoked.send_replace(Some(c));
+                        }
+                        // The relay refused the control stream for good
+                        // (r11 R3): no Dead, no reconnect loop. A refused
+                        // device is a revocation like the one above.
+                        ControlHint::Rejected(c) => {
+                            eprintln!(
+                                "segue-kernel: exit {name}: control stream refused (code {c}), not retried"
+                            );
+                            *rejected.lock().unwrap() = Some(c);
+                            if c == code::REVOKED {
+                                state.lock().unwrap().revoked = Some(c);
+                                revoked.send_replace(Some(c));
+                            }
                         }
                     }
                 }
@@ -434,6 +457,12 @@ impl KernelDialer {
             current_exit: (!self.exits.is_empty()).then(|| self.exits[st.pick()].name.clone()),
             exits: self.exits.iter().map(|e| e.name.clone()).collect(),
             revoked: st.revoked,
+            control_refused: self
+                .exits
+                .iter()
+                .zip(&self.channels)
+                .filter_map(|(e, c)| Some((e.name.clone(), (*c.rejected.lock().unwrap())?)))
+                .collect(),
         }
     }
 
@@ -464,6 +493,9 @@ impl KernelDialer {
         // A new start (fresh credentials): the relay judges them again.
         st.revoked = None;
         self.revoked.send_replace(None);
+        for c in &self.channels {
+            *c.rejected.lock().unwrap() = None;
+        }
         for h in &mut st.health {
             h.ks.on_event(Event::UserConnect);
             h.last_fail = None;
