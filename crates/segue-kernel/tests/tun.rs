@@ -2591,3 +2591,266 @@ async fn slow_carriers_and_a_healthy_tun_flow_share_the_pool() {
     assert!(peak_transport <= pool.transport_blocks());
     assert!(dials <= 2 * SLOW, "{dials} dials for {SLOW} slow sessions");
 }
+
+/// The process's resident set in KiB, as the host reports it (`ps`).
+fn host_rss_kib() -> Option<u64> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Engine stand-in that dials a real TCP listener on loopback: every
+/// carrier is a kernel socket pair with its own buffers and syscalls.
+struct LoopbackEngine {
+    relay: SocketAddr,
+}
+
+#[async_trait]
+impl Dialer for LoopbackEngine {
+    async fn dial(
+        &self,
+        _tag: Option<&str>,
+        _addr: &TargetAddr,
+        _port: u16,
+    ) -> Result<segue_kernel::dial::Stream, DialError> {
+        let s = tokio::net::TcpStream::connect(self.relay)
+            .await
+            .map_err(|e| DialError(e.to_string()))?;
+        let _ = s.set_nodelay(true);
+        Ok(Box::new(s))
+    }
+}
+
+/// r9 F7: the combined test over a real carrier. One TUN flow both ways
+/// and many concurrent session flows (a burst each way, then idle, then
+/// another burst) all go through `KernelDialer` over loopback TCP to
+/// `run_relay`, on one shared 8 MiB pool. Records the pool's peak (all
+/// regions and the transport region) and the process RSS sampled from the
+/// host while it runs; everything must arrive intact with the pool
+/// within its blocks and RSS growth bounded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tun_and_session_flows_over_a_loopback_tcp_carrier_with_pool_and_rss() {
+    use segue_kernel::session::{Exit, KernelDialer, SegueRoute};
+    use segue_session::codec::{Kind, Target};
+    use segue_session::driver::{run_relay, BoxCarrier, SiteConnector};
+    use segue_session::pool::Pool;
+    use segue_session::relay::{AllowAll, RelayTable};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    const UP: usize = 256 << 10;
+    const DOWN: u64 = 256 << 10;
+    const SESSIONS: usize = 64;
+    const BURST: usize = 64 << 10;
+    const MIB: f64 = (1 << 20) as f64;
+
+    let pool = Pool::new(8 << 20);
+    let site_got = Arc::new(AtomicUsize::new(0));
+    let site: SiteConnector = {
+        let seen = site_got.clone();
+        Arc::new(move |t: Target, _k: Kind| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                let (a, b) = tokio::io::duplex(64 << 10);
+                let (mut r, mut w) = tokio::io::split(b);
+                if matches!(t, Target::Domain(..)) {
+                    // Session flows: an echo.
+                    tokio::spawn(async move {
+                        let _ = tokio::io::copy(&mut r, &mut w).await;
+                        let _ = w.shutdown().await;
+                    });
+                    return Ok(Box::new(a) as BoxCarrier);
+                }
+                // The TUN flow: the download pattern, and the upload checked.
+                tokio::spawn(async move {
+                    let mut i = 0u64;
+                    while i < DOWN {
+                        let chunk: Vec<u8> = (i..(i + 4096).min(DOWN))
+                            .map(|x| pattern_byte(x, 0))
+                            .collect();
+                        if w.write_all(&chunk).await.is_err() {
+                            return;
+                        }
+                        i += chunk.len() as u64;
+                    }
+                    let _ = w.shutdown().await;
+                });
+                tokio::spawn(async move {
+                    let mut at = 0u64;
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match r.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                for &x in &buf[..n] {
+                                    assert_eq!(x, pattern_byte(at, 0x5a), "upload byte {at}");
+                                    at += 1;
+                                }
+                                seen.store(at as usize, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                });
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    // The relay behind a real loopback listener.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(64);
+    let carriers = Arc::new(AtomicUsize::new(0));
+    let acceptor = tokio::spawn({
+        let carriers = carriers.clone();
+        async move {
+            while let Ok((s, _)) = listener.accept().await {
+                let _ = s.set_nodelay(true);
+                carriers.fetch_add(1, Ordering::SeqCst);
+                if accept_tx.send(Box::new(s)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    let table = RelayTable::new(
+        segue_session::Config::default(),
+        Pool::new(64 << 20),
+        Box::new(AllowAll),
+        9,
+    );
+    let relay = tokio::spawn(run_relay(table, accept_rx, site, None));
+    let dialer = Arc::new(
+        KernelDialer::new(
+            Arc::new(LoopbackEngine { relay: relay_addr }),
+            vec![Exit {
+                name: "la".into(),
+                carrier: "relay".into(),
+                relay: relay_addr,
+                node_id: 1,
+            }],
+            [(
+                "p1".to_string(),
+                SegueRoute {
+                    ticket: b"ticket".to_vec(),
+                    exit_class: 0,
+                },
+            )]
+            .into(),
+            Default::default(),
+        )
+        .with_pool(pool.clone()),
+    );
+
+    // Sample the pool and the host's RSS for the whole run.
+    let done = Arc::new(AtomicBool::new(false));
+    let rss_base = host_rss_kib().expect("ps reports no RSS");
+    let rss_peak = Arc::new(AtomicU64::new(rss_base));
+    let sampler = std::thread::spawn({
+        let (done, rss_peak) = (done.clone(), rss_peak.clone());
+        move || {
+            while !done.load(Ordering::SeqCst) {
+                if let Some(k) = host_rss_kib() {
+                    rss_peak.fetch_max(k, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    });
+    let watch = tokio::spawn({
+        let (pool, done) = (pool.clone(), done.clone());
+        async move {
+            let (mut peak, mut peak_transport) = (0, 0);
+            while !done.load(Ordering::SeqCst) {
+                peak = peak.max(pool.used_blocks() + pool.transport_used_blocks());
+                peak_transport = peak_transport.max(pool.transport_used_blocks());
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            (peak, peak_transport)
+        }
+    });
+
+    // Session flows: burst, idle, burst again; all at once.
+    let mut jobs = Vec::new();
+    for i in 0..SESSIONS {
+        let d = dialer.clone();
+        jobs.push(tokio::spawn(async move {
+            let mut s = d
+                .dial(Some("p1"), &TargetAddr::Domain(format!("s{i}.test")), 443)
+                .await
+                .unwrap_or_else(|e| panic!("session {i} refused: {e}"));
+            for round in 0..2u8 {
+                let up: Vec<u8> = (0..BURST as u64)
+                    .map(|x| pattern_byte(x, i as u8 ^ round))
+                    .collect();
+                let (mut r, mut w) = tokio::io::split(&mut s);
+                let (_, down) = tokio::join!(async { w.write_all(&up).await.unwrap() }, async {
+                    let mut d = vec![0u8; BURST];
+                    r.read_exact(&mut d).await.unwrap();
+                    d
+                });
+                assert!(down == up, "session {i} round {round}: echo differs");
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }));
+    }
+    // The TUN flow, meanwhile.
+    let mut tun = TunStack::new(Arc::new(rules_proxy_default()), dialer.clone());
+    tun.config.shared_pool = Some(pool.clone());
+    let mut h = Harness::run(tun);
+    let started = Instant::now();
+    let down = tokio::time::timeout(
+        Duration::from_secs(60),
+        raw_transfer(&mut h, CLIENT4, SITE4, UP, &site_got),
+    )
+    .await
+    .expect("TUN flow stalled");
+    let tun_took = started.elapsed();
+    assert_eq!(down.len() as u64, DOWN);
+    for (i, &x) in down.iter().enumerate() {
+        assert_eq!(x, pattern_byte(i as u64, 0), "download byte {i}");
+    }
+    for (i, j) in jobs.into_iter().enumerate() {
+        tokio::time::timeout(Duration::from_secs(60), j)
+            .await
+            .unwrap_or_else(|_| panic!("session {i} never finished"))
+            .unwrap();
+    }
+    let all_took = started.elapsed();
+    done.store(true, Ordering::SeqCst);
+    let (peak, peak_transport) = watch.await.unwrap();
+    sampler.join().unwrap();
+    let rss_peak = rss_peak.load(Ordering::SeqCst);
+    let n_carriers = carriers.load(Ordering::SeqCst);
+    println!(
+        "loopback TCP: TUN {} KiB each way in {tun_took:?}, {SESSIONS} sessions x 2 x {} KiB echo, all in {all_took:?}; \
+         {n_carriers} carriers; pool {} blocks, peak {peak} used, transport peak {peak_transport}/{}; \
+         RSS {:.1} MiB -> peak {:.1} MiB (+{:.1} MiB)",
+        UP >> 10,
+        BURST >> 10,
+        pool.blocks(),
+        pool.transport_blocks(),
+        rss_base as f64 * 1024.0 / MIB,
+        rss_peak as f64 * 1024.0 / MIB,
+        (rss_peak - rss_base) as f64 * 1024.0 / MIB,
+    );
+    assert!(
+        peak <= pool.blocks(),
+        "peak {peak} of {} blocks",
+        pool.blocks()
+    );
+    assert!(peak_transport <= pool.transport_blocks());
+    // One carrier per session plus the control stream, a few redials at
+    // most: loopback does not stall.
+    assert!(
+        n_carriers <= SESSIONS + 1 + 2 + 4,
+        "{n_carriers} carriers for {} flows",
+        SESSIONS + 1
+    );
+    // The client's own memory is the 8 MiB pool plus fixed costs; the
+    // relay (64 MiB pool) and the test's buffers run in this process too,
+    // so this bounds only gross leaks or per-flow blow-ups.
+    let grew_mib = (rss_peak - rss_base) as f64 * 1024.0 / MIB;
+    assert!(grew_mib < 128.0, "RSS grew {grew_mib:.1} MiB");
+    relay.abort();
+    acceptor.abort();
+}
