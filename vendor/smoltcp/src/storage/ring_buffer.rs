@@ -93,6 +93,39 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
         self.window() == 0
     }
 
+    /// XRAY-PATCH: change the capacity of an owned buffer in place.
+    ///
+    /// The ring is linearized starting at the read position. Allocated
+    /// octets and as much of the unallocated area as fits are preserved, so
+    /// out-of-order data written with `write_unallocated` survives growth.
+    /// Returns `false` (and changes nothing) for borrowed storage or when
+    /// `capacity` is smaller than the allocated length.
+    #[cfg(feature = "alloc")]
+    pub fn resize(&mut self, capacity: usize) -> bool
+    where
+        T: Copy + Default,
+    {
+        if capacity < self.length {
+            return false;
+        }
+        let read_at = self.read_at;
+        let ManagedSlice::Owned(old) = &mut self.storage else {
+            return false;
+        };
+        let cap = old.len();
+        if cap == capacity {
+            return true;
+        }
+        let mut next = alloc::vec::Vec::with_capacity(capacity);
+        for i in 0..cap.min(capacity) {
+            next.push(old[(read_at + i) % cap]);
+        }
+        next.resize(capacity, T::default());
+        *old = next;
+        self.read_at = 0;
+        true
+    }
+
     /// Shorthand for `(self.read + idx) % self.capacity()` with an
     /// additional check to ensure that the capacity is not zero.
     fn get_idx(&self, idx: usize) -> usize {
@@ -768,6 +801,30 @@ mod test {
         let mut data = [0; 6];
         assert_eq!(ring.read_allocated(6, &mut data[..]), 3);
         assert_eq!(&data[..], b"mno\x00\x00\x00");
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_resize_preserves_wrapped_contents() {
+        let mut ring = RingBuffer::new(vec![0u8; 4]);
+        assert_eq!(ring.enqueue_slice(b"abcd"), 4);
+        let mut out = [0u8; 2];
+        assert_eq!(ring.dequeue_slice(&mut out), 2);
+        assert_eq!(ring.enqueue_slice(b"ef"), 2); // wrapped: "cdef"
+        assert!(ring.resize(8));
+        assert_eq!((ring.capacity(), ring.len()), (8, 4));
+        assert_eq!(ring.enqueue_slice(b"gh"), 2);
+        let mut all = [0u8; 6];
+        assert_eq!(ring.dequeue_slice(&mut all), 6);
+        assert_eq!(&all, b"cdefgh");
+        assert!(ring.resize(0), "empty ring shrinks to nothing");
+        assert_eq!(ring.capacity(), 0);
+        assert!(ring.resize(4));
+        assert_eq!(ring.enqueue_slice(b"ij"), 2);
+        assert!(!ring.resize(1), "cannot drop queued octets");
+        let mut borrowed = [0u8; 4];
+        let mut ring = RingBuffer::new(&mut borrowed[..]);
+        assert!(!ring.resize(8), "borrowed storage is fixed");
     }
 
     #[test]

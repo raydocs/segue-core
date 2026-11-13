@@ -15,13 +15,28 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+libc.workspace = true
+rand.workspace = true
 segue-config = { path = "../segue-config" }
+segue-policy = { path = "../segue-policy" }
 segue-engine = { path = "../segue-engine" }
 segue-routing = { path = "../segue-routing" }
+segue-session = { path = "../segue-session" }
 segue-transport = { path = "../segue-transport" }
+segue-tun = { path = "../segue-tun" }
+smoltcp = { workspace = true, features = ["socket-tcp-reno"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+quinn.workspace = true
+quinn-proto.workspace = true
+rcgen.workspace = true
+# Policy tests verify signatures directly.
+ring = "0.17.14"
+rustls.workspace = true

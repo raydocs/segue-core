@@ -3089,7 +3089,22 @@ diff --color -ruN a/src/connection/streams/mod.rs b/src/connection/streams/mod.r
 diff --color -ruN a/src/connection/streams/recv.rs b/src/connection/streams/recv.rs
 --- a/src/connection/streams/recv.rs
 +++ b/src/connection/streams/recv.rs
-@@ -110,7 +110,11 @@
+@@ -93,8 +93,12 @@
+ 
+         self.stopped = true;
+         self.assembler.clear();
+-        // Issue flow control credit for unread data
+-        let read_credits = self.end - self.assembler.bytes_read();
++        // Issue flow control credit for unread data. A reset already credited
++        // the stream up to its final size when it discarded the buffers.
++        let read_credits = match self.state {
++            RecvState::ResetRecvd { .. } => 0,
++            RecvState::Recv { .. } => self.end - self.assembler.bytes_read(),
++        };
+         // This may send a spurious STOP_SENDING if we've already received all data, but it's a bit
+         // fiddly to distinguish that from the case where we've received a FIN but are missing some
+         // data that the peer might still be trying to retransmit, in which case a STOP_SENDING is
+@@ -110,7 +114,11 @@
      /// `false` the new window should only be transmitted if a previous transmission
      /// had failed.
      pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
@@ -3102,7 +3117,7 @@ diff --color -ruN a/src/connection/streams/recv.rs b/src/connection/streams/recv
  
          // Only announce a window update if it's significant enough
          // to make it worthwhile sending a MAX_STREAM_DATA frame.
-@@ -265,8 +269,9 @@
+@@ -265,8 +273,9 @@
              Entry::Vacant(_) => return Err(ReadableError::ClosedStream),
          };
  
@@ -3152,7 +3167,28 @@ diff --color -ruN a/src/connection/streams/state.rs b/src/connection/streams/sta
          {
              Some(stream) => stream,
              None => {
-@@ -863,6 +867,13 @@
+@@ -345,13 +349,16 @@
+         }
+         self.on_stream_frame(!stopped, id);
+ 
+-        // Update connection-level flow control
+-        Ok(if bytes_read != final_offset.into_inner() {
+-            // bytes_read is always <= end, so this won't underflow.
++        // Update connection-level flow control. `Recv::stop` already returned
++        // the credit for `bytes_read..end` of a stopped stream, so only the
++        // bytes the reset declares past `end` are new credit for it.
++        let credited_to = if stopped { end } else { bytes_read };
++        Ok(if credited_to != final_offset.into_inner() {
++            // bytes_read <= end <= final_offset, so this won't underflow.
+             self.data_recvd = self
+                 .data_recvd
+                 .saturating_add(u64::from(final_offset) - end);
+-            self.add_read_credits(u64::from(final_offset) - bytes_read)
++            self.add_read_credits(u64::from(final_offset) - credited_to)
+         } else {
+             ShouldTransmit(false)
+         })
+@@ -863,6 +870,13 @@
          self.send_window = send_window;
      }
  
@@ -3166,7 +3202,7 @@ diff --color -ruN a/src/connection/streams/state.rs b/src/connection/streams/sta
      /// Set the receive_window and returns whether the receive_window has been
      /// expanded or shrunk: true if expanded, false if shrunk.
      pub(crate) fn set_receive_window(&mut self, receive_window: VarInt) -> bool {
-@@ -943,7 +954,7 @@
+@@ -943,7 +957,7 @@
      }
  
      pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
@@ -3175,13 +3211,10 @@ diff --color -ruN a/src/connection/streams/state.rs b/src/connection/streams/sta
          self.stream_freed(id, StreamHalf::Recv);
      }
  
-@@ -1048,6 +1059,104 @@
-         assert!(should_transmit.0);
-         assert!(pending.max_stream_id[Dir::Uni as usize]);
-         assert_eq!(client.local_max_data - initial_max, MESSAGE_SIZE as u64);
-+    }
-+
-+    #[test]
+@@ -1051,6 +1065,104 @@
+     }
+ 
+     #[test]
 +    fn a_resized_stream_window_is_offered_from_the_next_read() {
 +        const KIB: u64 = 1024;
 +        const MIB: u64 = 1024 * KIB;
@@ -3277,6 +3310,105 @@ diff --color -ruN a/src/connection/streams/state.rs b/src/connection/streams/sta
 +                frame::Frame::MaxStreamData { offset, .. } => Some(offset),
 +                _ => None,
 +            })
++    }
++
++    #[test]
+     fn reset_flow_control() {
+         let mut client = make(Side::Client);
+         let id = StreamId::new(Side::Server, Dir::Uni, 0);
+@@ -1229,6 +1341,95 @@
+         );
+         assert_eq!(client.local_max_data - initial_max, 48);
+         assert!(!client.recv.contains_key(&id));
++    }
++
++    /// A stopped stream's unread bytes are credited once, by `stop`; the
++    /// peer's RESET_STREAM may add only the bytes it declares past them.
++    #[test]
++    fn stopped_reset_credits_unread_bytes_once() {
++        let mut client = make(Side::Client);
++        let id = StreamId::new(Side::Server, Dir::Uni, 0);
++        let initial_max = client.local_max_data;
++        let _ = client
++            .received(
++                frame::Stream {
++                    id,
++                    offset: 0,
++                    fin: false,
++                    data: Bytes::from_static(&[0; 4096]),
++                },
++                4096,
++            )
++            .unwrap();
++        let mut pending = Retransmits::default();
++        RecvStream {
++            id,
++            state: &mut client,
++            pending: &mut pending,
++        }
++        .stop(0u32.into())
++        .unwrap();
++        assert_eq!(client.local_max_data - initial_max, 4096);
++
++        // The reset declares 1024 bytes the peer sent past what arrived.
++        let _ = client
++            .received_reset(frame::ResetStream {
++                id,
++                error_code: 0u32.into(),
++                final_offset: 5120u32.into(),
++            })
++            .unwrap();
++        assert_eq!(client.data_recvd, 5120);
++        assert_eq!(
++            client.local_max_data - initial_max,
++            5120,
++            "unread bytes credited twice"
++        );
++    }
++
++    /// A reset stream the application stops before reading the reset was
++    /// already credited to its final size by the reset; stopping it adds
++    /// nothing.
++    #[test]
++    fn reset_then_stop_credits_unread_bytes_once() {
++        let mut client = make(Side::Client);
++        let id = StreamId::new(Side::Server, Dir::Uni, 0);
++        let initial_max = client.local_max_data;
++        let _ = client
++            .received(
++                frame::Stream {
++                    id,
++                    offset: 0,
++                    fin: false,
++                    data: Bytes::from_static(&[0; 4096]),
++                },
++                4096,
++            )
++            .unwrap();
++        let _ = client
++            .received_reset(frame::ResetStream {
++                id,
++                error_code: 0u32.into(),
++                final_offset: 5120u32.into(),
++            })
++            .unwrap();
++        assert_eq!(client.local_max_data - initial_max, 5120);
++
++        let mut pending = Retransmits::default();
++        RecvStream {
++            id,
++            state: &mut client,
++            pending: &mut pending,
++        }
++        .stop(0u32.into())
++        .unwrap();
++        assert!(pending.stop_sending.is_empty());
++        assert!(!client.recv.contains_key(&id), "stream state is freed");
++        assert_eq!(
++            client.local_max_data - initial_max,
++            5120,
++            "unread bytes credited twice"
++        );
      }
  
      #[test]

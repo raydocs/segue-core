@@ -109,10 +109,9 @@ fn pem_decode(data: &[u8]) -> Option<Vec<u8>> {
     loop {
         if rest.starts_with(&START[1..]) {
             rest = &rest[START.len() - 1..];
-        } else if let Some(i) = find(rest, START) {
-            rest = &rest[i + START.len()..];
         } else {
-            return None;
+            let i = find(rest, START)?;
+            rest = &rest[i + START.len()..];
         }
         let (type_line, after) = get_line(rest);
         rest = after;

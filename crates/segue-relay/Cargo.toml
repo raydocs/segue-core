@@ -1,0 +1,27 @@
+[package]
+name = "segue-relay"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+# Segue's own code: not MPL. Kept in new files only; see licenses/.
+license = "LicenseRef-Segue-Proprietary"
+repository.workspace = true
+publish = false
+description = "Segue node relay: session anchor, ticket checks, overseas / Home (SOCKS5) exits"
+
+[[bin]]
+name = "segue-relay"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+rand.workspace = true
+ring = "0.17.14"
+segue-policy = { path = "../segue-policy" }
+segue-session = { path = "../segue-session" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

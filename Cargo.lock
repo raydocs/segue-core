@@ -2188,13 +2188,37 @@ name = "segue-kernel"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "libc",
+ "quinn",
+ "quinn-proto",
+ "rand 0.8.6",
+ "rcgen",
+ "ring",
+ "rustls",
  "segue-config",
  "segue-engine",
+ "segue-policy",
  "segue-routing",
+ "segue-session",
  "segue-transport",
+ "segue-tun",
  "serde",
  "serde_json",
+ "sha2",
+ "smoltcp",
  "tokio",
+]
+
+[[package]]
+name = "segue-policy"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "ring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2225,6 +2249,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "segue-relay"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "rand 0.8.6",
+ "ring",
+ "segue-policy",
+ "segue-session",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "segue-routing"
 version = "0.9.0"
 dependencies = [
@@ -2238,6 +2276,16 @@ dependencies = [
 name = "segue-runtime"
 version = "0.9.0"
 dependencies = [
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "segue-session"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rand 0.8.6",
  "thiserror 2.0.21",
  "tokio",
 ]

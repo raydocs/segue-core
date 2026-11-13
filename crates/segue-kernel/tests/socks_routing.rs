@@ -6,8 +6,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use segue_kernel::dial::{DialError, Dialer, Stream};
 use segue_kernel::rules::{Action, Cidr, Matcher, Rule, RuleSet};
+use segue_kernel::session::SessionStream;
 use segue_kernel::socks::{serve, Kernel, REP_HOST_UNREACHABLE, REP_NOT_ALLOWED, REP_OK};
 use segue_routing::TargetAddr;
+use segue_session::client::CloseReason;
+use segue_session::codec::code;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -35,6 +38,33 @@ impl Dialer for Fake {
             .push((tag.map(str::to_owned), shown));
         if tag == Some("broken") {
             return Err(DialError("outer link down".into()));
+        }
+        if let TargetAddr::Domain(d) = addr {
+            if let Some(end) = d.strip_suffix(".session.test") {
+                // A session that delivers part of a response, then ends
+                // `reset` or `clean`.
+                let (app, mut far) = tokio::io::duplex(4096);
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let reset = end == "reset";
+                tokio::spawn(async move {
+                    far.write_all(b"partial").await.unwrap();
+                    let _ = tx.send(if reset {
+                        CloseReason::Reset(code::REVOKED)
+                    } else {
+                        CloseReason::Clean
+                    });
+                    if reset {
+                        // The driver drops the pipe after reporting.
+                        return;
+                    }
+                    far.shutdown().await.unwrap();
+                    // Keep reading so the client's writes never block.
+                    let mut b = [0u8; 64];
+                    while matches!(far.read(&mut b).await, Ok(n) if n > 0) {}
+                    drop(far);
+                });
+                return Ok(Box::new(SessionStream::new(app, rx)));
+            }
         }
         let echo = self.echo.lock().unwrap().expect("echo server");
         Ok(Box::new(TcpStream::connect(echo).await.unwrap()))
@@ -76,13 +106,7 @@ async fn kernel(fake: Arc<Fake>) -> std::net::SocketAddr {
     );
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    tokio::spawn(serve(
-        l,
-        Arc::new(Kernel {
-            rules,
-            dialer: fake,
-        }),
-    ));
+    tokio::spawn(serve(l, Arc::new(Kernel::new(rules, fake))));
     addr
 }
 
@@ -138,4 +162,39 @@ async fn routes_and_refusals() {
         ],
         "exactly one dial per allowed flow; the failed openai flow never went direct"
     );
+}
+
+/// Read until EOF or error.
+async fn drain(c: &mut TcpStream) -> (Vec<u8>, std::io::Result<()>) {
+    let mut got = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), c.read(&mut buf))
+            .await
+            .expect("SOCKS stream hung");
+        match r {
+            Ok(0) => return (got, Ok(())),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => return (got, Err(e)),
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_reset_is_rst_and_clean_close_is_fin() {
+    let fake = Arc::new(Fake::default());
+    let k = kernel(fake).await;
+
+    let (rep, mut c) = connect(k, "reset.session.test", 443).await;
+    assert_eq!(rep, REP_OK);
+    let (got, end) = drain(&mut c).await;
+    assert_eq!(got, b"partial");
+    let e = end.expect_err("a reset session reached the client as FIN");
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+
+    let (rep, mut c) = connect(k, "clean.session.test", 443).await;
+    assert_eq!(rep, REP_OK);
+    let (got, end) = drain(&mut c).await;
+    assert_eq!(got, b"partial");
+    end.expect("a clean close is a FIN");
 }

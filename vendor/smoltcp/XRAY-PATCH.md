@@ -97,3 +97,29 @@ range after draining readable bytes, hole completion, and subsequent reuse.
 The unsafe queue-only variant fails the reassembly test. The focused full
 default-feature suite passed 685 tests; final selected-feature reconstruction
 tests and workload-specific memory measurements are recorded separately.
+
+## Resizable TCP rings (Segue TUN pooled buffers)
+
+Segue's TUN stack (`segue-kernel/src/tun.rs`) charges every TCP ring to a
+shared, bounded pool of 4 KiB blocks (KERNEL_SPEC §4.2) instead of reserving
+64 KiB + 64 KiB per flow. Three additions make that possible:
+
+* `RingBuffer::resize(capacity) -> bool` (owned storage only) linearizes the
+  ring from its read position into a new allocation of `capacity`, keeping
+  the allocated octets and as much of the unallocated area as fits (so
+  out-of-order payload written with `write_unallocated` survives growth).
+  It refuses borrowed storage and a capacity below the allocated length.
+* `tcp::Socket::resize_recv_buffer` / `resize_send_buffer` expose it.
+  Shrinking the receive ring additionally requires an empty assembler.
+  Window scaling is still fixed when the socket is created or reset; the TUN
+  creates sockets with a 4 KiB ring (no scaling) and never grows past 64 KiB.
+* Segment acceptance clamps the right edge of the receive window to the
+  physical free space (`rx_buffer.window()`). After a shrink the peer may
+  still hold an older, larger advertisement; octets beyond the ring are
+  dropped and retransmitted instead of overrunning storage. With an
+  unchanged ring this is a no-op, since the advertised window never exceeds
+  the free space.
+
+Test: `storage::ring_buffer::test::test_resize_preserves_wrapped_contents`;
+the TUN tests in `segue-kernel/tests/tun.rs` grow, release and reuse rings
+on live flows.
