@@ -376,6 +376,14 @@ impl SmartDns {
     }
 
     /// Send `packet` to every domestic resolver at once; first valid reply.
+    ///
+    /// Only complete replies count (r11 R2): a reply with TC is retried over
+    /// TCP and dropped if that does not give a complete one, so a fast
+    /// truncated reply never beats a slower complete one, never reaches the
+    /// address cache and never goes to a client. With no complete reply
+    /// from any resolver the caller answers SERVFAIL — over UDP too: we do
+    /// not pass a truncated upstream reply on as our own TC, the client
+    /// retries the query instead.
     async fn race(&self, packet: Vec<u8>) -> Option<Vec<u8>> {
         let _permit = self.upstream_limit.try_acquire().ok()?;
         self.upstream_queries
@@ -394,11 +402,16 @@ impl SmartDns {
                     return Ok(reply);
                 }
                 // Truncated upstream: ask the same server again over TCP
-                // (RFC 7766); keep the truncated reply if that fails.
-                match tokio::time::timeout_at(deadline, exchange_tcp(server, &packet)).await {
-                    Ok(Ok(full)) => Ok(full),
-                    _ => Ok(reply),
+                // (RFC 7766). A truncated reply is never an answer (r11
+                // R2): if TCP fails, times out, ends mid-frame or is
+                // truncated too, this server gave nothing.
+                let full = tokio::time::timeout_at(deadline, exchange_tcp(server, &packet))
+                    .await
+                    .map_err(|_| late())??;
+                if full[2] & FLAG_TC != 0 {
+                    return Err(std::io::ErrorKind::InvalidData.into());
                 }
+                Ok(full)
             });
         }
         // First definitive answer (NOERROR/NXDOMAIN) wins; a fast
@@ -406,6 +419,9 @@ impl SmartDns {
         let mut fallback = None;
         while let Some(done) = set.join_next().await {
             if let Ok(Ok(reply)) = done {
+                if reply[2] & FLAG_TC != 0 {
+                    continue;
+                }
                 let rcode = reply.get(3).map_or(RCODE_SERVFAIL, |b| b & 0x0f);
                 if rcode == RCODE_OK || rcode == RCODE_NXDOMAIN {
                     return Some(reply);
@@ -555,6 +571,10 @@ fn encode_name(out: &mut Vec<u8>, name: &str) -> Option<()> {
 /// (rcode, addresses of `qtype`, min TTL over the answer section).
 fn parse_answers(msg: &[u8], qtype: u16) -> Option<(u8, Vec<IpAddr>, u32)> {
     if msg.len() < 12 {
+        return None;
+    }
+    // A truncated message is not an answer set (RFC 2181 §9; r11 R2).
+    if msg[2] & FLAG_TC != 0 {
         return None;
     }
     let rcode = msg[3] & 0x0f;
@@ -1860,5 +1880,218 @@ mod tests {
         assert_eq!(&cut[..2], &[0, 0x55]);
         assert!(cut.len() <= 512);
         assert_eq!(tcp_queries.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// What a fake resolver's TCP side does after its UDP reply had TC.
+    #[derive(Clone, Copy, PartialEq)]
+    enum TcpSide {
+        /// No TCP listener: connection refused.
+        Refused,
+        /// Accepts, reads the query, never answers.
+        Silent,
+        /// Sends a length prefix and part of the message, then closes.
+        HalfFrame,
+        /// Answers over TCP with TC again.
+        AlsoTc,
+    }
+
+    /// A resolver whose UDP reply comes after `udp_delay`: header and
+    /// question with TC (NOERROR, no answers) when `tcp` is Some, else a
+    /// complete answer `9.9.9.9`. Returns its address and a counter of TCP
+    /// connections the kernel closed.
+    async fn resolver(
+        udp_delay: Duration,
+        tcp: Option<TcpSide>,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let up = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = up.local_addr().unwrap();
+        let closed = Arc::new(AtomicUsize::new(0));
+        let listener = match tcp {
+            Some(TcpSide::Refused) | None => None,
+            Some(_) => Some(TcpListener::bind(addr).await.unwrap()),
+        };
+        let truncated = tcp.is_some();
+        tokio::spawn(async move {
+            let mut b = [0u8; 1500];
+            while let Ok((n, from)) = up.recv_from(&mut b).await {
+                let q = b[..n].to_vec();
+                let up = up.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(udp_delay).await;
+                    let r = if truncated {
+                        let mut r = q;
+                        r[2] |= 0x80 | FLAG_TC;
+                        r
+                    } else {
+                        let parsed = parse_question(&q).ok().unwrap();
+                        respond(&parsed, RCODE_OK, &["9.9.9.9".parse().unwrap()], 300)
+                    };
+                    let _ = up.send_to(&r, from).await;
+                });
+            }
+        });
+        if let Some(l) = listener {
+            let side = tcp.unwrap();
+            let closed = closed.clone();
+            tokio::spawn(async move {
+                while let Ok((mut c, _)) = l.accept().await {
+                    let closed = closed.clone();
+                    tokio::spawn(async move {
+                        let n = c.read_u16().await.unwrap();
+                        let mut q = vec![0u8; usize::from(n)];
+                        c.read_exact(&mut q).await.unwrap();
+                        match side {
+                            TcpSide::Silent => {
+                                let mut sink = [0u8; 64];
+                                while c.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+                                closed.fetch_add(1, Relaxed);
+                            }
+                            TcpSide::HalfFrame => {
+                                let _ = c.write_all(&[0, 100, 1, 2, 3, 4, 5]).await;
+                            }
+                            TcpSide::AlsoTc => {
+                                let mut r = q;
+                                r[2] |= 0x80 | FLAG_TC;
+                                let mut f = (r.len() as u16).to_be_bytes().to_vec();
+                                f.extend_from_slice(&r);
+                                let _ = c.write_all(&f).await;
+                                let mut sink = [0u8; 64];
+                                while c.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+                            }
+                            TcpSide::Refused => unreachable!(),
+                        }
+                    });
+                }
+            });
+        }
+        (addr, closed)
+    }
+
+    fn dns_multi(addrs: Vec<SocketAddr>, timeout: Duration) -> Arc<SmartDns> {
+        let one = dns_to(addrs[0]);
+        let settings = DnsSettings {
+            domestic: addrs,
+            query_timeout: timeout,
+            cache_size: 16,
+        };
+        Arc::new(SmartDns::new(
+            one.policy.clone(),
+            one.pool.clone(),
+            settings,
+        ))
+    }
+
+    fn cached(dns: &SmartDns, name: &str) -> Option<Vec<IpAddr>> {
+        let cache = dns.cache.lock().unwrap();
+        cache
+            .get(&(name.to_owned(), TYPE_A))
+            .map(|e| e.value.ips.clone())
+    }
+
+    /// r11 R2: an upstream TC reply whose TCP retry fails in any way is
+    /// not an answer: SERVFAIL (over UDP and TCP, TC clear), nothing
+    /// cached, and the upstream credit is back.
+    #[tokio::test]
+    async fn truncated_upstream_without_tcp_answer_is_servfail() {
+        for side in [
+            TcpSide::Refused,
+            TcpSide::Silent,
+            TcpSide::HalfFrame,
+            TcpSide::AlsoTc,
+        ] {
+            let (addr, _) = resolver(Duration::ZERO, Some(side)).await;
+            let dns = dns_multi(vec![addr], Duration::from_millis(300));
+            for (i, via) in [Transport::Udp(65535), Transport::Tcp]
+                .into_iter()
+                .enumerate()
+            {
+                let q = query_for_test(0x70 + i as u16, "a.x.test", TYPE_A);
+                let r = dns.handle(&q, via).await.unwrap();
+                assert_eq!(r[3] & 0x0f, RCODE_SERVFAIL, "A, side {}", side as u8);
+                assert_eq!(r[2] & FLAG_TC, 0);
+                assert_eq!(&r[6..8], &[0, 0]);
+                let q = query_for_test(0x80 + i as u16, "a.x.test", TYPE_HTTPS);
+                let r = dns.handle(&q, via).await.unwrap();
+                assert_eq!(r[3] & 0x0f, RCODE_SERVFAIL, "HTTPS, side {}", side as u8);
+                assert_eq!(r[2] & FLAG_TC, 0);
+            }
+            assert_eq!(cached(&dns, "a.x.test"), None);
+            assert_eq!(
+                dns.upstream_limit.available_permits(),
+                MAX_UPSTREAM_IN_FLIGHT
+            );
+        }
+    }
+
+    /// r11 R2: a fast truncated reply (TCP refused) does not beat a slower
+    /// complete one from another resolver; that one is the answer and the
+    /// only thing cached.
+    #[tokio::test]
+    async fn fast_truncated_loses_to_slow_complete() {
+        for side in [TcpSide::Refused, TcpSide::HalfFrame, TcpSide::AlsoTc] {
+            let (fast, _) = resolver(Duration::ZERO, Some(side)).await;
+            let (slow, _) = resolver(Duration::from_millis(100), None).await;
+            let dns = dns_multi(vec![fast, slow], Duration::from_millis(800));
+            let q = query_for_test(0x91, "b.x.test", TYPE_A);
+            let r = dns.handle(&q, Transport::Udp(65535)).await.unwrap();
+            assert_eq!(r[3] & 0x0f, RCODE_OK, "side {}", side as u8);
+            assert_eq!(r[2] & FLAG_TC, 0);
+            assert_eq!(&r[6..8], &[0, 1], "one A record");
+            assert_eq!(
+                cached(&dns, "b.x.test"),
+                Some(vec!["9.9.9.9".parse().unwrap()])
+            );
+            let q = query_for_test(0x92, "b.x.test", TYPE_HTTPS);
+            let r = dns.handle(&q, Transport::Tcp).await.unwrap();
+            assert_eq!(r[3] & 0x0f, RCODE_OK);
+            assert_eq!(r[2] & FLAG_TC, 0);
+        }
+    }
+
+    /// r11 R2: when the TCP retry times out, its connection is closed and
+    /// the upstream credit returned when the query gives up.
+    #[tokio::test]
+    async fn tcp_retry_timeout_releases_connection_and_credit() {
+        let (addr, closed) = resolver(Duration::ZERO, Some(TcpSide::Silent)).await;
+        let dns = dns_multi(vec![addr], Duration::from_millis(200));
+        let mut tasks = Vec::new();
+        for i in 0..8u16 {
+            let dns = dns.clone();
+            tasks.push(tokio::spawn(async move {
+                let q = query_for_test(0xa0 + i, &format!("c{i}.x.test"), TYPE_A);
+                dns.handle(&q, Transport::Udp(65535)).await.unwrap()
+            }));
+        }
+        let started = std::time::Instant::now();
+        for t in tasks {
+            let r = t.await.unwrap();
+            assert_eq!(r[3] & 0x0f, RCODE_SERVFAIL);
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            dns.upstream_limit.available_permits(),
+            MAX_UPSTREAM_IN_FLIGHT
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while closed.load(std::sync::atomic::Ordering::Relaxed) < 8 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "connections left open"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// r11 R2: parse_answers never reads a truncated message as an answer
+    /// set (it would cache a partial or empty address list).
+    #[test]
+    fn parse_answers_rejects_tc() {
+        let q = query_for_test(1, "a.b", TYPE_A);
+        let parsed = parse_question(&q).ok().unwrap();
+        let mut r = respond(&parsed, RCODE_OK, &["9.9.9.9".parse().unwrap()], 5);
+        assert!(parse_answers(&r, TYPE_A).is_some());
+        r[2] |= FLAG_TC;
+        assert!(parse_answers(&r, TYPE_A).is_none());
     }
 }
