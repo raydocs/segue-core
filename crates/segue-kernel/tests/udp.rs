@@ -576,3 +576,71 @@ async fn plain_flow_drops_each_quic_datagram() {
     assert_eq!(env.udp.as_ref().unwrap().dropped(), 4);
     assert_eq!(env.fake.sent.lock().unwrap().len(), 2);
 }
+
+/// QUIC short header of `n` bytes (first byte 0x40..=0x7F).
+fn short_header(first: u8, n: usize) -> Vec<u8> {
+    let mut p = vec![first];
+    p.resize(n, 0x31);
+    p
+}
+
+/// Ordinary UDP protocols' first datagrams (none QUIC-shaped).
+fn plain_firsts() -> Vec<(&'static str, Vec<u8>)> {
+    let sized = |head: &[u8], n: usize| {
+        let mut p = head.to_vec();
+        p.resize(n, 0x5a);
+        p
+    };
+    vec![
+        ("wireguard", sized(&[0x01, 0, 0, 0], 148)),
+        (
+            "stun",
+            sized(&[0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42], 28),
+        ),
+        (
+            "dtls",
+            sized(&[0x16, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0], 200),
+        ),
+        ("rtp", sized(&[0x80, 0x60, 0x12, 0x34], 1000)),
+        ("dns-like", sized(&[0x12, 0x34, 0x01, 0x00, 0x00, 0x01], 40)),
+    ]
+}
+
+/// r9 F1: a new bare-IP flow whose first datagram is a QUIC short header
+/// (a connection set up before the kernel, or migrated from elsewhere) is
+/// dropped like an Initial, v4 and v6; nothing is dialled. Ordinary UDP
+/// protocols' first datagrams still go by the IP rules.
+#[tokio::test]
+async fn short_header_first_to_bare_ip_is_dropped_plain_udp_passes() {
+    // Each protocol on its own flow: room for all of them.
+    let s = UdpSettings {
+        max_flows: 8,
+        ..settings()
+    };
+    let env = start_max(Some(s), None, 1500).await;
+    let (_, _ctl, relay) = associate(env.socks).await;
+    let c = client(relay).await;
+    let mut n = 0;
+    for dst in [ip("8.8.8.8"), ip("2001:4860:4860::8888")] {
+        for first in [0x40, 0x5c, 0x7f] {
+            c.send(&packet(&dst, 8443, &short_header(first, 40)))
+                .await
+                .unwrap();
+            n += 1;
+        }
+    }
+    assert_eq!(recv(&c, QUIET).await, None);
+    assert!(env.fake.calls().is_empty(), "{:?}", env.fake.calls());
+    assert_eq!(env.udp.as_ref().unwrap().dropped(), n);
+    for (i, (name, d)) in plain_firsts().into_iter().enumerate() {
+        let port = 9000 + i as u16;
+        c.send(&packet(&ip("8.8.8.8"), port, &d)).await.unwrap();
+        assert_eq!(
+            recv(&c, WAIT).await.as_deref(),
+            Some(&packet(&ip("8.8.8.8"), port, &d)[..]),
+            "{name}"
+        );
+    }
+    assert_eq!(env.fake.calls().len(), plain_firsts().len());
+    assert_eq!(env.udp.as_ref().unwrap().dropped(), n);
+}

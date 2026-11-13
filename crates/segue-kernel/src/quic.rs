@@ -7,16 +7,18 @@
 //! flow is inspected: every connection on it goes to the same name.
 //!
 //! QUIC to a real IP is refused: on TUN with an ICMP port unreachable for
-//! the very datagram, so the app falls back to TCP (where the TLS SNI is
-//! always sniffable and routes the flow by name); on SOCKS by dropping it.
+//! the very datagram (an app that honours it, on a connected socket, gives
+//! up on QUIC at once and may fall back to TCP, where the flow is sniffed
+//! like any TCP flow, §5.2a.1); on SOCKS by dropping it (the app times out).
 //! The kernel does not try to follow connection IDs: a short header names
 //! a connection by an ID the server may have issued inside the encryption
 //! (NEW_CONNECTION_ID), so no observer can prove which connection, and so
 //! which server name, it belongs to (astra r8 N1–N3). Connection migration
 //! across flows is therefore not supported.
 //!
-//! [`looks_quic`] is the one test, stateless and applied to every datagram
-//! of a real-IP flow, not only the first.
+//! Two stateless tests, applied to datagrams of a real-IP flow:
+//! [`looks_quic_first`] to its first datagram, [`looks_quic`] to every
+//! later one.
 
 const V1: u32 = 0x0000_0001;
 const V2: u32 = 0x6b33_43cf;
@@ -38,15 +40,39 @@ pub const MIN_INITIAL_DATAGRAM: usize = 1200;
 ///
 /// Packets are coalesced only behind a long header (RFC 9000 §12.2), so the
 /// first packet already decides for every packet of the datagram: a
-/// datagram that hides a second packet behind a QUIC first one is QUIC. A
-/// short header alone cannot be told from ordinary UDP; without a long
-/// header on the same flow first it is no connection any server knows.
+/// datagram that hides a second packet behind a QUIC first one is QUIC.
+/// A short header is not recognised here; see [`looks_quic_first`].
 pub fn looks_quic(dgram: &[u8]) -> bool {
     if dgram.len() < 7 || dgram[0] & 0x80 == 0 {
         return false;
     }
     let version = u32::from_be_bytes([dgram[1], dgram[2], dgram[3], dgram[4]]);
     matches!(version, V1 | V2) || (dgram[0] & 0x40 != 0 && dgram.len() >= MIN_INITIAL_DATAGRAM)
+}
+
+/// Smallest datagram counted as a QUIC short header. Header protection
+/// samples 16 bytes starting 4 bytes after the packet number offset
+/// (RFC 9001 §5.4.2), so even with an empty connection ID a protected
+/// packet has 1 + 4 + 16 bytes; anything shorter is not one.
+pub const MIN_SHORT_HEADER_DATAGRAM: usize = 21;
+
+/// Whether the first datagram of a real-IP flow is to be taken for QUIC:
+/// [`looks_quic`], or a short header (1-RTT packet; first byte `0x40..=0x7F`:
+/// form bit 0, fixed bit 1) of at least [`MIN_SHORT_HEADER_DATAGRAM`] bytes.
+///
+/// A short header first on a new 5-tuple is a connection set up elsewhere:
+/// before the kernel started, from another address, or moved by the
+/// server's preferred address (RFC 9000 §9). Its server name cannot be
+/// proven, so it is refused like an Initial (astra r9 F1). Later datagrams
+/// of a flow admitted as ordinary UDP are held to [`looks_quic`] only: a
+/// flow whose first datagram was not QUIC carries no QUIC connection, and
+/// one byte in four of ordinary UDP payload falls in that range.
+///
+/// The price: ordinary UDP whose first datagram starts `0x40..=0x7F` and
+/// is 21 bytes or longer is refused too (a DNS-shaped query with such an
+/// ID to a port other than 53, say).
+pub fn looks_quic_first(dgram: &[u8]) -> bool {
+    looks_quic(dgram) || (dgram.len() >= MIN_SHORT_HEADER_DATAGRAM && dgram[0] & 0xc0 == 0x40)
 }
 
 /// RFC 9001 Appendix A.2: the client Initial (QUIC v1, SNI example.com).
@@ -130,6 +156,55 @@ mod tests {
         let mut rtp = vec![0x80, 0x60, 0x12, 0x34];
         rtp.resize(1300, 0x55);
         assert!(!looks_quic(&rtp));
+    }
+
+    #[test]
+    fn short_header_first_is_quic_from_21_bytes() {
+        for b in [0x40u8, 0x41, 0x5f, 0x7f] {
+            let mut p = vec![b];
+            p.resize(MIN_SHORT_HEADER_DATAGRAM, 0x33);
+            assert!(looks_quic_first(&p), "{b:#x}");
+            assert!(
+                !looks_quic(&p),
+                "{b:#x}: later datagrams are not held to it"
+            );
+            p.pop();
+            assert!(!looks_quic_first(&p), "{b:#x}: too short to be protected");
+        }
+        // Long headers are QUIC first or later.
+        assert!(looks_quic_first(&hex(RFC9001_CLIENT_INITIAL)));
+    }
+
+    /// Representative ordinary UDP first datagrams that must pass.
+    #[test]
+    fn plain_udp_first_datagrams_pass() {
+        let sized = |head: &[u8], n: usize| {
+            let mut p = head.to_vec();
+            p.resize(n, 0x5a);
+            p
+        };
+        let cases = [
+            // WireGuard handshake initiation: type 1, three reserved zeros, 148 bytes.
+            ("wireguard", sized(&[0x01, 0, 0, 0], 148)),
+            // STUN binding request: type 0x0001, magic cookie.
+            (
+                "stun",
+                sized(&[0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42], 20 + 8),
+            ),
+            // DTLS 1.2 ClientHello record.
+            (
+                "dtls",
+                sized(&[0x16, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0], 200),
+            ),
+            // RTP version 2, at a large size too.
+            ("rtp", sized(&[0x80, 0x60, 0x12, 0x34, 0, 0, 0, 0], 1300)),
+            // DNS-shaped: ID 0x1234, RD.
+            ("dns", sized(&[0x12, 0x34, 0x01, 0x00, 0x00, 0x01], 40)),
+        ];
+        for (name, p) in cases {
+            assert!(!looks_quic_first(&p), "{name}");
+            assert!(!looks_quic(&p), "{name}");
+        }
     }
 
     #[test]

@@ -26,13 +26,13 @@
 //! QUIC (§5.2a.2) is carried only to a destination whose name is known for
 //! certain: a domain in the request or a fake-IP address. The flow is
 //! routed by that name and pinned to that outbound for its life. To a
-//! bare IP that is not fake, UDP/443 is refused outright, and every datagram
-//! that looks like QUIC ([`crate::quic::looks_quic`], checked on each
-//! datagram, not just the first) is dropped: the client never completes a
-//! QUIC handshake and falls back to TCP, where the TLS SNI routes it by
-//! name. SOCKS5 has no per-datagram error, so that fallback waits for the
-//! client's own QUIC handshake timeout. Other UDP to a bare IP goes by the
-//! IP rules.
+//! bare IP that is not fake, UDP/443 is refused outright, a first datagram
+//! that looks like QUIC or like a QUIC short header
+//! ([`crate::quic::looks_quic_first`]) is dropped, and so is every later
+//! datagram that looks like QUIC ([`crate::quic::looks_quic`]). SOCKS5 has
+//! no per-datagram error: the client sees nothing and waits for its own
+//! QUIC handshake (or idle) timeout before it gives up or tries TCP. Other
+//! UDP to a bare IP goes by the IP rules.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -48,7 +48,7 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::dial::{Dialer, UdpSession};
-use crate::quic::looks_quic;
+use crate::quic::{looks_quic, looks_quic_first};
 use crate::rules::Action;
 use crate::socks::{Kernel, REP_GENERAL, REP_OK};
 
@@ -227,9 +227,10 @@ fn uplink(
         TargetAddr::Ip(ip) => plain(kernel, *ip),
         TargetAddr::Domain(_) => false,
     };
-    if plain && (port == QUIC_PORT || looks_quic(payload)) {
+    if plain && (port == QUIC_PORT || looks_quic_first(payload)) {
         // QUIC needs a name known for certain (a domain or a fake IP);
-        // UDP/443 to a bare IP is taken for QUIC whatever it carries.
+        // UDP/443 to a bare IP is taken for QUIC whatever it carries, and
+        // so is a first datagram shaped like a short header (r9 F1).
         return udp.drop_one();
     }
     let Some((tag, target)) = route(kernel, &udp.settings, &key.0, port) else {

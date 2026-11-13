@@ -2047,6 +2047,98 @@ async fn tun_plain_udp_flow_turning_quic_is_refused() {
     assert_eq!(e.dialer.udp_dials.lock().unwrap().len(), 1);
 }
 
+async fn next_icmp6(h: &mut Harness) -> (u8, u8, Vec<u8>) {
+    loop {
+        let p = h.next().await;
+        let o = out(&p);
+        if o.proto == IpProtocol::Icmpv6 {
+            let icmp = Icmpv6Packet::new_checked(&o.l4[..]).unwrap();
+            assert!(icmp.verify_checksum(&o.src.to_v6(), &o.dst.to_v6()));
+            assert_eq!(o.dst, client6().ip());
+            return (u8::from(icmp.msg_type()), icmp.msg_code(), o.l4.clone());
+        }
+    }
+}
+
+fn short_header(first: u8, n: usize) -> Vec<u8> {
+    let mut p = vec![first];
+    p.resize(n, 0x31);
+    p
+}
+
+/// r9 F1: a new real-IP flow whose first datagram is a QUIC short header
+/// (a connection set up before the kernel started, or moved here from
+/// another path) is refused like an Initial: ICMP port unreachable on v4,
+/// ICMPv6 destination unreachable / port unreachable (1/4) on v6, quoting
+/// the datagram; nothing is dialled. Below 21 bytes it is not taken for
+/// QUIC.
+#[tokio::test]
+async fn tun_short_header_first_to_real_ip_is_refused_v4_and_v6() {
+    let mut e = kernel_env(inline(), false, true, false, false);
+    let v4: SocketAddr = "8.8.8.8:8443".parse().unwrap();
+    let v6: SocketAddr = "[2001:4860:4860::8888]:8443".parse().unwrap();
+    for first in [0x40, 0x5c, 0x7f] {
+        let d = short_header(first, 40);
+        e.h.send(udp(CLIENT4, v4, &d)).await;
+        let (t, code, l4) = next_icmp(&mut e.h).await;
+        assert_eq!((t, code), (3, 3), "v4 {first:#x}");
+        // Quotes the original IP header + the first 8 bytes of UDP.
+        assert_eq!(&l4[8..], &udp(CLIENT4, v4, &d)[..28]);
+        let sent = udp(client6(), v6, &d);
+        e.h.send(sent.clone()).await;
+        let (t, code, l4) = next_icmp6(&mut e.h).await;
+        assert_eq!((t, code), (1, 4), "v6 {first:#x}");
+        assert_eq!(&l4[8..], &sent[..]);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(e.dialer.udp_dials.lock().unwrap().is_empty());
+}
+
+/// r9 F1: the first datagrams of ordinary UDP protocols to a real IP are
+/// not QUIC-shaped and go by the IP rules (here: the default proxy).
+#[tokio::test]
+async fn tun_plain_udp_protocols_to_real_ip_pass() {
+    let sized = |head: &[u8], n: usize| {
+        let mut p = head.to_vec();
+        p.resize(n, 0x5a);
+        p
+    };
+    let cases = [
+        ("wireguard", sized(&[0x01, 0, 0, 0], 148)),
+        (
+            "stun",
+            sized(&[0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42], 28),
+        ),
+        (
+            "dtls",
+            sized(&[0x16, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0], 200),
+        ),
+        ("rtp", sized(&[0x80, 0x60, 0x12, 0x34], 1300)),
+        ("dns-like", sized(&[0x12, 0x34, 0x01, 0x00, 0x00, 0x01], 40)),
+        ("short-header-sized-20", short_header(0x40, 20)),
+    ];
+    let e = kernel_env_with(
+        inline(),
+        false,
+        true,
+        false,
+        FakeDialer {
+            udp_max: 1500,
+            ..Default::default()
+        },
+    );
+    for (i, (_, d)) in cases.iter().enumerate() {
+        let dst = SocketAddr::new("8.8.8.8".parse().unwrap(), 9000 + i as u16);
+        e.h.send(udp(CLIENT4, dst, d)).await;
+    }
+    let mut sent = udp_sent(&e, cases.len()).await;
+    sent.sort();
+    let mut want: Vec<Vec<u8>> = cases.iter().map(|(_, d)| d.clone()).collect();
+    want.sort();
+    assert_eq!(sent, want);
+    assert_eq!(e.dialer.udp_dials.lock().unwrap().len(), cases.len());
+}
+
 // r6 R5: a TUN flow through a real segue session keeps moving bytes both
 // ways while every elastic block of the shared pool is held elsewhere.
 

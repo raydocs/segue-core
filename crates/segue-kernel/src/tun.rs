@@ -116,7 +116,7 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 use crate::dial::{Dialer, UdpSession};
 use crate::dns::SmartDns;
 use crate::policy::Policy;
-use crate::quic::looks_quic;
+use crate::quic::{looks_quic, looks_quic_first};
 use crate::rules::{Action, RuleSet};
 use crate::sniff::{sniff, Sniff};
 use crate::socks::{Kernel, SniffSettings};
@@ -2469,7 +2469,9 @@ fn policy(
                 udp_plans.insert(*key, d);
                 Verdict::Accept(tag)
             }
-            UdpRoute::Plain(_) if key.dst.port() == crate::udp::QUIC_PORT || looks_quic(first) => {
+            UdpRoute::Plain(_)
+                if key.dst.port() == crate::udp::QUIC_PORT || looks_quic_first(first) =>
+            {
                 Verdict::Unreachable
             }
             UdpRoute::Plain(d) => {
