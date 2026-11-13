@@ -296,9 +296,11 @@ pub(crate) fn stricter<'a>(
 ///   the IP rules alone (an accepted boundary: such a flow to an AI
 ///   service's IP outside the AI CIDRs is routed as that IP says).
 /// - An ECH extension (astra r10 N2) whose SNI is not a known ECH public
-///   name ([`Policy::is_ech_public_name`]): GREASE from a client with no
-///   ECH config (RFC 9849 §6.2), so the SNI is the real name and is
-///   routed like one.
+///   name ([`Policy::is_ech_public_name`]): treated as GREASE (RFC 9849
+///   §6.2), the SNI routed like a real name. A heuristic (r11 R1): real
+///   ECH behind an unlisted public name is routed by its outer name too,
+///   so an AI inner name can leave by the overseas route; a broad listed
+///   suffix refuses ordinary GREASE under it (KERNEL_SPEC §5.2a.1).
 /// - A hidden name: ECH with a known public name as SNI, or with no SNI.
 ///   Rejected IP: refused. IP in the bundle's AI ranges:
 ///   [`Policy::hidden_name`] (the AI route) to the IP. Any other IP:
