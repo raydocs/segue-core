@@ -240,26 +240,11 @@ impl Stamp {
     }
 }
 
-/// An I/O object that records in a [`Stamp`] each read or write that moved
-/// at least one byte.
+/// A writer that records in a [`Stamp`] each write that moved at least
+/// one byte.
 struct Touch<T> {
     inner: T,
     stamp: Arc<Stamp>,
-}
-
-impl<T: AsyncRead + Unpin> AsyncRead for Touch<T> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        let r = std::task::ready!(Pin::new(&mut self.inner).poll_read(cx, buf));
-        if r.is_ok() && buf.filled().len() > before {
-            self.stamp.touch();
-        }
-        std::task::Poll::Ready(r)
-    }
 }
 
 impl<T: AsyncWrite + Unpin> AsyncWrite for Touch<T> {
@@ -290,34 +275,74 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Touch<T> {
     }
 }
 
-/// A carrier's reader and writer, each recording when it last moved bytes.
+/// A carrier's reader and writer; the writer records when it last sent
+/// bytes.
 fn split_carrier(
     stream: BoxCarrier,
 ) -> (
-    Touch<tokio::io::ReadHalf<BoxCarrier>>,
+    tokio::io::ReadHalf<BoxCarrier>,
     Touch<tokio::io::WriteHalf<BoxCarrier>>,
-    Arc<Stamp>,
     Arc<Stamp>,
 ) {
     let (r, w) = tokio::io::split(stream);
-    let (rs, ws) = (Stamp::new(), Stamp::new());
+    let ws = Stamp::new();
     (
-        Touch {
-            inner: r,
-            stamp: rs.clone(),
-        },
+        r,
         Touch {
             inner: w,
             stamp: ws.clone(),
         },
-        rs,
         ws,
     )
+}
+
+/// How often a reader reports bytes of a frame still arriving
+/// ([`CarrierEv::Progress`]).
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Rate-limited [`CarrierEv::Progress`] reports of one reader.
+struct Progress {
+    cid: u64,
+    tx: mpsc::Sender<CarrierEv>,
+    last: Option<tokio::time::Instant>,
+}
+
+impl Progress {
+    fn new(cid: u64, tx: mpsc::Sender<CarrierEv>) -> Self {
+        Self {
+            cid,
+            tx,
+            last: None,
+        }
+    }
+
+    /// Bytes arrived (or wait, already here, for local memory): report it
+    /// unless reported within [`PROGRESS_EVERY`]. Never blocks; a report
+    /// that finds the channel full is dropped (the frames in it show the
+    /// carrier moving anyway).
+    fn report(&mut self) {
+        let now = tokio::time::Instant::now();
+        if self.last.is_some_and(|l| now < l + PROGRESS_EVERY) {
+            return;
+        }
+        self.last = Some(now);
+        let _ = self.tx.try_send(CarrierEv::Progress(self.cid));
+    }
+
+    /// A whole frame went out to the driver: the next partial one reports
+    /// at once.
+    fn reset(&mut self) {
+        self.last = None;
+    }
 }
 
 enum CarrierEv {
     /// With what covers the decoded frame until it is handled.
     Frame(u64, Result<Frame, ProtoError>, Option<Charge>),
+    /// Bytes of a frame not yet complete arrived on the carrier (or are
+    /// there, waiting for memory): the peer and the path are alive though
+    /// no frame came in (r8 N4/N5). See [`Progress`].
+    Progress(u64),
     Closed(u64),
 }
 
@@ -348,6 +373,7 @@ async fn read_charged<R: AsyncRead + Unpin>(
     let mut r = tokio::io::BufReader::with_capacity(SMALL_READ, r);
     let slot = Arc::new(AtomicBool::new(false));
     let mut ticket = None;
+    let mut progress = Progress::new(cid, tx.clone());
     loop {
         let mut hdr = [0u8; 10];
         if r.read_exact(&mut hdr[..3]).await.is_err() {
@@ -370,10 +396,11 @@ async fn read_charged<R: AsyncRead + Unpin>(
         // into a copy while the payload is still held.
         let cover = if ty == ty::DATA { len } else { 2 * len };
         let Some((payload, charge)) =
-            read_body(&mut r, &pool, &slot, &mut ticket, len, cover).await
+            read_body(&mut r, &pool, &slot, &mut ticket, &mut progress, len, cover).await
         else {
             break;
         };
+        progress.reset();
         match Frame::decode_owned(ty, flags, payload) {
             Ok(Some(f)) => {
                 if tx.send(CarrierEv::Frame(cid, Ok(f), charge)).await.is_err() {
@@ -405,6 +432,7 @@ async fn read_body<R: AsyncRead + Unpin>(
     pool: &Arc<Pool>,
     slot: &Arc<AtomicBool>,
     ticket: &mut Option<Ticket>,
+    progress: &mut Progress,
     len: usize,
     cover: usize,
 ) -> Option<(Vec<u8>, Option<Charge>)> {
@@ -421,29 +449,50 @@ async fn read_body<R: AsyncRead + Unpin>(
         if r.fill_buf().await.ok()?.is_empty() {
             return None;
         }
-        charge = Some(wait_charge(pool, slot, ticket, cover).await);
+        // The body is here and waits only for local memory: the carrier
+        // is not stalled.
+        progress.report();
+        let c = {
+            let wait = wait_charge(pool, slot, ticket, cover);
+            tokio::pin!(wait);
+            let mut tick = tokio::time::interval(PROGRESS_EVERY);
+            loop {
+                tokio::select! {
+                    c = &mut wait => break c,
+                    _ = tick.tick() => progress.report(),
+                }
+            }
+        };
+        charge = Some(c);
         *ticket = None;
     }
     let mut payload = vec![0u8; len];
     let transport = charge
         .as_ref()
         .is_some_and(|c| c.grant.tier() == Tier::Transport);
-    if !transport {
-        return r
-            .read_exact(&mut payload)
-            .await
-            .ok()
-            .map(|_| (payload, charge));
-    }
-    // Progress-based (r8 N5): every read that moves part of the frame
-    // restarts the hold; the cap bounds the whole frame however it moves.
-    let cap = tokio::time::Instant::now() + pool.transport_hold_max();
+    // A transport-region frame is held by progress (r8 N5): every read
+    // that moves part of it restarts the hold; the cap bounds the whole
+    // frame however it moves.
+    let cap = transport.then(|| tokio::time::Instant::now() + pool.transport_hold_max());
     let mut got = 0;
     while got < len {
-        let idle = (tokio::time::Instant::now() + pool.transport_hold()).min(cap);
-        match tokio::time::timeout_at(idle, r.read(&mut payload[got..])).await {
-            Ok(Ok(n)) if n > 0 => got += n,
+        let read = r.read(&mut payload[got..]);
+        let n = match cap {
+            Some(cap) => {
+                let idle = (tokio::time::Instant::now() + pool.transport_hold()).min(cap);
+                match tokio::time::timeout_at(idle, read).await {
+                    Ok(r) => r,
+                    Err(_) => return None,
+                }
+            }
+            None => read.await,
+        };
+        match n {
+            Ok(n) if n > 0 => got += n,
             _ => return None,
+        }
+        if got < len {
+            progress.report();
         }
     }
     Some((payload, charge))
@@ -480,6 +529,7 @@ async fn wait_charge(
 
 /// Relay side: no pool, a [`FrameDecoder`] over adaptive reads.
 async fn read_frames<R: AsyncRead + Unpin>(cid: u64, mut r: R, tx: mpsc::Sender<CarrierEv>) {
+    let mut progress = Progress::new(cid, tx.clone());
     let mut dec = FrameDecoder::new();
     let mut buf = ReadBuffer::new(None);
     loop {
@@ -525,6 +575,11 @@ async fn read_frames<R: AsyncRead + Unpin>(cid: u64, mut r: R, tx: mpsc::Sender<
                     return;
                 }
             }
+        }
+        if dec.held_bytes() > 0 {
+            progress.report();
+        } else {
+            progress.reset();
         }
     }
     let _ = tx.send(CarrierEv::Closed(cid)).await;
@@ -680,18 +735,10 @@ struct CarrierIo {
     tx: mpsc::Sender<Out>,
     reader: Task,
     writer: Task,
-    /// When the reader last received, and the writer last sent, a byte.
-    rx_at: Arc<Stamp>,
+    /// When the writer last sent a byte.
     tx_at: Arc<Stamp>,
     /// The reader's buffer (client side).
     _charge: Option<PoolGrant>,
-}
-
-impl CarrierIo {
-    /// When a byte last moved on this carrier, either way.
-    fn moved(&self) -> Option<tokio::time::Instant> {
-        self.rx_at.get().max(self.tx_at.get())
-    }
 }
 
 /// Run one client session over carriers from `connect`, bridging `app`.
@@ -777,14 +824,6 @@ where
 
     loop {
         let t = now();
-        // Bytes moving on the carrier, either way, show it is alive even
-        // while no whole frame came in: a slow carrier that keeps moving
-        // is not judged stalled (r8 N4/N5).
-        if let Some(cid) = s.carrier() {
-            if let Some(at) = carriers.get(&cid).and_then(CarrierIo::moved) {
-                s.note_carrier_activity(cid, at.into_std());
-            }
-        }
         s.handle_timeout(t);
         let backoff_ok = connect_backoff.is_none_or(|b| tokio::time::Instant::now() >= b);
         if !connecting && backoff_ok && s.wants_attach(t) {
@@ -914,6 +953,7 @@ where
                 match ev {
                     Some(CarrierEv::Frame(cid, Ok(f), _c)) => { let _ = s.on_frame(cid, f, t); }
                     Some(CarrierEv::Frame(cid, Err(e), _)) => s.on_decode_error(cid, e),
+                    Some(CarrierEv::Progress(cid)) => s.on_carrier_progress(cid, t),
                     Some(CarrierEv::Closed(cid)) => {
                         s.on_carrier_closed(cid, t);
                         if let Some(io) = carriers.remove(&cid) {
@@ -931,7 +971,7 @@ where
                     match res {
                         Ok(stream) => {
                             connect_backoff = None;
-                            let (r, w, rx_at, tx_at) = split_carrier(stream);
+                            let (r, w, tx_at) = split_carrier(stream);
                             let reader = spawn_reader(
                                 cid,
                                 r,
@@ -942,7 +982,7 @@ where
                             let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                                 let _ = etx.send(CarrierEv::Closed(cid)).await;
                             });
-                            carriers.insert(cid, CarrierIo { tx, reader, writer, rx_at, tx_at, _charge: None });
+                            carriers.insert(cid, CarrierIo { tx, reader, writer, tx_at, _charge: None });
                             s.attach(cid, now());
                         }
                         Err(_) => {
@@ -1302,12 +1342,6 @@ pub async fn run_relay_ctl(
 
     loop {
         let t = now();
-        // See the client: bytes moving on a session's carrier keep it live.
-        for (&cid, io) in &carriers {
-            if let Some(at) = io.moved() {
-                table.note_carrier_activity(cid, at.into_std());
-            }
-        }
         table.handle_timeout(t);
         // Upload drains that stopped progressing or ran too long (`Flush`).
         let tnow = tokio::time::Instant::now();
@@ -1453,13 +1487,13 @@ pub async fn run_relay_ctl(
                 Some(stream) => {
                     next_cid += 1;
                     let cid = next_cid;
-                    let (r, w, rx_at, tx_at) = split_carrier(stream);
+                    let (r, w, tx_at) = split_carrier(stream);
                     let reader = spawn_reader(cid, r, ev_tx.clone(), None);
                     let etx = ev_tx.clone();
                     let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                         let _ = etx.send(CarrierEv::Closed(cid)).await;
                     });
-                    carriers.insert(cid, CarrierIo { tx, reader, writer, rx_at, tx_at, _charge: None });
+                    carriers.insert(cid, CarrierIo { tx, reader, writer, tx_at, _charge: None });
                     table.add_carrier(cid);
                 }
                 None => accepting = false,
@@ -1469,6 +1503,7 @@ pub async fn run_relay_ctl(
                 match ev {
                     Some(CarrierEv::Frame(cid, Ok(f), _)) => table.on_frame(cid, f, t),
                     Some(CarrierEv::Frame(cid, Err(e), _)) => table.on_decode_error(cid, e),
+                    Some(CarrierEv::Progress(cid)) => table.on_carrier_progress(cid, t),
                     Some(CarrierEv::Closed(cid)) => {
                         if let Some(io) = carriers.remove(&cid) {
                             io.reader.abort();

@@ -157,6 +157,10 @@ pub struct ClientSession {
     /// Carriers lost in a row, each with data outstanding and no progress
     /// on it (r8 N5): they back off, and too many end the session.
     fruitless: u32,
+    /// When a frame last went out, and a keepalive ACK is owed (see
+    /// [`on_carrier_progress`](Self::on_carrier_progress)).
+    last_sent: Instant,
+    ka_due: bool,
     send: SendHalf,
     recv: RecvHalf,
     park: ParkTracker,
@@ -226,6 +230,8 @@ impl ClientSession {
             last_rx: now,
             progressed: false,
             fruitless: 0,
+            last_sent: now,
+            ka_due: false,
             send,
             recv,
             park: ParkTracker::default(),
@@ -307,6 +313,7 @@ impl ClientSession {
         self.park.cancel();
         self.last_rx = now;
         self.progressed = false;
+        self.ka_due = false;
         let hello = if !self.ever_opened {
             let retry = self.attached_once;
             if !retry {
@@ -388,13 +395,24 @@ impl ClientSession {
         }
     }
 
-    /// Bytes moved on carrier `cid` (either way) at `at`, though maybe no
-    /// whole frame yet: a carrier that keeps moving is not stalled, however
-    /// slowly it goes (r8 N4/N5).
-    pub fn note_carrier_activity(&mut self, cid: CarrierId, at: Instant) {
-        if self.carrier == Some(cid) && at > self.last_rx {
-            self.last_rx = at;
+    /// Bytes of a frame not yet complete arrived on carrier `cid` (the
+    /// driver's reader reports it, rate-limited): the relay and the path
+    /// are alive, only slow, so the carrier is not stalled (r8 N5). The
+    /// session repeats its current ACK (no offset moves; at most once per
+    /// keepalive period) so the relay's `t_live` sees the same. Only bytes
+    /// that arrived count, never bytes this side wrote.
+    pub fn on_carrier_progress(&mut self, cid: CarrierId, now: Instant) {
+        if self.carrier != Some(cid) || self.is_closed() {
+            return;
         }
+        self.last_rx = self.last_rx.max(now);
+        if self.confirmed && now >= self.last_sent + self.keepalive() {
+            self.ka_due = true;
+        }
+    }
+
+    fn keepalive(&self) -> std::time::Duration {
+        (self.cfg.timing.t_stall / 2).max(std::time::Duration::from_millis(10))
     }
 
     /// Carriers lost in a row with data outstanding and nothing moved on
@@ -608,8 +626,13 @@ impl ClientSession {
         if self.confirmed {
             let piggyback = self.send.has_sendable();
             if let Some(ack) = self.recv.poll_ack(now, piggyback) {
+                self.ka_due = false;
                 self.check_done();
                 return Some(TxNext::Frame(ack));
+            }
+            if self.ka_due && !self.send.has_sendable() {
+                self.ka_due = false;
+                return Some(TxNext::Frame(self.recv.force_ack()));
             }
         }
         Some(TxNext::Send)
@@ -632,11 +655,20 @@ impl ClientSession {
             return false;
         }
         self.send.has_sendable()
-            || (self.confirmed && self.recv.ack_deadline().is_some_and(|d| d <= now))
+            || (self.confirmed
+                && (self.ka_due || self.recv.ack_deadline().is_some_and(|d| d <= now)))
     }
 
     /// Next frame for carrier `cid`, if any.
     pub fn poll_transmit(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
+        let f = self.poll_transmit_inner(cid, now);
+        if f.is_some() {
+            self.last_sent = now;
+        }
+        f
+    }
+
+    fn poll_transmit_inner(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
         match self.next_tx(cid, now)? {
             TxNext::Hello => {
                 let mut h = self.hello.take().expect("checked");
@@ -655,6 +687,20 @@ impl ClientSession {
     /// buffer, r6 N13), using at most `room` bytes. DATA is cut to fit;
     /// an OPEN or RESUME that does not fit is kept and its size returned.
     pub fn poll_transmit_into(
+        &mut self,
+        cid: CarrierId,
+        now: Instant,
+        out: &mut Vec<u8>,
+        room: usize,
+    ) -> Tx {
+        let r = self.poll_transmit_into_inner(cid, now, out, room);
+        if r == Tx::Wrote {
+            self.last_sent = now;
+        }
+        r
+    }
+
+    fn poll_transmit_into_inner(
         &mut self,
         cid: CarrierId,
         now: Instant,

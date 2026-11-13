@@ -138,6 +138,10 @@ struct Session {
     /// When a frame of this session last went out (see
     /// [`RelayTable::keepalive`]).
     last_sent: Instant,
+    /// Bytes of a frame from the client are arriving: repeat the current
+    /// ACK so the client sees its carrier alive (see
+    /// [`RelayTable::on_carrier_progress`]).
+    ka_due: bool,
 }
 
 // Manual so the resume secret never reaches a log.
@@ -560,6 +564,7 @@ impl RelayTable {
                     created: now,
                     held_fin: None,
                     last_sent: now,
+                    ka_due: false,
                 };
                 self.sessions.insert(sid, s);
                 self.carriers.get_mut(&cid).unwrap().session = Some(sid);
@@ -675,7 +680,15 @@ impl RelayTable {
                 recv_offset,
                 max_offset,
             } => {
-                if s.send.on_ack(recv_offset, max_offset)? {
+                let progressed = s.send.on_ack(recv_offset, max_offset)?;
+                if s.state == SessionState::Active {
+                    // Any ACK on the current carrier shows the client is
+                    // taking what this side sends, if slowly: a client
+                    // receiving a large frame piecemeal repeats its ACK
+                    // (r8 N5), which keeps `t_live` from firing.
+                    s.last_progress = now;
+                }
+                if progressed {
                     s.last_progress = now;
                     if s.state == SessionState::Detached && s.carrier.is_some() {
                         // B1: ACK progress on the current carrier.
@@ -828,7 +841,8 @@ impl RelayTable {
         // would take the quiet carrier (its FIN unacknowledged) for a
         // stalled one. Repeat the current ACK (it moves no offset, so the
         // FIN stays unacknowledged) to show the carrier is alive.
-        if s.held_fin.is_some() && now >= s.last_sent + keepalive {
+        if s.ka_due || (s.held_fin.is_some() && now >= s.last_sent + keepalive) {
+            s.ka_due = false;
             s.last_sent = now;
             return Some(s.recv.force_ack());
         }
@@ -842,17 +856,25 @@ impl RelayTable {
         (self.cfg.timing.t_stall / 2).max(std::time::Duration::from_millis(10))
     }
 
-    /// Bytes moved on carrier `cid` (either way) at `at`, though maybe no
-    /// whole frame: an active session on it is making progress and is not
-    /// detached for want of an ACK while its carrier keeps moving, however
-    /// slowly (r8 N4/N5).
-    pub fn note_carrier_activity(&mut self, cid: CarrierId, at: Instant) {
+    /// Bytes of a frame not yet complete arrived on carrier `cid` (the
+    /// driver's reader reports it, rate-limited): the client and the path
+    /// are alive, only slow. The session repeats its current ACK (no
+    /// offset moves; at most once per keepalive period) so the client does
+    /// not take a carrier busy with a large frame for a stalled one
+    /// (r8 N5). Only bytes that arrived count, never bytes this side wrote:
+    /// a black-holed carrier's socket buffer absorbs writes.
+    pub fn on_carrier_progress(&mut self, cid: CarrierId, now: Instant) {
+        self.clock = self.clock.max(now);
+        let keepalive = self.keepalive();
         let Some(sid) = self.carriers.get(&cid).and_then(|c| c.session) else {
             return;
         };
         if let Some(s) = self.sessions.get_mut(&sid) {
-            if s.carrier == Some(cid) && s.state == SessionState::Active && at > s.last_progress {
-                s.last_progress = at;
+            if s.carrier == Some(cid)
+                && s.state == SessionState::Active
+                && now >= s.last_sent + keepalive
+            {
+                s.ka_due = true;
             }
         }
     }
