@@ -1,4 +1,4 @@
-//! Wire format (SESSION_PROTOCOL v0.4 §2).
+//! Wire format (SESSION_PROTOCOL v0.5 §2).
 //!
 //! `frame = type:u8 flags:u8 length:varint payload[length]`, varints are QUIC
 //! variable-length integers (RFC 9000 §16).
