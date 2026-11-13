@@ -675,7 +675,7 @@ fn svc_without_ech(rdata: &[u8]) -> Option<Vec<u8>> {
         match key {
             SVC_KEY_ECH => {}
             SVC_KEY_MANDATORY => {
-                if value.len() % 2 != 0 {
+                if !value.len().is_multiple_of(2) {
                     return None;
                 }
                 let keys: Vec<u8> = value
