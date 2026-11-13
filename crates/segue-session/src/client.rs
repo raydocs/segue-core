@@ -183,6 +183,8 @@ pub struct ClientSession {
     rx_partial: bool,
     /// Latest health report not yet taken (see [`Health`]).
     health: Option<Health>,
+    /// When the current carrier's attach was answered.
+    confirmed_at: Option<Instant>,
     /// When a frame last went out, and a keepalive ACK is owed (see
     /// [`on_carrier_progress`](Self::on_carrier_progress)).
     last_sent: Instant,
@@ -258,6 +260,7 @@ impl ClientSession {
             fruitless: 0,
             rx_partial: false,
             health: None,
+            confirmed_at: None,
             last_sent: now,
             ka_due: false,
             send,
@@ -369,6 +372,7 @@ impl ClientSession {
                 attach_gen: self.gen,
                 recv_offset: self.recv.recv_offset(),
                 max_offset: self.recv.max_offset(),
+                t_stall_ms: Some(self.stall_ms()),
             })
         };
         self.attached_once = true;
@@ -387,8 +391,15 @@ impl ClientSession {
             kind: self.params.kind,
             target: self.params.target.clone(),
             exit_class: self.params.exit_class,
+            t_stall_ms: Some(self.stall_ms()),
             first_data,
         }
+    }
+
+    /// This side's stall bound, told to the relay so its keepalive comes
+    /// often enough for it (r9).
+    fn stall_ms(&self) -> u64 {
+        self.cfg.timing.t_stall.as_millis().min(u64::MAX as u128) as u64
     }
 
     fn open_header_len(&self) -> usize {
@@ -506,7 +517,14 @@ impl ClientSession {
         // Anything outstanding, sent or not: bytes that arrived after the
         // last carrier that took data died are never sent before an
         // attach is answered, and must still count.
-        if !(expected || !self.confirmed || self.send.pending() || self.rx_partial) {
+        // A carrier answered and lost again before `t_live` without moving
+        // anything counts too: otherwise a path that accepts RESUME and
+        // drops the carrier at once is redialled in a tight loop. A carrier
+        // that served an idle session for longer and then closed does not.
+        let brief = self
+            .confirmed_at
+            .is_some_and(|c| now < c + self.cfg.timing.t_live);
+        if !(expected || !self.confirmed || brief || self.send.pending() || self.rx_partial) {
             return;
         }
         self.fruitless += 1;
@@ -613,7 +631,7 @@ impl ClientSession {
                 }
                 self.send.on_ack(o.recv_offset, o.max_offset)?;
                 self.instance_id = o.instance_id;
-                self.established();
+                self.established(now);
                 self.health = Some(Health::Up);
             }
             Frame::Resumed(r) => {
@@ -632,7 +650,7 @@ impl ClientSession {
                 // answers RESUME and then stalls keeps counting against
                 // the bound. Bytes the relay got that we had not seen
                 // acknowledged are progress.
-                self.established();
+                self.established(now);
                 if self.send.acked() > acked {
                     self.made_progress();
                 }
@@ -694,8 +712,9 @@ impl ClientSession {
         }
     }
 
-    fn established(&mut self) {
+    fn established(&mut self, now: Instant) {
         self.confirmed = true;
+        self.confirmed_at = Some(now);
         self.ever_opened = true;
         self.state = State::Active;
         self.attach_started = None;

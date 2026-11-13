@@ -372,8 +372,9 @@ enum CarrierEv {
     /// no frame came in (r8 N4/N5). See [`Progress`].
     Progress(u64),
     Closed(u64),
-    /// A frame on the carrier stopped arriving for the transport hold, or
-    /// outlived the hold cap: the reader gave the carrier up (r9 F2).
+    /// The carrier ended in the middle of a frame, or a frame on it
+    /// stopped arriving for the transport hold or outlived the hold cap:
+    /// it owed us bytes it never delivered (r9 F2).
     Stuck(u64),
 }
 
@@ -429,8 +430,7 @@ async fn read_charged<R: AsyncRead + Unpin>(
         let (payload, charge) =
             match read_body(&mut r, &pool, &slot, &mut ticket, &mut progress, len, cover).await {
                 Body::Read(p, c) => (p, c),
-                Body::Ended => break,
-                Body::Stuck => {
+                Body::Ended | Body::Stuck => {
                     let _ = tx.send(CarrierEv::Stuck(cid)).await;
                     return;
                 }
