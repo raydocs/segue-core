@@ -10,10 +10,7 @@ use async_trait::async_trait;
 use segue_kernel::dial::{Datagrams, DialError, Dialer, Stream, UdpSession};
 use segue_kernel::fakeip::FakeIpPool;
 use segue_kernel::policy::{Policy, PolicyStore};
-use segue_kernel::quic::{
-    hex, initial_for_test, QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2,
-    RFC9001_CLIENT_INITIAL,
-};
+use segue_kernel::quic::{hex, RFC9001_CLIENT_INITIAL, RFC9369_CLIENT_INITIAL};
 use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
 use segue_kernel::socks::{serve, Kernel, REP_CMD_UNSUPPORTED, REP_OK};
 use segue_kernel::udp::{Udp, UdpSettings};
@@ -472,159 +469,72 @@ async fn queued_bytes_are_bounded_per_association() {
     assert_eq!((got, udp.dropped()), (4, 6));
 }
 
-/// §5.2a.2: a bare-IP QUIC flow is routed by its Initial's SNI.
-#[tokio::test]
-async fn quic_initial_sni_routes_bare_ip_udp_by_name() {
-    let env = start(Some(settings()), None).await;
-    let (_, _ctl, relay) = associate(env.socks).await;
-    let c = client(relay).await;
-    let initial = hex(RFC9001_CLIENT_INITIAL);
-    c.send(&packet(&ip("8.8.8.8"), 443, &initial))
-        .await
-        .unwrap();
-    // (The fake session's 1000-byte payload limit drops the 1200-byte
-    // Initial itself; the dial is what is checked.)
-    for _ in 0..100 {
-        if !env.fake.calls().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        env.fake.calls(),
-        vec![(Some("proxy".into()), "example.com:443".into())]
-    );
+fn fake_pool() -> Arc<FakeIpPool> {
+    Arc::new(
+        FakeIpPool::new(
+            "198.18.0.0".parse().unwrap(),
+            15,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            [7; 32],
+        )
+        .unwrap(),
+    )
 }
 
-/// An AI name in a ClientHello split over two datagrams (real quic-go
-/// capture) is refused: nothing dialled, both datagrams dropped.
-#[tokio::test]
-async fn quic_ai_sni_split_over_two_datagrams_is_refused() {
-    let env = start(Some(settings()), None).await;
-    let (_, _ctl, relay) = associate(env.socks).await;
-    let c = client(relay).await;
-    for d in [QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2] {
-        c.send(&packet(&ip("8.8.8.8"), 443, &hex(d))).await.unwrap();
-    }
-    assert_eq!(recv(&c, QUIET).await, None);
-    assert!(env.fake.calls().is_empty(), "{:?}", env.fake.calls());
-    assert_eq!(env.udp.as_ref().unwrap().dropped(), 2);
+/// QUIC-shaped datagrams: v1, v2, an unknown version, and an Initial with
+/// a short header of another connection hidden behind it.
+fn quic_variants() -> Vec<Vec<u8>> {
+    let rfc = hex(RFC9001_CLIENT_INITIAL);
+    let mut unknown = rfc.clone();
+    unknown[1..5].copy_from_slice(&[0xff, 0, 0, 0x1d]);
+    let mut coalesced = rfc[..600].to_vec();
+    coalesced.extend_from_slice(b"\x40\x99\x99\x99\x99\x99\x99\x99\x99 hidden");
+    vec![rfc, hex(RFC9369_CLIENT_INITIAL), unknown, coalesced]
 }
 
-/// Until classified, QUIC that cannot be confirmed non-AI is refused (the
-/// app falls back to TCP): an incomplete ClientHello, anything on UDP/443
-/// that is not a readable Initial. Other UDP still goes by IP rules.
+/// r8 N1–N3 (§5.2a.2): QUIC to a bare IP is dropped on any port (SOCKS
+/// has no per-datagram refusal; the client's handshake times out and it
+/// falls back to TCP), and so is anything on UDP/443 to a bare IP. Nothing
+/// is dialled.
 #[tokio::test]
-async fn unconfirmed_quic_is_refused() {
-    let env = start(Some(settings()), None).await;
-    let (_, _ctl, relay) = associate(env.socks).await;
-    let c = client(relay).await;
-    let first = hex(QUIC_GO_CHATGPT_INITIAL);
-    for _ in 0..segue_kernel::quic::MAX_DATAGRAMS {
-        c.send(&packet(&ip("8.8.4.4"), 443, &first)).await.unwrap();
-    }
-    c.send(&packet(&ip("8.8.8.8"), 443, b"\x40short-header"))
-        .await
-        .unwrap();
-    assert_eq!(recv(&c, QUIET).await, None);
-    assert!(env.fake.calls().is_empty(), "{:?}", env.fake.calls());
-    c.send(&packet(&ip("8.8.8.8"), 3478, b"stun"))
-        .await
-        .unwrap();
-    assert!(recv(&c, WAIT).await.is_some());
-    assert_eq!(
-        env.fake.calls(),
-        vec![(Some("proxy".into()), "8.8.8.8:3478".into())]
-    );
-}
-
-/// N7: on one SOCKS UDP flow (same client socket, same destination), an
-/// allowed QUIC connection, then a new Initial (new DCID) naming an AI host.
-/// The AI connection is classified on its own: none of its datagrams reach
-/// the flow's outbound, while the first connection keeps flowing. Same for
-/// a non-443 flow that started as plain UDP.
-#[tokio::test]
-async fn second_quic_connection_on_same_flow_is_classified() {
-    for (port, first) in [
-        (443, hex(RFC9001_CLIENT_INITIAL)),
-        (8443, b"\x12\x34plain".to_vec()),
-    ] {
-        let env = start_max(Some(settings()), None, 1500).await;
-        let (_, _ctl, relay) = associate(env.socks).await;
-        let c = client(relay).await;
-        let dst = ip("8.8.8.8");
-        c.send(&packet(&dst, port, &first)).await.unwrap();
-        assert!(recv(&c, WAIT).await.is_some(), "{port}: first connection");
-        c.send(&packet(
-            &dst,
-            port,
-            &initial_for_test(&[9; 8], "chatgpt.com"),
-        ))
-        .await
-        .unwrap();
-        for d in [QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2] {
-            c.send(&packet(&dst, port, &hex(d))).await.unwrap();
-        }
-        // R7: QUIC the guard cannot attribute to the allowed connection (an
-        // unknown version, a Handshake to an ID nobody chose) never rides
-        // the flow, on any port.
-        let mut other_version = hex(RFC9001_CLIENT_INITIAL);
-        other_version[1..5].copy_from_slice(&[0xff, 0, 0, 0x1d]);
-        let mut handshake = vec![0xe0, 0, 0, 0, 1, 8];
-        handshake.extend_from_slice(&[8; 8]);
-        handshake.extend_from_slice(&[0, 4, 0, 0, 0, 0]);
-        for d in [other_version, handshake] {
-            c.send(&packet(&dst, port, &d)).await.unwrap();
-        }
-        // (Within the 300 ms idle timeout of the first connection.)
-        assert_eq!(
-            recv(&c, QUIET).await,
-            None,
-            "{port}: AI or unattributed QUIC echoed"
-        );
-        let short = b"\x40short header".to_vec();
-        c.send(&packet(&dst, port, &short)).await.unwrap();
-        assert!(recv(&c, WAIT).await.is_some(), "{port}: first still flows");
-        assert_eq!(*env.fake.sent.lock().unwrap(), vec![first.clone(), short]);
-        assert_eq!(env.fake.calls().len(), 1);
-        assert_eq!(env.udp.as_ref().unwrap().dropped(), 5);
-    }
-}
-
-/// R7 #2/#3 over SOCKS. The echo server reflects the client Initial, so
-/// the reply path learns a zero-length "server ID": that must not make
-/// every short header the allowed connection's. A short header to an
-/// unknown ID rides the flow only while no other outbound carries QUIC to
-/// the same server (the client switched to a CID issued inside the
-/// encryption); once another association reaches that server through
-/// another outbound, it is dropped (SOCKS cannot signal a refusal).
-#[tokio::test]
-async fn unknown_short_header_needs_an_uncontested_route() {
+async fn quic_to_bare_ip_is_dropped_on_any_port() {
     let env = start_max(Some(settings()), None, 1500).await;
-    let dst = ip("8.8.8.8");
-    let (_, _ctl_a, relay_a) = associate(env.socks).await;
-    let a = client(relay_a).await;
-    a.send(&packet(
-        &dst,
-        443,
-        &initial_for_test(&[1; 8], "example.com"),
-    ))
-    .await
-    .unwrap();
-    assert!(recv(&a, WAIT).await.is_some(), "first connection");
-    let rotated = b"\x40\x31\x31\x31\x31\x31\x31\x31\x31 rotated".to_vec();
-    a.send(&packet(&dst, 443, &rotated)).await.unwrap();
-    assert!(recv(&a, WAIT).await.is_some(), "rotated CID keeps flowing");
-    let (_, _ctl_b, relay_b) = associate(env.socks).await;
-    let b = client(relay_b).await;
-    b.send(&packet(
-        &dst,
-        443,
-        &initial_for_test(&[2; 8], "www.p2.test"),
-    ))
-    .await
-    .unwrap();
-    assert!(recv(&b, WAIT).await.is_some(), "other route's connection");
+    let (_, _ctl, relay) = associate(env.socks).await;
+    let c = client(relay).await;
+    let mut n = 0;
+    for port in [443, 8443] {
+        for d in quic_variants() {
+            c.send(&packet(&ip("8.8.8.8"), port, &d)).await.unwrap();
+            n += 1;
+        }
+    }
+    c.send(&packet(&ip("8.8.8.8"), 443, b"\x40short")).await.unwrap();
+    n += 1;
+    assert_eq!(recv(&c, QUIET).await, None);
+    assert!(env.fake.calls().is_empty(), "{:?}", env.fake.calls());
+    assert_eq!(env.udp.as_ref().unwrap().dropped(), n);
+}
+
+/// QUIC with a name known for certain (a domain in the request, or a
+/// fake IP) is routed by that name and the flow pinned: every datagram,
+/// whatever it looks like, rides it.
+#[tokio::test]
+async fn quic_to_a_name_is_routed_by_it_and_pinned() {
+    let pool = fake_pool();
+    let fake = TargetAddr::Ip(IpAddr::V4(pool.assign("www.p2.test", 0).unwrap()));
+    let env = start_max(Some(settings()), Some(pool), 1500).await;
+    let (_, _ctl, relay) = associate(env.socks).await;
+    let c = client(relay).await;
+    for dst in [dom("example.com"), fake.clone()] {
+        for d in quic_variants() {
+            c.send(&packet(&dst, 443, &d)).await.unwrap();
+            assert_eq!(recv(&c, WAIT).await.unwrap(), packet(&dst, 443, &d));
+        }
+        let short = b"\x40\x31\x31\x31\x31\x31\x31\x31\x31 rotated".to_vec();
+        c.send(&packet(&dst, 443, &short)).await.unwrap();
+        assert_eq!(recv(&c, WAIT).await.unwrap(), packet(&dst, 443, &short));
+    }
     assert_eq!(
         env.fake.calls(),
         vec![
@@ -632,8 +542,32 @@ async fn unknown_short_header_needs_an_uncontested_route() {
             (Some("p2".into()), "www.p2.test:443".into()),
         ]
     );
-    let moved = b"\x40\x32\x32\x32\x32\x32\x32\x32\x32 moved".to_vec();
-    a.send(&packet(&dst, 443, &moved)).await.unwrap();
-    assert_eq!(recv(&a, QUIET).await, None, "contested unknown ID dropped");
-    assert_eq!(env.udp.as_ref().unwrap().dropped(), 1);
+    // An AI name is refused as for any UDP to it.
+    c.send(&packet(&dom("chatgpt.com"), 443, &quic_variants()[0]))
+        .await
+        .unwrap();
+    assert_eq!(recv(&c, QUIET).await, None);
+    assert_eq!(env.fake.calls().len(), 2);
+}
+
+/// r8 N1: every datagram of a bare-IP flow is checked, not only the first.
+/// A plain flow is routed by IP; a QUIC datagram on it is dropped while
+/// plain datagrams keep flowing.
+#[tokio::test]
+async fn plain_flow_drops_each_quic_datagram() {
+    let env = start_max(Some(settings()), None, 1500).await;
+    let (_, _ctl, relay) = associate(env.socks).await;
+    let c = client(relay).await;
+    let dst = ip("8.8.8.8");
+    c.send(&packet(&dst, 8443, b"\x12\x34plain")).await.unwrap();
+    assert!(recv(&c, WAIT).await.is_some());
+    for d in quic_variants() {
+        c.send(&packet(&dst, 8443, &d)).await.unwrap();
+    }
+    assert_eq!(recv(&c, QUIET).await, None);
+    c.send(&packet(&dst, 8443, b"\x12\x34again")).await.unwrap();
+    assert!(recv(&c, WAIT).await.is_some());
+    assert_eq!(env.fake.calls(), vec![(Some("proxy".into()), "8.8.8.8:8443".into())]);
+    assert_eq!(env.udp.as_ref().unwrap().dropped(), 4);
+    assert_eq!(env.fake.sent.lock().unwrap().len(), 2);
 }

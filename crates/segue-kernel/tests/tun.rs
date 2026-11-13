@@ -11,8 +11,7 @@ use segue_kernel::dns::{answers_for_test, query_for_test, DnsSettings, SmartDns,
 use segue_kernel::fakeip::FakeIpPool;
 use segue_kernel::policy::{Policy, PolicyStore};
 use segue_kernel::quic::{
-    hex, initial_for_test, QUIC_GO_CHATGPT_INITIAL, QUIC_GO_CHATGPT_INITIAL_2,
-    RFC9001_CLIENT_INITIAL,
+    hex, QUIC_GO_CHATGPT_INITIAL, RFC9001_CLIENT_INITIAL, RFC9369_CLIENT_INITIAL,
 };
 use segue_kernel::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
 use segue_kernel::sniff::client_hello_for_test;
@@ -733,12 +732,7 @@ struct FakeDialer {
     udp_max: usize,
     /// Every datagram a UDP session was asked to send.
     udp_sent: Arc<Mutex<Vec<Vec<u8>>>>,
-    /// UDP sessions answer a QUIC v1 long-header datagram like a server:
-    /// a Handshake packet whose SCID is [`SERVER_CID`].
-    quic_server: bool,
 }
-
-const SERVER_CID: [u8; 8] = [0x5e; 8];
 
 #[async_trait]
 impl Dialer for FakeDialer {
@@ -796,7 +790,6 @@ impl Dialer for FakeDialer {
                 self.udp_max
             },
             sent: self.udp_sent.clone(),
-            quic_server: self.quic_server,
         }))
     }
 }
@@ -808,7 +801,6 @@ struct EchoSession {
     from: (TargetAddr, u16),
     max: usize,
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
-    quic_server: bool,
 }
 
 #[async_trait]
@@ -818,17 +810,8 @@ impl UdpSession for EchoSession {
     }
     async fn send(&self, _: &TargetAddr, _: u16, p: &[u8]) -> Result<(), DialError> {
         self.sent.lock().unwrap().push(p.to_vec());
-        let v =
-            if self.quic_server && p.len() >= 5 && p[0] & 0xc0 == 0xc0 && p[1..5] == [0, 0, 0, 1] {
-                let mut v = vec![0xe0, 0, 0, 0, 1, 0, SERVER_CID.len() as u8];
-                v.extend_from_slice(&SERVER_CID);
-                v.extend_from_slice(&[4, 0, 0, 0, 0]);
-                v
-            } else {
-                let mut v = b"echo:".to_vec();
-                v.extend_from_slice(p);
-                v
-            };
+        let mut v = b"echo:".to_vec();
+        v.extend_from_slice(p);
         self.tx.send(v).await.map_err(|e| DialError(e.to_string()))
     }
     async fn recv(&self, buf: &mut Vec<u8>) -> Result<(TargetAddr, u16), DialError> {
@@ -1562,46 +1545,6 @@ fn default_memory_budget_is_well_under_20_mib() {
     assert!(b.tcp_pool < cfg.max_tcp_flows * (cfg.tcp_rx_buffer + cfg.tcp_tx_buffer) / 4);
 }
 
-/// r7 #8: the per-connection sniff term covers what classifying one QUIC
-/// connection really allocates: three datagrams of a ClientHello that is
-/// not complete yet, held, plus the sniffer's state.
-#[test]
-fn quic_sniff_state_stays_within_its_budget_term() {
-    use segue_kernel::quic::{seal_initial_for_test, InitialSniffer, Quic};
-    // A ClientHello prefix whose extensions run past three datagrams.
-    let mut hello = vec![0x01, 0x00, 0x20, 0x00, 0x03, 0x03];
-    hello.extend_from_slice(&[7; 32]);
-    hello.extend_from_slice(&[0, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00, 0x1f, 0x00]);
-    hello.resize(4000, 0xfa);
-    let dcid = [9u8; 8];
-    let chunk = 1100;
-    let dgrams: Vec<Vec<u8>> = (0..3)
-        .map(|i| {
-            let off = i * chunk;
-            seal_initial_for_test(&dcid, off as u64, &hello[off..off + chunk])
-        })
-        .collect();
-    let mtu = dgrams.iter().map(Vec::len).max().unwrap();
-    counting::TRACKED.with(|t| t.set(true));
-    let base = counting::live();
-    let mut sniffer = InitialSniffer::default();
-    let mut held = Vec::with_capacity(3);
-    for d in &dgrams {
-        assert_eq!(sniffer.push(d), Quic::NeedMore);
-        held.push(d.clone());
-    }
-    let used = counting::live() - base;
-    counting::TRACKED.with(|t| t.set(false));
-    let term = segue_kernel::tun::sniff_state(mtu) as isize;
-    println!("classifying one connection holds {used} B, budget term {term} B");
-    assert!(
-        used >= 2 * 3 * chunk as isize,
-        "{used}: copies not measured"
-    );
-    assert!(used <= term, "{used} > {term}");
-    drop((sniffer, held));
-}
-
 struct RefuseAllRules;
 impl segue_kernel::tun::TunRouter for RefuseAllRules {
     fn route_tcp(&self, _: &FlowKey) -> segue_kernel::tun::TcpRoute {
@@ -1937,85 +1880,13 @@ async fn udp_dials(e: &Env) -> Vec<(Option<String>, TargetAddr, u16)> {
     Vec::new()
 }
 
-/// §5.2a.2 over TUN: a QUIC Initial's SNI routes the bare-IP flow by name.
-#[tokio::test]
-async fn tun_quic_sni_dials_by_name() {
-    let e = kernel_env(inline(), false, true, false, false);
-    let dst: SocketAddr = "8.8.8.8:443".parse().unwrap();
-    e.h.send(udp(CLIENT4, dst, &hex(RFC9001_CLIENT_INITIAL)))
-        .await;
-    assert_eq!(
-        udp_dials(&e).await,
-        vec![(
-            Some("p1".to_string()),
-            TargetAddr::Domain("example.com".into()),
-            443
-        )]
-    );
-}
-
-/// The AI name of a two-datagram ClientHello (real quic-go capture) is
-/// refused: nothing dialled, the flow's next datagram gets ICMP.
-#[tokio::test]
-async fn tun_quic_ai_sni_split_hello_is_refused() {
-    let mut e = kernel_env(inline(), false, true, false, false);
-    let dst: SocketAddr = "8.8.8.8:443".parse().unwrap();
-    let (a, b) = (hex(QUIC_GO_CHATGPT_INITIAL), hex(QUIC_GO_CHATGPT_INITIAL_2));
-    e.h.send(udp(CLIENT4, dst, &a)).await;
-    e.h.send(udp(CLIENT4, dst, &b)).await;
-    let mut icmp = None;
-    for _ in 0..50 {
-        e.h.send(udp(CLIENT4, dst, &a)).await;
-        if let Ok(Some(p)) =
-            tokio::time::timeout(Duration::from_millis(100), e.h.from_stack.recv()).await
-        {
-            icmp = Some(p);
-            break;
+async fn next_icmp(h: &mut Harness) -> (u8, u8, Vec<u8>) {
+    loop {
+        let p = h.next().await;
+        if out(&p).proto == IpProtocol::Icmp {
+            return icmpv4(&p);
         }
     }
-    let (t, code, _) = icmpv4(&icmp.expect("ICMP after refusal"));
-    assert_eq!((t, code), (3, 13));
-    assert!(e.dialer.udp_dials.lock().unwrap().is_empty());
-}
-
-/// A split ClientHello with a non-AI policy: held until the name is known,
-/// then dialled once, by that name.
-#[tokio::test]
-async fn tun_quic_split_hello_held_then_dialled_by_name() {
-    let rules = RuleSet::new(Vec::new(), Action::Proxy("p1".into()));
-    let e = kernel_env(
-        Policy::inline(rules, CidrTable::default()),
-        false,
-        true,
-        false,
-        false,
-    );
-    let dst: SocketAddr = "8.8.8.8:443".parse().unwrap();
-    e.h.send(udp(CLIENT4, dst, &hex(QUIC_GO_CHATGPT_INITIAL)))
-        .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(e.dialer.udp_dials.lock().unwrap().is_empty(), "held");
-    e.h.send(udp(CLIENT4, dst, &hex(QUIC_GO_CHATGPT_INITIAL_2)))
-        .await;
-    assert_eq!(
-        udp_dials(&e).await,
-        vec![(
-            Some("p1".to_string()),
-            TargetAddr::Domain("chatgpt.com".into()),
-            443
-        )]
-    );
-}
-
-/// Unreadable QUIC on UDP/443 is refused at once with ICMP.
-#[tokio::test]
-async fn tun_unconfirmed_quic_is_refused() {
-    let mut e = kernel_env(inline(), false, true, false, false);
-    e.h.send(udp(CLIENT4, "8.8.8.8:443".parse().unwrap(), b"\x40short"))
-        .await;
-    let (t, code, _) = icmpv4(&e.h.next().await);
-    assert_eq!((t, code), (3, 13));
-    assert!(e.dialer.udp_dials.lock().unwrap().is_empty());
 }
 
 /// Wait until the UDP sessions were asked to send `n` datagrams.
@@ -2030,82 +1901,116 @@ async fn udp_sent(e: &Env, n: usize) -> Vec<Vec<u8>> {
     e.dialer.udp_sent.lock().unwrap().clone()
 }
 
-/// N7 over TUN: on one UDP tuple, an allowed QUIC connection, then a new
-/// Initial (new DCID) naming an AI host. The AI connection's datagrams
-/// never reach the flow's outbound; the first connection keeps flowing.
-#[tokio::test]
-async fn tun_second_quic_connection_on_same_tuple_is_classified() {
-    for (dst, first) in [
-        // UDP/443, first connection non-AI QUIC.
-        ("8.8.8.8:443", hex(RFC9001_CLIENT_INITIAL)),
-        // Another port, plain UDP first (routed by IP), then QUIC.
-        ("8.8.8.8:8443", b"\x12\x34plain".to_vec()),
-    ] {
-        let e = kernel_env_with(
-            inline(),
-            false,
-            true,
-            false,
-            FakeDialer {
-                udp_max: 1500,
-                quic_server: true,
-                ..Default::default()
-            },
-        );
-        let dst: SocketAddr = dst.parse().unwrap();
-        e.h.send(udp(CLIENT4, dst, &first)).await;
-        assert_eq!(udp_sent(&e, 1).await, vec![first.clone()], "{dst}");
-        // The server's reply (its connection ID) reaches the client.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let ai = initial_for_test(&[9; 8], "chatgpt.com");
-        e.h.send(udp(CLIENT4, dst, &ai)).await;
-        let (a, b) = (hex(QUIC_GO_CHATGPT_INITIAL), hex(QUIC_GO_CHATGPT_INITIAL_2));
-        e.h.send(udp(CLIENT4, dst, &a)).await;
-        e.h.send(udp(CLIENT4, dst, &b)).await;
-        // R7: an unknown QUIC version never rides the flow, on any port.
-        let mut other_version = hex(RFC9001_CLIENT_INITIAL);
-        other_version[1..5].copy_from_slice(&[0xff, 0, 0, 0x1d]);
-        e.h.send(udp(CLIENT4, dst, &other_version)).await;
-        // On the QUIC flow a short header to an ID the reply path never
-        // saw is the connection after a CID change (no other route carries
-        // QUIC to this server: R7 #3); on the plain-UDP flow it is
-        // ordinary UDP.
-        let unknown = b"\x40\x01\x02\x03\x04\x05\x06\x07\x08 unknown".to_vec();
-        e.h.send(udp(CLIENT4, dst, &unknown)).await;
-        // The first connection still flows.
-        let mut short = vec![0x40];
-        short.extend_from_slice(&SERVER_CID);
-        short.extend_from_slice(b"short header");
-        e.h.send(udp(CLIENT4, dst, &short)).await;
-        let want = vec![first.clone(), unknown, short];
-        let sent = udp_sent(&e, want.len()).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let sent2 = e.dialer.udp_sent.lock().unwrap().clone();
-        assert_eq!(sent, sent2);
-        assert_eq!(sent, want, "{dst}: AI Initials not sent");
-        assert_eq!(e.dialer.udp_dials.lock().unwrap().len(), 1);
-    }
+/// A QUIC v1 Initial with an unknown version, the fixed bit greased away,
+/// and a short header of another connection hidden behind an Initial.
+fn quic_variants() -> Vec<(&'static str, Vec<u8>)> {
+    let rfc = hex(RFC9001_CLIENT_INITIAL);
+    let mut unknown = rfc.clone();
+    unknown[1..5].copy_from_slice(&[0xff, 0, 0, 0x1d]);
+    let mut greased = rfc.clone();
+    greased[0] &= !0x40;
+    let mut coalesced = rfc[..600].to_vec();
+    coalesced.extend_from_slice(b"\x40\x99\x99\x99\x99\x99\x99\x99\x99 hidden");
+    vec![
+        ("v1", rfc),
+        ("v2", hex(RFC9369_CLIENT_INITIAL)),
+        ("quic-go", hex(QUIC_GO_CHATGPT_INITIAL)),
+        ("unknown version", unknown),
+        ("fixed bit greased", greased),
+        ("coalesced", coalesced),
+    ]
 }
 
-/// The next ICMP the stack sends, skipping datagrams (QUIC replies).
-async fn next_icmp(h: &mut Harness) -> (u8, u8, Vec<u8>) {
-    loop {
-        let p = h.next().await;
-        if out(&p).proto == IpProtocol::Icmp {
-            return icmpv4(&p);
+/// §5.2a.2: to a fake IP the flow is routed by the recorded name at its
+/// first datagram and pinned there: every later datagram (short headers,
+/// other versions, a coalesced pair) rides the same flow, uninspected.
+#[tokio::test]
+async fn tun_quic_to_fake_ip_dials_by_name_and_stays_pinned() {
+    let e = kernel_env_with(
+        inline(),
+        false,
+        true,
+        false,
+        FakeDialer {
+            udp_max: 1500,
+            ..Default::default()
+        },
+    );
+    let ip = e.pool.assign("example.com", 0).unwrap();
+    let dst = SocketAddr::new(IpAddr::V4(ip), 443);
+    let mut sent = Vec::new();
+    for (_, d) in quic_variants() {
+        e.h.send(udp(CLIENT4, dst, &d)).await;
+        sent.push(d);
+    }
+    let short = b"\x40\x01\x02\x03\x04\x05\x06\x07\x08 short".to_vec();
+    e.h.send(udp(CLIENT4, dst, &short)).await;
+    sent.push(short);
+    assert_eq!(udp_sent(&e, sent.len()).await, sent);
+    assert_eq!(
+        e.dialer.udp_dials.lock().unwrap().clone(),
+        vec![(
+            Some("p1".to_string()),
+            TargetAddr::Domain("example.com".into()),
+            443
+        )]
+    );
+}
+
+/// The fake IP's name decides, as for TCP: an AI name (no UDP on that
+/// exit) is refused with "administratively prohibited", never dialled.
+#[tokio::test]
+async fn tun_quic_to_fake_ip_of_ai_name_is_refused() {
+    let mut e = kernel_env(inline(), false, true, false, false);
+    let ip = e.pool.assign("chatgpt.com", 0).unwrap();
+    let dst = SocketAddr::new(IpAddr::V4(ip), 443);
+    e.h.send(udp(CLIENT4, dst, &hex(QUIC_GO_CHATGPT_INITIAL)))
+        .await;
+    let (t, code, _) = next_icmp(&mut e.h).await;
+    assert_eq!((t, code), (3, 13));
+    assert!(e.dialer.udp_dials.lock().unwrap().is_empty());
+}
+
+/// r8 N1–N3: QUIC to a real IP is refused at its first datagram with ICMP
+/// port unreachable (the app falls back to TCP at once), on any port and
+/// whatever the version, the fixed bit or what hides behind the first
+/// packet. Nothing is dialled.
+#[tokio::test]
+async fn tun_quic_to_real_ip_is_refused_at_once() {
+    for port in [443, 8443] {
+        for (name, d) in quic_variants() {
+            let mut e = kernel_env(inline(), false, true, false, false);
+            let dst = SocketAddr::new("8.8.8.8".parse().unwrap(), port);
+            e.h.send(udp(CLIENT4, dst, &d)).await;
+            let (t, code, _) = next_icmp(&mut e.h).await;
+            assert_eq!((t, code), (3, 3), "{name} on {port}");
+            // Every retry too.
+            e.h.send(udp(CLIENT4, dst, &d)).await;
+            let (t, code, _) = next_icmp(&mut e.h).await;
+            assert_eq!((t, code), (3, 3), "{name} on {port}, again");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(e.dialer.udp_dials.lock().unwrap().is_empty(), "{name}");
         }
     }
 }
 
-/// R7 #2 + #3 over TUN. An ordinary UDP flow (direct by IP) on which an
-/// allowed QUIC connection starts is a QUIC flow from then on. While no
-/// other route carries QUIC to that server, a short header to an ID the
-/// guard never saw (a CID the server issued inside the encryption) keeps
-/// flowing; once another flow carries QUIC to the same server by another
-/// outbound, such a packet may be a connection that migrated from there,
-/// so the flow is refused with ICMP (fail fast, never a silent black hole).
+/// UDP/443 to a real IP is taken for QUIC whatever it carries.
 #[tokio::test]
-async fn tun_unknown_cid_flows_until_another_route_claims_the_server() {
+async fn tun_udp_443_to_real_ip_is_refused() {
+    let mut e = kernel_env(inline(), false, true, false, false);
+    e.h.send(udp(CLIENT4, "8.8.8.8:443".parse().unwrap(), b"\x40short"))
+        .await;
+    let (t, code, _) = next_icmp(&mut e.h).await;
+    assert_eq!((t, code), (3, 3));
+    assert!(e.dialer.udp_dials.lock().unwrap().is_empty());
+}
+
+/// r8 N1: a plain UDP flow to a real IP goes by the IP rules, but every
+/// datagram is checked: the first QUIC one refuses the flow (ICMP, not
+/// sent) and the flow stays refused; short headers and other plain UDP
+/// before it flow.
+#[tokio::test]
+async fn tun_plain_udp_flow_turning_quic_is_refused() {
     let mut e = kernel_env_with(
         inline(),
         false,
@@ -2113,57 +2018,35 @@ async fn tun_unknown_cid_flows_until_another_route_claims_the_server() {
         false,
         FakeDialer {
             udp_max: 1500,
-            quic_server: true,
             ..Default::default()
         },
     );
-    let dst: SocketAddr = "192.0.2.1:8443".parse().unwrap();
+    let dst: SocketAddr = "8.8.8.8:8443".parse().unwrap();
     let plain = b"\x12\x34plain".to_vec();
+    let short = b"\x40\x01\x02\x03\x04\x05\x06\x07\x08 short".to_vec();
     e.h.send(udp(CLIENT4, dst, &plain)).await;
-    let first = initial_for_test(&[1; 8], "example.com");
-    e.h.send(udp(CLIENT4, dst, &first)).await;
-    assert_eq!(udp_sent(&e, 2).await, vec![plain.clone(), first.clone()]);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    // A rotated ID: carried.
-    let rotated = b"\x40\x31\x31\x31\x31\x31\x31\x31\x31 rotated".to_vec();
-    e.h.send(udp(CLIENT4, dst, &rotated)).await;
-    assert_eq!(udp_sent(&e, 3).await.last(), Some(&rotated));
-    // Another app socket: QUIC to the same server through outbound p2.
-    let other_src: SocketAddr = "172.19.0.2:40001".parse().unwrap();
-    let p2 = initial_for_test(&[2; 8], "www.p2.test");
-    e.h.send(udp(other_src, dst, &p2)).await;
-    assert_eq!(udp_sent(&e, 4).await.last(), Some(&p2));
+    e.h.send(udp(CLIENT4, dst, &short)).await;
+    assert_eq!(udp_sent(&e, 2).await, vec![plain.clone(), short.clone()]);
     assert_eq!(
-        e.dialer
-            .udp_dials
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|d| d.0.clone())
-            .collect::<Vec<_>>(),
-        vec![None, Some("p2".to_string())]
+        udp_dials(&e).await,
+        vec![(
+            Some("p1".to_string()),
+            TargetAddr::Ip("8.8.8.8".parse().unwrap()),
+            8443
+        )]
     );
+    e.h.send(udp(CLIENT4, dst, &hex(RFC9001_CLIENT_INITIAL)))
+        .await;
+    let (t, code, _) = next_icmp(&mut e.h).await;
+    assert_eq!((t, code), (3, 3));
+    e.h.send(udp(CLIENT4, dst, &plain)).await;
+    let (t, code, _) = next_icmp(&mut e.h).await;
+    assert_eq!((t, code), (3, 3), "stays refused");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // The first flow's learned ID still flows; a new unknown ID now
-    // refuses the flow: never sent, and the app gets ICMP.
-    e.h.send(udp(CLIENT4, dst, &rotated)).await;
-    assert_eq!(udp_sent(&e, 5).await.last(), Some(&rotated));
-    let moved = b"\x40\x32\x32\x32\x32\x32\x32\x32\x32 moved".to_vec();
-    e.h.send(udp(CLIENT4, dst, &moved)).await;
-    e.h.send(udp(CLIENT4, dst, &moved)).await;
-    let (t, code, _) = tokio::time::timeout(Duration::from_secs(2), next_icmp(&mut e.h))
-        .await
-        .expect("the refused flow gets ICMP");
-    assert_eq!((t, code), (3, 13));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        e.dialer.udp_sent.lock().unwrap().len(),
-        5,
-        "moved never sent"
-    );
+    assert_eq!(e.dialer.udp_sent.lock().unwrap().len(), 2);
+    assert_eq!(e.dialer.udp_dials.lock().unwrap().len(), 1);
 }
 
-// ---------------------------------------------------------------------------
 // r6 R5: a TUN flow through a real segue session keeps moving bytes both
 // ways while every elastic block of the shared pool is held elsewhere.
 
