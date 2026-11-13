@@ -567,8 +567,10 @@ impl KernelDialer {
     ) -> Result<crate::dial::Stream, DialError> {
         let start = Instant::now();
         let mut tries = 0;
+        let mut pin = None;
         loop {
-            match self.open_once(r, addr, port).await {
+            let mut exit = None;
+            match self.open_once(r, addr, port, pin, &mut exit).await {
                 Err((e, Some(c)))
                     if c == code::UNKNOWN_SESSION
                         && tries < FRESH_OPENS
@@ -576,6 +578,18 @@ impl KernelDialer {
                 {
                     tries += 1;
                     eprintln!("segue-kernel: {e}; opening a fresh session");
+                    // The relay answered on that exit (r10 failover): the
+                    // path works, the first OPEN was only slow (T_attach)
+                    // or lost. That answer is proof for the exit, and the
+                    // fresh session goes to the same exit: re-picking
+                    // would move it (under Auto) to an exit that has not
+                    // failed lately only because nothing tried it, and
+                    // the failures the slow OPEN reported would refuse a
+                    // strict flow on the exit that just answered.
+                    if let Some(i) = exit {
+                        relay_answered(&mut self.state.lock().unwrap().health[i]);
+                        pin = Some(i);
+                    }
                 }
                 res => return res.map_err(|(e, _)| e),
             }
@@ -587,6 +601,8 @@ impl KernelDialer {
         r: &SegueRoute,
         addr: &TargetAddr,
         port: u16,
+        pin: Option<usize>,
+        exit: &mut Option<usize>,
     ) -> Result<crate::dial::Stream, (DialError, Option<u8>)> {
         let i = {
             let st = self.state.lock().unwrap();
@@ -602,7 +618,8 @@ impl KernelDialer {
             if self.exits.is_empty() {
                 return Err((DialError("refused: no exits configured".into()), None));
             }
-            let i = st.pick();
+            let i = pin.unwrap_or_else(|| st.pick());
+            *exit = Some(i);
             let h = &st.health[i];
             // Refused at once while the exit's carrier connects fail, or
             // its sessions are backing off after failures (r9 F5).
@@ -753,6 +770,14 @@ impl Drop for HealthReporter {
             st.health[self.i].sessions.remove(&self.id);
         }
     }
+}
+
+/// The relay answered a session on this exit with a protocol frame (a
+/// REJECT it sends only when it read our OPEN): the path works.
+fn relay_answered(h: &mut Health) {
+    h.unproven = false;
+    h.last_fail = None;
+    h.ks.on_event(Event::ChannelUp);
 }
 
 fn mark_failed(h: &mut Health) {

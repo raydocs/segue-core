@@ -44,6 +44,8 @@ struct Node {
     /// this many bytes and then drops everything (control streams are
     /// spared): a path that answers RESUME and stalls mid-DATA.
     cut: Arc<AtomicUsize>,
+    /// The next this many carriers drop everything from the start.
+    drop_next: Arc<AtomicUsize>,
 }
 
 /// Engine stand-in: `dial(Some(carrier), relay)` → a pipe into that
@@ -206,7 +208,11 @@ impl Dialer for Engine {
         // that drops every byte both ways and closes nothing.
         let (client, a) = tokio::io::duplex(64 << 10);
         let (b, relay) = tokio::io::duplex(64 << 10);
-        let hole = Arc::new(AtomicBool::new(false));
+        let dropped = node
+            .drop_next
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        let hole = Arc::new(AtomicBool::new(dropped));
         let is_control = Arc::new(AtomicBool::new(false));
         node.holes
             .lock()
@@ -295,6 +301,7 @@ fn node(auth: Box<dyn Authorizer>, site: Option<SiteConnector>, cfg: Config) -> 
         holes: Holes::default(),
         sites,
         cut: Arc::default(),
+        drop_next: Arc::default(),
     }
 }
 
@@ -308,6 +315,7 @@ struct Lab {
     la_holes: Holes,
     la_ctrl: mpsc::Sender<RelayCtrl>,
     la_cut: Arc<AtomicUsize>,
+    la_drop_next: Arc<AtomicUsize>,
     engine: Arc<Engine>,
 }
 
@@ -336,6 +344,7 @@ fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg:
     let la = node(la_auth, la_site, la_cfg);
     let ny = node(Box::new(AllowAll), None, Config::default());
     let la_cut = la.cut.clone();
+    let la_drop_next = la.drop_next.clone();
     let (la_up, ny_up) = (la.up.clone(), ny.up.clone());
     let (la_carriers, ny_carriers) = (la.carriers.clone(), ny.carriers.clone());
     let la_sites = la.sites.clone();
@@ -380,6 +389,7 @@ fn lab_cfg(la_auth: Box<dyn Authorizer>, la_site: Option<SiteConnector>, la_cfg:
         la_holes,
         la_ctrl,
         la_cut,
+        la_drop_next,
         engine,
     }
 }
@@ -1261,4 +1271,35 @@ async fn one_good_and_one_bad_session_on_an_exit() {
         .expect("AI flow after recovery got nothing")
         .unwrap();
     assert!(n > 0);
+}
+
+/// r10 failover (e2e "Auto failover"): under Auto, la works (probed) and
+/// ny is down but has not failed lately (nothing tried it). An AI flow's
+/// first OPEN on la is lost, so it is retried after T_attach and the
+/// relay answers the retry UNKNOWN_SESSION (it never saw the first). That
+/// slow OPEN reported failures that took la down; the fresh session then
+/// re-picked an exit and went to ny, whose carrier is down, and the AI
+/// flow failed although la had just answered. Now the relay's answer is
+/// proof for la and the fresh session stays on it.
+#[tokio::test]
+async fn a_fresh_session_after_unknown_session_stays_on_the_exit_that_answered() {
+    let l = lab();
+    l.d.probe().await.unwrap();
+    assert_eq!(l.d.posture(), Posture::Connected);
+    l.ny_up.store(false, Ordering::SeqCst);
+    l.la_drop_next.store(1, Ordering::SeqCst);
+    let sites = l.la_sites.load(Ordering::SeqCst);
+    let s = tokio::time::timeout(Duration::from_secs(15), l.d.dial(Some("ai"), &site(), 443))
+        .await
+        .expect("AI dial hung")
+        .expect("AI flow failed although la answered");
+    roundtrip(s).await;
+    assert_eq!(
+        l.la_sites.load(Ordering::SeqCst),
+        sites + 1,
+        "site connected more than once"
+    );
+    assert_eq!(l.ny_carriers.load(Ordering::SeqCst), 0, "moved to ny");
+    assert_eq!(l.d.posture(), Posture::Connected);
+    assert_eq!(l.d.status().current_exit.as_deref(), Some("la"));
 }
