@@ -11,8 +11,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use segue_kernel::dial::{DialError, Dialer, Stream};
 use segue_kernel::dns::{
-    answers_for_test, query_for_test, serve_tcp, serve_udp, DnsSettings, SmartDns, RCODE_NXDOMAIN,
-    RCODE_OK, RCODE_REFUSED, RCODE_SERVFAIL, TYPE_A, TYPE_AAAA,
+    answers_for_test, query_for_test, serve_tcp, serve_udp, DnsSettings, SmartDns, Transport,
+    RCODE_NXDOMAIN, RCODE_OK, RCODE_REFUSED, RCODE_SERVFAIL, TYPE_A, TYPE_AAAA,
 };
 use segue_kernel::fakeip::FakeIpPool;
 use segue_kernel::policy::{
@@ -549,7 +549,7 @@ async fn smart_dns(domestic: Vec<SocketAddr>, pool: Arc<FakeIpPool>) -> Arc<Smar
 
 async fn ask(dns: &Arc<SmartDns>, id: u16, name: &str, qtype: u16) -> (u8, Vec<IpAddr>) {
     let reply = dns
-        .handle(&query_for_test(id, name, qtype))
+        .handle(&query_for_test(id, name, qtype), Transport::Udp(65535))
         .await
         .expect("reply");
     let (rid, rcode, ips) = answers_for_test(&reply).expect("parse");
@@ -642,21 +642,30 @@ async fn smart_dns_classifies_and_caches() {
     // the client's id restored.
     let hits = up.hits.load(Ordering::SeqCst);
     let reply = dns
-        .handle(&query_for_test(0xbeef, "cdn.example", 16))
+        .handle(
+            &query_for_test(0xbeef, "cdn.example", 16),
+            Transport::Udp(65535),
+        )
         .await
         .unwrap();
     assert_eq!(&reply[..2], &[0xbe, 0xef]);
     assert_eq!(up.hits.load(Ordering::SeqCst), hits + 1);
     // ...and for a fake-IP name is answered empty locally.
     let reply = dns
-        .handle(&query_for_test(0xcafe, "chat.openai.com", 16))
+        .handle(
+            &query_for_test(0xcafe, "chat.openai.com", 16),
+            Transport::Udp(65535),
+        )
         .await
         .unwrap();
     assert_eq!(answers_for_test(&reply), Some((0xcafe, RCODE_OK, vec![])));
     assert_eq!(up.hits.load(Ordering::SeqCst), hits + 1);
 
     // Garbage is dropped or FORMERR'd, never a panic.
-    assert!(dns.handle(&[1, 2, 3]).await.is_none());
+    assert!(dns
+        .handle(&[1, 2, 3], Transport::Udp(65535))
+        .await
+        .is_none());
 }
 
 #[tokio::test]

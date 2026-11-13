@@ -29,7 +29,11 @@
 //! config sends its real server name in the clear, so the SNI sniffer
 //! (§5.2a.1) can route by it.
 //!
-//! Not done: ECS, TCP fallback to upstreams on a truncated reply, binding
+//! A reply is rebuilt only when it carries an `ech` to remove; otherwise
+//! it is passed on byte for byte. A truncated upstream reply is fetched
+//! again over TCP; replies to UDP clients are cut to their EDNS size.
+//!
+//! Not done: ECS, binding
 //! upstream sockets to a protected interface (the shell's job under TUN).
 
 use std::collections::{HashMap, HashSet};
@@ -52,6 +56,8 @@ pub const TYPE_SVCB: u16 = 64;
 pub const TYPE_HTTPS: u16 = 65;
 const TYPE_CNAME: u16 = 5;
 const TYPE_OPT: u16 = 41;
+const FLAG_TC: u8 = 0x02;
+const FLAG_AD: u8 = 0x20;
 const CLASS_IN: u16 = 1;
 /// SvcParamKey `ech` (RFC 9460 §14.3.2; ECH config list, RFC 9848).
 pub const SVC_KEY_ECH: u16 = 5;
@@ -68,6 +74,15 @@ const NEGATIVE_TTL: u32 = 30;
 /// A cache entry this far past its expiry is no longer served stale.
 const MAX_STALE: Duration = Duration::from_secs(3600);
 const TCP_IDLE: Duration = Duration::from_secs(10);
+
+/// How a reply goes back to the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// UDP; the most payload the path carries (TUN: MTU less headers).
+    Udp(usize),
+    /// TCP (length-prefixed): no size limit but the 16-bit length.
+    Tcp,
+}
 
 pub struct DnsSettings {
     pub domestic: Vec<SocketAddr>,
@@ -147,7 +162,19 @@ impl SmartDns {
     /// cache, the fake-IP pool or any upstream is touched (§5.4). The policy
     /// is read again after every upstream wait; an answer is always rendered
     /// under the policy in force when it is sent.
-    pub async fn handle(self: &Arc<Self>, query: &[u8]) -> Option<Vec<u8>> {
+    ///
+    /// Over UDP the reply is cut to the client's EDNS size (512 without
+    /// OPT) and the path's `cap`: header, question and OPT with TC
+    /// ([`truncate_udp`]); over TCP it is whole (r10 N8).
+    pub async fn handle(self: &Arc<Self>, query: &[u8], via: Transport) -> Option<Vec<u8>> {
+        let reply = self.answer(query).await?;
+        Some(match via {
+            Transport::Udp(cap) => truncate_udp(reply, udp_limit(query, cap)),
+            Transport::Tcp => reply,
+        })
+    }
+
+    async fn answer(self: &Arc<Self>, query: &[u8]) -> Option<Vec<u8>> {
         let q = match parse_question(query) {
             Ok(q) => q,
             Err(Some((id, rd))) => return Some(header_only(id, rd, RCODE_FORMERR)),
@@ -354,19 +381,31 @@ impl SmartDns {
         self.upstream_queries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let packet = Arc::new(packet);
-        let mut set = JoinSet::new();
+        let mut set: JoinSet<std::io::Result<Vec<u8>>> = JoinSet::new();
         for &server in &self.s.domestic {
             let packet = packet.clone();
-            let timeout = self.s.query_timeout;
-            set.spawn(
-                async move { tokio::time::timeout(timeout, exchange(server, &packet)).await },
-            );
+            let deadline = tokio::time::Instant::now() + self.s.query_timeout;
+            set.spawn(async move {
+                let late = || std::io::Error::from(std::io::ErrorKind::TimedOut);
+                let reply = tokio::time::timeout_at(deadline, exchange(server, &packet))
+                    .await
+                    .map_err(|_| late())??;
+                if reply[2] & FLAG_TC == 0 {
+                    return Ok(reply);
+                }
+                // Truncated upstream: ask the same server again over TCP
+                // (RFC 7766); keep the truncated reply if that fails.
+                match tokio::time::timeout_at(deadline, exchange_tcp(server, &packet)).await {
+                    Ok(Ok(full)) => Ok(full),
+                    _ => Ok(reply),
+                }
+            });
         }
         // First definitive answer (NOERROR/NXDOMAIN) wins; a fast
         // SERVFAIL/REFUSED must not beat a good answer still in flight.
         let mut fallback = None;
         while let Some(done) = set.join_next().await {
-            if let Ok(Ok(Ok(reply))) = done {
+            if let Ok(Ok(reply)) = done {
                 let rcode = reply.get(3).map_or(RCODE_SERVFAIL, |b| b & 0x0f);
                 if rcode == RCODE_OK || rcode == RCODE_NXDOMAIN {
                     return Some(reply);
@@ -389,19 +428,44 @@ async fn exchange(server: SocketAddr, packet: &[u8]) -> std::io::Result<Vec<u8>>
     let sock = UdpSocket::bind(bind).await?;
     sock.connect(server).await?;
     sock.send(packet).await?;
-    let want_q = question_bytes(packet).ok_or(std::io::ErrorKind::InvalidInput)?;
+    question_bytes(packet).ok_or(std::io::ErrorKind::InvalidInput)?;
     let mut buf = vec![0u8; 65535];
     loop {
         let n = sock.recv(&mut buf).await?;
-        let r = &buf[..n];
-        if n >= 12 && r[..2] == packet[..2] && r[2] & 0x80 != 0 {
-            if let Some(got_q) = question_bytes(r) {
-                if got_q.eq_ignore_ascii_case(want_q) {
-                    return Ok(r.to_vec());
-                }
-            }
+        if answers_query(packet, &buf[..n]) {
+            return Ok(buf[..n].to_vec());
         }
     }
+}
+
+/// One exchange over TCP (after a truncated UDP reply).
+async fn exchange_tcp(server: SocketAddr, packet: &[u8]) -> std::io::Result<Vec<u8>> {
+    question_bytes(packet).ok_or(std::io::ErrorKind::InvalidInput)?;
+    let len = u16::try_from(packet.len()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    let mut conn = TcpStream::connect(server).await?;
+    let mut framed = Vec::with_capacity(packet.len() + 2);
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(packet);
+    conn.write_all(&framed).await?;
+    loop {
+        let n = usize::from(conn.read_u16().await?);
+        let mut r = vec![0u8; n];
+        conn.read_exact(&mut r).await?;
+        if answers_query(packet, &r) {
+            return Ok(r);
+        }
+    }
+}
+
+/// `r` is a response with the ID and question of `packet`.
+fn answers_query(packet: &[u8], r: &[u8]) -> bool {
+    r.len() >= 12
+        && r[..2] == packet[..2]
+        && r[2] & 0x80 != 0
+        && matches!(
+            (question_bytes(r), question_bytes(packet)),
+            (Some(got), Some(want)) if got.eq_ignore_ascii_case(want)
+        )
 }
 
 /// Bytes of the single question section, if the message has exactly one.
@@ -533,20 +597,27 @@ fn parse_answers(msg: &[u8], qtype: u16) -> Option<(u8, Vec<IpAddr>, u32)> {
     Some((rcode, ips, ttl))
 }
 
-/// `msg` without the `ech` SvcParam in its HTTPS / SVCB records (r9 F4);
-/// None if the message cannot be walked.
-///
-/// A message with no such parameter is returned unchanged. Otherwise it is
-/// rebuilt: header and question as they were; every answer with its owner
-/// name written out in full (no compression) and, for CNAME, its target
-/// too; HTTPS / SVCB data without `ech` (and without `ech` in `mandatory`,
-/// which is dropped once empty); other answer data verbatim (RFC 3597:
-/// only well-known types compress names in their data; CNAME is the one
-/// an HTTPS / SVCB answer chain carries). The authority section and all
-/// additional records but OPT are dropped: a client needs neither to use
-/// the answer, and keeping them would mean rewriting their compressed
-/// names too.
-pub fn strip_ech(msg: &[u8]) -> Option<Vec<u8>> {
+/// One resource record of a walked message (offsets into it).
+struct RrAt {
+    /// 0 answer, 1 authority, 2 additional.
+    section: usize,
+    name: usize,
+    ty: u16,
+    /// Offset of TYPE (the 10-byte fixed part).
+    fixed: usize,
+    data: std::ops::Range<usize>,
+}
+
+/// The layout of a message: where its questions end, every record.
+struct Walk {
+    qd: usize,
+    question_end: usize,
+    rrs: Vec<RrAt>,
+}
+
+/// Walk every section of `msg` without following pointers. None if a
+/// count or length runs past the end.
+fn walk(msg: &[u8]) -> Option<Walk> {
     if msg.len() < 12 {
         return None;
     }
@@ -558,77 +629,259 @@ pub fn strip_ech(msg: &[u8]) -> Option<Vec<u8>> {
         msg.get(..p)?;
     }
     let question_end = p;
-    struct Rr {
-        name: usize,
-        ty: u16,
-        fixed: usize,
-        data: (usize, usize),
-    }
     let mut rrs = Vec::with_capacity(an + ns + ar);
-    let mut found = false;
-    for _ in 0..an + ns + ar {
+    for i in 0..an + ns + ar {
         let name = p;
         p = skip_name(msg, p)?;
         let h = msg.get(p..p + 10)?;
         let ty = u16::from_be_bytes([h[0], h[1]]);
         let rdlen = usize::from(u16::from_be_bytes([h[8], h[9]]));
-        let data = (p + 10, p + 10 + rdlen);
-        let rdata = msg.get(data.0..data.1)?;
-        if ty == TYPE_HTTPS || ty == TYPE_SVCB {
-            found |= svc_params(rdata)?.iter().any(|&(k, _)| k == SVC_KEY_ECH);
-        }
-        rrs.push(Rr {
+        let data = p + 10..p + 10 + rdlen;
+        msg.get(data.clone())?;
+        rrs.push(RrAt {
+            section: if i < an {
+                0
+            } else if i < an + ns {
+                1
+            } else {
+                2
+            },
             name,
             ty,
             fixed: p,
-            data,
+            data: data.clone(),
         });
-        p = data.1;
+        p = data.end;
     }
-    if !found {
+    Some(Walk {
+        qd,
+        question_end,
+        rrs,
+    })
+}
+
+/// The EDNS UDP payload size a query offers (its OPT record's class).
+fn edns_size(msg: &[u8]) -> Option<u16> {
+    let w = walk(msg)?;
+    let opt = w.rrs.iter().find(|r| r.ty == TYPE_OPT)?;
+    Some(u16::from_be_bytes([msg[opt.fixed + 2], msg[opt.fixed + 3]]))
+}
+
+/// Largest UDP reply to `query`: its EDNS size (never below 512, RFC 6891
+/// §6.2.5), or 512 without OPT; and no more than the path carries (`cap`).
+fn udp_limit(query: &[u8], cap: usize) -> usize {
+    edns_size(query)
+        .map_or(512, |s| usize::from(s).max(512))
+        .min(cap)
+}
+
+/// `reply` if it fits in `limit` bytes; otherwise header and question with
+/// TC set, and the reply's OPT record kept (RFC 6891 §7; its options
+/// dropped only if even they do not fit), so the client retries over TCP.
+fn truncate_udp(reply: Vec<u8>, limit: usize) -> Vec<u8> {
+    if reply.len() <= limit {
+        return reply;
+    }
+    let Some(w) = walk(&reply) else {
+        // Unwalkable: the header alone, nothing claimed.
+        let mut out = reply[..12.min(reply.len())].to_vec();
+        if out.len() == 12 {
+            out[2] |= FLAG_TC;
+            out[4..12].fill(0);
+        }
+        return out;
+    };
+    // Header and question keep their offsets: any pointer inside the
+    // question stays valid.
+    let mut out = reply[..w.question_end].to_vec();
+    out[2] |= FLAG_TC;
+    out[6..12].fill(0);
+    let opt = w.rrs.iter().find(|r| r.ty == TYPE_OPT && r.section == 2);
+    if let Some(opt) = opt {
+        let whole = &reply[opt.name..opt.data.end];
+        if out.len() + whole.len() <= limit {
+            out.extend_from_slice(whole);
+        } else {
+            out.extend_from_slice(&reply[opt.name..opt.fixed + 8]);
+            out.extend_from_slice(&[0, 0]);
+        }
+        out[10..12].copy_from_slice(&1u16.to_be_bytes());
+    }
+    out
+}
+
+/// `name` at `p` written out in full, lowercase (RRset owner comparison).
+fn lower_name(msg: &[u8], p: usize) -> Option<Vec<u8>> {
+    let mut n = Vec::new();
+    expand_name(msg, p, &mut n)?;
+    n.make_ascii_lowercase();
+    Some(n)
+}
+
+/// `msg` without the `ech` SvcParam in its HTTPS / SVCB records (r9 F4);
+/// None if the message cannot be walked or safely rebuilt (the caller
+/// answers SERVFAIL).
+///
+/// A message with no HTTPS / SVCB record carrying `ech` is returned byte
+/// for byte (r10 N8). Otherwise it is decoded and encoded again (r10 N7,
+/// N8), every section kept:
+///
+/// - header as it was but AD cleared: the rewritten RRsets are no longer
+///   what was validated (RFC 4035 §3.2.3); CD, RD and the OPT record (DO
+///   bit, options) untouched;
+/// - every name written out in full, no compression: owners, the question
+///   and the names inside the data of the types that may carry compressed
+///   names (RFC 1035 NS, MD, MF, CNAME, SOA, MB, MG, MR, PTR, MINFO, MX;
+///   RFC 3597 §4 RP, AFSDB, RT, PX, NAPTR, SRV), so no pointer can land on
+///   a moved offset;
+/// - HTTPS / SVCB data without `ech` (and without `ech` in `mandatory`,
+///   which is dropped once empty);
+/// - RRSIG records covering an HTTPS / SVCB RRset that was rewritten are
+///   dropped: they no longer verify. Other signatures stay;
+/// - data of the other known types verbatim (their names are never
+///   compressed: [`NO_COMPRESSED_NAMES`]).
+///
+/// A record of any other (unknown) type makes it None: its data might hold
+/// a compressed name we cannot find, and removing just the HTTPS / SVCB
+/// records would move offsets just the same. SERVFAIL is the safe answer:
+/// no ECH config and no corrupt message reaches the client. Size limits
+/// are applied by the caller, per transport.
+pub fn strip_ech(msg: &[u8]) -> Option<Vec<u8>> {
+    let w = walk(msg)?;
+    let mut rewritten: Vec<(Vec<u8>, u16)> = Vec::new();
+    for rr in &w.rrs {
+        if rr.ty == TYPE_HTTPS || rr.ty == TYPE_SVCB {
+            let params = svc_params(&msg[rr.data.clone()])?;
+            if params.iter().any(|&(k, _)| k == SVC_KEY_ECH) {
+                rewritten.push((lower_name(msg, rr.name)?, rr.ty));
+            }
+        }
+    }
+    if rewritten.is_empty() {
         return Some(msg.to_vec());
     }
-    let mut out = Vec::with_capacity(msg.len());
+    let mut out = Vec::with_capacity(msg.len() + 128);
     out.extend_from_slice(&msg[..12]);
-    out.extend_from_slice(&msg[12..question_end]);
-    let (mut n_an, mut n_ar) = (0u16, 0u16);
-    for (i, rr) in rrs.iter().enumerate() {
-        let answer = i < an;
-        if !answer && !(i >= an + ns && rr.ty == TYPE_OPT) {
-            continue;
-        }
-        let rdata = &msg[rr.data.0..rr.data.1];
-        let data = match rr.ty {
-            TYPE_HTTPS | TYPE_SVCB if answer => svc_without_ech(rdata)?,
-            TYPE_CNAME if answer => {
-                let mut d = Vec::new();
-                expand_name(msg, rr.data.0, &mut d)?;
-                d
+    out[3] &= !FLAG_AD;
+    let mut p = 12;
+    for _ in 0..w.qd {
+        p = expand_name(msg, p, &mut out)?;
+        out.extend_from_slice(msg.get(p..p + 4)?);
+        p += 4;
+    }
+    let mut counts = [0u16; 3];
+    for rr in &w.rrs {
+        let rdata = &msg[rr.data.clone()];
+        if rr.ty == TYPE_RRSIG && rdata.len() >= 2 {
+            let covered = u16::from_be_bytes([rdata[0], rdata[1]]);
+            if (covered == TYPE_HTTPS || covered == TYPE_SVCB)
+                && rewritten.contains(&(lower_name(msg, rr.name)?, covered))
+            {
+                continue;
             }
-            _ => rdata.to_vec(),
-        };
+        }
         expand_name(msg, rr.name, &mut out)?;
         out.extend_from_slice(&msg[rr.fixed..rr.fixed + 8]);
-        out.extend_from_slice(&u16::try_from(data.len()).ok()?.to_be_bytes());
-        out.extend_from_slice(&data);
-        if answer {
-            n_an += 1;
-        } else {
-            n_ar += 1;
+        let len_at = out.len();
+        out.extend_from_slice(&[0, 0]);
+        match rr.ty {
+            TYPE_HTTPS | TYPE_SVCB => out.extend_from_slice(&svc_without_ech(rdata)?),
+            ty => expand_rdata(msg, ty, rr.data.clone(), &mut out)?,
         }
+        let len = u16::try_from(out.len() - len_at - 2).ok()?;
+        out[len_at..len_at + 2].copy_from_slice(&len.to_be_bytes());
+        counts[rr.section] += 1;
     }
-    out[6..8].copy_from_slice(&n_an.to_be_bytes());
-    out[8..10].copy_from_slice(&0u16.to_be_bytes());
-    out[10..12].copy_from_slice(&n_ar.to_be_bytes());
-    if out.len() > msg.len().max(512) {
-        // Names written out grew it past what the upstream sent (and past
-        // the classic UDP size): header and question with TC, so the
-        // client asks again over TCP.
-        out.truncate(question_end);
-        out[2] |= 0x02;
-        out[6..12].fill(0);
+    for (i, n) in counts.iter().enumerate() {
+        out[6 + 2 * i..8 + 2 * i].copy_from_slice(&n.to_be_bytes());
     }
     (out.len() <= usize::from(u16::MAX)).then_some(out)
+}
+
+const TYPE_NS: u16 = 2;
+const TYPE_MD: u16 = 3;
+const TYPE_MF: u16 = 4;
+const TYPE_SOA: u16 = 6;
+const TYPE_MB: u16 = 7;
+const TYPE_MG: u16 = 8;
+const TYPE_MR: u16 = 9;
+const TYPE_PTR: u16 = 12;
+const TYPE_MINFO: u16 = 14;
+const TYPE_MX: u16 = 15;
+const TYPE_RP: u16 = 17;
+const TYPE_AFSDB: u16 = 18;
+const TYPE_RT: u16 = 21;
+const TYPE_PX: u16 = 26;
+const TYPE_SRV: u16 = 33;
+const TYPE_NAPTR: u16 = 35;
+const TYPE_RRSIG: u16 = 46;
+
+/// Types whose data never holds a compressed name (no name at all, or one
+/// its RFC forbids compressing: DNAME, RRSIG / NSEC signer and next name,
+/// IPSECKEY gateway, HIP servers, SVCB / HTTPS TargetName).
+const NO_COMPRESSED_NAMES: &[u16] = &[
+    1, 10, 11, 13, 16, 19, 20, 22, 25, 27, 28, 29, 37, 39, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+    51, 52, 53, 55, 59, 60, 61, 62, 63, 64, 65, 99, 108, 109, 256, 257,
+];
+
+/// Append the data of a `ty` record at `range` of `msg` with every name in
+/// it written out in full. None if malformed, or if `ty` is unknown.
+fn expand_rdata(
+    msg: &[u8],
+    ty: u16,
+    range: std::ops::Range<usize>,
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let end = range.end;
+    let name = |p: usize, out: &mut Vec<u8>| -> Option<usize> {
+        let q = expand_name(msg, p, out)?;
+        (q <= end).then_some(q)
+    };
+    let fixed = |p: usize, n: usize, out: &mut Vec<u8>| -> Option<usize> {
+        let q = p.checked_add(n).filter(|&q| q <= end)?;
+        out.extend_from_slice(&msg[p..q]);
+        Some(q)
+    };
+    let p = range.start;
+    let p = match ty {
+        TYPE_NS | TYPE_MD | TYPE_MF | TYPE_CNAME | TYPE_MB | TYPE_MG | TYPE_MR | TYPE_PTR => {
+            name(p, out)?
+        }
+        TYPE_SOA => {
+            let p = name(p, out)?;
+            let p = name(p, out)?;
+            fixed(p, 20, out)?
+        }
+        TYPE_MINFO | TYPE_RP => {
+            let p = name(p, out)?;
+            name(p, out)?
+        }
+        TYPE_MX | TYPE_AFSDB | TYPE_RT => {
+            let p = fixed(p, 2, out)?;
+            name(p, out)?
+        }
+        TYPE_PX => {
+            let p = fixed(p, 2, out)?;
+            let p = name(p, out)?;
+            name(p, out)?
+        }
+        TYPE_SRV => {
+            let p = fixed(p, 6, out)?;
+            name(p, out)?
+        }
+        TYPE_NAPTR => {
+            // order, preference, then flags / services / regexp strings.
+            let mut p = fixed(p, 4, out)?;
+            for _ in 0..3 {
+                let len = usize::from(*msg.get(p).filter(|_| p < end)?);
+                p = fixed(p, 1 + len, out)?;
+            }
+            name(p, out)?
+        }
+        t if NO_COMPRESSED_NAMES.contains(&t) => fixed(p, end - p, out)?,
+        _ => return None,
+    };
+    (p == end).then_some(())
 }
 
 /// The SvcParams of SVCB / HTTPS data: (key, value range). None if
@@ -700,23 +953,26 @@ fn svc_without_ech(rdata: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Append the name at `p` of `msg` uncompressed. Pointers must point
-/// backwards (so the walk ends); at most 255 bytes of name.
-fn expand_name(msg: &[u8], mut p: usize, out: &mut Vec<u8>) -> Option<()> {
+/// Append the name at `p` of `msg` uncompressed; returns where the name
+/// ends at `p` (after its first pointer or its root label). Pointers must
+/// point backwards (so the walk ends); at most 255 bytes of name.
+fn expand_name(msg: &[u8], mut p: usize, out: &mut Vec<u8>) -> Option<usize> {
     let mut total = 0usize;
     let mut limit = p;
+    let mut end = None;
     loop {
         let len = *msg.get(p)?;
         match len {
             0 => {
                 out.push(0);
-                return Some(());
+                return Some(end.unwrap_or(p + 1));
             }
             l if l & 0xc0 == 0xc0 => {
                 let to = usize::from(u16::from_be_bytes([l & 0x3f, *msg.get(p + 1)?]));
                 if to >= limit {
                     return None;
                 }
+                end.get_or_insert(p + 2);
                 limit = to;
                 p = to;
             }
@@ -824,7 +1080,10 @@ async fn serve_udp_limited(
         let (sock, dns) = (sock.clone(), dns.clone());
         tokio::spawn(async move {
             let _permit = permit;
-            if let Some(reply) = dns.handle(&msg).await {
+            if let Some(reply) = dns
+                .handle(&msg, Transport::Udp(usize::from(u16::MAX)))
+                .await
+            {
                 let _ = sock.send_to(&reply, peer).await;
             }
         });
@@ -874,7 +1133,7 @@ async fn tcp_conn(mut conn: TcpStream, dns: &Arc<SmartDns>) -> std::io::Result<(
         tokio::time::timeout(TCP_IDLE, conn.read_exact(&mut msg))
             .await
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
-        let Some(reply) = dns.handle(&msg).await else {
+        let Some(reply) = dns.handle(&msg, Transport::Tcp).await else {
             return Ok(());
         };
         let mut framed = Vec::with_capacity(reply.len() + 2);
@@ -989,7 +1248,10 @@ mod tests {
         let ask = |name: &'static str| {
             let dns = dns.clone();
             tokio::spawn(async move {
-                let r = dns.handle(&query_for_test(1, name, TYPE_A)).await.unwrap();
+                let r = dns
+                    .handle(&query_for_test(1, name, TYPE_A), Transport::Udp(65535))
+                    .await
+                    .unwrap();
                 answers_for_test(&r).unwrap()
             })
         };
@@ -1138,8 +1400,10 @@ mod tests {
             m.extend_from_slice(&(rd.len() as u16).to_be_bytes());
             m.extend_from_slice(&rd);
         }
-        // Authority: SOA-ish record owned by x.test (pointer), opaque data.
-        m.extend_from_slice(&[0xc0, 16, 0, 6, 0, 1, 0, 0, 0, 60, 0, 3, 1, 2, 3]);
+        // Authority: SOA owned by x.test (pointer), its names compressed.
+        m.extend_from_slice(&[0xc0, 16, 0, 6, 0, 1, 0, 0, 0, 60, 0, 29]);
+        m.extend_from_slice(&[2, b'n', b's', 0xc0, 16, 1, b'h', 0xc0, 16]);
+        m.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5]);
         // Additional: OPT.
         m.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
         m
@@ -1160,7 +1424,6 @@ mod tests {
             out.push((ty, name, m[p + 10..p + 10 + len].to_vec()));
             p += 10 + len;
         }
-        assert_eq!(p, m.len() - 11, "only the OPT record follows");
         out
     }
 
@@ -1170,14 +1433,16 @@ mod tests {
 
     /// r9 F4 (a): the `ech` SvcParam leaves every HTTPS record (and the
     /// `mandatory` list), other params stay in order; names come out
-    /// whole; CNAME target intact; authority dropped, OPT kept.
+    /// whole; CNAME target intact; authority kept with its SOA names
+    /// written out, OPT kept.
     #[test]
     fn strip_ech_removes_only_the_ech_param() {
         let mandatory: (u16, &[u8]) = (0, &[0, 1, 0, 5]);
         let m = https_reply(&[&[mandatory, ALPN, HINT, ECH], &[ALPN, ECH]]);
         let out = strip_ech(&m).unwrap();
         assert_eq!(&out[..2], &m[..2]);
-        assert_eq!(u16::from_be_bytes([out[8], out[9]]), 0, "authority dropped");
+        assert_eq!(u16::from_be_bytes([out[8], out[9]]), 1, "authority kept");
+        assert!(out.ends_with(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]));
         assert_eq!(u16::from_be_bytes([out[10], out[11]]), 1, "OPT kept");
         let a = answers(&out);
         let full = |s: &str| {
@@ -1240,22 +1505,9 @@ mod tests {
         }
     }
 
-    /// r9 F4 (a) end to end: an HTTPS query for an unmatched name goes to
-    /// the domestic resolver; its ECH config does not reach the client.
-    #[tokio::test]
-    async fn passthrough_https_answer_has_no_ech() {
-        let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = up.local_addr().unwrap();
-        let canned = https_reply(&[&[ALPN, ECH]]);
-        tokio::spawn(async move {
-            let mut b = [0u8; 1500];
-            while let Ok((n, from)) = up.recv_from(&mut b).await {
-                let mut r = canned.clone();
-                r[..2].copy_from_slice(&b[..2]);
-                let _ = up.send_to(&r, from).await;
-                let _ = n;
-            }
-        });
+    /// A smart DNS whose one domestic resolver is `addr`; every name is
+    /// unmatched (passed through).
+    fn dns_to(addr: SocketAddr) -> Arc<SmartDns> {
         let policy = PolicyStore::inline(Policy::inline(
             crate::rules::RuleSet::new(vec![], Action::Proxy("p".into())),
             crate::rules::CidrTable::default(),
@@ -1275,9 +1527,31 @@ mod tests {
             query_timeout: Duration::from_millis(500),
             cache_size: 16,
         };
-        let dns = Arc::new(SmartDns::new(policy, pool, settings));
+        Arc::new(SmartDns::new(policy, pool, settings))
+    }
+
+    /// r9 F4 (a) end to end: an HTTPS query for an unmatched name goes to
+    /// the domestic resolver; its ECH config does not reach the client.
+    #[tokio::test]
+    async fn passthrough_https_answer_has_no_ech() {
+        let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = up.local_addr().unwrap();
+        let canned = https_reply(&[&[ALPN, ECH]]);
+        tokio::spawn(async move {
+            let mut b = [0u8; 1500];
+            while let Ok((n, from)) = up.recv_from(&mut b).await {
+                let mut r = canned.clone();
+                r[..2].copy_from_slice(&b[..2]);
+                let _ = up.send_to(&r, from).await;
+                let _ = n;
+            }
+        });
+        let dns = dns_to(addr);
         let reply = dns
-            .handle(&query_for_test(0x4242, "www.x.test", TYPE_HTTPS))
+            .handle(
+                &query_for_test(0x4242, "www.x.test", TYPE_HTTPS),
+                Transport::Udp(65535),
+            )
             .await
             .unwrap();
         let a = answers(&reply);
@@ -1286,5 +1560,305 @@ mod tests {
             a[1].2,
             [&[0u8, 1, 0][..], &[0, 1, 0, 3], b"\x02h2"].concat()
         );
+    }
+
+    /// Every record of `m` as (section, owner, type, class+TTL, data), all
+    /// names written out: what a client decodes, whatever the compression.
+    type Decoded = Vec<(usize, Vec<u8>, u16, Vec<u8>, Vec<u8>)>;
+    fn decode(m: &[u8]) -> Decoded {
+        let w = walk(m).unwrap();
+        w.rrs
+            .iter()
+            .map(|r| {
+                let mut owner = Vec::new();
+                expand_name(m, r.name, &mut owner).unwrap();
+                let mut data = Vec::new();
+                match r.ty {
+                    TYPE_HTTPS | TYPE_SVCB => data.extend_from_slice(&m[r.data.clone()]),
+                    ty => expand_rdata(m, ty, r.data.clone(), &mut data).unwrap(),
+                }
+                (
+                    r.section,
+                    owner,
+                    r.ty,
+                    m[r.fixed + 2..r.fixed + 8].to_vec(),
+                    data,
+                )
+            })
+            .collect()
+    }
+
+    fn name_bytes(s: &str) -> Vec<u8> {
+        let mut v = Vec::new();
+        encode_name(&mut v, s).unwrap();
+        v
+    }
+
+    /// Append one record (owner bytes as given, possibly a pointer).
+    fn rr(m: &mut Vec<u8>, owner: &[u8], ty: u16, data: &[u8]) {
+        m.extend_from_slice(owner);
+        m.extend_from_slice(&ty.to_be_bytes());
+        m.extend_from_slice(&[0, 1, 0, 0, 1, 44]);
+        m.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        m.extend_from_slice(data);
+    }
+
+    fn ptr(at: usize) -> [u8; 2] {
+        [0xc0 | (at >> 8) as u8, at as u8]
+    }
+
+    fn https_data(ech: bool) -> Vec<u8> {
+        let mut d = vec![0, 1, 0];
+        d.extend_from_slice(&[0, 1, 0, 3, 2, b'h', b'2']);
+        if ech {
+            d.extend_from_slice(&[0, 5, 0, 4, 0xfe, 0x0d, 0, 0]);
+        }
+        d
+    }
+
+    fn rrsig(covered: u16) -> Vec<u8> {
+        let mut d = covered.to_be_bytes().to_vec();
+        // alg, labels, original TTL, expiration, inception, key tag.
+        d.extend_from_slice(&[13, 3, 0, 0, 1, 44, 0, 0, 0, 9, 0, 0, 0, 1, 0, 7]);
+        d.extend_from_slice(&name_bytes("x.test"));
+        d.extend_from_slice(&[0xaa; 64]);
+        d
+    }
+
+    /// OPT: UDP size 1232, DO set, a cookie option.
+    const OPT: &[u8] = &[
+        0, 0, 41, 0x04, 0xd0, 0, 0, 0x80, 0, 0, 12, 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8,
+    ];
+
+    /// An ANY reply for www.x.test, AD and CD set, every name after the
+    /// question compressed: CNAME to cdn.x.test, HTTPS of cdn (with or
+    /// without ech) and its RRSIG, then MX of cdn whose exchange points
+    /// into the CNAME data (a cross-RDATA pointer) and its RRSIG; an
+    /// authority NS whose target points into the MX data; the OPT above.
+    fn any_reply(ech: bool) -> Vec<u8> {
+        let mut m = query_for_test(0x77, "www.x.test", 255);
+        m[2] = 0x81;
+        m[3] = 0x80 | FLAG_AD | 0x10; // RA, AD, CD
+        m[6..12].copy_from_slice(&[0, 5, 0, 1, 0, 1]);
+        let cdn = m.len() + 12;
+        rr(
+            &mut m,
+            &ptr(12),
+            TYPE_CNAME,
+            &[&b"\x03cdn"[..], &ptr(16)].concat(),
+        );
+        rr(&mut m, &ptr(cdn), TYPE_HTTPS, &https_data(ech));
+        rr(&mut m, &ptr(cdn), TYPE_RRSIG, &rrsig(TYPE_HTTPS));
+        let mail = m.len() + 12 + 2;
+        rr(
+            &mut m,
+            &ptr(cdn),
+            TYPE_MX,
+            &[&[0u8, 10, 4][..], b"mail", &ptr(cdn)].concat(),
+        );
+        rr(&mut m, &ptr(cdn), TYPE_RRSIG, &rrsig(TYPE_MX));
+        rr(
+            &mut m,
+            &ptr(16),
+            TYPE_NS,
+            &[&b"\x02ns"[..], &ptr(mail)].concat(),
+        );
+        m.extend_from_slice(OPT);
+        m
+    }
+
+    /// r10 N7 / N8: a reply with no ech is passed on byte for byte, AD and
+    /// signatures included.
+    #[test]
+    fn no_ech_is_byte_for_byte_with_ad_and_rrsig() {
+        let m = any_reply(false);
+        assert_eq!(decode(&m).len(), 7, "fixture walks");
+        assert_eq!(strip_ech(&m).unwrap(), m);
+    }
+
+    /// r10 N7 / N8: with ech removed, AD is cleared (CD, RD, RA kept), the
+    /// RRSIG over the rewritten HTTPS RRset is dropped, the one over MX
+    /// stays, the OPT record (DO bit, cookie) is unchanged, and every
+    /// other record decodes as before though its pointers moved.
+    #[test]
+    fn rewrite_clears_ad_drops_stale_rrsig_and_expands_rdata() {
+        let m = any_reply(true);
+        let out = strip_ech(&m).unwrap();
+        assert_eq!(out[2], m[2]);
+        assert_eq!(out[3], m[3] & !FLAG_AD);
+        assert_eq!(out[3] & 0x10, 0x10, "CD kept");
+        assert!(out.ends_with(OPT), "OPT, DO and options as they were");
+        let (want, got) = (decode(&m), decode(&out));
+        let mut expect: Decoded = want
+            .into_iter()
+            .filter(|r| !(r.2 == TYPE_RRSIG && r.4[..2] == TYPE_HTTPS.to_be_bytes()))
+            .collect();
+        expect[1].4 = https_data(false);
+        assert_eq!(got, expect);
+        assert_eq!(&out[6..12], &[0, 4, 0, 1, 0, 1]);
+        // The MX exchange and NS target come out whole.
+        let full = |s: &str| name_bytes(s);
+        assert_eq!(
+            got[2].4,
+            [&[0u8, 10][..], &full("mail.cdn.x.test")].concat()
+        );
+        assert_eq!(got[4].4, full("ns.mail.cdn.x.test"));
+        // No pointer is left anywhere after the header.
+        let w = walk(&out).unwrap();
+        for r in &w.rrs {
+            assert_eq!(skip_name(&out, r.name).unwrap() - r.name, {
+                let mut n = Vec::new();
+                expand_name(&out, r.name, &mut n).unwrap();
+                n.len()
+            });
+        }
+        assert_eq!(strip_ech(&out).unwrap(), out, "idempotent");
+    }
+
+    /// r10 N8: a type we cannot rebuild safely next to an ech to strip
+    /// makes the reply unusable (SERVFAIL by the caller); without ech it
+    /// passes untouched.
+    #[test]
+    fn unknown_type_with_ech_is_refused_without_is_passed() {
+        for ech in [true, false] {
+            let mut m = any_reply(ech);
+            m[7] += 1;
+            let at = m.len() - OPT.len();
+            let mut tail = Vec::new();
+            rr(&mut tail, &ptr(16), 0xff00, &[0xc0, 12]);
+            m.splice(at..at, tail);
+            assert!(decode_ok(&m));
+            if ech {
+                assert_eq!(strip_ech(&m), None);
+            } else {
+                assert_eq!(strip_ech(&m).unwrap(), m);
+            }
+        }
+    }
+
+    fn decode_ok(m: &[u8]) -> bool {
+        walk(m).is_some()
+    }
+
+    /// r10 N8: long names, many HTTPS records, all compressed: the
+    /// rebuilt reply decodes to the same records less ech, however much
+    /// it grew.
+    #[test]
+    fn long_names_and_many_https_records_rebuild_exactly() {
+        let long = format!(
+            "{}.{}.{}.x.test",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(60)
+        );
+        let mut m = query_for_test(9, &long, TYPE_HTTPS);
+        m[2] = 0x81;
+        m[3] = 0x80;
+        let n = 12u16;
+        m[6..8].copy_from_slice(&n.to_be_bytes());
+        for i in 0..n {
+            let mut d = https_data(true);
+            d[1] = i as u8 + 1;
+            rr(&mut m, &ptr(12), TYPE_HTTPS, &d);
+        }
+        m[10..12].copy_from_slice(&1u16.to_be_bytes());
+        m.extend_from_slice(OPT);
+        let out = strip_ech(&m).unwrap();
+        assert!(out.len() > m.len() + 11 * 190, "names written out");
+        let got = decode(&out);
+        assert_eq!(got.len(), 13);
+        for (i, r) in got.iter().take(12).enumerate() {
+            assert_eq!(r.1, name_bytes(&long));
+            let mut d = https_data(false);
+            d[1] = i as u8 + 1;
+            assert_eq!(r.4, d);
+        }
+        // Over UDP without EDNS: cut to 512 with TC; header + question.
+        let q = query_for_test(9, &long, TYPE_HTTPS);
+        let cut = truncate_udp(out.clone(), udp_limit(&q, 65535));
+        assert_eq!(cut[2] & FLAG_TC, FLAG_TC);
+        assert!(cut.len() <= 512);
+        assert_eq!(&cut[4..12], &[0, 1, 0, 0, 0, 0, 0, 1], "OPT kept");
+        assert!(cut.ends_with(OPT));
+        // A client offering 4096 gets it whole; the path cap still applies.
+        let mut q4096 = q.clone();
+        q4096[10..12].copy_from_slice(&1u16.to_be_bytes());
+        q4096.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(udp_limit(&q4096, 65535), 4096);
+        assert_eq!(truncate_udp(out.clone(), udp_limit(&q4096, 65535)), out);
+        assert_eq!(udp_limit(&q4096, 1472), 1472);
+        // EDNS sizes below 512 count as 512 (RFC 6891 §6.2.5).
+        let at = q4096.len() - 8;
+        q4096[at..at + 2].copy_from_slice(&[0, 100]);
+        assert_eq!(udp_limit(&q4096, 65535), 512);
+    }
+
+    /// An HTTPS reply too big for a 512-byte UDP answer even before the
+    /// rewrite, every record with ech.
+    fn big_https_reply(id: u16) -> Vec<u8> {
+        let mut m = query_for_test(id, "www.x.test", TYPE_HTTPS);
+        m[2] = 0x81;
+        m[3] = 0x80;
+        let n = 30u16;
+        m[6..8].copy_from_slice(&n.to_be_bytes());
+        for i in 0..n {
+            let mut d = https_data(true);
+            d[1] = i as u8 + 1;
+            rr(&mut m, &ptr(12), TYPE_HTTPS, &d);
+        }
+        m
+    }
+
+    /// r10 N8: an upstream reply with TC is fetched again over TCP from
+    /// the same resolver; the client gets the whole rewritten answer over
+    /// TCP, and over UDP a TC reply cut to its size (so it retries on TCP
+    /// and gets the whole answer, not TC again).
+    #[tokio::test]
+    async fn truncated_upstream_is_retried_over_tcp() {
+        let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = up.local_addr().unwrap();
+        let tcp = TcpListener::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 1500];
+            while let Ok((n, from)) = up.recv_from(&mut b).await {
+                // Header + question, TC.
+                let mut r = b[..n].to_vec();
+                r[2] |= 0x80 | FLAG_TC;
+                let _ = up.send_to(&r, from).await;
+            }
+        });
+        let tcp_queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = tcp_queries.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = tcp.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    while let Ok(n) = c.read_u16().await {
+                        let mut q = vec![0u8; usize::from(n)];
+                        if c.read_exact(&mut q).await.is_err() {
+                            return;
+                        }
+                        seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let r = big_https_reply(u16::from_be_bytes([q[0], q[1]]));
+                        let mut f = (r.len() as u16).to_be_bytes().to_vec();
+                        f.extend_from_slice(&r);
+                        let _ = c.write_all(&f).await;
+                    }
+                });
+            }
+        });
+        let dns = dns_to(addr);
+        let q = query_for_test(0x55, "www.x.test", TYPE_HTTPS);
+        let whole = dns.handle(&q, Transport::Tcp).await.unwrap();
+        assert_eq!(whole[2] & FLAG_TC, 0);
+        let got = decode(&whole);
+        assert_eq!(got.len(), 30);
+        assert!(got.iter().all(|r| r.4[2..] == https_data(false)[2..]));
+        assert!(whole.len() > 512);
+        let cut = dns.handle(&q, Transport::Udp(65535)).await.unwrap();
+        assert_eq!(cut[2] & FLAG_TC, FLAG_TC);
+        assert_eq!(&cut[..2], &[0, 0x55]);
+        assert!(cut.len() <= 512);
+        assert_eq!(tcp_queries.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }

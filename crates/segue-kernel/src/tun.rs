@@ -2336,8 +2336,12 @@ impl TunStack {
                         continue;
                     };
                     let out = msg_tx.clone();
+                    // A reply must fit one datagram on the TUN (no IP
+                    // fragmentation here): the client's EDNS size or this.
+                    let cap = stack.max_udp_reply(&d.key);
                     tokio::spawn(async move {
-                        if let Some(payload) = dns.handle(&d.payload).await {
+                        let via = crate::dns::Transport::Udp(cap);
+                        if let Some(payload) = dns.handle(&d.payload, via).await {
                             let _ = out
                                 .send(UdpMsg::Dns {
                                     key: d.key,
@@ -2906,7 +2910,7 @@ async fn dns_tcp(ctx: &Ctx, link: &Link, mut down: mpsc::Receiver<Chunk>, up: mp
         let query = data[2..2 + len].to_vec();
         drop(c);
         wrote(ctx, link, 2 + len);
-        let Some(answer) = dns.handle(&query).await else {
+        let Some(answer) = dns.handle(&query, crate::dns::Transport::Tcp).await else {
             continue;
         };
         drop(query);
