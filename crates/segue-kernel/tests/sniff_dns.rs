@@ -409,6 +409,152 @@ async fn real_ech_goes_ai_on_ai_ip_else_is_refused_locally() {
     assert_eq!(rep, REP_NOT_ALLOWED);
 }
 
+/// One ECH ClientHello to `ip`:443: Some(dial) if it was dialled (and
+/// echoed), None if refused with RST.
+async fn ech_flow(
+    fake: &Arc<Fake>,
+    k: SocketAddr,
+    outer: &str,
+    ip: &str,
+) -> Option<(Option<String>, String)> {
+    let before = fake.calls().len();
+    let hello = client_hello_ech_for_test(outer, false);
+    let (rep, mut c) = connect_ip(k, ip.parse().unwrap(), 443).await;
+    assert_eq!(rep, REP_OK);
+    c.write_all(&hello).await.unwrap();
+    let mut got = vec![0u8; hello.len()];
+    match tokio::time::timeout(Duration::from_secs(3), c.read_exact(&mut got)).await {
+        Ok(Ok(_)) => {
+            assert_eq!(got, hello);
+            let calls = fake.calls();
+            assert_eq!(calls.len(), before + 1, "{outer} {ip}");
+            calls.last().cloned()
+        }
+        _ => {
+            assert_eq!(
+                fake.calls().len(),
+                before,
+                "{outer} {ip}: refused, not dialled"
+            );
+            None
+        }
+    }
+}
+
+/// r11 R1, accepted residual (KERNEL_SPEC §5.2a.1): the public-name list
+/// is a heuristic. Real ECH whose public name is not on it (a custom or
+/// new ECH front) looks exactly like GREASE: it is routed by the outer
+/// SNI, so on an IP outside the AI ranges an AI inner name leaves by the
+/// overseas route. Listing that public name is what turns it into a
+/// hidden name (AI route on an AI IP, else refused).
+#[tokio::test]
+async fn unlisted_ech_public_name_is_routed_by_outer_sni() {
+    let ai = [Cidr::parse("1.2.3.0/24").unwrap()];
+    let base = || {
+        Policy::inline(rules(), CidrTable::default())
+            .with_hidden_name(proxy("ai"))
+            .with_ai_ips(&ai)
+    };
+    let outer = "ech.custom-front.example";
+    let fake = Arc::new(Fake::default());
+    let (k, kernel) = start_kernel_arc(fake.clone(), None, PolicyStore::inline(base())).await;
+    // Off the AI ranges: the overseas route, by the outer name (the leak).
+    assert_eq!(
+        ech_flow(&fake, k, outer, "9.9.9.9").await,
+        Some((Some("proxy".into()), format!("{outer}:443")))
+    );
+    // On an AI IP the IP rule still gives the AI route (by the outer name).
+    assert_eq!(
+        ech_flow(&fake, k, outer, "1.2.3.4").await,
+        Some((Some("ai".into()), format!("{outer}:443")))
+    );
+    assert_eq!(kernel.hidden.refused(), 0);
+
+    let mut listed = base();
+    listed.ech_public_names.push("custom-front.example".into());
+    let fake = Arc::new(Fake::default());
+    let (k, kernel) = start_kernel_arc(fake.clone(), None, PolicyStore::inline(listed)).await;
+    assert_eq!(ech_flow(&fake, k, outer, "9.9.9.9").await, None);
+    assert_eq!(
+        ech_flow(&fake, k, outer, "1.2.3.4").await,
+        Some((Some("ai".into()), "1.2.3.4:443".into()))
+    );
+    assert_eq!(kernel.hidden.refused(), 1);
+}
+
+/// r11 R1, accepted cost: a broad suffix on the public-name list makes
+/// every ECH-carrying hello under it a hidden name, so an ordinary site's
+/// GREASE ECH off the AI ranges is refused. The same site without ECH,
+/// and names outside the suffix, are unaffected.
+#[tokio::test]
+async fn broad_ech_public_suffix_refuses_ordinary_grease() {
+    let mut p = Policy::inline(rules(), CidrTable::default())
+        .with_hidden_name(proxy("ai"))
+        .with_ai_ips(&[Cidr::parse("1.2.3.0/24").unwrap()]);
+    p.ech_public_names.push("shops.example".into());
+    let fake = Arc::new(Fake::default());
+    let (k, kernel) = start_kernel_arc(fake.clone(), None, PolicyStore::inline(p)).await;
+    // False refusal: plain GREASE from a normal site under the suffix.
+    assert_eq!(
+        ech_flow(&fake, k, "www.shops.example", "9.9.9.9").await,
+        None
+    );
+    assert_eq!(kernel.hidden.refused(), 1);
+    // Outside the suffix: routed by the SNI as before.
+    assert_eq!(
+        ech_flow(&fake, k, "www.other.example", "9.9.9.9").await,
+        Some((Some("proxy".into()), "www.other.example:443".into()))
+    );
+    // No ECH extension: never a hidden name.
+    let (_, mut c) = connect_ip(k, "9.9.9.9".parse().unwrap(), 443).await;
+    let hello = client_hello_for_test(Some("www.shops.example"), 32);
+    assert_eq!(roundtrip(&mut c, &hello, 3).await, hello);
+    assert_eq!(
+        fake.calls().last().cloned(),
+        Some((Some("proxy".into()), "www.shops.example:443".into()))
+    );
+    assert_eq!(kernel.hidden.refused(), 1);
+}
+
+/// r11 R1: the public-name list is delivered in the signed bundle; a new
+/// bundle with an updated `ech_public_names` takes effect for the next
+/// flow on a running kernel (an outer SNI routed by name before is a
+/// hidden name after).
+#[tokio::test]
+async fn signed_bundle_updates_ech_public_names() {
+    let (signer, store) = signed_store();
+    let overseas = r#"{"type":"proxy","outbound":"overseas"}"#;
+    store
+        .install(&signer.bundle_with("[]", overseas, r#","ai_cidrs":["1.2.3.0/24"]"#))
+        .unwrap();
+    let fake = Arc::new(Fake::default());
+    let (k, kernel) = start_kernel_arc(fake.clone(), None, store.clone()).await;
+    let outer = "ech.custom-front.example";
+    assert_eq!(
+        ech_flow(&fake, k, outer, "9.9.9.9").await,
+        Some((Some("overseas".into()), format!("{outer}:443")))
+    );
+    // The default list still applies.
+    assert_eq!(
+        ech_flow(&fake, k, "cloudflare-ech.com", "9.9.9.9").await,
+        None
+    );
+
+    store
+        .install(&signer.bundle_with(
+            "[]",
+            overseas,
+            r#","ai_cidrs":["1.2.3.0/24"],"ech_public_names":["cloudflare-ech.com","custom-front.example"]"#,
+        ))
+        .unwrap();
+    assert_eq!(ech_flow(&fake, k, outer, "9.9.9.9").await, None);
+    assert_eq!(
+        ech_flow(&fake, k, outer, "1.2.3.4").await,
+        Some((Some("ai".into()), "1.2.3.4:443".into()))
+    );
+    assert_eq!(kernel.hidden.refused(), 2);
+}
+
 /// r10 N2: the per-destination limiter on hidden-name refusals: a burst of
 /// reports per destination, then one per refill period; every attempt is
 /// still counted (and refused); destinations are tracked independently and
@@ -907,10 +1053,15 @@ struct Signer {
 impl Signer {
     /// A signed bundle with `rules` (JSON array) and `default` (JSON action).
     fn bundle(&self, rules: &str, default: &str) -> Vec<u8> {
+        self.bundle_with(rules, default, "")
+    }
+
+    /// Same, with `extra` (`,"key":value...`) appended to the body.
+    fn bundle_with(&self, rules: &str, default: &str, extra: &str) -> Vec<u8> {
         let v = self.version.fetch_add(1, Ordering::SeqCst) + 1;
         let body = format!(
             r#"{{"version":{v},"expires_at":{},"ai_domains":["openai.com"],
-                "rules":{rules},"default":{default},"chnroute":["36.0.0.0/8"]}}"#,
+                "rules":{rules},"default":{default},"chnroute":["36.0.0.0/8"]{extra}}}"#,
             unix_now() + 3600
         );
         sign(&self.key, 1, body.as_bytes()).unwrap().into_bytes()
