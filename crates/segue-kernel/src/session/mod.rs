@@ -195,6 +195,10 @@ struct State {
     revoked: Option<u8>,
     /// None: Auto; Some(i): exits[i].
     choice: Option<usize>,
+    /// Bumped whenever the user changes `choice` (r11 R5): a fresh
+    /// session pinned to the exit of an earlier attempt keeps the pin
+    /// only while this is unchanged.
+    choice_gen: u64,
     health: Vec<Health>,
 }
 
@@ -319,6 +323,7 @@ impl KernelDialer {
                 user_off: false,
                 revoked: None,
                 choice: None,
+                choice_gen: 0,
                 health,
             })),
             off: watch::channel(false).0,
@@ -478,7 +483,11 @@ impl KernelDialer {
                     .ok_or_else(|| DialError(format!("unknown exit {name:?}")))?,
             )
         };
-        self.state.lock().unwrap().choice = choice;
+        let mut st = self.state.lock().unwrap();
+        if st.choice != choice {
+            st.choice = choice;
+            st.choice_gen += 1;
+        }
         Ok(())
     }
 
@@ -610,18 +619,19 @@ impl KernelDialer {
                 {
                     tries += 1;
                     eprintln!("segue-kernel: {e}; opening a fresh session");
-                    // The relay answered on that exit (r10 failover): the
-                    // path works, the first OPEN was only slow (T_attach)
-                    // or lost. That answer is proof for the exit, and the
-                    // fresh session goes to the same exit: re-picking
-                    // would move it (under Auto) to an exit that has not
-                    // failed lately only because nothing tried it, and
-                    // the failures the slow OPEN reported would refuse a
-                    // strict flow on the exit that just answered.
-                    if let Some(i) = exit {
-                        relay_answered(&mut self.state.lock().unwrap().health[i]);
-                        pin = Some(i);
-                    }
+                    // UNKNOWN_SESSION is sent before the ticket is checked
+                    // (A2), so it proves only that this exit's relay is
+                    // reachable (r11 R5): not that the ticket is valid,
+                    // the target reachable or the exit's failing sessions
+                    // recovered. It changes nothing in the exit's health;
+                    // it only lets the fresh session try the same exit
+                    // once, even if the slow OPEN's failures took the exit
+                    // down (r10 failover: re-picking would move it, under
+                    // Auto, to an exit that has not failed lately only
+                    // because nothing tried it). Its OPENED, or data
+                    // moving, is what restores the exit. The pin holds only
+                    // while the user's exit choice is unchanged.
+                    pin = exit;
                 }
                 res => return res.map_err(|(e, _)| e),
             }
@@ -633,8 +643,8 @@ impl KernelDialer {
         r: &SegueRoute,
         addr: &TargetAddr,
         port: u16,
-        pin: Option<usize>,
-        exit: &mut Option<usize>,
+        pin: Option<(usize, u64)>,
+        exit: &mut Option<(usize, u64)>,
     ) -> Result<crate::dial::Stream, (DialError, Option<u8>)> {
         let i = {
             let st = self.state.lock().unwrap();
@@ -650,14 +660,18 @@ impl KernelDialer {
             if self.exits.is_empty() {
                 return Err((DialError("refused: no exits configured".into()), None));
             }
-            let i = pin.unwrap_or_else(|| st.pick());
-            *exit = Some(i);
+            // A pin from an UNKNOWN_SESSION answer (see `open`) is void
+            // once the user picked another exit.
+            let pinned = pin.filter(|&(_, g)| g == st.choice_gen).map(|(i, _)| i);
+            let i = pinned.unwrap_or_else(|| st.pick());
+            *exit = Some((i, st.choice_gen));
             let h = &st.health[i];
             // Refused at once while the exit's carrier connects fail, or
-            // its sessions are backing off after failures (r9 F5).
+            // its sessions are backing off after failures (r9 F5). The
+            // one fresh attempt after UNKNOWN_SESSION is let through.
             let down = matches!(h.ks.posture(), Posture::Reconnecting | Posture::Error)
                 && (h.recently_failed() || h.failing() > 0);
-            if r.exit_class == EXIT_AI && down {
+            if r.exit_class == EXIT_AI && down && pinned.is_none() {
                 return Err((
                     DialError("refused: tunnel reconnecting (strict route)".into()),
                     None,
@@ -722,12 +736,48 @@ impl KernelDialer {
                     self.ensure_channel(i, &r.ticket);
                     Ok(Box::new(SessionStream::new(app, closed_rx)))
                 }
-                Err(_) => Err(closed_err((&mut closed_rx).await.ok())),
+                Err(_) => Err(self.refused(i, (&mut closed_rx).await.ok())),
             },
-            c = &mut closed_rx => Err(closed_err(c.ok())),
+            c = &mut closed_rx => Err(self.refused(i, c.ok())),
             _ = tokio::time::sleep(OPEN_WAIT) => Err((DialError("session open timed out".into()), None)),
         }
     }
+}
+
+impl KernelDialer {
+    /// A session on exit `i` ended before OPENED with `reason`. A refusal
+    /// that says the exit cannot serve this device's new sessions is a
+    /// health failure (r11 R5), aggregated like a session's `Failed`;
+    /// others (the target, the site, capacity) are not, and none of them
+    /// proves the exit.
+    fn refused(&self, i: usize, reason: Option<CloseReason>) -> (DialError, Option<u8>) {
+        let (e, c) = closed_err(reason);
+        if c.is_some_and(refusal_fails_exit) {
+            let mut st = self.state.lock().unwrap();
+            let h = &mut st.health[i];
+            if !h.proven(Instant::now()) {
+                h.unproven = true;
+                mark_failed(h);
+            }
+        }
+        (e, c)
+    }
+}
+
+/// A REJECT / RST of an OPEN that says the exit cannot open sessions for
+/// this device now: refused credentials, an exit class the ticket does
+/// not grant, another wire version, or the Home exit being unavailable.
+/// `TARGET_DENIED`, site errors and capacity are about the one flow.
+fn refusal_fails_exit(c: u8) -> bool {
+    matches!(
+        c,
+        code::VERSION
+            | code::AUTH
+            | code::EXPIRED
+            | code::REVOKED
+            | code::EXIT_DENIED
+            | code::HOME_UNAVAILABLE
+    )
 }
 
 /// A session's health report (r9 F5) into its exit's health (r10 N6).
@@ -802,14 +852,6 @@ impl Drop for HealthReporter {
             st.health[self.i].sessions.remove(&self.id);
         }
     }
-}
-
-/// The relay answered a session on this exit with a protocol frame (a
-/// REJECT it sends only when it read our OPEN): the path works.
-fn relay_answered(h: &mut Health) {
-    h.unproven = false;
-    h.last_fail = None;
-    h.ks.on_event(Event::ChannelUp);
 }
 
 fn mark_failed(h: &mut Health) {
