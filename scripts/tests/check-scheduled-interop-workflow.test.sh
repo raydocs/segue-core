@@ -242,7 +242,7 @@ expected_rc_interop="$(cat <<'EXPECTED'
   rc-interop:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 45
     steps:
       - name: Check out release candidate
@@ -275,7 +275,7 @@ EXPECTED
 expected_scheduled_pinned="$(cat <<'EXPECTED'
   scheduled-pinned-interop:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 90
     steps:
       - name: Check out scheduled xray-rust revision
@@ -308,7 +308,7 @@ EXPECTED
 expected_main_smoke="$(cat <<'EXPECTED'
   xray-core-main-smoke:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 30
     continue-on-error: true
     steps:
@@ -356,7 +356,7 @@ EXPECTED
 expected_rust="$(cat <<'EXPECTED'
   rust:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 45
     steps:
       - name: Check out repository
@@ -446,7 +446,7 @@ EXPECTED
 expected_publish_fields="$(cat <<'EXPECTED'
     if: needs.release-metadata.outputs.is_rc == 'true'
     needs:
-    runs-on: ubuntu-24.04
+    runs-on: instabox-medium
     timeout-minutes: 10
     permissions:
     steps:
