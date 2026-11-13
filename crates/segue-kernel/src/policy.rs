@@ -60,6 +60,23 @@ pub struct Body {
     pub default: Action,
     #[serde(default)]
     pub chnroute: Vec<String>,
+    /// ECH client-facing (public) names, as domain suffixes: a ClientHello
+    /// with an ECH extension whose SNI is one of these hides its real
+    /// name (KERNEL_SPEC §5.2a.1, astra r10 N2). Absent: the built-in
+    /// [`DEFAULT_ECH_PUBLIC_NAMES`]; `[]` turns the list off.
+    #[serde(default = "default_ech_public_names")]
+    pub ech_public_names: Vec<String>,
+}
+
+/// Known ECH public names when a bundle names none: Cloudflare's shared
+/// client-facing server.
+pub const DEFAULT_ECH_PUBLIC_NAMES: &[&str] = &["cloudflare-ech.com"];
+
+fn default_ech_public_names() -> Vec<String> {
+    DEFAULT_ECH_PUBLIC_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// The routing data every flow and DNS query reads.
@@ -78,6 +95,11 @@ pub struct Policy {
     /// relay's Home whitelist decides (§5.5 item 3). Never the outer SNI's
     /// route. Reject for the fail-closed policy and, unless set, inline.
     pub hidden_name: Action,
+    /// The bundle's AI IP ranges: a hidden name to one of these takes
+    /// [`Policy::hidden_name`]; to any other IP it is refused locally.
+    pub ai_ips: CidrTable,
+    /// ECH public names (canonical suffixes), see [`Body::ech_public_names`].
+    pub ech_public_names: Vec<String>,
     /// 0 for an inline (dev) policy and for the fail-closed policy.
     pub version: u64,
     /// None: does not expire (inline dev rules).
@@ -94,6 +116,8 @@ impl Policy {
             chnroute: CidrTable::default(),
             foreign: Action::Reject,
             hidden_name: Action::Reject,
+            ai_ips: CidrTable::default(),
+            ech_public_names: default_ech_public_names(),
             version: 0,
             expires_at: None,
             refuse_all: true,
@@ -105,6 +129,8 @@ impl Policy {
         Self {
             foreign: rules.default_action().clone(),
             hidden_name: Action::Reject,
+            ai_ips: CidrTable::default(),
+            ech_public_names: default_ech_public_names(),
             rules,
             chnroute,
             version: 0,
@@ -124,6 +150,19 @@ impl Policy {
     pub fn with_hidden_name(mut self, route: Action) -> Self {
         self.hidden_name = route;
         self
+    }
+
+    /// Lab / tests: the AI IP ranges a hidden name may go to.
+    pub fn with_ai_ips(mut self, cidrs: &[Cidr]) -> Self {
+        self.ai_ips = CidrTable::new(cidrs);
+        self
+    }
+
+    /// `sni` (normalized) is, or is under, a known ECH public name.
+    pub fn is_ech_public_name(&self, sni: &str) -> bool {
+        self.ech_public_names
+            .iter()
+            .any(|s| segue_policy::suffix_match(sni, s))
     }
 
     /// Decision for a fake-IP flow to `domain` (re-authorized per flow): an
@@ -254,14 +293,24 @@ impl Verifier {
                 action: Action::Proxy(self.ai_route.clone()),
             });
         }
+        let mut ai_ips = Vec::with_capacity(b.ai_cidrs.len());
         for (i, c) in b.ai_cidrs.iter().enumerate() {
+            let cidr = Cidr::parse(c).map_err(|e| bad(format!("ai_cidrs[{i}]: {e}")))?;
+            ai_ips.push(cidr);
             rules.push(Rule {
-                matcher: Matcher::Cidr(
-                    Cidr::parse(c).map_err(|e| bad(format!("ai_cidrs[{i}]: {e}")))?,
-                ),
+                matcher: Matcher::Cidr(cidr),
                 action: Action::Proxy(self.ai_route.clone()),
             });
         }
+        let ech_public_names = b
+            .ech_public_names
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                segue_policy::canonical_domain(d)
+                    .ok_or_else(|| bad(format!("ech_public_names[{i}]: bad domain {d:?}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         for (i, r) in b.rules.iter().enumerate() {
             let r = RuleSpec {
                 domain_suffix: r.domain_suffix.clone(),
@@ -292,6 +341,8 @@ impl Verifier {
         Ok(Policy {
             foreign: b.default.clone(),
             hidden_name: Action::Proxy(self.ai_route.clone()),
+            ai_ips: CidrTable::new(&ai_ips),
+            ech_public_names,
             rules: set,
             chnroute: CidrTable::new(&cidrs),
             version: b.version,
@@ -616,6 +667,34 @@ mod tests {
         assert_eq!(Policy::fail_closed().hidden_name, Action::Reject);
         let inline = Policy::inline(RuleSet::new(vec![], Action::Direct), CidrTable::default());
         assert_eq!(inline.hidden_name, Action::Reject);
+    }
+
+    /// r10 N2: the bundle's AI CIDRs are the IPs a hidden name may go to;
+    /// `ech_public_names` defaults to `cloudflare-ech.com`, can be set or
+    /// emptied, matches by suffix, and a bad entry refuses the bundle.
+    #[test]
+    fn ech_public_names_and_ai_ips_from_the_bundle() {
+        let k = keys();
+        let with = |extra: &str| {
+            let b = format!(
+                r#"{{"version":1,"expires_at":{},"ai_domains":[],"ai_cidrs":["203.0.113.0/24"],
+                    "default":{{"type":"proxy","outbound":"overseas"}}{extra}}}"#,
+                NOW + 100
+            );
+            verifier(&k).open(sign(&k.key, 1, b.as_bytes()).unwrap().as_bytes())
+        };
+        let (_, p) = with("").unwrap();
+        assert!(p.ai_ips.contains("203.0.113.9".parse().unwrap()));
+        assert!(!p.ai_ips.contains("9.9.9.9".parse().unwrap()));
+        assert!(p.is_ech_public_name("cloudflare-ech.com"));
+        assert!(p.is_ech_public_name("x.cloudflare-ech.com"));
+        assert!(!p.is_ech_public_name("notcloudflare-ech.com"));
+        let (_, p) = with(r#","ech_public_names":["Ech.Example."]"#).unwrap();
+        assert!(p.is_ech_public_name("ech.example"));
+        assert!(!p.is_ech_public_name("cloudflare-ech.com"));
+        let (_, p) = with(r#","ech_public_names":[]"#).unwrap();
+        assert!(!p.is_ech_public_name("cloudflare-ech.com"));
+        assert!(with(r#","ech_public_names":["bad name"]"#).is_err());
     }
 
     /// Review r5 N3: the kernel and the relay read the same signed bytes

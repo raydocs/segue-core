@@ -253,6 +253,7 @@ async fn world() -> World {
         fake_ip: Some(pool.clone()),
         sniff: None,
         udp: Some(Arc::new(Udp::new(UdpSettings::default()))),
+        hidden: Default::default(),
     });
     let (to_stack, rx) = mpsc::channel(256);
     let (tx, mut from_stack) = mpsc::channel::<Bytes>(256);

@@ -155,6 +155,7 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             fake_ip,
             sniff: config.sniff,
             udp: config.udp.map(|u| Arc::new(Udp::new(u))),
+            hidden: Default::default(),
         });
         serve(listener, kernel).await?;
         Ok(())

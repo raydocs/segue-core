@@ -2068,7 +2068,7 @@ impl TunRouter for TunKernel {
         if policy.refuse_all {
             return None;
         }
-        crate::socks::sniffed_route(&policy, key.dst.ip(), found)
+        crate::socks::sniffed_route(&policy, key.dst, found, &self.kernel.hidden)
             .map(|(tag, target)| Dial { tag, target })
     }
 

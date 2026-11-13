@@ -1608,6 +1608,7 @@ struct Env {
     h: Harness,
     dialer: Arc<FakeDialer>,
     pool: Arc<FakeIpPool>,
+    kernel: Arc<Kernel>,
 }
 
 fn kernel_env(policy: Policy, sniff: bool, udp: bool, fail: bool, dns: bool) -> Env {
@@ -1641,6 +1642,7 @@ fn kernel_env_with(policy: Policy, sniff: bool, udp: bool, dns: bool, dialer: Fa
                 ..Default::default()
             }))
         }),
+        hidden: Default::default(),
     });
     let smart = dns.then(|| {
         Arc::new(SmartDns::new(
@@ -1654,8 +1656,13 @@ fn kernel_env_with(policy: Policy, sniff: bool, udp: bool, dns: bool, dialer: Fa
             },
         ))
     });
-    let h = Harness::run(TunStack::for_kernel(kernel, smart));
-    Env { h, dialer, pool }
+    let h = Harness::run(TunStack::for_kernel(kernel.clone(), smart));
+    Env {
+        h,
+        dialer,
+        pool,
+        kernel,
+    }
 }
 
 fn inline() -> Policy {
@@ -1703,35 +1710,76 @@ async fn sniffed_rejected_name_resets_and_never_dials() {
     assert!(e.dialer.dials.lock().unwrap().is_empty());
 }
 
-/// r9 F4: on TUN too, a ClientHello offering ECH is a hidden name: it goes
-/// the AI route to the IP, never by its outer SNI (here a direct name on
-/// a direct IP, and a proxied name on an unmatched IP).
+/// r10 N2 on TUN: an ECH extension with an ordinary SNI is GREASE and is
+/// routed by that SNI (here an AI name on an unmatched IP goes "ai" by
+/// name; a plain name on a direct IP goes direct). Real ECH (a known
+/// public name as SNI, or none) to an AI IP takes the AI route by IP; to
+/// any other IP it is reset locally, counted, and nothing is dialled.
 #[tokio::test]
-async fn ech_hello_goes_the_ai_route_never_by_outer_sni() {
-    for (outer, dst) in [
-        ("x.p2.test", SITE4),
-        ("www.baidu.com", "192.0.2.9:443".parse().unwrap()),
-    ] {
-        let policy = inline().with_hidden_name(Action::Proxy("ai".into()));
-        let mut e = kernel_env(policy, true, false, false, false);
+async fn ech_hello_grease_by_sni_real_ech_ai_ip_or_local_refuse() {
+    let ai_ip: SocketAddr = "198.51.100.7:443".parse().unwrap();
+    let policy = || {
+        inline()
+            .with_hidden_name(Action::Proxy("ai".into()))
+            .with_ai_ips(&[Cidr::parse("198.51.100.0/24").unwrap()])
+    };
+    type Want = (Option<&'static str>, TargetAddr);
+    let cases: [(&str, SocketAddr, Want); 4] = [
+        (
+            "chat.openai.com",
+            SITE4,
+            (Some("ai"), TargetAddr::Domain("chat.openai.com".into())),
+        ),
+        (
+            "x.p2.test",
+            SITE4,
+            (Some("p2"), TargetAddr::Domain("x.p2.test".into())),
+        ),
+        (
+            "cloudflare-ech.com",
+            ai_ip,
+            (Some("ai"), TargetAddr::Ip(ai_ip.ip())),
+        ),
+        ("", ai_ip, (Some("ai"), TargetAddr::Ip(ai_ip.ip()))),
+    ];
+    for (sni, dst, want) in cases {
+        let mut e = kernel_env(policy(), true, false, false, false);
         let sseq = connect(&mut e.h, dst).await;
-        let hello = client_hello_ech_for_test(outer, false);
+        let hello = client_hello_ech_for_test(sni, false);
         e.h.send(tcp(CLIENT4, dst, ACK, 101, sseq, &hello)).await;
         let mut site = e.dialer.site().await;
         let mut got = vec![0u8; hello.len()];
         site.read_exact(&mut got).await.unwrap();
-        assert_eq!(got, hello, "{outer}");
+        assert_eq!(got, hello, "{sni}");
         assert_eq!(
             e.dialer.dials.lock().unwrap().clone(),
-            vec![(Some("ai".to_string()), TargetAddr::Ip(dst.ip()), 443)],
-            "{outer}"
+            vec![(want.0.map(str::to_owned), want.1, 443)],
+            "{sni}"
         );
+        assert_eq!(e.kernel.hidden.refused(), 0);
     }
-    // Inline policy without a hidden-name route: refused.
-    let mut e = kernel_env(inline(), true, false, false, false);
-    let sseq = connect(&mut e.h, SITE4).await;
-    let hello = client_hello_ech_for_test("x.p2.test", true);
-    e.h.send(tcp(CLIENT4, SITE4, ACK, 101, sseq, &hello)).await;
+    // Real ECH to an IP outside the AI ranges: RST, nothing dialled.
+    for sni in ["cloudflare-ech.com", "a.cloudflare-ech.com", ""] {
+        let mut e = kernel_env(policy(), true, false, false, false);
+        let sseq = connect(&mut e.h, SITE4).await;
+        let hello = client_hello_ech_for_test(sni, true);
+        e.h.send(tcp(CLIENT4, SITE4, ACK, 101, sseq, &hello)).await;
+        let rst = e.h.next_meaningful().await;
+        assert!(rst.rst, "{sni}: {rst:?}");
+        assert!(e.dialer.dials.lock().unwrap().is_empty());
+        assert_eq!(e.kernel.hidden.refused(), 1);
+    }
+    // Inline policy without a hidden-name route: refused even to an AI IP.
+    let mut e = kernel_env(
+        inline().with_ai_ips(&[Cidr::parse("198.51.100.0/24").unwrap()]),
+        true,
+        false,
+        false,
+        false,
+    );
+    let sseq = connect(&mut e.h, ai_ip).await;
+    let hello = client_hello_ech_for_test("cloudflare-ech.com", true);
+    e.h.send(tcp(CLIENT4, ai_ip, ACK, 101, sseq, &hello)).await;
     let rst = e.h.next_meaningful().await;
     assert!(rst.rst, "{rst:?}");
     assert!(e.dialer.dials.lock().unwrap().is_empty());

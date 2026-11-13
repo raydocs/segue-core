@@ -295,6 +295,7 @@ mod mac {
                     refuse: ["ai".to_string()].into(),
                     ..Default::default()
                 }))),
+                hidden: Default::default(),
             });
             let dns = Arc::new(SmartDns::new(
                 policy,

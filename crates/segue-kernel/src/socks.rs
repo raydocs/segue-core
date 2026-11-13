@@ -15,9 +15,11 @@
 //! replayed to the upstream unchanged.
 //! A flow refused after the early success is reset (RST), as in §5.2a.5.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use segue_routing::TargetAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,6 +57,9 @@ pub struct Kernel {
     pub sniff: Option<SniffSettings>,
     /// None: UDP ASSOCIATE is answered "command not supported".
     pub udp: Option<Arc<Udp>>,
+    /// Hidden-name (real ECH) flows refused locally, shared by the SOCKS
+    /// and TUN front ends.
+    pub hidden: HiddenRefusals,
 }
 
 impl Kernel {
@@ -66,6 +71,7 @@ impl Kernel {
             fake_ip: None,
             sniff: None,
             udp: None,
+            hidden: Default::default(),
         }
     }
 }
@@ -245,7 +251,8 @@ async fn sniffed(
     }
     reply(&mut conn, REP_OK).await?;
     let (first, found) = peek_host(&mut conn, s).await?;
-    let Some((tag, target)) = sniffed_route(policy, ip, &found) else {
+    let dst = SocketAddr::new(ip, port);
+    let Some((tag, target)) = sniffed_route(policy, dst, &found, &kernel.hidden) else {
         return reset(conn);
     };
     let tag = tag.as_deref();
@@ -279,38 +286,54 @@ pub(crate) fn stricter<'a>(
     }
 }
 
-/// Route of a bare-IP TCP flow to `ip` once sniffing is over (§5.2a.1),
-/// SOCKS and TUN alike: (outbound tag, None = direct; target), or None to
-/// refuse. `found` is final: [`Sniff::NeedMore`] (timeout, `max_bytes`)
-/// counts as no name.
+/// Route of a bare-IP TCP flow to `dst` once sniffing is over (§5.2a.1),
+/// None to refuse. `found` is final: [`Sniff::NeedMore`] (timeout,
+/// `max_bytes`) counts as no name.
 ///
 /// - A name: the stricter of its rule and the IP's ([`stricter`]); the
 ///   relay connects by that name unless the route is direct.
 /// - No name (not TLS/HTTP, no SNI, server speaks first, sniff timeout):
 ///   the IP rules alone (an accepted boundary: such a flow to an AI
 ///   service's IP outside the AI CIDRs is routed as that IP says).
-/// - A hidden name (ECH, r9 F4): [`Policy::hidden_name`] (the AI route of
-///   a signed bundle) to the IP, unless the IP is rejected. The outer SNI
-///   is never looked up: it names the client-facing server, which may
-///   front AI and non-AI names alike.
+/// - An ECH extension (astra r10 N2) whose SNI is not a known ECH public
+///   name ([`Policy::is_ech_public_name`]): GREASE from a client with no
+///   ECH config (RFC 9849 §6.2), so the SNI is the real name and is
+///   routed like one.
+/// - A hidden name: ECH with a known public name as SNI, or with no SNI.
+///   Rejected IP: refused. IP in the bundle's AI ranges:
+///   [`Policy::hidden_name`] (the AI route) to the IP. Any other IP:
+///   refused here, counted in `hidden` ([`HiddenRefusals`]), never sent to
+///   the relay. The outer SNI is never looked up: it names the
+///   client-facing server, which fronts AI and non-AI names alike.
 pub(crate) fn sniffed_route(
     policy: &Policy,
-    ip: IpAddr,
+    dst: SocketAddr,
     found: &Sniff,
+    hidden: &HiddenRefusals,
 ) -> Option<(Option<String>, TargetAddr)> {
+    let ip = dst.ip();
     let rules = &policy.rules;
     let by_ip = rules.lookup(&TargetAddr::Ip(ip));
-    let (action, name) = match found {
-        Sniff::Domain(d) => {
+    let named = match found {
+        Sniff::Domain(d) => Some(d),
+        Sniff::Ech { outer: Some(d) } if !policy.is_ech_public_name(d) => Some(d),
+        _ => None,
+    };
+    let (action, name) = match (found, named) {
+        (_, Some(d)) => {
             let by_domain = rules.lookup(&TargetAddr::Domain(d.clone()));
             let a = stricter(by_ip, by_domain).unwrap_or_else(|| rules.default_action());
             (a, Some(d))
         }
-        Sniff::Hidden => match by_ip {
+        (Sniff::Ech { .. }, None) => match by_ip {
             Some((_, Action::Reject)) => (&Action::Reject, None),
-            _ => (&policy.hidden_name, None),
+            _ if policy.ai_ips.contains(ip) => (&policy.hidden_name, None),
+            _ => {
+                hidden.refuse(dst, Instant::now());
+                (&Action::Reject, None)
+            }
         },
-        Sniff::None | Sniff::NeedMore => (by_ip.map_or(rules.default_action(), |(_, a)| a), None),
+        _ => (by_ip.map_or(rules.default_action(), |(_, a)| a), None),
     };
     match action {
         Action::Reject => None,
@@ -323,6 +346,70 @@ pub(crate) fn sniffed_route(
             Some(tag.clone()),
             name.map_or(TargetAddr::Ip(ip), |d| TargetAddr::Domain(d.clone())),
         )),
+    }
+}
+
+/// Hidden-name (real ECH) flows refused locally (astra r10 N2): a count,
+/// and a token bucket per destination (IP, port) so that an app retrying
+/// in a loop logs a few lines, not one per attempt. The refusal itself is
+/// never rate limited: every such flow is refused, none reaches the relay.
+/// Refusing new SYNs to a destination outright would also cut off the
+/// GREASE and plain-TLS flows that share the IP (a CDN front), so the
+/// limiter only decides what is reported.
+#[derive(Debug, Default)]
+pub struct HiddenRefusals {
+    refused: AtomicU64,
+    logged: AtomicU64,
+    buckets: Mutex<HashMap<SocketAddr, (f64, Instant)>>,
+}
+
+impl HiddenRefusals {
+    /// Reports per destination at once.
+    pub const BURST: f64 = 3.0;
+    /// Then one report per this long.
+    pub const REFILL: Duration = Duration::from_secs(60);
+    /// Most destinations tracked; beyond, new ones are not reported.
+    pub const MAX_TRACKED: usize = 1024;
+
+    /// Every hidden-name flow refused locally.
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    /// Of those, how many were reported (passed the per-destination bucket).
+    pub fn logged(&self) -> u64 {
+        self.logged.load(Ordering::Relaxed)
+    }
+
+    /// Count one refusal to `dst` at `now`; true if it is reported.
+    pub fn refuse(&self, dst: SocketAddr, now: Instant) -> bool {
+        self.refused.fetch_add(1, Ordering::Relaxed);
+        let refill = |(tokens, at): (f64, Instant)| {
+            let t = tokens
+                + now.saturating_duration_since(at).as_secs_f64() / Self::REFILL.as_secs_f64();
+            t.min(Self::BURST)
+        };
+        let mut b = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        if b.len() >= Self::MAX_TRACKED && !b.contains_key(&dst) {
+            // Forget destinations whose bucket has refilled.
+            b.retain(|_, v| refill(*v) < Self::BURST);
+            if b.len() >= Self::MAX_TRACKED {
+                return false;
+            }
+        }
+        let e = b.entry(dst).or_insert((Self::BURST, now));
+        let tokens = refill(*e);
+        let report = tokens >= 1.0;
+        *e = (if report { tokens - 1.0 } else { tokens }, now);
+        drop(b);
+        if report {
+            self.logged.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "segue-kernel: refused {dst}: ECH hides the server name and the address is not in the AI ranges ({} so far)",
+                self.refused()
+            );
+        }
+        report
     }
 }
 

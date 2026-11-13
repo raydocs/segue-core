@@ -3,9 +3,12 @@
 //! ([`crate::quic`]).
 //!
 //! A ClientHello is read whole (every extension) before it is judged: one
-//! that offers Encrypted Client Hello ([`EXT_ECH`]) is [`Sniff::Hidden`]
-//! wherever the extension sits, because its SNI is the outer,
-//! client-facing name and says nothing about the real server.
+//! that carries an Encrypted Client Hello extension ([`EXT_ECH`]) wherever
+//! it sits is [`Sniff::Ech`] with its plaintext SNI. That extension alone
+//! does not mean the name is hidden: a client with no ECH config sends a
+//! GREASE one with the real name in the SNI (RFC 9849 §6.2). Whether the
+//! SNI is an ECH public name is the router's call
+//! ([`crate::policy::Policy::is_ech_public_name`], astra r10 N2).
 //!
 //! Pure parsers over a byte prefix. They never consume anything from the
 //! socket: the caller keeps the bytes and replays them to the upstream.
@@ -23,10 +26,11 @@ pub enum Sniff {
     NeedMore,
     /// Not TLS/HTTP, or TLS/HTTP without a usable host name. Final.
     None,
-    /// A TLS ClientHello offering ECH: the real name is encrypted and the
-    /// SNI present is only the outer name. Final; never routed by that
-    /// outer name (astra r9 F4).
-    Hidden,
+    /// A TLS ClientHello with an ECH extension, real or GREASE, and its
+    /// plaintext SNI if it has a usable one (lowercase, no trailing dot).
+    /// Final. Real ECH: the SNI is the outer, client-facing name; GREASE:
+    /// it is the real server's name.
+    Ech { outer: Option<String> },
 }
 
 /// `encrypted_client_hello` extension (RFC 9849; draft-ietf-tls-esni).
@@ -151,22 +155,26 @@ fn parse_client_hello(hs: &[u8]) -> Sniff {
         // Every extension is read: ECH may follow the SNI (browsers shuffle
         // the order), so a name is only final once the list is complete.
         let mut name = Sniff::None;
+        let mut ech = false;
         while c.p + 4 <= ext_end {
             let ty = c.u16()?;
             let len = c.u16()?;
             let body = c.take(len)?;
             match ty {
-                t if t == usize::from(EXT_ECH) => return Some(Sniff::Hidden),
+                t if t == usize::from(EXT_ECH) => ech = true,
                 0 => name = server_name(body),
                 _ => {}
             }
         }
         // Extensions parsed fully, or ran out of bytes.
-        if c.p >= ext_end && ext_end <= c.b.len() {
-            Some(name)
-        } else {
-            None
+        if c.p < ext_end || ext_end > c.b.len() {
+            return None;
         }
+        Some(match (ech, name) {
+            (true, Sniff::Domain(d)) => Sniff::Ech { outer: Some(d) },
+            (true, _) => Sniff::Ech { outer: None },
+            (false, name) => name,
+        })
     })();
     r.unwrap_or(short)
 }
@@ -323,7 +331,7 @@ pub fn client_hello_for_test(sni: Option<&str>, pad: usize) -> Vec<u8> {
 }
 
 #[doc(hidden)]
-/// Test helper: a ClientHello with an outer SNI `outer` and an
+/// Test helper: a ClientHello with SNI `outer` (none if empty) and an
 /// `encrypted_client_hello` extension, before or after the SNI.
 pub fn client_hello_ech_for_test(outer: &str, ech_first: bool) -> Vec<u8> {
     let n = outer.as_bytes();
@@ -335,7 +343,11 @@ pub fn client_hello_ech_for_test(outer: &str, ech_first: bool) -> Vec<u8> {
     let mut sni = 0u16.to_be_bytes().to_vec();
     sni.extend_from_slice(&(sn.len() as u16).to_be_bytes());
     sni.extend_from_slice(&sn);
-    // type outer(0), kdf/aead, config id, enc, payload: opaque to us.
+    if outer.is_empty() {
+        sni.clear();
+    }
+    // A real ECH and a GREASE one (RFC 9849 §6.2) look the same on the
+    // wire: type outer(0), kdf/aead, config id, enc, payload(0), kdf/aead, config id, enc, payload: opaque to us.
     let body = [
         &[0u8, 0, 1, 0, 1, 0x2a, 0, 4, 1, 2, 3, 4, 0, 8][..],
         &[0x55; 8],
@@ -431,18 +443,21 @@ mod tests {
         );
     }
 
-    /// r9 F4: ECH anywhere in the extension list hides the name; the outer
-    /// SNI is never reported, and a name before the end of the list is
-    /// not final yet.
+    /// r9 F4 / r10 N2: an ECH extension anywhere in the list makes the
+    /// result [`Sniff::Ech`] with the plaintext SNI, never a plain
+    /// domain; a name before the end of the list is not final yet.
     #[test]
-    fn ech_hides_the_name_wherever_it_sits() {
+    fn ech_is_reported_with_its_sni_wherever_it_sits() {
         for ech_first in [true, false] {
-            let h = client_hello_ech_for_test("public.example", ech_first);
-            assert_eq!(sniff(&h), Sniff::Hidden, "ech_first={ech_first}");
+            let h = client_hello_ech_for_test("Public.Example", ech_first);
+            let want = Sniff::Ech {
+                outer: Some("public.example".into()),
+            };
+            assert_eq!(sniff(&h), want, "ech_first={ech_first}");
             for n in 0..h.len() {
                 let r = sniff(&h[..n]);
                 assert!(
-                    matches!(r, Sniff::NeedMore | Sniff::Hidden),
+                    r == Sniff::NeedMore || r == want,
                     "ech_first={ech_first} prefix {n}: {r:?}"
                 );
             }

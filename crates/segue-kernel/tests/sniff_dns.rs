@@ -123,6 +123,14 @@ async fn start_kernel_with(
     pool: Option<Arc<FakeIpPool>>,
     policy: Arc<PolicyStore>,
 ) -> SocketAddr {
+    start_kernel_arc(fake, pool, policy).await.0
+}
+
+async fn start_kernel_arc(
+    fake: Arc<Fake>,
+    pool: Option<Arc<FakeIpPool>>,
+    policy: Arc<PolicyStore>,
+) -> (SocketAddr, Arc<Kernel>) {
     *fake.echo.lock().unwrap() = Some(echo_server().await);
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -135,9 +143,11 @@ async fn start_kernel_with(
             max_bytes: 16 * 1024,
         }),
         udp: None,
+        hidden: Default::default(),
     };
-    tokio::spawn(serve(l, Arc::new(kernel)));
-    addr
+    let kernel = Arc::new(kernel);
+    tokio::spawn(serve(l, kernel.clone()));
+    (addr, kernel)
 }
 
 /// SOCKS5 CONNECT to an IPv4 address.
@@ -292,40 +302,102 @@ async fn silent_client_falls_back_to_ip_rules_after_timeout() {
     );
 }
 
-/// r9 F4: a ClientHello offering ECH has only an outer name; the flow is
-/// routed as a hidden name (the AI route, here "ai"), dialled by IP, and
-/// the outer SNI is never used, whether it names a direct, proxied or AI
-/// site, and whether ECH comes before or after the SNI. The hello is
-/// replayed unchanged. An IP reject still wins.
+/// r10 N2: an ECH extension with an SNI that is not a known ECH public
+/// name is GREASE (RFC 9849 §6.2: a client with no ECH config sends one
+/// anyway); the SNI is the real name and the flow is routed by it exactly
+/// like a plain ClientHello, ECH before or after the SNI. The hello is
+/// replayed unchanged.
 #[tokio::test]
-async fn ech_client_hello_goes_the_ai_route_never_by_outer_sni() {
+async fn grease_ech_is_routed_by_its_sni() {
     let policy = PolicyStore::inline(
         Policy::inline(rules(), CidrTable::default()).with_hidden_name(proxy("ai")),
     );
-    for (outer, ip) in [
-        ("www.baidu.com", "9.9.9.9"),
-        ("cdn.example", "10.1.1.1"),
-        ("x.ads.test", "5.5.1.1"),
+    for (sni, ip, want) in [
+        ("www.baidu.com", "9.9.9.9", (None, "9.9.9.9:443")),
+        ("cdn.example", "10.1.1.1", (None, "10.1.1.1:443")),
+        ("cdn.example", "9.9.9.9", (Some("proxy"), "cdn.example:443")),
+        (
+            "chat.openai.com",
+            "9.9.9.9",
+            (Some("ai"), "chat.openai.com:443"),
+        ),
+        // Not a public name: only a suffix match counts.
+        (
+            "notcloudflare-ech.com",
+            "9.9.9.9",
+            (Some("proxy"), "notcloudflare-ech.com:443"),
+        ),
     ] {
         for ech_first in [true, false] {
             let fake = Arc::new(Fake::default());
-            let k = start_kernel_with(fake.clone(), None, policy.clone()).await;
+            let (k, kernel) = start_kernel_arc(fake.clone(), None, policy.clone()).await;
             let (rep, mut c) = connect_ip(k, ip.parse().unwrap(), 443).await;
             assert_eq!(rep, REP_OK);
+            let hello = client_hello_ech_for_test(sni, ech_first);
+            assert_eq!(roundtrip(&mut c, &hello, 7).await, hello, "{sni}");
+            assert_eq!(
+                fake.calls(),
+                vec![(want.0.map(str::to_owned), want.1.to_owned())],
+                "{sni} ech_first={ech_first}"
+            );
+            assert_eq!(kernel.hidden.refused(), 0);
+        }
+    }
+    // An ads name still refused by its rule, ECH or not.
+    let fake = Arc::new(Fake::default());
+    let k = start_kernel_with(fake.clone(), None, policy).await;
+    let (_, mut c) = connect_ip(k, "9.9.9.9".parse().unwrap(), 443).await;
+    c.write_all(&client_hello_ech_for_test("x.ads.test", false))
+        .await
+        .unwrap();
+    expect_reset(c).await;
+    assert!(fake.calls().is_empty());
+}
+
+/// r10 N2: real ECH (the SNI is a known public name, `cloudflare-ech.com`
+/// or under it, or there is no SNI): the name is hidden. To an AI IP the
+/// flow takes the AI route by IP; to any other IP it is refused here (RST
+/// after the early SOCKS success), counted, and never dialled. An IP
+/// reject still wins; without a hidden-name route (inline default) even an
+/// AI IP is refused.
+#[tokio::test]
+async fn real_ech_goes_ai_on_ai_ip_else_is_refused_locally() {
+    let ai = [Cidr::parse("1.2.3.0/24").unwrap()];
+    let policy = PolicyStore::inline(
+        Policy::inline(rules(), CidrTable::default())
+            .with_hidden_name(proxy("ai"))
+            .with_ai_ips(&ai),
+    );
+    for outer in ["cloudflare-ech.com", "Public.Cloudflare-ECH.com", ""] {
+        for ech_first in [true, false] {
+            let fake = Arc::new(Fake::default());
+            let (k, kernel) = start_kernel_arc(fake.clone(), None, policy.clone()).await;
             let hello = client_hello_ech_for_test(outer, ech_first);
+            let (rep, mut c) = connect_ip(k, "1.2.3.4".parse().unwrap(), 443).await;
+            assert_eq!(rep, REP_OK);
             assert_eq!(roundtrip(&mut c, &hello, 7).await, hello, "{outer}");
             assert_eq!(
                 fake.calls(),
-                vec![(Some("ai".into()), format!("{ip}:443"))],
-                "{outer} ech_first={ech_first}"
+                vec![(Some("ai".into()), "1.2.3.4:443".into())],
+                "{outer:?} ech_first={ech_first}"
             );
+            // Not an AI IP (an unmatched one, a direct one, a proxied one).
+            for ip in ["9.9.9.9", "10.1.1.1", "5.5.1.1"] {
+                let (_, mut c) = connect_ip(k, ip.parse().unwrap(), 443).await;
+                c.write_all(&hello).await.unwrap();
+                expect_reset(c).await;
+            }
+            assert_eq!(fake.calls().len(), 1, "{outer:?}: nothing else dialled");
+            assert_eq!(kernel.hidden.refused(), 3);
         }
     }
-    // Without a hidden-name route (inline default) the flow is refused.
+    // Inline default: no hidden-name route, an AI IP is refused too.
     let fake = Arc::new(Fake::default());
-    let k = start_kernel(fake.clone(), None).await;
-    let (_, mut c) = connect_ip(k, "9.9.9.9".parse().unwrap(), 443).await;
-    c.write_all(&client_hello_ech_for_test("www.baidu.com", false))
+    let inline =
+        PolicyStore::inline(Policy::inline(rules(), CidrTable::default()).with_ai_ips(&ai));
+    let k = start_kernel_with(fake.clone(), None, inline).await;
+    let (_, mut c) = connect_ip(k, "1.2.3.4".parse().unwrap(), 443).await;
+    c.write_all(&client_hello_ech_for_test("cloudflare-ech.com", false))
         .await
         .unwrap();
     expect_reset(c).await;
@@ -335,6 +407,39 @@ async fn ech_client_hello_goes_the_ai_route_never_by_outer_sni() {
     let k = start_kernel_with(fake.clone(), None, policy).await;
     let (rep, _c) = connect_ip(k, "10.66.1.1".parse().unwrap(), 443).await;
     assert_eq!(rep, REP_NOT_ALLOWED);
+}
+
+/// r10 N2: the per-destination limiter on hidden-name refusals: a burst of
+/// reports per destination, then one per refill period; every attempt is
+/// still counted (and refused); destinations are tracked independently and
+/// their number is bounded.
+#[test]
+fn hidden_refusal_reports_are_rate_limited_per_destination() {
+    use segue_kernel::socks::HiddenRefusals;
+    let h = HiddenRefusals::default();
+    let t0 = std::time::Instant::now();
+    let a: SocketAddr = "9.9.9.9:443".parse().unwrap();
+    let b: SocketAddr = "9.9.9.9:8443".parse().unwrap();
+    let burst = HiddenRefusals::BURST as usize;
+    let reported: Vec<bool> = (0..10).map(|_| h.refuse(a, t0)).collect();
+    assert_eq!(reported.iter().filter(|r| **r).count(), burst);
+    assert!(reported[..burst].iter().all(|r| *r));
+    assert!(h.refuse(b, t0), "another destination has its own bucket");
+    let later = t0 + HiddenRefusals::REFILL;
+    assert!(h.refuse(a, later), "one token back after a refill period");
+    assert!(!h.refuse(a, later));
+    assert_eq!((h.refused(), h.logged()), (13, burst as u64 + 2));
+    // Bounded: past MAX_TRACKED busy destinations, new ones are counted
+    // but not reported until old buckets refill.
+    let h = HiddenRefusals::default();
+    for i in 0..HiddenRefusals::MAX_TRACKED {
+        let d = SocketAddr::new(std::net::Ipv4Addr::from(0x0a00_0000 + i as u32).into(), 443);
+        assert!(h.refuse(d, t0));
+    }
+    let extra: SocketAddr = "192.0.2.1:443".parse().unwrap();
+    assert!(!h.refuse(extra, t0));
+    assert!(h.refuse(extra, t0 + HiddenRefusals::REFILL * 3));
+    assert_eq!(h.refused(), HiddenRefusals::MAX_TRACKED as u64 + 2);
 }
 
 /// r9 F4 (c), accepted boundary: TLS without SNI keeps the IP rules (here
