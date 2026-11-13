@@ -123,14 +123,15 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
             let pool = Arc::new(pool);
             {
-                // New bindings are journaled synchronously; this only
-                // keeps last-use times and compacts the journal.
+                // New bindings are journaled (on the pool's persistence
+                // thread) before their answer; this only keeps last-use
+                // times and compacts the journal, also off this thread.
                 let pool = pool.clone();
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(segue_kernel::fakeip::SAVE_INTERVAL);
                     loop {
                         tick.tick().await;
-                        if let Err(e) = pool.save() {
+                        if let Err(e) = pool.save_durable().await {
                             eprintln!("segue-kernel: fake-ip state: {e}");
                         }
                     }

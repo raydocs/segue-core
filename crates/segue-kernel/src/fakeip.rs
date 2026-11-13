@@ -28,9 +28,13 @@
 //! Persistence ([`FakeIpPool::open`]). The key and every binding live in a
 //! private state file plus an append-only journal next to it. A new binding
 //! is appended to the journal and fsynced **before** its address is
-//! returned, so no crash can lose an address a client was given. The state
-//! is written once at first start (before any address exists), so a
-//! missing state file later means someone removed it. Missing-but-journaled,
+//! returned, so no crash can lose an address a client was given. That disk
+//! work runs on a dedicated persistence thread
+//! ([`FakeIpPool::assign_durable`]), never on the network runtime. At first
+//! start the journal is created and its directory entry synced, then the
+//! state is written (before any address exists), so a missing state file
+//! later means someone removed it, and a missing journal next to a current
+//! state means bindings were lost. Missing-but-journaled, journal-less,
 //! corrupt, oversized, foreign (other range) or unsafely stored state
 //! (symlink, not a regular file, group/other permissions, another owner,
 //! a directory others can write) is an error: the kernel refuses to start
@@ -42,12 +46,13 @@ use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 
 /// Default cap on tracked addresses.
 pub const DEFAULT_MAX_ENTRIES: usize = 16_384;
@@ -55,14 +60,23 @@ pub const DEFAULT_MAX_ENTRIES: usize = 16_384;
 pub const SAVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Longest domain kept (DNS presentation form).
 pub const MAX_DOMAIN: usize = 253;
-/// State or journal bytes allowed per tracked entry when reading (plus
-/// [`STATE_SLACK`]): an offset, a 253-byte name, a version and a time in
-/// JSON.
-const BYTES_PER_ENTRY: u64 = 320;
+/// Worst-case serialized size of one entry, in the state or as a journal
+/// line: offset, version and time at their widest, plus a 253-byte name
+/// whose every byte JSON escapes to two (`"` or `\`). Reads and writes use
+/// the same bound, so the pool never writes state it would refuse to read.
+const BYTES_PER_ENTRY: u64 = 2 * MAX_DOMAIN as u64 + 64;
 const STATE_SLACK: u64 = 4096;
 
-/// Format 1 (quarantine-era) state has the same fields and is still read.
-const STATE_FORMAT: u32 = 2;
+/// Format 3: the journal was created (and its directory entry synced)
+/// before this state was first written, so a missing journal next to it
+/// means bindings were lost. Formats 1 and 2 have the same fields and are
+/// still read.
+const STATE_FORMAT: u32 = 3;
+
+/// Largest state or journal (bytes) a pool of `max_entries` writes or reads.
+fn size_limit(max_entries: usize) -> u64 {
+    STATE_SLACK + max_entries as u64 * BYTES_PER_ENTRY
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FakeEntry {
@@ -78,38 +92,65 @@ struct Slot {
     last_used: Instant,
 }
 
-struct Journal {
-    file: File,
-    /// Bindings appended since the journal was last emptied.
-    lines: u64,
-}
-
 struct Inner {
     by_offset: HashMap<u32, Slot>,
     by_domain: HashMap<String, u32>,
-    /// Present when persistence is on and the journal is writable. A failed
-    /// append leaves `None` with `broken` set: new names are refused until a
-    /// save rewrites the state and empties the journal.
-    journal: Option<Journal>,
-    broken: bool,
 }
 
-pub struct FakeIpPool {
+/// Bindings and placement, shared by the pool and its persistence thread.
+struct Core {
     base: u32,
     prefix: u8,
     /// Usable offsets are 1..size-1 (network and broadcast addresses skipped).
     size: u32,
     key: [u8; 32],
-    /// DNS TTL handed to clients.
-    pub ttl: Duration,
     /// How long after its last use an entry can still be looked up.
     lifetime: Duration,
     max_entries: usize,
     inner: Mutex<Inner>,
     /// Something changed since the last save.
     dirty: AtomicBool,
-    /// Where the state is kept (None: this process only).
-    state: Option<PathBuf>,
+    /// Test hook: extra time each journal append takes (slow storage).
+    #[cfg(test)]
+    slow_append: Mutex<Duration>,
+}
+
+pub struct FakeIpPool {
+    /// DNS TTL handed to clients.
+    pub ttl: Duration,
+    core: Arc<Core>,
+    /// Persistence thread (None: in memory only). It alone appends to the
+    /// journal, adds new bindings and writes the state, so the network
+    /// runtime never waits on the disk and a binding is never both missing
+    /// from a snapshot and dropped from the journal.
+    jobs: Option<Mutex<mpsc::Sender<Job>>>,
+}
+
+enum Job {
+    Assign {
+        domain: String,
+        version: u64,
+        reply: oneshot::Sender<Option<Ipv4Addr>>,
+    },
+    Save {
+        reply: oneshot::Sender<std::io::Result<bool>>,
+    },
+}
+
+/// The open journal. None in [`Writer`] means a failed append: new names
+/// are refused until a save recreates it and rewrites the state.
+struct Journal {
+    file: File,
+    /// Current length; appends stop at the read limit.
+    bytes: u64,
+}
+
+/// Owns the files. Runs on the persistence thread (and, before the pool
+/// is shared, inside [`FakeIpPool::open`]).
+struct Writer {
+    core: Arc<Core>,
+    path: PathBuf,
+    journal: Option<Journal>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -139,35 +180,19 @@ impl FakeIpPool {
         grace: Duration,
         key: [u8; 32],
     ) -> Result<Self, String> {
-        if !(8..=30).contains(&prefix) {
-            return Err(format!(
-                "fake_ip_range prefix must be 8..=30, got /{prefix}"
-            ));
-        }
-        let size = 1u32 << (32 - prefix);
-        let base = u32::from(base) & !(size - 1);
         Ok(Self {
-            base,
-            prefix,
-            size,
-            key,
             ttl,
-            lifetime: ttl + grace,
-            max_entries: DEFAULT_MAX_ENTRIES,
-            inner: Mutex::new(Inner {
-                by_offset: HashMap::new(),
-                by_domain: HashMap::new(),
-                journal: None,
-                broken: false,
-            }),
-            dirty: AtomicBool::new(false),
-            state: None,
+            core: Arc::new(Core::new(base, prefix, ttl + grace, key, DEFAULT_MAX_ENTRIES)?),
+            jobs: None,
         })
     }
 
-    /// Override the tracked-address cap.
+    /// Override the tracked-address cap (in-memory pools; [`Self::open`]
+    /// takes it as an argument).
     pub fn with_max_entries(mut self, max_entries: usize) -> Self {
-        self.max_entries = max_entries.max(1);
+        Arc::get_mut(&mut self.core)
+            .expect("set before the pool is shared")
+            .max_entries = max_entries.max(1);
         self
     }
 
@@ -198,13 +223,15 @@ impl FakeIpPool {
             )
         };
         let jpath = journal_path(path);
-        let limit = STATE_SLACK + max_entries as u64 * BYTES_PER_ENTRY;
+        let max_entries = max_entries.max(1);
+        let limit = size_limit(max_entries);
         let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
         check_dir(dir.unwrap_or(Path::new("."))).map_err(|e| refuse(e.to_string()))?;
         let state = read_private(path, limit).map_err(|e| refuse(e.to_string()))?;
         let journal = read_private(&jpath, limit).map_err(|e| refuse(e.to_string()))?;
         let now = crate::policy::unix_now();
-        let mut pool = match state {
+        let lifetime = ttl + grace;
+        let core = match state {
             None if journal.is_some() => {
                 return Err(refuse(format!(
                     "missing, but its journal {} exists",
@@ -213,35 +240,62 @@ impl FakeIpPool {
             }
             None => {
                 log.push(format!("fake-ip: new state {}", path.display()));
-                Self::new(base, prefix, ttl, grace, rand::random())?.with_max_entries(max_entries)
+                Core::new(base, prefix, lifetime, rand::random(), max_entries)?
             }
             Some(bytes) => {
-                let (pool, n) = Self::restore(base, prefix, ttl, grace, max_entries, &bytes, now)
-                    .map_err(refuse)?;
+                let (core, n, format) =
+                    Core::restore(base, prefix, lifetime, max_entries, &bytes, now)
+                        .map_err(refuse)?;
+                if format >= 3 && journal.is_none() {
+                    // The journal is made durable before such a state is
+                    // ever written: its loss may have taken bindings with it.
+                    return Err(refuse(format!(
+                        "its journal {} is missing",
+                        jpath.display()
+                    )));
+                }
                 log.push(format!(
                     "fake-ip: restored key and {n} entries from {}",
                     path.display()
                 ));
-                pool
+                core
             }
         };
         if let Some(j) = &journal {
-            let n = pool
+            let n = core
                 .replay(j, now)
                 .map_err(|e| refuse(format!("journal: {e}")))?;
             if n > 0 {
                 log.push(format!("fake-ip: {n} entries from the journal"));
             }
         }
-        pool.state = Some(path.to_owned());
-        // Write the state now (first start: the key exists on disk before
-        // any address does; restart: the journal is folded in), then open an
-        // empty journal for this run's new bindings.
-        pool.dirty.store(true, Ordering::Release);
-        pool.save().map_err(|e| refuse(e.to_string()))?;
-        Ok((pool, log))
+        let core = Arc::new(core);
+        // Write the state now (first start: the journal, then the key, exist
+        // on disk before any address does; restart: the journal is folded
+        // in), leaving an empty journal for this run's new bindings.
+        let mut writer = Writer {
+            core: core.clone(),
+            path: path.to_owned(),
+            journal: None,
+        };
+        core.dirty.store(true, Ordering::Release);
+        writer.save().map_err(|e| refuse(e.to_string()))?;
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("fake-ip-persist".into())
+            .spawn(move || writer.run(rx))
+            .map_err(|e| refuse(format!("persistence thread: {e}")))?;
+        Ok((
+            Self {
+                ttl,
+                core,
+                jobs: Some(Mutex::new(tx)),
+            },
+            log,
+        ))
     }
 
+    #[cfg(test)]
     fn restore(
         base: Ipv4Addr,
         prefix: u8,
@@ -251,8 +305,257 @@ impl FakeIpPool {
         bytes: &[u8],
         now_unix: u64,
     ) -> Result<(Self, usize), String> {
+        let (core, n, _) = Core::restore(base, prefix, ttl + grace, max_entries, bytes, now_unix)?;
+        Ok((
+            Self {
+                ttl,
+                core: Arc::new(core),
+                jobs: None,
+            },
+            n,
+        ))
+    }
+
+    fn send(&self, job: Job) -> bool {
+        let jobs = self.jobs.as_ref().expect("persistent pool");
+        jobs.lock().expect("fake-ip jobs").send(job).is_ok()
+    }
+
+    /// Serialized key + every binding.
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.core.snapshot()
+    }
+
+    /// Address for `domain`, allocating one if needed; `version` is the
+    /// policy version in force. Refreshes its age. None when the name gets
+    /// no address: the pool is full (no address is ever reused for another
+    /// name), the name cannot be stored, or the binding could not be made
+    /// durable. A new binding of a persistent pool is journaled and synced
+    /// on the persistence thread before this returns; the caller's task
+    /// yields meanwhile, so the network runtime keeps running.
+    pub async fn assign_durable(&self, domain: &str, version: u64) -> Option<Ipv4Addr> {
+        if self.jobs.is_none() {
+            return self.core.assign_mem(domain, version);
+        }
+        if let Some(ip) = self.core.existing(domain, version) {
+            return Some(ip);
+        }
+        let (reply, rx) = oneshot::channel();
+        if !self.send(Job::Assign {
+            domain: domain.to_owned(),
+            version,
+            reply,
+        }) {
+            return None;
+        }
+        rx.await.ok().flatten()
+    }
+
+    /// [`Self::assign_durable`] for callers outside an async runtime
+    /// (tests, tools). On a persistent pool it blocks on the disk; never
+    /// call it from a runtime thread.
+    pub fn assign(&self, domain: &str, version: u64) -> Option<Ipv4Addr> {
+        if self.jobs.is_none() {
+            return self.core.assign_mem(domain, version);
+        }
+        if let Some(ip) = self.core.existing(domain, version) {
+            return Some(ip);
+        }
+        let (reply, rx) = oneshot::channel();
+        if !self.send(Job::Assign {
+            domain: domain.to_owned(),
+            version,
+            reply,
+        }) {
+            return None;
+        }
+        rx.blocking_recv().ok().flatten()
+    }
+
+    /// Rewrite the state file (atomically, owner-only, via a fresh
+    /// exclusively created temporary) if anything changed since the last
+    /// save, then empty the journal. Runs on the persistence thread.
+    /// Returns whether it wrote. No-op for an in-memory pool.
+    pub async fn save_durable(&self) -> std::io::Result<bool> {
+        if self.jobs.is_none() {
+            return Ok(false);
+        }
+        let (reply, rx) = oneshot::channel();
+        if !self.send(Job::Save { reply }) {
+            return Err(std::io::Error::other("fake-ip persistence thread gone"));
+        }
+        rx.await
+            .unwrap_or_else(|_| Err(std::io::Error::other("fake-ip persistence thread gone")))
+    }
+
+    /// [`Self::save_durable`], blocking (never from a runtime thread).
+    pub fn save(&self) -> std::io::Result<bool> {
+        if self.jobs.is_none() {
+            return Ok(false);
+        }
+        let (reply, rx) = oneshot::channel();
+        if !self.send(Job::Save { reply }) {
+            return Err(std::io::Error::other("fake-ip persistence thread gone"));
+        }
+        rx.blocking_recv()
+            .unwrap_or_else(|_| Err(std::io::Error::other("fake-ip persistence thread gone")))
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        self.core.contains(ip)
+    }
+
+    /// Reverse lookup for a new flow. Unknown or idle addresses give None;
+    /// the caller refuses the flow. Never returns a domain other than the
+    /// one the address was handed out for.
+    pub fn lookup(&self, ip: IpAddr) -> Option<FakeEntry> {
+        self.core.lookup(ip)
+    }
+
+    /// Tracked addresses.
+    pub fn tracked(&self) -> usize {
+        self.core.inner.lock().expect("fake-ip lock").by_offset.len()
+    }
+
+    #[cfg(test)]
+    fn set_slow_append(&self, d: Duration) {
+        *self.core.slow_append.lock().unwrap() = d;
+    }
+}
+
+impl Writer {
+    fn run(mut self, rx: mpsc::Receiver<Job>) {
+        while let Ok(job) = rx.recv() {
+            match job {
+                Job::Assign {
+                    domain,
+                    version,
+                    reply,
+                } => {
+                    let _ = reply.send(self.assign(&domain, version));
+                }
+                Job::Save { reply } => {
+                    let _ = reply.send(self.save());
+                }
+            }
+        }
+    }
+
+    /// Journal (and sync) a new binding, then add it. Only this thread adds
+    /// bindings, so the offset picked stays free while the disk works, and
+    /// a save (same thread) sees every binding whose line it truncates.
+    fn assign(&mut self, domain: &str, version: u64) -> Option<Ipv4Addr> {
+        if let Some(ip) = self.core.existing(domain, version) {
+            return Some(ip);
+        }
+        let off = self.core.pick(domain)?;
+        let j = self.journal.as_mut()?;
+        let mut line = serde_json::to_vec(&(off, domain, version, crate::policy::unix_now()))
+            .expect("line serializes");
+        line.push(b'\n');
+        if j.bytes + line.len() as u64 > size_limit(self.core.max_entries) {
+            // Cannot happen within the bounds (one line per binding, each
+            // at most BYTES_PER_ENTRY); never write what a restart refuses.
+            return None;
+        }
+        #[cfg(test)]
+        std::thread::sleep(*self.core.slow_append.lock().unwrap());
+        if j.file.write_all(&line).and_then(|()| j.file.sync_data()).is_err() {
+            self.journal = None;
+            self.core.dirty.store(true, Ordering::Release);
+            return None;
+        }
+        j.bytes += line.len() as u64;
+        self.core.insert(off, domain, version);
+        Some(self.core.addr(off))
+    }
+
+    fn save(&mut self) -> std::io::Result<bool> {
+        if !self.core.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(false);
+        }
+        let r = self.compact();
+        if r.is_err() {
+            self.core.dirty.store(true, Ordering::Release);
+        }
+        r.map(|()| true)
+    }
+
+    /// Make sure a durable journal exists, write the state, empty the
+    /// journal.
+    fn compact(&mut self) -> std::io::Result<()> {
+        if self.journal.is_none() {
+            // First save, or after a failed append (no binding was added
+            // since: they are refused meanwhile). Created and its directory
+            // entry synced before any state that requires it is written; its
+            // old lines (if any) stay until that state is in place.
+            let jpath = journal_path(&self.path);
+            let file = open_journal(&jpath)?;
+            file.sync_all()?;
+            sync_dir(&self.path)?;
+            let bytes = file.metadata()?.len();
+            self.journal = Some(Journal { file, bytes });
+        }
+        let bytes = self.core.snapshot();
+        if bytes.len() as u64 > size_limit(self.core.max_entries) {
+            return Err(invalid(format!(
+                "state of {} bytes exceeds the {}-byte read limit",
+                bytes.len(),
+                size_limit(self.core.max_entries)
+            )));
+        }
+        write_atomic(&self.path, &bytes)?;
+        let j = self.journal.as_mut().expect("opened above");
+        j.file.set_len(0)?;
+        j.file.sync_all()?;
+        j.bytes = 0;
+        Ok(())
+    }
+}
+
+impl Core {
+    fn new(
+        base: Ipv4Addr,
+        prefix: u8,
+        lifetime: Duration,
+        key: [u8; 32],
+        max_entries: usize,
+    ) -> Result<Self, String> {
+        if !(8..=30).contains(&prefix) {
+            return Err(format!(
+                "fake_ip_range prefix must be 8..=30, got /{prefix}"
+            ));
+        }
+        let size = 1u32 << (32 - prefix);
+        let base = u32::from(base) & !(size - 1);
+        Ok(Self {
+            base,
+            prefix,
+            size,
+            key,
+            lifetime,
+            max_entries: max_entries.max(1),
+            inner: Mutex::new(Inner {
+                by_offset: HashMap::new(),
+                by_domain: HashMap::new(),
+            }),
+            dirty: AtomicBool::new(false),
+            #[cfg(test)]
+            slow_append: Mutex::new(Duration::ZERO),
+        })
+    }
+
+    /// Returns the core, the number of entries and the state format.
+    fn restore(
+        base: Ipv4Addr,
+        prefix: u8,
+        lifetime: Duration,
+        max_entries: usize,
+        bytes: &[u8],
+        now_unix: u64,
+    ) -> Result<(Self, usize, u32), String> {
         let st: State = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-        if st.format != STATE_FORMAT && st.format != 1 {
+        if !(1..=STATE_FORMAT).contains(&st.format) {
             return Err(format!("unknown format {}", st.format));
         }
         let key: [u8; 32] = base64::engine::general_purpose::STANDARD
@@ -260,31 +563,31 @@ impl FakeIpPool {
             .map_err(|e| e.to_string())?
             .try_into()
             .map_err(|_| "key must be 32 bytes".to_string())?;
-        let pool = Self::new(base, prefix, ttl, grace, key)?.with_max_entries(max_entries);
-        if st.range != pool.range() {
+        let core = Self::new(base, prefix, lifetime, key, max_entries)?;
+        if st.range != core.range() {
             return Err(format!(
                 "kept for range {}, configured {}",
                 st.range,
-                pool.range()
+                core.range()
             ));
         }
-        if st.entries.len() > pool.max_entries {
+        if st.entries.len() > core.max_entries {
             return Err(format!(
                 "{} entries, more than fake_ip_max_entries {}",
                 st.entries.len(),
-                pool.max_entries
+                core.max_entries
             ));
         }
         let down = now_unix.saturating_sub(st.saved_at);
         let n = st.entries.len();
         {
-            let mut inner = pool.inner.lock().expect("fake-ip lock");
+            let mut inner = core.inner.lock().expect("fake-ip lock");
             for (off, domain, version, idle) in st.entries {
                 let idle = idle.saturating_add(down);
-                pool.bind(&mut inner, off, domain, version, idle, false)?;
+                core.bind(&mut inner, off, domain, version, idle, false)?;
             }
         }
-        Ok((pool, n))
+        Ok((core, n, st.format))
     }
 
     /// Fold journal lines into the pool. A last line without its newline is
@@ -361,13 +664,10 @@ impl FakeIpPool {
         format!("{}/{}", Ipv4Addr::from(self.base), self.prefix)
     }
 
-    /// Serialized key + every binding.
-    pub fn snapshot(&self) -> Vec<u8> {
-        let inner = self.inner.lock().expect("fake-ip lock");
-        self.snapshot_of(&inner)
-    }
 
-    fn snapshot_of(&self, inner: &Inner) -> Vec<u8> {
+    /// Serialized key + every binding.
+    fn snapshot(&self) -> Vec<u8> {
+        let inner = self.inner.lock().expect("fake-ip lock");
         let now = Instant::now();
         let entries = inner
             .by_offset
@@ -387,52 +687,7 @@ impl FakeIpPool {
         serde_json::to_vec(&st).expect("state serializes")
     }
 
-    /// Rewrite the state file (atomically, owner-only, via a fresh
-    /// exclusively created temporary) if anything changed since the last
-    /// save, then empty the journal when nothing was appended meanwhile.
-    /// Returns whether it wrote. No-op for an in-memory pool.
-    pub fn save(&self) -> std::io::Result<bool> {
-        let Some(path) = &self.state else {
-            return Ok(false);
-        };
-        if !self.dirty.swap(false, Ordering::AcqRel) {
-            return Ok(false);
-        }
-        let (bytes, lines) = {
-            let inner = self.inner.lock().expect("fake-ip lock");
-            let lines = inner.journal.as_ref().map(|j| j.lines);
-            (self.snapshot_of(&inner), lines)
-        };
-        let r = write_atomic(path, &bytes).and_then(|()| {
-            let mut inner = self.inner.lock().expect("fake-ip lock");
-            match (&mut inner.journal, lines) {
-                // Bindings appended after the snapshot stay journaled.
-                (Some(j), Some(l)) if j.lines != l => Ok(()),
-                (Some(j), _) => {
-                    j.file.set_len(0)?;
-                    j.file.sync_all()?;
-                    j.lines = 0;
-                    Ok(())
-                }
-                (None, _) => {
-                    // First save, or after a failed append (no binding was
-                    // added since: they are refused while broken).
-                    let file = open_journal(&journal_path(path))?;
-                    file.set_len(0)?;
-                    file.sync_all()?;
-                    inner.journal = Some(Journal { file, lines: 0 });
-                    inner.broken = false;
-                    Ok(())
-                }
-            }
-        });
-        if r.is_err() {
-            self.dirty.store(true, Ordering::Release);
-        }
-        r.map(|()| true)
-    }
-
-    pub fn contains(&self, ip: IpAddr) -> bool {
+    fn contains(&self, ip: IpAddr) -> bool {
         let ip = match ip {
             IpAddr::V4(v4) => v4,
             IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -452,53 +707,61 @@ impl FakeIpPool {
         1 + v % (self.size - 2)
     }
 
-    /// Address for `domain`, allocating one if needed; `version` is the
-    /// policy version in force. Refreshes its age. None when the name gets
-    /// no address: the pool is full (no address is ever reused for another
-    /// name), the name cannot be stored, or the binding could not be made
-    /// durable.
-    pub fn assign(&self, domain: &str, version: u64) -> Option<Ipv4Addr> {
-        let now = Instant::now();
+    /// The address already bound to `domain`, refreshed.
+    fn existing(&self, domain: &str, version: u64) -> Option<Ipv4Addr> {
         let mut inner = self.inner.lock().expect("fake-ip lock");
-        if let Some(&off) = inner.by_domain.get(domain) {
-            let slot = inner.by_offset.get_mut(&off).expect("index consistent");
-            slot.last_used = now;
-            slot.version = version;
-            self.dirty.store(true, Ordering::Release);
-            return Some(self.addr(off));
-        }
+        let off = *inner.by_domain.get(domain)?;
+        let slot = inner.by_offset.get_mut(&off).expect("index consistent");
+        slot.last_used = Instant::now();
+        slot.version = version;
+        self.dirty.store(true, Ordering::Release);
+        Some(self.addr(off))
+    }
+
+    /// A free offset for a new `domain`; None when the name cannot be
+    /// stored or nothing may be handed out (cap reached, range full).
+    fn pick(&self, domain: &str) -> Option<u32> {
+        let inner = self.inner.lock().expect("fake-ip lock");
+        self.pick_in(&inner, domain)
+    }
+
+    fn pick_in(&self, inner: &Inner, domain: &str) -> Option<u32> {
         if !valid_domain(domain) || inner.by_offset.len() >= self.max_entries {
             return None;
         }
         let usable = self.size - 2;
         let start = self.home(domain);
-        let off = (0..usable)
+        (0..usable)
             .map(|i| 1 + (start - 1 + i) % usable)
-            .find(|off| !inner.by_offset.contains_key(off))?;
-        if self.state.is_some() {
-            // Durable before the address is handed out.
-            let j = inner.journal.as_mut()?;
-            let mut line =
-                serde_json::to_vec(&(off, domain, version, crate::policy::unix_now()))
-                    .expect("line serializes");
-            line.push(b'\n');
-            if j.file.write_all(&line).and_then(|()| j.file.sync_data()).is_err() {
-                inner.journal = None;
-                inner.broken = true;
-                self.dirty.store(true, Ordering::Release);
-                return None;
-            }
-            j.lines += 1;
-        }
+            .find(|off| !inner.by_offset.contains_key(off))
+    }
+
+    fn insert(&self, off: u32, domain: &str, version: u64) {
+        let mut inner = self.inner.lock().expect("fake-ip lock");
+        Self::insert_in(&mut inner, off, domain, version);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn insert_in(inner: &mut Inner, off: u32, domain: &str, version: u64) {
         inner.by_domain.insert(domain.to_owned(), off);
         inner.by_offset.insert(
             off,
             Slot {
                 domain: domain.to_owned(),
                 version,
-                last_used: now,
+                last_used: Instant::now(),
             },
         );
+    }
+
+    /// Assign without persistence (in-memory pool).
+    fn assign_mem(&self, domain: &str, version: u64) -> Option<Ipv4Addr> {
+        if let Some(ip) = self.existing(domain, version) {
+            return Some(ip);
+        }
+        let mut inner = self.inner.lock().expect("fake-ip lock");
+        let off = self.pick_in(&inner, domain)?;
+        Self::insert_in(&mut inner, off, domain, version);
         self.dirty.store(true, Ordering::Release);
         Some(self.addr(off))
     }
@@ -506,7 +769,7 @@ impl FakeIpPool {
     /// Reverse lookup for a new flow. Unknown or idle addresses give None;
     /// the caller refuses the flow. Never returns a domain other than the
     /// one the address was handed out for.
-    pub fn lookup(&self, ip: IpAddr) -> Option<FakeEntry> {
+    fn lookup(&self, ip: IpAddr) -> Option<FakeEntry> {
         if !self.contains(ip) {
             return None;
         }
@@ -527,11 +790,6 @@ impl FakeIpPool {
             domain: slot.domain.clone(),
             version: slot.version,
         })
-    }
-
-    /// Tracked addresses.
-    pub fn tracked(&self) -> usize {
-        self.inner.lock().expect("fake-ip lock").by_offset.len()
     }
 
     fn addr(&self, off: u32) -> Ipv4Addr {
@@ -666,6 +924,22 @@ fn open_journal(path: &Path) -> std::io::Result<File> {
     Ok(f)
 }
 
+/// Sync the directory holding `path`, so a file created or renamed there
+/// survives a power loss.
+fn sync_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// Replace `path` with `bytes`: write a new, exclusively created 0600
 /// temporary next to it, fsync, rename over, fsync the directory.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -681,10 +955,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, path)?;
-        #[cfg(unix)]
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            File::open(dir)?.sync_all()?;
-        }
+        sync_dir(path)?;
         Ok(())
     })();
     if r.is_err() {
@@ -1011,6 +1282,7 @@ mod tests {
         std::fs::create_dir(&j).unwrap();
         assert!(open_at(&path, DEFAULT_MAX_ENTRIES).is_err());
         std::fs::remove_dir(&j).unwrap();
+        put(&j, b"");
         // A directory others can write to.
         std::fs::set_permissions(&d.0, std::fs::Permissions::from_mode(0o777)).unwrap();
         let e = open_at(&path, DEFAULT_MAX_ENTRIES).err().unwrap();
@@ -1040,6 +1312,94 @@ mod tests {
         write_atomic(&path, b"{}").unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    }
+
+    /// R4: the journal is durable before the first state names it, so a
+    /// current state without its journal is a lost binding log, not a
+    /// fresh one.
+    #[test]
+    fn missing_journal_next_to_state_refuses_to_start() {
+        let d = private_dir();
+        let path = d.0.join("fakeip.state");
+        let (p, _) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
+        assert!(journal_path(&path).exists(), "journal exists before any address");
+        let x = p.assign("a.com", 1).unwrap();
+        assert!(p.save().unwrap(), "folded into the state");
+        drop(p);
+        let state = std::fs::read(&path).unwrap();
+        // The journal's directory entry was lost (power cut before it
+        // reached the disk): refuse instead of starting with an empty log.
+        std::fs::remove_file(journal_path(&path)).unwrap();
+        let e = open_at(&path, DEFAULT_MAX_ENTRIES).err().unwrap();
+        assert!(e.contains("journal") && e.contains("missing"), "{e}");
+        assert!(!journal_path(&path).exists(), "nothing recreated");
+        // A legacy (format 2) state could not promise a journal: accepted.
+        put(&path, &tamper(&state, |v| v["format"] = 2.into()));
+        let (q, _) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
+        assert_eq!(q.lookup(x.into()).unwrap().domain, "a.com");
+        assert!(journal_path(&path).exists());
+    }
+
+    /// R9: every name the pool accepts can be saved and read back, even
+    /// when JSON doubles each byte (quotes, backslashes).
+    #[test]
+    fn worst_case_names_save_and_restore() {
+        let d = private_dir();
+        let path = d.0.join("fakeip.state");
+        let max = 64;
+        let names: Vec<String> = (0..max)
+            .map(|i| format!("{i:02}{}", if i % 2 == 0 { "\"" } else { "\\" }.repeat(MAX_DOMAIN - 2)))
+            .collect();
+        assert!(names.iter().all(|n| valid_domain(n) && n.len() == MAX_DOMAIN));
+        let (p, _) = open_at(&path, max).unwrap();
+        let ips: Vec<_> = names.iter().map(|n| p.assign(n, u64::MAX).unwrap()).collect();
+        // Crash before any save: everything is in the journal.
+        std::mem::forget(p);
+        let (q, _) = open_at(&path, max).expect("journal within the read limit");
+        for (n, ip) in names.iter().zip(&ips) {
+            assert_eq!(&q.lookup((*ip).into()).unwrap().domain, n);
+        }
+        // Folded into the state (open saves): still readable.
+        assert!(std::fs::metadata(&path).unwrap().len() > 24_576);
+        drop(q);
+        let (r, _) = open_at(&path, max).expect("state within the read limit");
+        assert_eq!(r.tracked(), max);
+    }
+
+    /// R10: a slow disk delays only the DNS answer waiting for its binding,
+    /// not the runtime; the line is synced before the address is returned.
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_journal_does_not_stall_the_runtime() {
+        use std::sync::atomic::AtomicU32;
+        let d = private_dir();
+        let path = d.0.join("fakeip.state");
+        let (p, _) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
+        p.set_slow_append(Duration::from_millis(300));
+        let ticks = Arc::new(AtomicU32::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                t.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let start = Instant::now();
+        let ip = p.assign_durable("a.com", 1).await.unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        let n = ticks.load(Ordering::Relaxed);
+        assert!(n >= 10, "runtime ran only {n} ticks during a 300 ms append");
+        let journal = std::fs::read(journal_path(&path)).unwrap();
+        assert!(
+            String::from_utf8_lossy(&journal).contains("a.com"),
+            "journaled before the answer"
+        );
+        // Known names answer at once; saving also runs off the runtime.
+        assert_eq!(p.assign_durable("a.com", 1).await, Some(ip));
+        assert!(p.save_durable().await.unwrap());
+        ticker.abort();
+        drop(p);
+        let (q, _) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
+        assert_eq!(q.lookup(ip.into()).unwrap().domain, "a.com");
     }
 
     #[test]

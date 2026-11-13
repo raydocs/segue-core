@@ -152,7 +152,7 @@ impl SmartDns {
             return self.passthrough(query, &q).await;
         }
         match (classify(&policy, &q.name), q.qtype) {
-            (Class::Fake, TYPE_A) => Some(self.fake_answer(&q, &policy)),
+            (Class::Fake, TYPE_A) => Some(self.fake_answer(&q, &policy).await),
             // The pool is IPv4 only; AAAA for proxied names is NODATA so
             // clients use the fake A record (§5.2.6).
             (Class::Fake, _) => Some(respond(&q, RCODE_OK, &[], 0)),
@@ -162,8 +162,9 @@ impl SmartDns {
         }
     }
 
-    fn fake_answer(&self, q: &Question<'_>, policy: &Policy) -> Vec<u8> {
-        match self.pool.assign(&q.name, policy.version) {
+    /// A new binding is durable (persistence thread) before this answers.
+    async fn fake_answer(&self, q: &Question<'_>, policy: &Policy) -> Vec<u8> {
+        match self.pool.assign_durable(&q.name, policy.version).await {
             Some(ip) => respond(
                 q,
                 RCODE_OK,
@@ -197,12 +198,12 @@ impl SmartDns {
             if stale {
                 self.spawn_refresh(key);
             }
-            return self.render(q, value, ttl);
+            return self.render(q, value, ttl).await;
         }
         match self.resolve(&q.name, q.qtype).await {
             Some((value, ttl)) => {
                 self.store(key, value.clone(), ttl);
-                self.render(q, value, ttl.max(1))
+                self.render(q, value, ttl.max(1)).await
             }
             None => self.after_wait(q, || respond(q, RCODE_SERVFAIL, &[], 0)),
         }
@@ -210,7 +211,7 @@ impl SmartDns {
 
     /// The answer for a name that needed (or once needed) the domestic
     /// resolvers, decided under the policy in force now.
-    fn render(&self, q: &Question<'_>, value: Raw, ttl: u32) -> Vec<u8> {
+    async fn render(&self, q: &Question<'_>, value: Raw, ttl: u32) -> Vec<u8> {
         let policy = self.policy.current();
         if policy.refuse_all {
             return respond(q, RCODE_REFUSED, &[], 0);
@@ -225,7 +226,7 @@ impl SmartDns {
         };
         match (foreign, q.qtype) {
             (false, _) => respond(q, value.rcode, &value.ips, ttl),
-            (true, TYPE_A) => self.fake_answer(q, &policy),
+            (true, TYPE_A) => self.fake_answer(q, &policy).await,
             (true, _) => respond(q, RCODE_OK, &[], 0),
         }
     }

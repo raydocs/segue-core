@@ -219,9 +219,9 @@ struct RawDns {
     #[serde(default)]
     foreign: Option<Action>,
     /// Where the fake-IP key and bindings are kept across restarts
-    /// (relative to the config file). Default `fakeip.state`; `null` keeps
-    /// them in memory only, so a restart may hand a cached address to
-    /// another name.
+    /// (relative to the config file). Default `fakeip.state`; `null` (lab,
+    /// inline rules only; refused with a signed policy) keeps them in
+    /// memory only, so a restart may hand a cached address to another name.
     #[serde(default = "default_fake_state")]
     fake_ip_state: Option<PathBuf>,
     #[serde(default = "default_fake_max")]
@@ -445,6 +445,15 @@ impl KernelConfig {
                     // decision for unknown names (the bundle `default`).
                     return Err(
                         "dns.foreign comes from the policy bundle (its default); remove it".into(),
+                    );
+                }
+                if signed && d.fake_ip_state.is_none() {
+                    // Without persisted bindings a restart can hand an
+                    // address a client still caches to another name.
+                    return Err(
+                        "dns.fake_ip_state: null is lab only; with a signed policy the \
+                         fake-IP bindings must be persisted (omit it or name a file)"
+                            .into(),
                     );
                 }
                 let (c, cidrs) = dns_config(d, &known, base)?;
@@ -931,6 +940,25 @@ mod tests {
             err.contains("dns.foreign comes from the policy bundle"),
             "{err}"
         );
+        // In-memory fake-IP bindings are lab only: a signed config must
+        // persist them (omitting the key keeps the default file).
+        let err = KernelConfig::parse_in(
+            &doc(&format!(
+                r#"{pol},"dns":{{"listen":"127.0.0.1:5353","domestic":["223.5.5.5:53"],"fake_ip_state":null}}"#
+            )),
+            &dir,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("fake_ip_state"), "{err}");
+        let c = KernelConfig::parse_in(
+            &doc(&format!(
+                r#"{pol},"dns":{{"listen":"127.0.0.1:5353","domestic":["223.5.5.5:53"]}}"#
+            )),
+            &dir,
+        )
+        .unwrap();
+        assert!(c.dns.unwrap().fake_ip_state.is_some());
         // A signed bundle in place installs at startup and is persisted.
         let body = br#"{"version":2,"expires_at":4000000000,"ai_domains":["openai.com"],"default":{"type":"direct"}}"#;
         std::fs::write(dir.join("b"), crate::policy::sign(&key, 1, body).unwrap()).unwrap();
