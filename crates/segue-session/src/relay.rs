@@ -131,6 +131,10 @@ struct Session {
     rst: Option<u8>,
     /// When OPEN created the session; fixed for its whole life.
     created: Instant,
+    /// The client's FIN offset, received but not yet acknowledged because
+    /// the site has not taken the upload yet (see
+    /// [`RelayTable::confirm_site_flush`]).
+    held_fin: Option<u64>,
 }
 
 // Manual so the resume secret never reaches a log.
@@ -171,10 +175,28 @@ struct CarrierSlot {
 /// Control frames queued per control stream; PINGs beyond this are not
 /// answered (a peer that never reads cannot grow the queue).
 const CTRL_QUEUE: usize = 64;
-/// Live control streams one device may hold on this relay (one per exit
-/// in the kernel; a few spare for a stream being replaced). The oldest is
-/// closed when another arrives, so one ticket cannot take carrier slots.
-pub const MAX_CTRL_PER_DEVICE: usize = 4;
+/// Live control streams one device may hold on this relay.
+///
+/// The kernel keeps one control stream per configured exit, and nothing
+/// limits how many exits of one device point at the same relay; during a
+/// network change the replacement streams arrive while the old ones are
+/// still open. So the cap is not "a few" (review r6 R8: with 4, a fifth
+/// exit kicked the first, whose reconnect kicked another, forever) but
+/// 2 × 16 exits: comfortably above any real configuration, still a small
+/// fraction of the relay's carrier slots (`max_carriers`, 4096 by default).
+///
+/// At the cap a newcomer replaces only a stream that has gone quiet
+/// ([`ctrl_quiet`]); a stream that is still pinging is never kicked, the
+/// newcomer is closed instead (without a reply, so the client just
+/// retries and does not treat a channel as dead).
+pub const MAX_CTRL_PER_DEVICE: usize = 32;
+
+/// A control stream that sent nothing for this long may be replaced by a
+/// new one of the same device: a third of `t_ctrl_idle` (10 s by default,
+/// two missed kernel PINGs at 5 s).
+pub fn ctrl_quiet(t: &crate::Timing) -> std::time::Duration {
+    t.t_ctrl_idle / 3
+}
 /// STALL entries per frame (20 bytes each, under MAX_PAYLOAD).
 const STALL_BATCH: usize = 512;
 
@@ -190,6 +212,8 @@ pub struct RelayTable {
     to_close: Vec<CarrierId>,
     /// Latest `now` seen; used for tombstone expiry.
     clock: Instant,
+    /// See [`RelayTable::confirm_site_flush`].
+    hold_fin: bool,
 }
 
 impl RelayTable {
@@ -205,7 +229,24 @@ impl RelayTable {
             events: VecDeque::new(),
             to_close: Vec::new(),
             clock: Instant::now(),
+            hold_fin: false,
         }
+    }
+
+    /// With `on`, the client's FIN is acknowledged (and a session can end
+    /// CLEAN) only after [`site_flushed`]: the driver reports that the site
+    /// took every uploaded byte and its write side was shut down. Until
+    /// then [`read_eof`] already reports the end, so the driver can shut
+    /// the site down. A site that fails or never finishes is reset
+    /// ([`site_reset`]), so a truncated upload is never reported clean
+    /// (review r6, relay upload drain). Off: FIN is acknowledged on
+    /// arrival (state-machine tests that have no site writer).
+    ///
+    /// [`site_flushed`]: Self::site_flushed
+    /// [`read_eof`]: Self::read_eof
+    /// [`site_reset`]: Self::site_reset
+    pub fn confirm_site_flush(&mut self, on: bool) {
+        self.hold_fin = on;
     }
 
     pub fn instance_id(&self) -> u64 {
@@ -362,16 +403,31 @@ impl RelayTable {
             Ok(d) => d,
             Err(c) => return self.reject(cid, c, 0, None),
         };
-        // Newest wins: close the device's oldest streams beyond the cap.
-        let mut mine: Vec<(Instant, CarrierId)> = self
+        // At the cap, replace the device's quietest streams, but only ones
+        // that stopped sending; never kick a live one (review r6 R8).
+        let mut mine: Vec<(Instant, Instant, CarrierId)> = self
             .carriers
             .iter()
             .filter(|(c, x)| **c != cid && x.control == Some(device) && !x.close_after)
-            .map(|(c, x)| (x.ctrl_since.unwrap_or(now), *c))
+            .map(|(c, x)| {
+                let since = x.ctrl_since.unwrap_or(now);
+                (x.ctrl_seen.unwrap_or(since), since, *c)
+            })
             .collect();
         if mine.len() >= MAX_CTRL_PER_DEVICE {
             mine.sort_unstable();
-            for &(_, old) in &mine[..=mine.len() - MAX_CTRL_PER_DEVICE] {
+            let quiet = ctrl_quiet(&self.cfg.timing);
+            let over = mine.len() + 1 - MAX_CTRL_PER_DEVICE;
+            let stale: Vec<CarrierId> = mine
+                .iter()
+                .take(over)
+                .take_while(|(seen, _, _)| now.saturating_duration_since(*seen) >= quiet)
+                .map(|&(_, _, c)| c)
+                .collect();
+            if stale.len() < over {
+                return self.close_carrier_now(cid);
+            }
+            for old in stale {
                 self.close_carrier_now(old);
             }
         }
@@ -486,6 +542,7 @@ impl RelayTable {
                     recv,
                     rst: None,
                     created: now,
+                    held_fin: None,
                 };
                 self.sessions.insert(sid, s);
                 self.carriers.get_mut(&cid).unwrap().session = Some(sid);
@@ -579,11 +636,23 @@ impl RelayTable {
         frame: Frame,
         now: Instant,
     ) -> Result<(), ProtoError> {
+        let hold = self.hold_fin;
         let s = self.sessions.get_mut(sid).unwrap();
         match frame {
             Frame::Data { offset, data, .. } => {
+                if s.held_fin.is_some_and(|f| offset + data.len() as u64 > f) {
+                    return Err(ProtoError::Violation("data after fin"));
+                }
                 s.recv.on_data(offset, &data, now)?;
             }
+            Frame::Fin { offset } if hold && !s.recv.fin_received() => match s.held_fin {
+                Some(f) if f == offset => {}
+                Some(_) => return Err(ProtoError::Violation("fin moved")),
+                None if offset != s.recv.recv_offset() => {
+                    return Err(ProtoError::Violation("fin not at recv_offset"))
+                }
+                None => s.held_fin = Some(offset),
+            },
             Frame::Fin { offset } => s.recv.on_fin(offset, now)?,
             Frame::Ack {
                 recv_offset,
@@ -779,7 +848,26 @@ impl RelayTable {
 
     /// The client's FIN has been reached by `read`.
     pub fn read_eof(&self, sid: &SessionId) -> bool {
-        self.sessions.get(sid).is_some_and(|s| s.recv.eof())
+        self.sessions.get(sid).is_some_and(|s| {
+            s.recv.eof() || (s.held_fin == Some(s.recv.consumed()) && s.recv.buffered() == 0)
+        })
+    }
+
+    /// The site writer flushed the whole upload and shut the site's write
+    /// side down (see [`confirm_site_flush`]): acknowledge the client's FIN.
+    ///
+    /// [`confirm_site_flush`]: Self::confirm_site_flush
+    pub fn site_flushed(&mut self, sid: &SessionId, now: Instant) {
+        self.clock = self.clock.max(now);
+        let Some(s) = self.sessions.get_mut(sid) else {
+            return;
+        };
+        let Some(f) = s.held_fin.take() else {
+            return;
+        };
+        if let Err(e) = s.recv.on_fin(f, now) {
+            self.fail(sid, e);
+        }
     }
 
     /// Revocation / admin: RST every session of `device`.

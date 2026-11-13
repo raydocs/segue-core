@@ -147,6 +147,13 @@ pub struct Dialer {
     pub dns_timeout: Duration,
 }
 
+/// A normalized, resolved target.
+struct Resolved {
+    name: Option<String>,
+    ips: Vec<IpAddr>,
+    port: u16,
+}
+
 /// Where a target goes after classification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
@@ -186,7 +193,12 @@ impl Dialer {
     /// the relay cannot confirm is refused (`target_denied`), never sent
     /// out of the data centre as overseas.
     pub async fn route(&self, grant: &Grant, target: &Target, hint: u8) -> Result<Route, u8> {
-        let device = grant.device;
+        let r = self.resolve_target(target).await?;
+        self.classify(grant, &r, hint, true)
+    }
+
+    /// Normalize and resolve a target (refused with no unexpired bundle).
+    async fn resolve_target(&self, target: &Target) -> Result<Resolved, u8> {
         if self.ai.check((self.clock)()).is_none() {
             // No unexpired signed bundle: nothing can be classified (and
             // nothing is resolved).
@@ -201,9 +213,17 @@ impl Dialer {
                 (Some(n), ips, *port)
             }
         };
-        // Classify with the policy in force after the DNS wait (review r5
-        // N1): a bundle installed meanwhile applies to this connect, and one
-        // that expired meanwhile refuses it.
+        Ok(Resolved { name, ips, port })
+    }
+
+    /// Classify a resolved target with the policy in force now. Called
+    /// after the DNS wait (review r5 N1) and again before every further
+    /// connect attempt (review r6 R1), so a bundle installed or expired
+    /// while an earlier address was being tried applies to the next one.
+    /// `count`: record a reclassification (first call only).
+    fn classify(&self, grant: &Grant, r: &Resolved, hint: u8, count: bool) -> Result<Route, u8> {
+        let device = grant.device;
+        let (name, ips, port) = (&r.name, &r.ips, r.port);
         let Some(ai) = self.ai.check((self.clock)()) else {
             Metrics::inc(&self.metrics.policy_unavailable);
             return Err(code::TARGET_DENIED);
@@ -214,7 +234,12 @@ impl Dialer {
         }
         let is_ai = ai_name || ips.iter().any(|&ip| ai.is_ai_ip(ip));
         let hint_ai = hint == crate::hint::AI;
-        if is_ai != hint_ai {
+        if is_ai != hint_ai && !count {
+            if hint_ai {
+                Metrics::inc(&self.metrics.target_denied);
+                return Err(code::TARGET_DENIED);
+            }
+        } else if is_ai != hint_ai {
             let n = self.metrics.reclass(device);
             if n == 1 || n.is_power_of_two() {
                 crate::log!(
@@ -296,35 +321,51 @@ impl Dialer {
             Metrics::inc(&self.metrics.session_limit);
             return Err(self.deny(code::CAPACITY));
         };
-        let route = self
-            .route(&r.grant, &r.target, r.exit_class)
+        let resolved = self
+            .resolve_target(&r.target)
             .await
             .map_err(|c| self.deny(c))?;
-        match route {
-            Route::Overseas(addrs) => {
-                let mut last = code::CONNECT_REFUSED;
-                // Bound the total connect time: a name with many dead
-                // addresses must not hold the slot for `n × timeout`.
-                for a in addrs.into_iter().take(MAX_CONNECT_ADDRS) {
-                    match tokio::time::timeout(self.connect_timeout, TcpStream::connect(a)).await {
-                        Ok(Ok(s)) => {
-                            let _ = s.set_nodelay(true);
-                            Metrics::inc(&self.metrics.connects_overseas);
-                            return Ok(Box::new(Site {
-                                inner: s,
-                                _slot: slot,
-                                home: None,
-                                _lease: None,
-                                bytes: AtomicU64::new(0),
-                            }));
-                        }
-                        Ok(Err(_)) => last = code::CONNECT_REFUSED,
-                        Err(_) => last = code::CONNECT_TIMEOUT,
-                    }
-                }
+        let mut route = self
+            .classify(&r.grant, &resolved, r.exit_class, true)
+            .map_err(|c| self.deny(c))?;
+        let mut tried: Vec<SocketAddr> = Vec::new();
+        let mut last = code::CONNECT_REFUSED;
+        loop {
+            let a = match &route {
+                Route::Home(_) => break,
+                Route::Overseas(addrs) => addrs.iter().find(|a| !tried.contains(a)).copied(),
+            };
+            // Bound the total connect time: a name with many dead
+            // addresses must not hold the slot for `n × timeout`.
+            let Some(a) = a.filter(|_| tried.len() < MAX_CONNECT_ADDRS) else {
                 Metrics::inc(&self.metrics.connect_failures);
-                Err(self.deny(last))
+                return Err(self.deny(last));
+            };
+            tried.push(a);
+            match tokio::time::timeout(self.connect_timeout, TcpStream::connect(a)).await {
+                Ok(Ok(s)) => {
+                    let _ = s.set_nodelay(true);
+                    Metrics::inc(&self.metrics.connects_overseas);
+                    return Ok(Box::new(Site {
+                        inner: s,
+                        _slot: slot,
+                        home: None,
+                        _lease: None,
+                        bytes: AtomicU64::new(0),
+                    }));
+                }
+                Ok(Err(_)) => last = code::CONNECT_REFUSED,
+                Err(_) => last = code::CONNECT_TIMEOUT,
             }
+            // The attempt took time: re-check the policy before the next
+            // one (review r6 R1). A target that became AI goes Home; one
+            // whose bundle expired is refused.
+            route = self
+                .classify(&r.grant, &resolved, r.exit_class, false)
+                .map_err(|c| self.deny(c))?;
+        }
+        match route {
+            Route::Overseas(_) => unreachable!("overseas attempts return above"),
             Route::Home(a) => match self
                 .home
                 .dial(r.grant.device, a, self.connect_timeout)

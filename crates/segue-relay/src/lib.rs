@@ -55,7 +55,9 @@ pub fn system_clock() -> Clock {
 }
 
 /// Write via a temporary file and rename, so a crash leaves the old or the
-/// new content, never a torn file.
+/// new content, never a torn file. Returns only once the new content is
+/// durable (review r6 R2): the file is synced before the rename and the
+/// directory after it, so a power loss cannot bring back the old entry.
 pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut tmp = path.as_os_str().to_owned();
@@ -66,5 +68,10 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    std::fs::File::open(dir)?.sync_all()
 }

@@ -594,6 +594,79 @@ async fn policy_change_during_dns_wait_applies() {
     assert_eq!(t.await.unwrap(), Err(code::TARGET_DENIED));
 }
 
+/// Review r6 R1: the policy is checked again before every further connect
+/// attempt. `flip.test` resolves to [::1, 127.0.0.1]; nothing listens on
+/// [::1] (refused), an echo server on 127.0.0.1. While the first address
+/// fails, v2 makes the name AI (or the bundle expires): the second address
+/// must not be dialed overseas on the stale Route.
+///
+/// The hook is the relay clock: the dialer reads it once per policy check
+/// (before DNS, after DNS, then before each further attempt), so its third
+/// read is the one after the first failed attempt.
+#[tokio::test]
+async fn policy_change_between_connect_attempts_applies() {
+    use segue_session::driver::SiteRequest;
+    for expire in [false, true] {
+        let (echo_addr, echo_n) = echo().await;
+        let res: Resolver = Arc::new(|_h: String| {
+            Box::pin(async move { Ok(vec!["::1".parse().unwrap(), "127.0.0.1".parse().unwrap()]) })
+        });
+        let e = env("127.0.0.1:1", false, "");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let ai = Arc::new(std::sync::OnceLock::<Arc<segue_relay::policy::AiPolicy>>::new());
+        let v2 = bundle(&e.policy_key, 2, &["ai.test", "flip.test"], &[]).into_bytes();
+        let (rd, ai2) = (reads.clone(), ai.clone());
+        let clock: segue_relay::Clock = Arc::new(move || {
+            let t = now();
+            if rd.fetch_add(1, Ordering::SeqCst) < 2 {
+                return t;
+            }
+            if expire {
+                return t + 7200;
+            }
+            if let Some(p) = ai2.get() {
+                let _ = p.install(&v2, t);
+            }
+            t
+        });
+        let guard = Guard {
+            extra_blocked: vec![],
+            exceptions: vec![
+                Cidr::parse("127.0.0.1/32").unwrap(),
+                Cidr::parse("::1/128").unwrap(),
+            ],
+        };
+        let r = Relay::new(e.relay.cfg.clone(), clock, Some(res), Some(guard)).unwrap();
+        let _ = ai.set(r.ai.clone());
+        reads.store(0, Ordering::SeqCst);
+        let got = r
+            .dialer
+            .connect(SiteRequest {
+                session_id: [7; 16],
+                grant: grant_of(&claims(1, vec![ExitClass::Overseas, ExitClass::Ai])),
+                target: Target::Domain("flip.test".into(), echo_addr.port()),
+                kind: Kind::Tcp,
+                exit_class: 0,
+            })
+            .await;
+        let code = got
+            .err()
+            .map(|e| segue_session::driver::SiteError::code_of(&e));
+        assert_eq!(
+            echo_n.load(Ordering::SeqCst),
+            0,
+            "dialed overseas on a stale route (expire={expire})"
+        );
+        assert!(reads.load(Ordering::SeqCst) >= 3, "policy not re-read");
+        let want = if expire {
+            code::TARGET_DENIED
+        } else {
+            code::HOME_UNAVAILABLE
+        };
+        assert_eq!(code, Some(want), "expire={expire}");
+    }
+}
+
 /// Review r5 N2: the rollback floor survives a restart. v2 accepted, the
 /// file replaced by a valid v1 while the relay is down: the new relay
 /// keeps v2's AI set.
@@ -629,6 +702,34 @@ async fn policy_rollback_refused_after_restart() {
             .await,
         Ok(Route::Home(lo))
     );
+}
+
+/// Review r6 R3: the accepted revocation state recorded seq 10 with device
+/// 42; it is now corrupt and the input file is a complete, valid seq 9
+/// without 42. The relay refuses to start instead of starting from an
+/// empty floor and taking seq 9 (which would un-revoke 42).
+#[test]
+fn corrupt_revocation_state_refuses_start() {
+    let e = env("127.0.0.1:1", false, "");
+    let cfg = e.relay.cfg.clone();
+    let state = cfg.revocation_state.clone().expect("state path");
+    std::fs::write(
+        cfg.revocation_file.as_ref().unwrap(),
+        revocation_text(10, now(), &[42]),
+    )
+    .unwrap();
+    e.relay.revoked.reload().unwrap();
+    let full = std::fs::read_to_string(&state).unwrap();
+    assert!(full.contains("seq 10"));
+    std::fs::write(&state, &full[..full.len() - 3]).unwrap();
+    std::fs::write(
+        cfg.revocation_file.as_ref().unwrap(),
+        revocation_text(9, now(), &[]),
+    )
+    .unwrap();
+    let r = Relay::new(cfg, system_clock(), Some(resolver()), None);
+    let err = r.err().expect("started over a corrupt revocation state");
+    assert!(err.contains("revocation state"), "{err}");
 }
 
 /// Review r4 #1: with no usable bundle the relay cannot confirm anything
@@ -1075,4 +1176,66 @@ async fn revocation_resets_live_sessions() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// Review r6 (server.rs task ownership): cancelling `serve` (dropping or
+/// aborting its future, as a hot restart or an embedder does) must take its
+/// tasks with it. A live session's site socket and a carrier still in its
+/// first-frame wait are closed at once; before, the driver and the
+/// per-accept tasks ran on detached, holding both open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_serve_stops_its_tasks() {
+    let e = env("127.0.0.1:1", false, "198.51.100.0/24");
+    // A site that holds its connection and reports when it is closed.
+    let site = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let site_port = site.local_addr().unwrap().port();
+    let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = site.accept().await {
+            let tx = closed_tx.clone();
+            tokio::spawn(async move {
+                let mut b = [0u8; 1024];
+                while let Ok(n) = s.read(&mut b).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let _ = tx.send(());
+            });
+        }
+    });
+    let (ra, _stop, h) = start(&e).await;
+    let params = OpenParams {
+        ticket: e.signer.sign(&claims(5, vec![ExitClass::Overseas])),
+        kind: Kind::Tcp,
+        target: Target::Domain("echo.test".into(), site_port),
+        exit_class: 0,
+        anchor_node_id: 1,
+        instance_hint: 0,
+    };
+    let pool = Pool::new(8 << 20);
+    let s = ClientSession::new(Default::default(), &pool, params, Instant::now()).unwrap();
+    let connector: Connector = Arc::new(move || {
+        Box::pin(async move { Ok(Box::new(TcpStream::connect(ra).await?) as BoxCarrier) })
+    });
+    let (mut app, far) = tokio::io::duplex(64 << 10);
+    let client = tokio::spawn(run_client(s, far, connector));
+    app.write_all(b"hello").await.unwrap();
+    // A carrier that never sends its first frame.
+    let mut idle = TcpStream::connect(ra).await.unwrap();
+    // Wait for the site connection to be up, then cancel serve.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(closed_rx.try_recv().is_err(), "site closed early");
+    h.abort();
+    let _ = h.await;
+    tokio::time::timeout(Duration::from_secs(3), closed_rx.recv())
+        .await
+        .expect("site socket outlived the cancelled serve");
+    let mut b = [0u8; 16];
+    let r = tokio::time::timeout(Duration::from_secs(3), idle.read(&mut b)).await;
+    assert!(
+        matches!(r, Ok(Ok(0)) | Ok(Err(_))),
+        "first-frame task outlived the cancelled serve: {r:?}"
+    );
+    client.abort();
 }

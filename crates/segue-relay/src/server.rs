@@ -121,9 +121,12 @@ impl Relay {
             cfg.revocation_file.clone(),
             cfg.revocation_state.clone(),
         ));
-        if let Err(e) = revoked.restore() {
-            crate::log!("error", "revocation state not restored", "error" = e);
-        }
+        // An accepted state that exists but cannot be read is fatal (review
+        // r6 R3): its floor is unknown, and starting from nothing would
+        // take back an older snapshot that un-revokes devices.
+        revoked
+            .restore()
+            .map_err(|e| format!("{e}; refusing to start (repair or remove it)"))?;
         if cfg.revocation_file.is_some() {
             // Without an earlier snapshot a bad file is fatal; with one,
             // the file (e.g. an older list replayed) is refused and the
@@ -134,9 +137,9 @@ impl Relay {
                     "error",
                     "revocation file refused; keeping restored list",
                     "seq" = seq,
-                    "error" = e
+                    "error" = e.message
                 ),
-                (Err(e), None) => return Err(e),
+                (Err(e), None) => return Err(e.into()),
             }
         }
         let ai = Arc::new(AiPolicy::with_state(
@@ -225,7 +228,7 @@ impl Relay {
 
     /// Re-read the revocation list; RST sessions of newly revoked devices.
     pub async fn reload_revocations(&self, ctrl: &mpsc::Sender<RelayCtrl>) {
-        match self.revoked.reload() {
+        let added = match self.revoked.reload() {
             Ok(added) => {
                 if !added.is_empty() {
                     Metrics::inc(&self.metrics.revocation_reloads);
@@ -236,21 +239,31 @@ impl Relay {
                         "new" = added.len()
                     );
                 }
-                for d in added {
-                    Metrics::inc(&self.metrics.devices_reset);
-                    let _ = ctrl
-                        .send(RelayCtrl::ResetDevice {
-                            device: d,
-                            close_code: code::REVOKED,
-                        })
-                        .await;
-                }
+                added
             }
-            Err(e) => crate::log!(
-                "error",
-                "revocation reload failed; keeping last list",
-                "error" = e
-            ),
+            Err(e) => {
+                if !e.newly_revoked.is_empty() || self.revoked.storage_fault() {
+                    // Not committed (state not durable), but the newly
+                    // revoked devices are enforced now (review r6 R2).
+                    Metrics::inc(&self.metrics.state_persist_failures);
+                }
+                crate::log!(
+                    "error",
+                    "revocation snapshot not committed; keeping last list",
+                    "enforced_now" = e.newly_revoked.len(),
+                    "error" = e.message
+                );
+                e.newly_revoked
+            }
+        };
+        for d in added {
+            Metrics::inc(&self.metrics.devices_reset);
+            let _ = ctrl
+                .send(RelayCtrl::ResetDevice {
+                    device: d,
+                    close_code: code::REVOKED,
+                })
+                .await;
         }
     }
 }
@@ -274,13 +287,33 @@ impl Relay {
     }
 }
 
+/// A spawned task owned by `serve`: aborted when dropped, so a cancelled
+/// or aborted `serve` future (hot restart, embedding, tests) takes its
+/// driver, notice, revocation/policy, prober and metrics tasks with it
+/// instead of leaving them running detached (review r6, server.rs task
+/// ownership).
+struct Owned(tokio::task::JoinHandle<()>);
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn own<F: std::future::Future<Output = ()> + Send + 'static>(f: F) -> Owned {
+    Owned(tokio::spawn(f))
+}
+
 /// Serve until `shutdown` turns true, then drain up to `limits.drain`.
+///
+/// Every task this spawns is owned by the future: dropping it before it
+/// returns aborts them all, including first-frame reads in flight.
 pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch::Receiver<bool>) {
     let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(64);
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<RelayCtrl>(256);
     let (note_tx, mut note_rx) = mpsc::unbounded_channel::<RelayNotice>();
     let table = relay.table();
-    let driver = tokio::spawn(run_relay_ctl(
+    let mut driver = own(run_relay_ctl(
         table,
         accept_rx,
         relay.dialer.connector(),
@@ -289,7 +322,7 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
     ));
 
     let m = relay.metrics.clone();
-    let notes = tokio::spawn(async move {
+    let notes = own(async move {
         while let Some(n) = note_rx.recv().await {
             if let RelayNotice::Closed { close_code, .. } = n {
                 Metrics::inc(&m.sessions_closed);
@@ -301,12 +334,12 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
     let bg = {
         let relay = relay.clone();
         let ctrl = ctrl_tx.clone();
-        tokio::spawn(async move {
+        own(async move {
             // Probes run in their own task: a slow or hung gateway must
             // never delay revocation (≤ 60 s to RST, §6.4).
-            let prober = {
+            let _prober = {
                 let relay = relay.clone();
-                tokio::spawn(async move {
+                own(async move {
                     let mut probe = tokio::time::interval(relay.cfg.limits.probe_interval);
                     probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
@@ -317,13 +350,6 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
                     }
                 })
             };
-            struct AbortOnDrop(tokio::task::JoinHandle<()>);
-            impl Drop for AbortOnDrop {
-                fn drop(&mut self) {
-                    self.0.abort();
-                }
-            }
-            let _prober = AbortOnDrop(prober);
             let mut rev = tokio::time::interval(REVOCATION_POLL);
             loop {
                 rev.tick().await;
@@ -335,7 +361,7 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
 
     let metrics_srv = relay.cfg.metrics_listen.map(|addr| {
         let m = relay.metrics.clone();
-        tokio::spawn(async move {
+        own(async move {
             let Ok(l) = TcpListener::bind(addr).await else {
                 crate::log!("error", "metrics listen failed", "addr" = addr.to_string());
                 return;
@@ -350,8 +376,11 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
 
     let limit = Arc::new(Semaphore::new(relay.cfg.limits.max_carriers));
     let first = relay.cfg.limits.first_frame_timeout;
+    // Carriers still waiting for their first frame (aborted on drop).
+    let mut handshakes = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
+            Some(_) = handshakes.join_next(), if !handshakes.is_empty() => {}
             r = listener.accept() => {
                 let Ok((s, _peer)) = r else { continue };
                 let Ok(permit) = limit.clone().try_acquire_owned() else {
@@ -363,7 +392,7 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
                 let _ = s.set_nodelay(true);
                 let tx = accept_tx.clone();
                 let m = relay.metrics.clone();
-                tokio::spawn(async move {
+                handshakes.spawn(async move {
                     // The whole first frame must arrive and parse within
                     // the deadline; a byte at a time does not extend it.
                     // The table then authenticates that frame at once, and
@@ -394,20 +423,18 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
         "drain_secs" = relay.cfg.limits.drain.as_secs()
     );
     drop(listener);
+    handshakes.abort_all();
     drop(accept_tx);
-    bg.abort();
-    if let Some(h) = metrics_srv {
-        h.abort();
-    }
-    let mut driver = driver;
-    if tokio::time::timeout(relay.cfg.limits.drain, &mut driver)
+    drop(bg);
+    drop(metrics_srv);
+    if tokio::time::timeout(relay.cfg.limits.drain, &mut driver.0)
         .await
         .is_err()
     {
         crate::log!("warn", "drain limit reached; closing remaining sessions");
-        driver.abort();
     }
+    drop(driver);
     drop(ctrl_tx);
-    notes.abort();
+    drop(notes);
     crate::log!("info", "relay stopped", "metrics" = relay.metrics.render());
 }

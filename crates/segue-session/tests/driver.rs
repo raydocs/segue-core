@@ -771,3 +771,65 @@ async fn sessions_admitted_before_the_pool_ran_out_still_finish() {
     assert!(ClientSession::new(cfg, &pool, params(), Instant::now()).is_some());
     relay.abort();
 }
+
+/// Review r6 (relay upload drain): the client FINs an upload the site is
+/// slow to take (it reads only after a pause longer than the old 1 s drain
+/// bound). The session may end CLEAN only once the site writer actually
+/// handed it every byte; before, the relay acknowledged the FIN when the
+/// bytes left the table, reported CLEAN, and then aborted the writer after
+/// the drain bound, so the site got a prefix of a "clean" upload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_truncated_upload_is_never_reported_clean() {
+    use segue_session::driver::{DeviceSiteConnector, SiteRequest};
+    const SITE_BUF: usize = 1024;
+    const UP: usize = 24 << 10;
+    let (got_tx, got_rx) = oneshot::channel::<Vec<u8>>();
+    let got_tx = Arc::new(Mutex::new(Some(got_tx)));
+    let site_conn: DeviceSiteConnector = Arc::new(move |_r: SiteRequest| {
+        let got_tx = got_tx.lock().unwrap().take();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(SITE_BUF);
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(b);
+                // Nothing to send back: half-close at once.
+                let _ = w.shutdown().await;
+                tokio::time::sleep(Duration::from_millis(2500)).await;
+                let mut up = Vec::new();
+                let _ = r.read_to_end(&mut up).await;
+                if let Some(tx) = got_tx {
+                    let _ = tx.send(up);
+                }
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let (mut app, _ctrl, client, relay) = revocable_pair(site_conn);
+    let up = pattern(UP, 7);
+    app.write_all(&up).await.unwrap();
+    app.shutdown().await.unwrap();
+    let mut down = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), app.read_to_end(&mut down))
+        .await
+        .expect("app stream never ended");
+    let reason = tokio::time::timeout(Duration::from_secs(10), client)
+        .await
+        .expect("client did not end")
+        .unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(10), got_rx)
+        .await
+        .expect("site never finished reading")
+        .unwrap();
+    assert_eq!(
+        reason,
+        CloseReason::Clean,
+        "a slow but working site is a clean close"
+    );
+    assert_eq!(
+        got.len(),
+        UP,
+        "reported clean, site got {} of {UP} bytes",
+        got.len()
+    );
+    assert!(got == up, "upload corrupted");
+    relay.abort();
+}

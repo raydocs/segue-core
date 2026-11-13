@@ -76,6 +76,23 @@ struct Persisted {
     previous: Option<String>,
 }
 
+/// Why a bundle was not installed.
+enum Refused {
+    /// The bundle itself (signature, version, expiry): not retried until
+    /// the file changes.
+    Bundle(String),
+    /// The state file could not be written durably: retried.
+    Persist(String),
+}
+
+impl Refused {
+    fn into_string(self) -> String {
+        match self {
+            Refused::Bundle(e) | Refused::Persist(e) => e,
+        }
+    }
+}
+
 /// Signed AI whitelist, reloaded from the bundle file.
 pub struct AiPolicy {
     keys: BTreeMap<u32, Vec<u8>>,
@@ -176,34 +193,54 @@ impl AiPolicy {
 
     /// Verify and install a bundle. `Ok(Some(v))`: version `v` is now
     /// current; `Ok(None)`: the same version as current (no change).
+    ///
+    /// The new state is installed only once it is durably on disk (review
+    /// r6 R2): if the state file cannot be written the bundle is refused
+    /// and the old one stays, so a restart can never fall back below a
+    /// floor this run acted on.
     pub fn install(&self, bytes: &[u8], now: u64) -> Result<Option<u64>, String> {
-        let l = self.verify(bytes)?;
+        self.try_install(bytes, now).map_err(Refused::into_string)
+    }
+
+    fn try_install(&self, bytes: &[u8], now: u64) -> Result<Option<u64>, Refused> {
+        let l = self.verify(bytes).map_err(Refused::Bundle)?;
         let mut st = self.state.write().unwrap();
         if l.version <= st.high_water {
             if st.current.as_ref().is_some_and(|c| c.version == l.version) {
                 return Ok(None);
             }
-            return Err(format!(
+            return Err(Refused::Bundle(format!(
                 "policy version {} not above {} (no rollback)",
                 l.version, st.high_water
-            ));
+            )));
         }
         if now >= l.expires_at {
-            return Err(format!("policy version {} expired", l.version));
+            return Err(Refused::Bundle(format!(
+                "policy version {} expired",
+                l.version
+            )));
         }
         let v = l.version;
-        st.high_water = v;
-        st.previous = st.current.take();
-        st.current = Some(Arc::new(l));
-        if let Err(e) = self.persist(&st) {
-            // In force in memory; a restart before the next good write
-            // could fall back to the older floor, so say so loudly.
-            crate::log!("error", "policy state not persisted", "error" = e);
-        }
+        let next = State {
+            high_water: v,
+            previous: st.current.clone(),
+            current: Some(Arc::new(l)),
+        };
+        self.persist(&next).map_err(|e| {
+            crate::log!(
+                "error",
+                "policy state not persisted; bundle refused",
+                "version" = v,
+                "error" = e.clone()
+            );
+            Refused::Persist(e)
+        })?;
+        *st = next;
         Ok(Some(v))
     }
 
-    /// Re-read the bundle file if it changed.
+    /// Re-read the bundle file if it changed. A bundle refused only because
+    /// its state could not be written is retried on the next call.
     pub fn reload(&self, now: u64) -> Result<Option<u64>, String> {
         let Some(path) = &self.path else {
             return Ok(None);
@@ -220,9 +257,13 @@ impl AiPolicy {
             return Err("policy bundle: too large".into());
         }
         let bytes = std::fs::read(path).map_err(|e| format!("policy bundle: {e}"))?;
-        let r = self.install(&bytes, now);
-        *self.file.lock().unwrap() = Some(stamp);
-        r
+        match self.try_install(&bytes, now) {
+            Err(Refused::Persist(e)) => Err(e),
+            r => {
+                *self.file.lock().unwrap() = Some(stamp);
+                r.map_err(Refused::into_string)
+            }
+        }
     }
 
     /// The AI sets valid at `now`; `None` when no unexpired bundle exists
@@ -331,6 +372,39 @@ mod tests {
         std::fs::write(&file, bundle(&k, 3, 3000, &["c.com"])).unwrap();
         assert!(pol.reload(100).is_err());
         assert!(pol.check(100).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review r6 R2: a bundle whose state cannot be written durably is not
+    /// installed (the old one stays in force), and it is retried on the
+    /// next reload once the state can be written. A restart then holds the
+    /// floor of everything this run acted on.
+    #[test]
+    fn unpersisted_bundle_is_not_installed() {
+        let (k, p) = segue_policy::generate_key();
+        let keys: BTreeMap<u32, Vec<u8>> =
+            [(1, segue_policy::parse_public_key(&p).unwrap())].into();
+        let dir =
+            std::env::temp_dir().join(format!("segue-relay-pol-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sdir = dir.join("state");
+        std::fs::create_dir_all(&sdir).unwrap();
+        let (file, state) = (dir.join("policy.bundle"), sdir.join("policy.state"));
+        let pol = AiPolicy::with_state(keys.clone(), Some(file.clone()), Some(state.clone()));
+        pol.restore().unwrap();
+        std::fs::write(&file, bundle(&k, 1, 1000, &["a.com"])).unwrap();
+        assert_eq!(pol.reload(100), Ok(Some(1)));
+        // The state directory goes away (disk/unwritable): v2 is refused.
+        std::fs::remove_dir_all(&sdir).unwrap();
+        std::fs::write(&file, bundle(&k, 2, 2000, &["b.com"])).unwrap();
+        assert!(pol.reload(100).is_err());
+        assert_eq!(pol.version(), Some(1), "installed without a durable floor");
+        assert!(!pol.check(100).unwrap().is_ai_domain("x.b.com"));
+        // Same file, storage back: retried without the file changing.
+        std::fs::create_dir_all(&sdir).unwrap();
+        assert_eq!(pol.reload(100), Ok(Some(2)));
+        let again = AiPolicy::with_state(keys, Some(file), Some(state));
+        assert_eq!(again.restore(), Ok(Some(2)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

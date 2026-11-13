@@ -54,6 +54,7 @@ counters!(
     home_line_failures,
     home_alerts,
     revocation_reloads,
+    state_persist_failures,
     devices_reset,
     sessions_closed,
 );

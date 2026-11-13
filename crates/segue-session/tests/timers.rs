@@ -329,13 +329,14 @@ fn control_stream_answers_ping_and_carries_stall_and_revoked() {
 }
 
 /// Review r5 N11: one valid ticket repeating CTRL_HELLO cannot pile up
-/// control streams. The device keeps at most `MAX_CTRL_PER_DEVICE` (the
-/// newest; older ones are closed), a stream that stops sending is closed
-/// after `t_ctrl_idle`, and none outlives `max_lifetime`.
+/// control streams. The device keeps at most `MAX_CTRL_PER_DEVICE` (a
+/// newcomer beyond it replaces only a quiet stream, else it is closed), a
+/// stream that stops sending is closed after `t_ctrl_idle`, and none
+/// outlives `max_lifetime`.
 #[test]
 fn control_streams_are_bounded_per_device_and_expire() {
     use segue_session::codec::{CtrlHello, VERSION};
-    use segue_session::relay::MAX_CTRL_PER_DEVICE;
+    use segue_session::relay::{ctrl_quiet, MAX_CTRL_PER_DEVICE};
     let t0 = Instant::now();
     let mut r = RelayTable::new(
         Config::default(),
@@ -348,30 +349,43 @@ fn control_streams_are_bounded_per_device_and_expire() {
         ticket: b"ticket".to_vec(),
         held_anchors: vec![],
     };
-    let n = 64u64;
+    let n = 2 * MAX_CTRL_PER_DEVICE as u64;
     let mut closed = std::collections::HashSet::new();
-    for cid in 1..=n {
+    let hello_at = |r: &mut RelayTable, cid: u64, t: Instant| {
         r.add_carrier(cid);
-        r.on_frame(cid, hello.to_frame(), t0);
-        closed.extend(r.take_closed_carriers());
+        r.on_frame(cid, hello.to_frame(), t);
+        let gone = r.take_closed_carriers();
         // A closed carrier leaves the table once the driver drops it.
-        for &c in &closed {
-            r.on_carrier_closed(c, t0);
+        for &c in &gone {
+            r.on_carrier_closed(c, t);
         }
+        gone
+    };
+    for cid in 1..=n {
+        closed.extend(hello_at(&mut r, cid, t0));
     }
     let live: Vec<u64> = (1..=n).filter(|c| !closed.contains(c)).collect();
     assert_eq!(live.len(), MAX_CTRL_PER_DEVICE, "live control streams");
-    assert_eq!(
-        live,
-        ((n - MAX_CTRL_PER_DEVICE as u64 + 1)..=n).collect::<Vec<_>>(),
-        "the newest are kept"
-    );
+    // Once the first ones went quiet, newcomers replace exactly those.
+    let quiet = ctrl_quiet(&Config::default().timing);
+    let tq = t0 + quiet;
+    for &c in &live[2..] {
+        r.on_frame(c, Frame::Ping { nonce: 0 }, tq);
+        while r.poll_transmit(c, tq).is_some() {}
+    }
+    let mut closed = std::collections::HashSet::new();
+    for cid in n + 1..=n + 3 {
+        closed.extend(hello_at(&mut r, cid, tq));
+    }
+    let want: std::collections::HashSet<u64> = [live[0], live[1], n + 3].into();
+    assert_eq!(closed, want, "quiet streams replaced, live ones kept");
+    let live: Vec<u64> = live[2..].iter().copied().chain([n + 1, n + 2]).collect();
     // Idle: one stream keeps pinging, the others go silent.
     let timing = Config::default().timing;
     let keep = *live.last().unwrap();
-    let mut t = t0;
+    let mut t = tq;
     let step = Duration::from_secs(5);
-    while t < t0 + timing.t_ctrl_idle + step {
+    while t < tq + timing.t_ctrl_idle + step {
         t += step;
         r.on_frame(keep, Frame::Ping { nonce: 1 }, t);
         while r.poll_transmit(keep, t).is_some() {}
@@ -383,9 +397,59 @@ fn control_streams_are_bounded_per_device_and_expire() {
     }
     assert!(!gone.contains(&keep), "live control stream closed");
     // Even a pinging stream ends at max_lifetime.
-    let end = t0 + timing.max_lifetime;
+    let end = tq + timing.max_lifetime;
     r.on_frame(keep, Frame::Ping { nonce: 2 }, end - Duration::from_secs(1));
     assert!(r.poll_timeout().is_some_and(|d| d <= end));
     assert_relay_settled(&mut r, end);
     assert!(r.take_closed_carriers().contains(&keep));
+}
+
+/// Review r6 R8: a device with more exits on one relay than the old cap
+/// (one control stream each, all pinging, each reconnecting as soon as it
+/// is closed) must not kick its own channels. With 5 such exits and the
+/// old cap of 4, every reconnect closed another live stream, forever.
+#[test]
+fn live_control_streams_of_many_exits_are_not_kicked() {
+    use segue_session::codec::{CtrlHello, VERSION};
+    let t0 = Instant::now();
+    let mut r = RelayTable::new(
+        Config::default(),
+        Pool::new(1 << 20),
+        Box::new(AllowAll),
+        INSTANCE,
+    );
+    let hello = CtrlHello {
+        version: VERSION,
+        ticket: b"ticket".to_vec(),
+        held_anchors: vec![],
+    };
+    let exits = 5usize;
+    // exit i -> its current carrier
+    let mut cur: Vec<u64> = Vec::new();
+    let mut next_cid = 1u64;
+    let mut kicked = 0;
+    let mut t = t0;
+    for round in 0..40 {
+        t += Duration::from_secs(1);
+        // Every exit without a stream (re)connects, like run_control.
+        while cur.len() < exits {
+            r.add_carrier(next_cid);
+            r.on_frame(next_cid, hello.to_frame(), t);
+            cur.push(next_cid);
+            next_cid += 1;
+        }
+        // Every stream pings each round.
+        for &c in &cur {
+            r.on_frame(c, Frame::Ping { nonce: round }, t);
+            while r.poll_transmit(c, t).is_some() {}
+        }
+        let gone = r.take_closed_carriers();
+        for &c in &gone {
+            r.on_carrier_closed(c, t);
+        }
+        kicked += gone.len();
+        cur.retain(|c| !gone.contains(c));
+    }
+    assert_eq!(kicked, 0, "live control streams closed");
+    assert_eq!(next_cid as usize - 1, exits, "streams reconnected");
 }
