@@ -1059,12 +1059,17 @@ where
             // 16 KiB prefetch per connection (r7 #7).
             s.write_capacity_for(abuf.len().min(CHUNK))
         };
+        // Sending can serve a deadline only with room in the writer queue
+        // and pool credit for the frame (elastic blocks or the transport
+        // slot). While either is missing, deadlines only sending can serve
+        // (the delayed ACK) are left out: the loop wakes when the writer
+        // drains or credit is given back (r10 N4).
         let room = s
             .carrier()
             .and_then(|cid| carriers.get(&cid))
             .is_none_or(|io| io.tx.capacity() > 0);
         let deadline = s
-            .poll_timeout_writable(room)
+            .poll_timeout_writable(room && !pool_blocked)
             .map(tokio::time::Instant::from_std);
         let backoff = connect_backoff.filter(|_| !connecting);
         let abuf_idle = abuf.idle_at();

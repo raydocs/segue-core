@@ -2571,3 +2571,158 @@ async fn carriers_cut_inside_a_frame_header_count_against_the_budget() {
         assert_eq!(n, MAX_FRUITLESS as usize, "{name}: {n} dials");
     }
 }
+
+/// r10 N4: the client's pool is full (no elastic block left) and the
+/// session's one transport-region frame is stuck in a slow writer, whose
+/// queue still has room; meanwhile the relay keeps sending DATA, so a
+/// delayed ACK falls due. It cannot be sent without credit: before, its
+/// deadline stayed in the past and the driver woke in a loop until the
+/// writer moved. Now it waits for credit (or the writer), at almost no
+/// CPU and a bounded number of wakeups.
+#[tokio::test]
+async fn client_does_not_spin_on_an_ack_it_has_no_credit_for() {
+    use segue_session::codec::{Frame, FrameDecoder, Opened};
+    use segue_session::pool::Tier;
+    let pool = Pool::new(1 << 20);
+    // Only the bound under test may end the stuck frame.
+    pool.set_transport_hold(Duration::from_secs(60));
+    pool.set_transport_hold_max(Duration::from_secs(60));
+    let dials = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::new(AtomicUsize::new(0));
+    // Set: the relay end reads again, and counts the ACKs it gets.
+    let go = Arc::new(tokio::sync::Notify::new());
+    let acks = Arc::new(AtomicUsize::new(0));
+    let connector: Connector = {
+        let (dials, sent, go, acks) = (dials.clone(), sent.clone(), go.clone(), acks.clone());
+        Arc::new(move || {
+            let (sent, go, acks) = (sent.clone(), go.clone(), acks.clone());
+            dials.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                // A tiny pipe: the relay end reads the OPEN and then
+                // nothing, so the client's writer blocks inside its next
+                // frame.
+                let (a, b) = tokio::io::duplex(256);
+                tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(b);
+                    let mut dec = FrameDecoder::new();
+                    let mut buf = [0u8; 256];
+                    let gen = loop {
+                        let n = r.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        dec.push(&buf[..n]);
+                        if let Ok(Some(Frame::Open(o))) = dec.next_frame() {
+                            break o.attach_gen;
+                        }
+                    };
+                    let opened = Frame::Opened(Opened {
+                        instance_id: INSTANCE,
+                        attach_gen: gen,
+                        recv_offset: 0,
+                        max_offset: 1 << 30,
+                        window_cap: 1 << 30,
+                        ack_bytes: 0,
+                    });
+                    if w.write_all(&opened.to_bytes()).await.is_err() {
+                        return;
+                    }
+                    tokio::spawn(async move {
+                        go.notified().await;
+                        loop {
+                            let n = r.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            dec.push(&buf[..n]);
+                            while let Ok(Some(f)) = dec.next_frame() {
+                                if matches!(f, Frame::Ack { .. }) {
+                                    acks.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    });
+                    // A slow download, 200 bytes every 20 ms.
+                    let mut off = 0u64;
+                    loop {
+                        let f = Frame::Data {
+                            offset: off,
+                            data: vec![9; 200],
+                            pad: 0,
+                        };
+                        if w.write_all(&f.to_bytes()).await.is_err() {
+                            return;
+                        }
+                        off += 200;
+                        sent.store(off as usize, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                });
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    let mut cfg = Config::default();
+    cfg.timing.t_stall = Duration::from_secs(60);
+    cfg.timing.t_live = Duration::from_secs(60);
+    let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+    let (mut app, far) = tokio::io::duplex(64 << 10);
+    let client = tokio::spawn(run_client(s, far, connector));
+    let mut buf = [0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), app.read(&mut buf))
+        .await
+        .expect("no download")
+        .unwrap();
+    assert!(n > 0);
+    // Spend every elastic block, then upload: the next frame takes the
+    // transport slot and sticks in the writer.
+    let mut held = 0;
+    loop {
+        let k = pool.take_blocks(1 << 20, 1, pool.limit(Tier::Elastic));
+        if k == 0 {
+            break;
+        }
+        held += k;
+    }
+    app.write_all(&pattern(4 << 10, 5)).await.unwrap();
+    // The app keeps taking the download (so ACKs fall due).
+    let reader = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = app.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+        app
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        pool.transport_used_blocks() > 0,
+        "no frame in the transport region"
+    );
+    let cpu = thread_cpu();
+    let at = sent.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let used = thread_cpu() - cpu;
+    println!("full pool, stuck slot, ACK due: {used:?} CPU in 2 s");
+    assert!(sent.load(Ordering::SeqCst) > at, "the download stopped");
+    assert!(
+        used < CPU_LIMIT,
+        "client burnt {used:?} CPU on an ACK it had no credit for"
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "carrier given up");
+    // Credit comes back and the relay reads again: the stuck frame
+    // completes, and ACKs go out promptly.
+    pool.give_blocks(held);
+    go.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while acks.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no ACK after credit came back");
+    assert!(!client.is_finished(), "session ended");
+    client.abort();
+    reader.abort();
+}

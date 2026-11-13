@@ -893,9 +893,11 @@ impl ClientSession {
     }
 
     /// [`poll_timeout`](Self::poll_timeout) for a driver that knows
-    /// whether the current carrier's writer has room (r9 F3): the delayed
-    /// ACK deadline is served only by sending, so it is left out while
-    /// the writer is full (the driver wakes when the writer drains).
+    /// whether it can send on the current carrier now: room in the
+    /// writer queue and pool credit for a frame (r9 F3, r10 N4). The
+    /// delayed ACK deadline is served only by sending, so it is left out
+    /// while sending is blocked (the driver wakes when the writer drains
+    /// or credit is released).
     pub fn poll_timeout_writable(&self, writable: bool) -> Option<Instant> {
         if self.is_closed() {
             return None;
