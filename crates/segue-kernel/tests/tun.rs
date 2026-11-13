@@ -2020,7 +2020,8 @@ async fn tun_quic_to_fake_ip_of_ai_name_is_refused() {
 }
 
 /// r8 N1–N3: QUIC to a real IP is refused at its first datagram with ICMP
-/// port unreachable (the app falls back to TCP at once), on any port and
+/// port unreachable (sent back at once; see
+/// `refusal_icmp_reaches_the_connected_client_socket_v4_and_v6`), on any port and
 /// whatever the version, the fixed bit or what hides behind the first
 /// packet. Nothing is dialled.
 #[tokio::test]
@@ -2185,6 +2186,155 @@ async fn tun_plain_udp_protocols_to_real_ip_pass() {
     want.sort();
     assert_eq!(sent, want);
     assert_eq!(e.dialer.udp_dials.lock().unwrap().len(), cases.len());
+}
+
+/// The demultiplexing an OS stack does with an ICMP error for UDP (BSD
+/// `udp_ctlinput` / `udp6_ctlinput`, Linux `__udp4_lib_err` /
+/// `__udp6_lib_err`): the outer ICMP must verify and be addressed to the
+/// socket's address; the quoted IP + UDP header names the socket's own
+/// 4-tuple (inner source = its local address, inner destination = its
+/// peer). Returns which connected socket gets which error.
+fn os_udp_error(
+    pkt: &[u8],
+    sockets: &[(SocketAddr, SocketAddr)],
+) -> Option<(usize, std::io::ErrorKind)> {
+    use std::io::ErrorKind::*;
+    let o = out(pkt);
+    let (kind, quoted) = match o.proto {
+        IpProtocol::Icmp => {
+            let icmp = Icmpv4Packet::new_checked(&o.l4[..]).ok()?;
+            if !icmp.verify_checksum() {
+                return None;
+            }
+            let kind = match (u8::from(icmp.msg_type()), icmp.msg_code()) {
+                (3, 3) => ConnectionRefused,
+                (3, 13) => HostUnreachable,
+                _ => return None,
+            };
+            (kind, &o.l4[8..])
+        }
+        IpProtocol::Icmpv6 => {
+            let icmp = Icmpv6Packet::new_checked(&o.l4[..]).ok()?;
+            if !icmp.verify_checksum(&o.src.to_v6(), &o.dst.to_v6()) {
+                return None;
+            }
+            let kind = match (u8::from(icmp.msg_type()), icmp.msg_code()) {
+                (1, 4) => ConnectionRefused,
+                (1, 1) => PermissionDenied,
+                _ => return None,
+            };
+            (kind, &o.l4[8..])
+        }
+        _ => return None,
+    };
+    // Quoted header: IPv4 (IHL) or IPv6 (40 bytes, next header UDP), then
+    // at least the 8-byte UDP header.
+    let (src, dst, udp) = match quoted.first()? >> 4 {
+        4 => {
+            let ihl = usize::from(quoted[0] & 0x0f) * 4;
+            if quoted.get(9) != Some(&17) || ihl < 20 {
+                return None;
+            }
+            let a = |i: usize| {
+                IpAddr::V4(Ipv4Addr::new(
+                    quoted[i],
+                    quoted[i + 1],
+                    quoted[i + 2],
+                    quoted[i + 3],
+                ))
+            };
+            (a(12), a(16), quoted.get(ihl..ihl + 8)?)
+        }
+        6 => {
+            if quoted.get(6) != Some(&17) {
+                return None;
+            }
+            let a = |i: usize| {
+                let b: [u8; 16] = quoted[i..i + 16].try_into().unwrap();
+                IpAddr::V6(Ipv6Addr::from(b))
+            };
+            (a(8), a(24), quoted.get(40..48)?)
+        }
+        _ => return None,
+    };
+    let local = SocketAddr::new(src, u16::from_be_bytes([udp[0], udp[1]]));
+    let peer = SocketAddr::new(dst, u16::from_be_bytes([udp[2], udp[3]]));
+    if o.dst != local.ip() {
+        return None;
+    }
+    let i = sockets.iter().position(|&s| s == (local, peer))?;
+    Some((i, kind))
+}
+
+/// r9 F6: the refusal of real-IP QUIC reaches the client socket. A real
+/// OS socket cannot be fed a crafted ICMP without privileges, so the
+/// client's stack is modelled ([`os_udp_error`]): for v4 and v6, the ICMP
+/// the TUN writes back for a QUIC Initial is the one a connected UDP
+/// socket for exactly that 4-tuple turns into ECONNREFUSED, it comes back
+/// while the datagram is being taken in (no timer), and a plain UDP flow
+/// from the same app to the same host is left alone.
+#[tokio::test]
+async fn refusal_icmp_reaches_the_connected_client_socket_v4_and_v6() {
+    let mut e = kernel_env_with(
+        inline(),
+        false,
+        true,
+        false,
+        FakeDialer {
+            udp_max: 1500,
+            ..Default::default()
+        },
+    );
+    let quic_v4 = (
+        SocketAddr::new(CLIENT4.ip(), 40001),
+        "8.8.8.8:8443".parse().unwrap(),
+    );
+    let plain_v4 = (
+        SocketAddr::new(CLIENT4.ip(), 40002),
+        "8.8.8.8:8443".parse().unwrap(),
+    );
+    let quic_v6 = (
+        SocketAddr::new(client6().ip(), 40001),
+        "[2001:4860:4860::8888]:8443".parse().unwrap(),
+    );
+    let sockets = [quic_v4, plain_v4, quic_v6];
+    e.h.send(udp(plain_v4.0, plain_v4.1, b"\x12\x34plain"))
+        .await;
+    assert_eq!(udp_sent(&e, 1).await.len(), 1);
+    for (i, s) in [(0, quic_v4), (2, quic_v6)] {
+        let t = Instant::now();
+        e.h.send(udp(s.0, s.1, &hex(RFC9001_CLIENT_INITIAL))).await;
+        let pkt = loop {
+            let p = e.h.next().await;
+            if matches!(out(&p).proto, IpProtocol::Icmp | IpProtocol::Icmpv6) {
+                break p;
+            }
+        };
+        let took = t.elapsed();
+        assert_eq!(
+            os_udp_error(&pkt, &sockets),
+            Some((i, std::io::ErrorKind::ConnectionRefused)),
+            "{s:?}"
+        );
+        assert!(took < Duration::from_millis(100), "{s:?}: {took:?}");
+    }
+    // The model is not trivially true: the same ICMP matches no socket
+    // with another local port or another peer.
+    e.h.send(udp(quic_v4.0, quic_v4.1, &hex(RFC9001_CLIENT_INITIAL)))
+        .await;
+    let pkt = e.h.next().await;
+    assert_eq!(os_udp_error(&pkt, &sockets[..1]).map(|r| r.0), Some(0));
+    let others = [
+        (SocketAddr::new(CLIENT4.ip(), 40009), quic_v4.1),
+        (quic_v4.0, "8.8.4.4:8443".parse().unwrap()),
+        (quic_v4.0, "8.8.8.8:8444".parse().unwrap()),
+    ];
+    assert_eq!(os_udp_error(&pkt, &others), None);
+    assert_eq!(
+        e.dialer.udp_dials.lock().unwrap().len(),
+        1,
+        "only the plain flow"
+    );
 }
 
 // r6 R5: a TUN flow through a real segue session keeps moving bytes both

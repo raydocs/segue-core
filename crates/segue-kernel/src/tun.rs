@@ -396,8 +396,9 @@ pub enum Verdict {
     Refuse,
     /// Refuse a UDP flow with ICMP port unreachable rather than
     /// "administratively prohibited": QUIC to a destination whose name is
-    /// not known for certain (§5.2a.2). Apps take it as "no QUIC here" and
-    /// fall back to TCP at once. For TCP the same as `Refuse`.
+    /// not known for certain (§5.2a.2). An app that honours ICMP on its
+    /// (connected) socket gets ECONNREFUSED at once and may try TCP; one
+    /// that ignores it times out. For TCP the same as `Refuse`.
     Unreachable,
 }
 

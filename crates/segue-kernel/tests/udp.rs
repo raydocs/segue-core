@@ -494,8 +494,8 @@ fn quic_variants() -> Vec<Vec<u8>> {
 }
 
 /// r8 N1–N3 (§5.2a.2): QUIC to a bare IP is dropped on any port (SOCKS
-/// has no per-datagram refusal; the client's handshake times out and it
-/// falls back to TCP), and so is anything on UDP/443 to a bare IP. Nothing
+/// has no per-datagram refusal: the client's handshake times out), and so
+/// is anything on UDP/443 to a bare IP. Nothing
 /// is dialled.
 #[tokio::test]
 async fn quic_to_bare_ip_is_dropped_on_any_port() {

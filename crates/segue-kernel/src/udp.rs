@@ -15,8 +15,9 @@
 //!   Direct rule.
 //!
 //! "Refused" for UDP means the datagrams are dropped: SOCKS5 has no way to
-//! signal a per-datagram error, and the app falls back to TCP (where the
-//! same rules answer with a proper refusal).
+//! signal a per-datagram error. The app sees nothing and waits for its own
+//! timeout; one that then tries TCP meets the same rules there, with a
+//! proper refusal.
 //!
 //! Memory is bounded per association (`max_flows` × `queue` datagrams, and
 //! at most `queue_bytes` of queued payload) and globally
@@ -60,8 +61,8 @@ pub const ASSOCIATION_QUEUE_BYTES: usize = 1 << 20;
 pub struct UdpSettings {
     /// Outbounds that never carry UDP (the Home / AI exit).
     pub refuse: BTreeSet<String>,
-    /// Outbounds that refuse UDP to port 443 (QUIC over a Reality carrier),
-    /// so the app falls back to TCP.
+    /// Outbounds that refuse UDP to port 443 (QUIC over a Reality carrier);
+    /// the app may then try TCP after its own timeout.
     pub refuse_quic: BTreeSet<String>,
     /// A flow with no datagram either way for this long is closed; an
     /// association with no flows and no client datagram for this long ends.
