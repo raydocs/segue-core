@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -862,16 +862,72 @@ struct SiteIo {
     outstanding: bool,
     shut: bool,
     eof: bool,
-    /// Resets the session if the site writer has not flushed the upload
-    /// and shut down within [`SITE_FLUSH`] of the client's FIN.
-    flush_timer: Option<Task>,
+    /// Upload bytes the site has accepted (see [`SiteWrite`]).
+    accepted: Arc<AtomicU64>,
+    /// The upload drain after the client's FIN (see [`Flush`]).
+    flush: Flush,
 }
 
-/// How long the site writer may take, after the client's FIN, to hand the
-/// rest of the upload to the site and shut its write side down. Only then
+/// The upload drain after the client's FIN: the site writer must hand the
+/// rest of the upload to the site and shut its write side down; only then
 /// is the FIN acknowledged and the session can end CLEAN (r6: a truncated
-/// upload must never be reported clean); past this it is reset.
-const SITE_FLUSH: std::time::Duration = std::time::Duration::from_secs(30);
+/// upload must never be reported clean). Bounded by progress (review r7
+/// #9): reset when the site accepts nothing for `site_flush_idle`, or when
+/// the whole drain exceeds `site_flush_max`. Both count from the moment
+/// the FIN and every byte before it arrived ([`RelayTable::upload_complete`]),
+/// not from when the shutdown got into the writer queue, so a full queue
+/// does not hold the clock back.
+enum Flush {
+    /// The client's upload is still arriving.
+    Waiting,
+    Draining {
+        since: tokio::time::Instant,
+        /// `accepted` as last seen, and when it last changed.
+        seen: u64,
+        moved: tokio::time::Instant,
+    },
+    /// The site writer shut down: the FIN is acknowledged.
+    Done,
+}
+
+impl Flush {
+    fn deadline(&self, t: &crate::Timing) -> Option<tokio::time::Instant> {
+        match self {
+            Flush::Draining { since, moved, .. } => {
+                Some((*moved + t.site_flush_idle).min(*since + t.site_flush_max))
+            }
+            _ => None,
+        }
+    }
+
+    /// Start or advance the drain clock; true when it ran out.
+    fn check(
+        &mut self,
+        complete: bool,
+        accepted: u64,
+        now: tokio::time::Instant,
+        t: &crate::Timing,
+    ) -> bool {
+        match self {
+            Flush::Waiting if complete => {
+                *self = Flush::Draining {
+                    since: now,
+                    seen: accepted,
+                    moved: now,
+                };
+                false
+            }
+            Flush::Draining { seen, moved, .. } => {
+                if accepted != *seen {
+                    *seen = accepted;
+                    *moved = now;
+                }
+                self.deadline(t).is_some_and(|d| d <= now)
+            }
+            _ => false,
+        }
+    }
+}
 
 /// The site's write half: reports once its shutdown completed, i.e. every
 /// byte before it was written and the FIN went out.
@@ -879,6 +935,8 @@ struct SiteWrite<W> {
     inner: W,
     sid: SessionId,
     flushed: Option<mpsc::UnboundedSender<SessionId>>,
+    /// Bytes the site accepted: the drain's progress (see [`Flush`]).
+    accepted: Arc<AtomicU64>,
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for SiteWrite<W> {
@@ -887,7 +945,11 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for SiteWrite<W> {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let r = std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, buf));
+        if let Ok(n) = r {
+            self.accepted.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        std::task::Poll::Ready(r)
     }
 
     fn poll_flush(
@@ -952,7 +1014,7 @@ pub async fn run_relay_ctl(
     let (site_tx, mut site_rx) = mpsc::channel::<SiteEv>(64);
     let (flushed_tx, mut flushed_rx) = mpsc::unbounded_channel::<SessionId>();
     // The client's FIN is acknowledged only once the site writer flushed
-    // (see `SITE_FLUSH`).
+    // (see `Flush`).
     table.confirm_site_flush(true);
     let mut carriers: HashMap<u64, CarrierIo> = HashMap::new();
     let mut sites: HashMap<SessionId, SiteIo> = HashMap::new();
@@ -966,6 +1028,21 @@ pub async fn run_relay_ctl(
     loop {
         let t = now();
         table.handle_timeout(t);
+        // Upload drains that stopped progressing or ran too long (`Flush`).
+        let tnow = tokio::time::Instant::now();
+        let stuck: Vec<SessionId> = sites
+            .iter_mut()
+            .filter_map(|(sid, io)| {
+                let complete = table.upload_complete(sid);
+                let a = io.accepted.load(Ordering::Relaxed);
+                io.flush
+                    .check(complete, a, tnow, table.timing())
+                    .then_some(*sid)
+            })
+            .collect();
+        for sid in stuck {
+            table.site_reset(&sid);
+        }
         while let Some(ev) = table.take_event() {
             match ev {
                 RelayEvent::Connect {
@@ -1015,7 +1092,7 @@ pub async fn run_relay_ctl(
                         if close_code == code::CLEAN {
                             // CLEAN needs the client's FIN acknowledged, which
                             // waits for the site writer to flush and shut down
-                            // (`SITE_FLUSH`): it is done, only exiting.
+                            // (`Flush`): it is done, only exiting.
                             drop(io.tx);
                             tasks.drain(io.writer);
                         } else {
@@ -1066,11 +1143,6 @@ pub async fn run_relay_ctl(
                 } else {
                     if table.read_eof(sid) && io.tx.try_send(Vec::new().into()).is_ok() {
                         io.shut = true;
-                        let (stx, sid) = (site_tx.clone(), *sid);
-                        io.flush_timer = Some(spawn(async move {
-                            tokio::time::sleep(SITE_FLUSH).await;
-                            let _ = stx.send(SiteEv::Error(sid)).await;
-                        }));
                     }
                     break;
                 }
@@ -1091,6 +1163,8 @@ pub async fn run_relay_ctl(
         }
         let deadline = table.poll_timeout().map(tokio::time::Instant::from_std);
         let drain = tasks.next_deadline();
+        let tm = table.timing();
+        let flush = sites.values().filter_map(|io| io.flush.deadline(tm)).min();
         tokio::select! {
             c = accept.recv(), if accepting => match c {
                 Some(stream) => {
@@ -1134,7 +1208,8 @@ pub async fn run_relay_ctl(
                             continue;
                         }
                         let (mut r, w) = tokio::io::split(stream);
-                        let w = SiteWrite { inner: w, sid, flushed: Some(flushed_tx.clone()) };
+                        let accepted = Arc::new(AtomicU64::new(0));
+                        let w = SiteWrite { inner: w, sid, flushed: Some(flushed_tx.clone()), accepted: accepted.clone() };
                         let etx = site_tx.clone();
                         let (tx, writer) = spawn_writer(w, writable.clone(), async move {
                             let _ = etx.send(SiteEv::Error(sid)).await;
@@ -1151,7 +1226,7 @@ pub async fn run_relay_ctl(
                                 }
                             }
                         });
-                        sites.insert(sid, SiteIo { tx, req, reader, writer, outstanding: false, shut: false, eof: false, flush_timer: None });
+                        sites.insert(sid, SiteIo { tx, req, reader, writer, outstanding: false, shut: false, eof: false, accepted, flush: Flush::Waiting });
                         table.connect_done(&sid, Ok(()), t);
                     }
                     Some(SiteEv::Connected(sid, Err(e))) => {
@@ -1176,7 +1251,7 @@ pub async fn run_relay_ctl(
             }
             Some(sid) = flushed_rx.recv() => {
                 if let Some(io) = sites.get_mut(&sid) {
-                    io.flush_timer = None;
+                    io.flush = Flush::Done;
                 }
                 table.site_flushed(&sid, now());
             }
@@ -1187,6 +1262,7 @@ pub async fn run_relay_ctl(
             _ = writable.notified() => {}
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
             _ = tokio::time::sleep_until(drain.unwrap_or_else(tokio::time::Instant::now)), if drain.is_some() => {}
+            _ = tokio::time::sleep_until(flush.unwrap_or_else(tokio::time::Instant::now)), if flush.is_some() => {}
         }
     }
 }

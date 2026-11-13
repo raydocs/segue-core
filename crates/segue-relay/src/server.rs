@@ -212,6 +212,8 @@ impl Relay {
         let mut scfg = segue_session::Config::default();
         scfg.limits.window_cap = self.cfg.limits.window_cap;
         scfg.limits.replay_cap = self.cfg.limits.replay_cap;
+        scfg.timing.site_flush_idle = self.cfg.limits.site_flush_idle;
+        scfg.timing.site_flush_max = self.cfg.limits.site_flush_max;
         let auth = TicketAuth {
             verifier: self.verifier.clone(),
             revoked: self.revoked.clone(),

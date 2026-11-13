@@ -97,6 +97,8 @@ struct RawLimits {
     line_fail_threshold: u32,
     probe_interval_secs: u64,
     drain_secs: u64,
+    site_flush_idle_secs: u64,
+    site_flush_max_secs: u64,
 }
 
 impl Default for RawLimits {
@@ -116,6 +118,8 @@ impl Default for RawLimits {
             line_fail_threshold: d.line_fail_threshold,
             probe_interval_secs: d.probe_interval.as_secs(),
             drain_secs: d.drain.as_secs(),
+            site_flush_idle_secs: d.site_flush_idle.as_secs(),
+            site_flush_max_secs: d.site_flush_max.as_secs(),
         }
     }
 }
@@ -144,6 +148,12 @@ pub struct Limits {
     pub probe_interval: Duration,
     /// Graceful shutdown drain limit.
     pub drain: Duration,
+    /// After a client's FIN: reset when the site accepts no upload byte
+    /// for this long (segue-session `Timing::site_flush_idle`).
+    pub site_flush_idle: Duration,
+    /// After a client's FIN: overall bound on flushing the upload to the
+    /// site (`Timing::site_flush_max`).
+    pub site_flush_max: Duration,
 }
 
 impl Default for Limits {
@@ -162,6 +172,8 @@ impl Default for Limits {
             line_fail_threshold: 3,
             probe_interval: Duration::from_secs(60),
             drain: Duration::from_secs(30),
+            site_flush_idle: segue_session::Timing::default().site_flush_idle,
+            site_flush_max: segue_session::Timing::default().site_flush_max,
         }
     }
 }
@@ -332,7 +344,14 @@ impl Config {
             line_fail_threshold: r.line_fail_threshold.max(1),
             probe_interval: Duration::from_secs(r.probe_interval_secs.max(1)),
             drain: Duration::from_secs(r.drain_secs),
+            site_flush_idle: Duration::from_secs(r.site_flush_idle_secs),
+            site_flush_max: Duration::from_secs(r.site_flush_max_secs),
         };
+        if limits.site_flush_idle.is_zero() || limits.site_flush_max < limits.site_flush_idle {
+            return Err(
+                "limits: site_flush_idle_secs must be > 0 and <= site_flush_max_secs".into(),
+            );
+        }
         if limits.pool_bytes < 1 << 20
             || limits.window_cap < 16 * 1024
             || limits.replay_cap < 16 * 1024

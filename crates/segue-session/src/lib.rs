@@ -69,6 +69,16 @@ pub struct Timing {
     /// is closed. Clients PING every 5 s and judge the stream dead after
     /// 12 s, so a live client never comes near it.
     pub t_ctrl_idle: Duration,
+    /// Relay: once the client's FIN and every byte before it arrived, the
+    /// site writer is reset if the site accepts no upload byte (and the
+    /// write side is not shut down) for this long. Progress-based: a slow
+    /// site that keeps reading is never cut by it (review r7 #9).
+    pub site_flush_idle: Duration,
+    /// Relay: overall bound, from the same point, on handing the rest of
+    /// the upload to the site and shutting its write side down, however
+    /// slowly it progresses. Past either bound the session is reset
+    /// (`site_reset`), never CLEAN.
+    pub site_flush_max: Duration,
 }
 
 impl Default for Timing {
@@ -84,6 +94,8 @@ impl Default for Timing {
             idle_after: Duration::from_secs(1),
             max_lifetime: Duration::from_secs(24 * 3600),
             t_ctrl_idle: Duration::from_secs(30),
+            site_flush_idle: Duration::from_secs(30),
+            site_flush_max: Duration::from_secs(300),
         }
     }
 }

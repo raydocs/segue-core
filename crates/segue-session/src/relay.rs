@@ -249,6 +249,19 @@ impl RelayTable {
         self.hold_fin = on;
     }
 
+    pub fn timing(&self) -> &crate::Timing {
+        &self.cfg.timing
+    }
+
+    /// The client's FIN and every upload byte before it have arrived: what
+    /// is left of the upload is only waiting for the site (the driver's
+    /// flush bounds start here, review r7 #9).
+    pub fn upload_complete(&self, sid: &SessionId) -> bool {
+        self.sessions
+            .get(sid)
+            .is_some_and(|s| s.recv.fin_received() || s.held_fin == Some(s.recv.recv_offset()))
+    }
+
     pub fn instance_id(&self) -> u64 {
         self.instance_id
     }
