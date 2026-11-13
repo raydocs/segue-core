@@ -535,78 +535,104 @@ impl Frame {
 
     /// Append the encoded frame to `out`. Panics if the payload would exceed
     /// [`MAX_PAYLOAD`]; callers size DATA with [`max_data_len`].
+    ///
+    /// The payload is written straight into `out` behind a 4-byte length
+    /// slot that is narrowed afterwards (an in-place move, no intermediate
+    /// buffer: r6 N13).
     pub fn encode(&self, out: &mut Vec<u8>) {
-        let mut p = Vec::new();
+        self.encode_with(out, [&[], &[]]);
+    }
+
+    /// [`encode`](Self::encode) with `tail` appended to OPEN's
+    /// `first_data` or DATA's `data` (before any padding), so bytes held
+    /// elsewhere (a ring buffer's two halves) are copied once, straight
+    /// into the wire buffer. Other frames take no tail.
+    pub fn encode_with(&self, out: &mut Vec<u8>, tail: [&[u8]; 2]) {
+        let tail_len = tail[0].len() + tail[1].len();
+        debug_assert!(
+            tail_len == 0 || matches!(self, Frame::Open(_) | Frame::Data { .. }),
+            "tail on a frame without data"
+        );
+        let start = out.len();
+        out.push(self.type_byte());
+        out.push(0);
+        out.extend_from_slice(&[0; 4]);
+        let body = out.len();
+        let p = &mut *out;
         let mut flags = 0u8;
         match self {
             Frame::Open(o) => {
                 p.push(o.version);
-                put_lp(&mut p, &o.ticket);
+                put_lp(p, &o.ticket);
                 p.extend_from_slice(&o.session_id);
                 p.extend_from_slice(&o.resume_secret);
                 p.extend_from_slice(&o.attach_gen.to_be_bytes());
                 p.push(u8::from(o.retry));
-                put_varint(&mut p, o.anchor_instance_id);
+                put_varint(p, o.anchor_instance_id);
                 p.push(o.kind as u8);
-                put_target(&mut p, &o.target);
+                put_target(p, &o.target);
                 p.push(o.exit_class);
                 p.extend_from_slice(&o.first_data);
+                p.extend_from_slice(tail[0]);
+                p.extend_from_slice(tail[1]);
             }
             Frame::Opened(o) => {
-                put_varint(&mut p, o.instance_id);
+                put_varint(p, o.instance_id);
                 p.extend_from_slice(&o.attach_gen.to_be_bytes());
-                put_varint(&mut p, o.recv_offset);
-                put_varint(&mut p, o.max_offset);
-                put_varint(&mut p, o.window_cap);
-                put_varint(&mut p, o.ack_bytes);
+                put_varint(p, o.recv_offset);
+                put_varint(p, o.max_offset);
+                put_varint(p, o.window_cap);
+                put_varint(p, o.ack_bytes);
             }
             Frame::Resume(r) => {
                 p.push(r.version);
-                put_lp(&mut p, &r.ticket);
-                put_varint(&mut p, r.anchor_node_id);
-                put_varint(&mut p, r.anchor_instance_id);
+                put_lp(p, &r.ticket);
+                put_varint(p, r.anchor_node_id);
+                put_varint(p, r.anchor_instance_id);
                 p.extend_from_slice(&r.session_id);
                 p.extend_from_slice(&r.resume_secret);
                 p.extend_from_slice(&r.attach_gen.to_be_bytes());
-                put_varint(&mut p, r.recv_offset);
-                put_varint(&mut p, r.max_offset);
+                put_varint(p, r.recv_offset);
+                put_varint(p, r.max_offset);
             }
             Frame::Resumed(r) => {
-                put_varint(&mut p, r.instance_id);
+                put_varint(p, r.instance_id);
                 p.extend_from_slice(&r.attach_gen.to_be_bytes());
-                put_varint(&mut p, r.recv_offset);
-                put_varint(&mut p, r.max_offset);
+                put_varint(p, r.recv_offset);
+                put_varint(p, r.max_offset);
             }
             Frame::Reject(r) => {
                 p.push(r.code);
                 p.extend_from_slice(&r.attach_gen.to_be_bytes());
                 if let Some(c) = &r.closed {
                     p.push(c.close_code);
-                    put_varint(&mut p, c.final_recv_offset);
-                    put_varint(&mut p, c.final_sent_offset);
+                    put_varint(p, c.final_recv_offset);
+                    put_varint(p, c.final_sent_offset);
                 }
             }
             Frame::Data { offset, data, pad } => {
                 if *pad > 0 {
                     flags |= FLAG_PADDED;
-                    put_varint(&mut p, *pad as u64);
+                    put_varint(p, *pad as u64);
                 }
-                put_varint(&mut p, *offset);
+                put_varint(p, *offset);
                 p.extend_from_slice(data);
+                p.extend_from_slice(tail[0]);
+                p.extend_from_slice(tail[1]);
                 p.resize(p.len() + pad, 0);
             }
             Frame::Ack {
                 recv_offset,
                 max_offset,
             } => {
-                put_varint(&mut p, *recv_offset);
-                put_varint(&mut p, *max_offset);
+                put_varint(p, *recv_offset);
+                put_varint(p, *max_offset);
             }
-            Frame::Fin { offset } => put_varint(&mut p, *offset),
+            Frame::Fin { offset } => put_varint(p, *offset),
             Frame::Rst { code } => p.push(*code),
             Frame::Pad(n) => p.resize(*n, 0),
             Frame::Dgram { addr, data } => {
-                put_target(&mut p, &Target::Ip(*addr));
+                put_target(p, &Target::Ip(*addr));
                 p.extend_from_slice(data);
             }
             Frame::Ping { nonce } => p.extend_from_slice(&nonce.to_be_bytes()),
@@ -616,35 +642,35 @@ impl Frame {
             }
             Frame::Wake { full, entries } => {
                 flags |= u8::from(*full);
-                put_varint(&mut p, entries.len() as u64);
+                put_varint(p, entries.len() as u64);
                 for e in entries {
-                    put_varint(&mut p, e.anchor_node_id);
+                    put_varint(p, e.anchor_node_id);
                     p.extend_from_slice(&e.session_id);
                     p.extend_from_slice(&e.park_gen.to_be_bytes());
                 }
             }
             Frame::Park(entries) => {
-                put_varint(&mut p, entries.len() as u64);
+                put_varint(p, entries.len() as u64);
                 for e in entries {
                     p.extend_from_slice(&e.session_id);
-                    put_varint(&mut p, e.req_id);
+                    put_varint(p, e.req_id);
                     p.extend_from_slice(&e.attach_gen.to_be_bytes());
-                    put_varint(&mut p, e.c_recv_offset);
-                    put_varint(&mut p, e.c_sent_offset);
+                    put_varint(p, e.c_recv_offset);
+                    put_varint(p, e.c_sent_offset);
                 }
             }
             Frame::ParkAck(entries) => {
-                put_varint(&mut p, entries.len() as u64);
+                put_varint(p, entries.len() as u64);
                 for e in entries {
                     p.extend_from_slice(&e.session_id);
-                    put_varint(&mut p, e.req_id);
+                    put_varint(p, e.req_id);
                     p.extend_from_slice(&e.attach_gen.to_be_bytes());
                     p.push(u8::from(e.accepted));
                     p.extend_from_slice(&e.park_gen.to_be_bytes());
                 }
             }
             Frame::Stall(entries) => {
-                put_varint(&mut p, entries.len() as u64);
+                put_varint(p, entries.len() as u64);
                 for (sid, gen) in entries {
                     p.extend_from_slice(sid);
                     p.extend_from_slice(&gen.to_be_bytes());
@@ -652,17 +678,67 @@ impl Frame {
             }
             Frame::Control { payload, .. } => p.extend_from_slice(payload),
         }
-        assert!(p.len() <= MAX_PAYLOAD, "frame payload too large");
-        out.push(self.type_byte());
-        out.push(flags);
-        put_varint(out, p.len() as u64);
-        out.extend_from_slice(&p);
+        finish_frame(out, start, body, flags);
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::new();
+        let mut v = Vec::with_capacity(self.size_hint());
         self.encode(&mut v);
         v
+    }
+
+    /// Upper bound of the encoded size for the frames that carry bytes
+    /// (so [`to_bytes`](Self::to_bytes) allocates once), a small guess for
+    /// the rest.
+    pub(crate) fn size_hint(&self) -> usize {
+        let body = match self {
+            Frame::Open(o) => o.ticket.len() + o.first_data.len() + 340,
+            Frame::Resume(r) => r.ticket.len() + 96,
+            Frame::Data { data, pad, .. } => data.len() + pad + 24,
+            Frame::Dgram { data, .. } => data.len() + 24,
+            Frame::Pong { extra, .. } => extra.len() + 8,
+            Frame::Pad(n) => *n,
+            _ => 64,
+        };
+        (6 + body).min(MAX_PAYLOAD + 6)
+    }
+
+    /// Decode a payload the caller owns: DATA keeps the payload's own
+    /// allocation for its bytes (moved down in place), so a frame read
+    /// into a charged buffer is never copied again (r6 N13).
+    pub fn decode_owned(
+        ty: u8,
+        flags: u8,
+        mut payload: Vec<u8>,
+    ) -> Result<Option<Frame>, ProtoError> {
+        if ty != ty::DATA {
+            return Self::decode(ty, flags, &payload);
+        }
+        let mut r = Reader { buf: &payload };
+        let pad = if flags & FLAG_PADDED != 0 {
+            r.usize()?
+        } else {
+            0
+        };
+        let offset = r.varint()?;
+        let rest = r.buf.len();
+        if pad > rest {
+            return Err(ProtoError::Malformed);
+        }
+        let hdr = payload.len() - rest;
+        payload.truncate(payload.len() - pad);
+        payload.drain(..hdr);
+        if offset
+            .checked_add(payload.len() as u64)
+            .is_none_or(|e| e > VARINT_MAX)
+        {
+            return Err(ProtoError::Malformed);
+        }
+        Ok(Some(Frame::Data {
+            offset,
+            data: payload,
+            pad,
+        }))
     }
 
     /// Decode one payload. `Ok(None)` = unknown ignorable type, skipped.
@@ -758,7 +834,7 @@ impl Frame {
                     0
                 };
                 let offset = r.varint()?;
-                let rest = r.rest();
+                let rest = std::mem::take(&mut r.buf);
                 if pad > rest.len() {
                     return Err(ProtoError::Malformed);
                 }
@@ -862,6 +938,34 @@ impl Frame {
         };
         r.end()?;
         Ok(Some(f))
+    }
+}
+
+/// Close a frame started at `start` with a 4-byte length slot ending at
+/// `body`: write the flags and the shortest varint length, moving the
+/// payload down in place when the varint is shorter.
+fn finish_frame(out: &mut Vec<u8>, start: usize, body: usize, flags: u8) {
+    let len = out.len() - body;
+    assert!(len <= MAX_PAYLOAD, "frame payload too large");
+    out[start + 1] = flags;
+    let mut v = [0u8; 8];
+    let n = varint_len(len as u64);
+    write_varint(&mut v[..n], len as u64);
+    let at = start + 2;
+    out[at..at + n].copy_from_slice(&v[..n]);
+    if n < 4 {
+        out.copy_within(body.., at + n);
+        out.truncate(out.len() - (4 - n));
+    }
+}
+
+/// `v` as a varint of exactly `buf.len()` bytes (1, 2, 4 or 8).
+fn write_varint(buf: &mut [u8], v: u64) {
+    match buf.len() {
+        1 => buf[0] = v as u8,
+        2 => buf.copy_from_slice(&((v as u16) | 0x4000).to_be_bytes()),
+        4 => buf.copy_from_slice(&((v as u32) | 0x8000_0000).to_be_bytes()),
+        _ => buf.copy_from_slice(&(v | 0xC000_0000_0000_0000).to_be_bytes()),
     }
 }
 

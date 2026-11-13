@@ -162,14 +162,31 @@ impl SendHalf {
 
     /// Copy of `[0, n)` for OPEN's `first_data`; the cursor moves past it.
     pub fn take_first_data(&mut self, limit: usize) -> Vec<u8> {
+        let n = self.take_first_len(limit);
+        let [a, b] = self.first_data(n);
+        [a, b].concat()
+    }
+
+    /// Length of OPEN's `first_data` (`[0, n)`, at most `limit`); the
+    /// cursor moves past it. The bytes stay in the replay buffer, see
+    /// [`first_data`](Self::first_data).
+    pub fn take_first_len(&mut self, limit: usize) -> usize {
         if self.acked != 0 {
-            return Vec::new();
+            return 0;
         }
         let n = limit.min(self.buf.len()).min(self.peer_max as usize);
-        let v: Vec<u8> = self.buf.iter().take(n).copied().collect();
         self.cursor = self.cursor.max(n as u64);
         self.sent_hw = self.sent_hw.max(n as u64);
-        v
+        n
+    }
+
+    /// `[0, n)` of the stream as the replay buffer's two halves; empty
+    /// once anything was acknowledged (OPEN is answered by then).
+    pub fn first_data(&self, n: usize) -> [&[u8]; 2] {
+        if self.acked != 0 {
+            return [&[], &[]];
+        }
+        deque_range(&self.buf, 0, n.min(self.buf.len()))
     }
 
     /// Process `ACK{recv_offset, max_offset}` (rule 2). Returns whether
@@ -204,23 +221,21 @@ impl SendHalf {
         Ok(())
     }
 
-    /// Next DATA or FIN for the current carrier, within the peer's window.
-    pub fn poll_frame(&mut self) -> Option<Frame> {
+    /// What goes out next for the current carrier, within the peer's
+    /// window; the cursor moves past it.
+    fn poll_next(&mut self, max_bytes: usize) -> Option<Next> {
         let end = self.data_end();
         if self.cursor < end {
             let lim = end.min(self.peer_max);
             if self.cursor < lim {
-                let n = ((lim - self.cursor) as usize).min(max_data_len(self.cursor, 0));
+                let n = ((lim - self.cursor) as usize)
+                    .min(max_data_len(self.cursor, 0))
+                    .min(max_bytes);
                 let start = (self.cursor - self.acked) as usize;
-                let data: Vec<u8> = self.buf.range(start..start + n).copied().collect();
                 let offset = self.cursor;
                 self.cursor += n as u64;
                 self.sent_hw = self.sent_hw.max(self.cursor);
-                return Some(Frame::Data {
-                    offset,
-                    data,
-                    pad: 0,
-                });
+                return Some(Next::Data { offset, start, n });
             }
             return None;
         }
@@ -228,10 +243,48 @@ impl SendHalf {
             if self.cursor == f {
                 self.cursor = f + 1;
                 self.sent_hw = self.sent_hw.max(f + 1);
-                return Some(Frame::Fin { offset: f });
+                return Some(Next::Fin(f));
             }
         }
         None
+    }
+
+    /// Next DATA or FIN for the current carrier, within the peer's window.
+    pub fn poll_frame(&mut self) -> Option<Frame> {
+        Some(match self.poll_next(usize::MAX)? {
+            Next::Data { offset, start, n } => Frame::Data {
+                offset,
+                data: self.buf.range(start..start + n).copied().collect(),
+                pad: 0,
+            },
+            Next::Fin(offset) => Frame::Fin { offset },
+        })
+    }
+
+    /// [`poll_frame`](Self::poll_frame) encoded straight into `out`, at
+    /// most `room` bytes of it: DATA bytes go from the replay buffer to
+    /// the wire buffer in one copy, and `out` grows exactly once (r6 N13).
+    /// Returns whether a frame was written.
+    pub fn poll_frame_into(&mut self, out: &mut Vec<u8>, room: usize) -> bool {
+        // Type, flags, length and offset varints: at most 18 bytes.
+        let max = room.saturating_sub(18).max(1);
+        match self.poll_next(max) {
+            None => false,
+            Some(Next::Data { offset, start, n }) => {
+                let f = Frame::Data {
+                    offset,
+                    data: Vec::new(),
+                    pad: 0,
+                };
+                out.reserve_exact(6 + crate::codec::varint_len(offset) + n);
+                f.encode_with(out, deque_range(&self.buf, start, n));
+                true
+            }
+            Some(Next::Fin(offset)) => {
+                Frame::Fin { offset }.encode(out);
+                true
+            }
+        }
     }
 
     /// Something could be sent now (window permitting).
@@ -256,6 +309,23 @@ impl SendHalf {
     }
 }
 
+enum Next {
+    Data { offset: u64, start: usize, n: usize },
+    Fin(u64),
+}
+
+/// `[start, start + n)` of `buf` as at most two slices.
+fn deque_range(buf: &VecDeque<u8>, start: usize, n: usize) -> [&[u8]; 2] {
+    let (a, b) = buf.as_slices();
+    if start >= a.len() {
+        let s = start - a.len();
+        [&b[s..s + n], &[]]
+    } else {
+        let end = (start + n).min(a.len());
+        [&a[start..end], &b[..start + n - end]]
+    }
+}
+
 #[derive(Debug)]
 pub struct RecvHalf {
     consumed: u64,
@@ -266,6 +336,15 @@ pub struct RecvHalf {
     grant: Grant,
     min_credit: usize,
     window_cap: usize,
+    /// Receive window aimed for while active: starts at the initial credit
+    /// and doubles (up to `window_cap`) only while the sender keeps
+    /// running into it, so a session that moved a few bytes does not pin
+    /// a full window it cannot take back (§4 rule 8: `max_offset` never
+    /// moves back). Back to the initial credit when idle.
+    win: usize,
+    win_init: usize,
+    /// The sender came within a quarter window of `max_offset`.
+    limited: bool,
     idle_after: std::time::Duration,
     ack_delay: std::time::Duration,
     last_ack: (u64, u64),
@@ -291,6 +370,9 @@ impl RecvHalf {
             grant,
             min_credit: limits.min_credit,
             window_cap: limits.window_cap.max(limits.initial_credit),
+            win: limits.initial_credit,
+            win_init: limits.initial_credit,
+            limited: false,
             idle_after: timing.idle_after,
             ack_delay: timing.ack_delay,
             last_ack: (0, initial),
@@ -367,6 +449,9 @@ impl RecvHalf {
         reserve_within(&mut self.buf, fresh.len(), self.grant.bytes());
         self.buf.extend(fresh);
         self.recv = end;
+        if self.adv_max - end <= (self.win / 4) as u64 {
+            self.limited = true;
+        }
         self.last_data = now;
         self.touch(now);
         Ok(fresh.len())
@@ -387,6 +472,23 @@ impl RecvHalf {
     }
 
     /// Hand buffered bytes to the application.
+    /// The first contiguous run of buffered bytes (see
+    /// [`consume`](Self::consume)): lets a caller write received bytes to
+    /// the application without copying them out first.
+    pub fn front(&self) -> &[u8] {
+        self.buf.as_slices().0
+    }
+
+    /// Drop `n` bytes from the front after they were delivered.
+    pub fn consume(&mut self, n: usize, now: Instant) {
+        let n = n.min(self.buf.len());
+        self.buf.drain(..n);
+        self.consumed += n as u64;
+        if n > 0 {
+            self.update_credit(now);
+        }
+    }
+
     pub fn read(&mut self, out: &mut [u8], now: Instant) -> usize {
         let n = out.len().min(self.buf.len());
         for (o, b) in out.iter_mut().zip(self.buf.drain(..n)) {
@@ -410,11 +512,14 @@ impl RecvHalf {
         let outstanding = (self.adv_max - self.consumed) as usize;
         let active =
             !self.buf.is_empty() || now.saturating_duration_since(self.last_data) < self.idle_after;
-        let mut desired = if active {
-            self.window_cap
-        } else {
-            self.min_credit
-        };
+        if !active {
+            self.win = self.win_init;
+            self.limited = false;
+        } else if self.limited {
+            self.win = (self.win * 2).min(self.window_cap);
+            self.limited = false;
+        }
+        let mut desired = if active { self.win } else { self.min_credit };
         if !active {
             // Idle and drained: the buffer's memory goes back now; it is
             // re-reserved (within the grant) when data arrives. The grant
@@ -634,7 +739,8 @@ mod tests {
 
     #[test]
     fn credit_never_exceeds_pool() {
-        let pool = Pool::new(64 * 1024);
+        // All elastic: four initial credits exactly.
+        let pool = Pool::with_regions(64 * 1024, 0, 0);
         let l = Limits::default();
         let t = Timing::default();
         let now = Instant::now();

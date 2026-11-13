@@ -99,10 +99,24 @@ impl std::fmt::Debug for OpenParams {
 /// Local code used when the client gives up re-attaching / retrying OPEN.
 pub const LOCAL_GIVE_UP: u8 = code::CONNECT_TIMEOUT;
 
+/// Result of [`ClientSession::poll_transmit_into`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tx {
+    /// Nothing to send now.
+    Idle,
+    /// One frame was appended.
+    Wrote,
+    /// The next frame (OPEN/RESUME) needs this many bytes of room.
+    NeedRoom(usize),
+}
+
+enum TxNext {
+    Hello,
+    Frame(Frame),
+    Send,
+}
+
 pub struct ClientSession {
-    /// Taken at admission so the driver's buffers stay inside the pool
-    /// when it is spent (r5 N13).
-    reserve: Arc<crate::pool::SessionReserve>,
     cfg: Config,
     session_id: SessionId,
     secret: Secret,
@@ -120,6 +134,9 @@ pub struct ClientSession {
     need_attach: bool,
     abandoned: Vec<CarrierId>,
     first_len: usize,
+    /// `first_data` of the pending OPEN: `[0, hello_first)` of the replay
+    /// buffer, attached when the OPEN is encoded (no copy held meanwhile).
+    hello_first: usize,
     open_started: Option<Instant>,
     attach_started: Option<Instant>,
     detached_since: Option<Instant>,
@@ -169,9 +186,7 @@ impl ClientSession {
     ) -> Option<Self> {
         let recv = RecvHalf::new(pool, &cfg.limits, &cfg.timing, now)?;
         let send = SendHalf::new(pool, &cfg.limits)?;
-        let reserve = crate::pool::SessionReserve::new(pool)?;
         Some(Self {
-            reserve: Arc::new(reserve),
             backoff: std::time::Duration::from_millis(200),
             cfg,
             session_id,
@@ -189,6 +204,7 @@ impl ClientSession {
             need_attach: true,
             abandoned: Vec::new(),
             first_len: 0,
+            hello_first: 0,
             open_started: None,
             attach_started: None,
             detached_since: None,
@@ -203,11 +219,6 @@ impl ClientSession {
     /// The pool this session's buffers are charged to.
     pub fn pool(&self) -> &Arc<Pool> {
         self.recv.pool()
-    }
-
-    /// What the driver may use when the pool is spent.
-    pub fn reserve(&self) -> &Arc<crate::pool::SessionReserve> {
-        &self.reserve
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -284,13 +295,13 @@ impl ClientSession {
             if !retry {
                 self.open_started = Some(now);
                 let limit = MAX_PAYLOAD - self.open_header_len();
-                let first = self.send.take_first_data(limit);
-                self.first_len = first.len();
+                self.first_len = self.send.take_first_len(limit);
+                self.hello_first = self.first_len;
                 self.state = State::Opening;
-                Frame::Open(self.open_frame(false, first))
+                Frame::Open(self.open_frame(false, Vec::new()))
             } else {
-                let first = self.send.take_first_data(self.first_len);
-                Frame::Open(self.open_frame(true, first))
+                self.hello_first = self.send.take_first_len(self.first_len);
+                Frame::Open(self.open_frame(true, Vec::new()))
             }
         } else {
             self.state = State::Attaching;
@@ -510,16 +521,16 @@ impl ClientSession {
         }
     }
 
-    /// Next frame for carrier `cid`, if any.
-    pub fn poll_transmit(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
+    /// What goes out next on carrier `cid`.
+    fn next_tx(&mut self, cid: CarrierId, now: Instant) -> Option<TxNext> {
         if self.carrier != Some(cid) {
             return None;
         }
-        if let Some(h) = self.hello.take() {
-            return Some(h);
+        if self.hello.is_some() {
+            return Some(TxNext::Hello);
         }
         if let Some(code) = self.rst.take() {
-            return Some(Frame::Rst { code });
+            return Some(TxNext::Frame(Frame::Rst { code }));
         }
         if self.is_closed() {
             return None;
@@ -533,10 +544,92 @@ impl ClientSession {
             let piggyback = self.send.has_sendable();
             if let Some(ack) = self.recv.poll_ack(now, piggyback) {
                 self.check_done();
-                return Some(ack);
+                return Some(TxNext::Frame(ack));
             }
         }
-        self.send.poll_frame()
+        Some(TxNext::Send)
+    }
+
+    /// Whether [`poll_transmit`](Self::poll_transmit) would return a
+    /// frame now (so a driver only takes memory for one when it would).
+    pub fn has_transmit(&self, cid: CarrierId, now: Instant) -> bool {
+        if self.carrier != Some(cid) {
+            return false;
+        }
+        if self.hello.is_some() || self.rst.is_some() {
+            return true;
+        }
+        if self.is_closed() {
+            return false;
+        }
+        let optimistic = self.state == State::Opening && self.gen == 0 && !self.confirmed;
+        if !self.confirmed && !optimistic {
+            return false;
+        }
+        self.send.has_sendable()
+            || (self.confirmed && self.recv.ack_deadline().is_some_and(|d| d <= now))
+    }
+
+    /// Next frame for carrier `cid`, if any.
+    pub fn poll_transmit(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
+        match self.next_tx(cid, now)? {
+            TxNext::Hello => {
+                let mut h = self.hello.take().expect("checked");
+                if let Frame::Open(o) = &mut h {
+                    o.first_data = self.send.first_data(self.hello_first).concat();
+                }
+                Some(h)
+            }
+            TxNext::Frame(f) => Some(f),
+            TxNext::Send => self.send.poll_frame(),
+        }
+    }
+
+    /// [`poll_transmit`](Self::poll_transmit) encoded straight into `out`
+    /// (reserved exactly, application bytes copied once from the replay
+    /// buffer, r6 N13), using at most `room` bytes. DATA is cut to fit;
+    /// an OPEN or RESUME that does not fit is kept and its size returned.
+    pub fn poll_transmit_into(
+        &mut self,
+        cid: CarrierId,
+        now: Instant,
+        out: &mut Vec<u8>,
+        room: usize,
+    ) -> Tx {
+        match self.next_tx(cid, now) {
+            None => Tx::Idle,
+            Some(TxNext::Hello) => {
+                let h = self.hello.as_ref().expect("checked");
+                let tail = match h {
+                    Frame::Open(_) => self.send.first_data(self.hello_first),
+                    _ => [&[][..], &[][..]],
+                };
+                // The header alone is small; its exact size bounds the
+                // frame (the length varint grows by at most two bytes).
+                let mut hdr = Vec::new();
+                h.encode(&mut hdr);
+                let need = hdr.len() + 2 + tail[0].len() + tail[1].len();
+                if need > room {
+                    return Tx::NeedRoom(need);
+                }
+                out.reserve_exact(need);
+                h.encode_with(out, tail);
+                self.hello = None;
+                Tx::Wrote
+            }
+            Some(TxNext::Frame(f)) => {
+                out.reserve_exact(f.size_hint());
+                f.encode(out);
+                Tx::Wrote
+            }
+            Some(TxNext::Send) => {
+                if self.send.poll_frame_into(out, room) {
+                    Tx::Wrote
+                } else {
+                    Tx::Idle
+                }
+            }
+        }
     }
 
     pub fn poll_timeout(&self) -> Option<Instant> {
@@ -655,6 +748,18 @@ impl ClientSession {
         let n = self.recv.read(out, now);
         self.check_done();
         n
+    }
+
+    /// Received bytes ready for the application, without copying them
+    /// out (see [`consume`](Self::consume)).
+    pub fn readable(&self) -> &[u8] {
+        self.recv.front()
+    }
+
+    /// `n` bytes of [`readable`](Self::readable) reached the application.
+    pub fn consume(&mut self, n: usize, now: Instant) {
+        self.recv.consume(n, now);
+        self.check_done();
     }
 
     /// All data up to the relay's FIN has been read.

@@ -689,7 +689,7 @@ async fn sessions_admitted_before_the_pool_ran_out_still_finish() {
     // refused instead of being admitted without progress; after release the
     // pool admits again.
     use segue_session::pipe::pipe;
-    use segue_session::pool::{Grant, BLOCK};
+    use segue_session::pool::{Grant, Tier, BLOCK};
     const N: usize = 4;
     const LEN: usize = 64 << 10;
     let cfg = Config::default();
@@ -738,7 +738,9 @@ async fn sessions_admitted_before_the_pool_ran_out_still_finish() {
     while let Some(g) = Grant::fixed(&pool, BLOCK) {
         hog.push(g);
     }
-    assert_eq!(pool.used_bytes(), pool.capacity_bytes());
+    // Every elastic block is spent; only the shared draining regions
+    // (no session owns them) are left.
+    assert_eq!(pool.used_blocks(), pool.limit(Tier::Elastic));
     assert!(
         ClientSession::new(cfg.clone(), &pool, params(), Instant::now()).is_none(),
         "admitted a session the spent pool cannot move"

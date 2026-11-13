@@ -13,6 +13,25 @@
 //! stack's rings and relay chunks, KERNEL_SPEC §6.3 "本地 TCP 收发缓冲、会话
 //! 接收缓冲、回放缓冲都从池里取") through [`Pool::take_blocks`] /
 //! [`Pool::give_blocks`].
+//!
+//! Progress without per-session reserves (r6 R5/R6). Buffers fall in two
+//! kinds. *Elastic* ones (receive windows, replay buffers, pipe and TUN ring
+//! growth, admission floors) may be held for as long as the peer or the
+//! application likes. *Draining* ones (a frame queued to a carrier, a frame
+//! just read from one, a chunk on its way to the application or the TUN)
+//! are freed as soon as the next stage takes them, and that stage always
+//! has a floor of its own. The top of the pool is kept for the draining
+//! kinds in [`Tier`]s: elastic grants stop at [`Tier::Elastic`]'s limit, and
+//! each draining kind may go up to its own, higher limit. A tier's holders
+//! only ever wait for stages of a *higher* tier (or for the network and
+//! the application), so the waits form no cycle and a pool full of elastic
+//! grants still moves bytes: transport frames wait for nothing in the pool,
+//! TUN relay chunks only for transport frames, and received bytes go from a
+//! session's receive buffer to its application end with no buffer of their
+//! own (the TUN takes them only into ring room it has). The regions are a few
+//! frames in size and shared by every session, so admission costs only the
+//! per-flow floors (§4 rule 8: 16 KB initial credit, one replay block, one
+//! pipe block each way).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -25,9 +44,28 @@ pub fn blocks_for(bytes: usize) -> usize {
     bytes.div_ceil(BLOCK)
 }
 
+/// Who may take blocks how far (see the module docs). Ordered: a higher
+/// tier may use everything a lower one may, plus its own region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    /// Grants that may be held indefinitely, and admission.
+    Elastic,
+    /// TUN relay chunks (stack ↔ relay task).
+    Relay,
+    /// Frames queued to, or just read from, a carrier.
+    Transport,
+}
+
+/// Default regions on top of the elastic part, in blocks: two full
+/// frames for carriers, four 16 KiB chunks for the TUN relay.
+pub const TRANSPORT_REGION: usize = 2 * FRAME_MAX.div_ceil(BLOCK);
+pub const RELAY_REGION: usize = 16;
+
 #[derive(Debug)]
 pub struct Pool {
     blocks: usize,
+    /// Highest `used` each [`Tier`] may reach, ascending.
+    limits: [usize; 3],
     used: AtomicUsize,
     sessions: AtomicUsize,
     waiters: AtomicUsize,
@@ -35,9 +73,23 @@ pub struct Pool {
 }
 
 impl Pool {
+    /// `bytes` with the default regions, each at most an eighth of the
+    /// pool (a tiny test pool is almost all elastic).
     pub fn new(bytes: usize) -> Arc<Self> {
+        let blocks = bytes / BLOCK;
+        let cap = |r: usize| r.min(blocks / 8);
+        Self::with_regions(bytes, cap(RELAY_REGION), cap(TRANSPORT_REGION))
+    }
+
+    /// `bytes` with explicit draining regions (blocks) above the elastic
+    /// part.
+    pub fn with_regions(bytes: usize, relay: usize, transport: usize) -> Arc<Self> {
+        let blocks = bytes / BLOCK;
+        let relay_top = blocks.saturating_sub(transport);
+        let elastic = relay_top.saturating_sub(relay);
         Arc::new(Self {
-            blocks: bytes / BLOCK,
+            blocks,
+            limits: [elastic, relay_top, blocks],
             used: AtomicUsize::new(0),
             sessions: AtomicUsize::new(0),
             waiters: AtomicUsize::new(0),
@@ -48,6 +100,16 @@ impl Pool {
     /// Pool size in blocks.
     pub fn blocks(&self) -> usize {
         self.blocks
+    }
+
+    /// Highest number of blocks in use up to which `tier` may take.
+    pub fn limit(&self, tier: Tier) -> usize {
+        self.limits[tier as usize]
+    }
+
+    /// Take 1..=`want` blocks within `tier`; 0 if none is free there.
+    pub fn take_tier(&self, want: usize, tier: Tier) -> usize {
+        self.take_blocks(want, 1, self.limit(tier))
     }
 
     /// Blocks in use.
@@ -63,20 +125,21 @@ impl Pool {
         self.used.load(Ordering::Acquire) * BLOCK
     }
 
-    /// Fewer than 25 % of blocks free.
+    /// Fewer than 25 % of the elastic blocks free.
     pub fn under_pressure(&self) -> bool {
+        let elastic = self.limit(Tier::Elastic);
         let used = self.used.load(Ordering::Acquire);
-        (self.blocks - used.min(self.blocks)) * 4 < self.blocks
+        (elastic - used.min(elastic)) * 4 < elastic
     }
 
-    /// Equal share per live session (floor one block).
+    /// Equal share of the elastic part per live session (floor one block).
     pub fn fair_share_bytes(&self) -> usize {
         let n = self.sessions.load(Ordering::Acquire).max(1);
-        (self.blocks / n).max(1) * BLOCK
+        (self.limit(Tier::Elastic) / n).max(1) * BLOCK
     }
 
-    fn try_take(&self, n: usize) -> bool {
-        n == 0 || self.take_blocks(n, n, self.blocks) == n
+    fn try_take(&self, n: usize, tier: Tier) -> bool {
+        n == 0 || self.take_blocks(n, n, self.limit(tier)) == n
     }
 
     fn give(&self, n: usize) {
@@ -157,10 +220,12 @@ pub struct Grant {
     pool: Arc<Pool>,
     blocks: usize,
     counted: bool,
+    tier: Tier,
 }
 
 impl Grant {
-    /// An empty grant. `counted` grants take part in the fair-share count.
+    /// An empty elastic grant. `counted` grants take part in the
+    /// fair-share count.
     pub fn new(pool: &Arc<Pool>, counted: bool) -> Self {
         if counted {
             pool.sessions.fetch_add(1, Ordering::AcqRel);
@@ -169,15 +234,46 @@ impl Grant {
             pool: pool.clone(),
             blocks: 0,
             counted,
+            tier: Tier::Elastic,
         }
     }
 
-    /// Exactly `bytes` (rounded up to blocks), for buffers whose size is
-    /// fixed for their lifetime (driver I/O buffers and queues). Not counted
-    /// in the fair share. `None` when the pool cannot cover it.
+    /// Exactly `bytes` (rounded up to blocks), elastic, for buffers whose
+    /// size is fixed for their lifetime (floors). Not counted in the fair
+    /// share. `None` when the pool cannot cover it.
     pub fn fixed(pool: &Arc<Pool>, bytes: usize) -> Option<Self> {
+        Self::fixed_in(pool, bytes, Tier::Elastic)
+    }
+
+    /// Exactly `bytes` within `tier` (a draining buffer), all or nothing.
+    pub fn fixed_in(pool: &Arc<Pool>, bytes: usize, tier: Tier) -> Option<Self> {
         let mut g = Self::new(pool, false);
+        g.tier = tier;
         g.try_resize(bytes).then_some(g)
+    }
+
+    /// Between one block and `bytes` within `tier`, as much as is free;
+    /// `None` when not even one block is (a draining buffer that can be
+    /// made smaller).
+    pub fn up_to(pool: &Arc<Pool>, bytes: usize, tier: Tier) -> Option<Self> {
+        Self::between(pool, BLOCK, bytes, tier)
+    }
+
+    /// Between `min` and `want` bytes (rounded up to blocks, at least one)
+    /// within `tier`, as much as is free; `None` below `min`.
+    pub fn between(pool: &Arc<Pool>, min: usize, want: usize, tier: Tier) -> Option<Self> {
+        let min = blocks_for(min).max(1);
+        let n = pool.take_blocks(blocks_for(want).max(min), min, pool.limit(tier));
+        (n > 0).then(|| Self {
+            pool: pool.clone(),
+            blocks: n,
+            counted: false,
+            tier,
+        })
+    }
+
+    pub fn tier(&self) -> Tier {
+        self.tier
     }
 
     pub fn pool(&self) -> &Arc<Pool> {
@@ -196,7 +292,7 @@ impl Grant {
             self.pool.give(self.blocks - want);
             self.blocks = want;
             true
-        } else if self.pool.try_take(want - self.blocks) {
+        } else if self.pool.try_take(want - self.blocks, self.tier) {
             self.blocks = want;
             true
         } else {
@@ -208,7 +304,7 @@ impl Grant {
     /// pool is short. Returns the bytes now held.
     pub fn grow_towards(&mut self, bytes: usize) -> usize {
         if !self.try_resize(bytes.max(self.bytes())) {
-            while self.blocks < blocks_for(bytes) && self.pool.try_take(1) {
+            while self.blocks < blocks_for(bytes) && self.pool.try_take(1, self.tier) {
                 self.blocks += 1;
             }
         }
@@ -225,110 +321,8 @@ impl Drop for Grant {
     }
 }
 
-/// Blocks a session takes from the pool when it is admitted and keeps for
-/// its whole life, lent out to the buffers that must exist for it to make
-/// progress at all when the pool is spent (r5 N12/N13): one queued carrier
-/// frame and one block for the app. Lending never touches the pool, so
-/// these buffers are inside the pool bound instead of exceptions to it.
-#[derive(Debug)]
-pub struct Reserve {
-    _grant: Grant,
-    free: AtomicUsize,
-    returned: Notify,
-}
-
-impl Reserve {
-    /// `None` when the pool cannot cover `bytes`: the session is refused.
-    pub fn new(pool: &Arc<Pool>, bytes: usize) -> Option<Arc<Self>> {
-        let g = Grant::fixed(pool, bytes)?;
-        Some(Arc::new(Self {
-            free: AtomicUsize::new(g.bytes()),
-            _grant: g,
-            returned: Notify::new(),
-        }))
-    }
-
-    /// Bytes not lent out.
-    pub fn available(&self) -> usize {
-        self.free.load(Ordering::Acquire)
-    }
-
-    /// Resolves when a loan comes back (or spuriously; callers retry).
-    pub async fn returned(&self) {
-        self.returned.notified().await;
-    }
-
-    /// Lend `bytes` until the loan is dropped; `None` if not that many are
-    /// free.
-    pub fn lend(self: &Arc<Self>, bytes: usize) -> Option<Loan> {
-        self.free
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |f| {
-                f.checked_sub(bytes)
-            })
-            .ok()?;
-        Some(Loan {
-            reserve: self.clone(),
-            bytes,
-        })
-    }
-}
-
-/// Part of a [`Reserve`], returned on drop.
-#[derive(Debug)]
-pub struct Loan {
-    reserve: Arc<Reserve>,
-    bytes: usize,
-}
-
-impl Loan {
-    pub fn bytes(&self) -> usize {
-        self.bytes
-    }
-
-    /// Give back all but `bytes`.
-    pub fn shrink(&mut self, bytes: usize) {
-        if bytes < self.bytes {
-            self.reserve
-                .free
-                .fetch_add(self.bytes - bytes, Ordering::AcqRel);
-            self.bytes = bytes;
-            self.reserve.returned.notify_waiters();
-        }
-    }
-}
-
-impl Drop for Loan {
-    fn drop(&mut self) {
-        self.reserve.free.fetch_add(self.bytes, Ordering::AcqRel);
-        self.reserve.returned.notify_waiters();
-    }
-}
-
 /// Largest encoded frame (payload plus type and length).
 pub const FRAME_MAX: usize = crate::codec::MAX_PAYLOAD + 16;
-
-/// What one client session reserves at admission for its driver: one
-/// queued carrier frame, one block for the app, and the carrier reader's
-/// partial frame plus one decoded frame in flight. Each is used only when
-/// the pool itself cannot cover the buffer.
-#[derive(Debug)]
-pub struct SessionReserve {
-    pub carrier: Arc<Reserve>,
-    pub app: Arc<Reserve>,
-    pub reader: Arc<Reserve>,
-}
-
-impl SessionReserve {
-    pub const BYTES: usize = FRAME_MAX + BLOCK + 2 * FRAME_MAX;
-
-    pub fn new(pool: &Arc<Pool>) -> Option<Self> {
-        Some(Self {
-            carrier: Reserve::new(pool, FRAME_MAX)?,
-            app: Reserve::new(pool, BLOCK)?,
-            reader: Reserve::new(pool, 2 * FRAME_MAX)?,
-        })
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -336,7 +330,7 @@ mod tests {
 
     #[test]
     fn never_overcommits() {
-        let pool = Pool::new(10 * BLOCK);
+        let pool = Pool::with_regions(10 * BLOCK, 0, 0);
         let mut a = Grant::new(&pool, true);
         let mut b = Grant::new(&pool, true);
         assert!(a.try_resize(6 * BLOCK));
@@ -371,19 +365,36 @@ mod tests {
     }
 
     #[test]
-    fn reserve_lends_within_what_it_holds() {
-        let pool = Pool::new(4 * BLOCK);
-        let r = Reserve::new(&pool, 2 * BLOCK).unwrap();
-        assert_eq!(pool.used_bytes(), 2 * BLOCK);
-        assert!(Reserve::new(&pool, 3 * BLOCK).is_none());
-        let a = r.lend(BLOCK + 1).unwrap();
-        assert!(r.lend(BLOCK).is_none());
-        assert!(r.lend(BLOCK - 1).is_some());
-        drop(a);
-        assert_eq!(r.available(), 2 * BLOCK);
-        // Lending never moves the pool.
-        assert_eq!(pool.used_bytes(), 2 * BLOCK);
-        drop(r);
+    fn draining_tiers_keep_room_above_elastic_grants() {
+        let pool = Pool::with_regions(20 * BLOCK, 4, 4);
+        assert_eq!(pool.limit(Tier::Elastic), 12);
+        // Elastic grants stop below every region, however hard they try.
+        let mut hog = Grant::new(&pool, true);
+        assert_eq!(hog.grow_towards(1 << 20), 12 * BLOCK);
+        assert!(Grant::fixed(&pool, BLOCK).is_none());
+        // Each draining tier reaches its own limit, and no further.
+        let relay = Grant::up_to(&pool, 1 << 20, Tier::Relay).unwrap();
+        assert_eq!(relay.bytes(), 4 * BLOCK);
+        assert!(Grant::up_to(&pool, BLOCK, Tier::Relay).is_none());
+        let frame = Grant::fixed_in(&pool, 4 * BLOCK, Tier::Transport).unwrap();
+        assert!(Grant::fixed_in(&pool, BLOCK, Tier::Transport).is_none());
+        assert_eq!(pool.used_bytes(), 20 * BLOCK);
+        drop((relay, frame));
+        // Under pressure the fair share is of the elastic part.
+        assert!(pool.under_pressure());
+        assert_eq!(pool.fair_share_bytes(), 12 * BLOCK);
+        drop(hog);
         assert_eq!(pool.used_bytes(), 0);
+    }
+
+    #[test]
+    fn default_regions_leave_most_of_8mb_elastic() {
+        let pool = Pool::new(8 << 20);
+        let reserved = pool.blocks() - pool.limit(Tier::Elastic);
+        assert_eq!(reserved, RELAY_REGION + TRANSPORT_REGION);
+        assert!(reserved * BLOCK <= 320 << 10, "{reserved} blocks");
+        // A small pool keeps at most an eighth per region.
+        let small = Pool::new(16 * BLOCK);
+        assert_eq!(small.limit(Tier::Elastic), 16 - 4);
     }
 }
