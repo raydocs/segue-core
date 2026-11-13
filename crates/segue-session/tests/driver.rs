@@ -1621,7 +1621,9 @@ async fn a_slow_site_drain_with_default_timing_does_not_redial() {
 /// the bound again from then: about twice the bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_drain_idle_bound_counts_from_the_last_site_write() {
-    const UP: usize = 8 << 10;
+    // Well past the site's buffer: the site writer is in the middle of a
+    // chunk when the site takes its late bytes.
+    const UP: usize = 48 << 10;
     const IDLE: Duration = Duration::from_millis(1500);
     const LATE: Duration = Duration::from_millis(600);
     let keep = Arc::new(Mutex::new(Vec::new()));
@@ -1662,7 +1664,7 @@ async fn the_drain_idle_bound_counts_from_the_last_site_write() {
     println!("stuck drain reset {took:?} after the FIN");
     assert!(took >= IDLE, "reset before the idle bound: {took:?}");
     assert!(
-        took < LATE + IDLE + Duration::from_millis(500),
+        took < LATE + IDLE + Duration::from_millis(300),
         "reset {took:?} after the FIN: the idle bound did not count from the last write"
     );
     relay.abort();
@@ -1716,6 +1718,31 @@ fn throttled_connector(
     })
 }
 
+/// A site that sends `down` in large writes (so the relay sends full
+/// frames) while it takes the upload, then ends.
+fn bulk_site(down: Arc<Vec<u8>>) -> SiteConnector {
+    Arc::new(move |_t, _k| {
+        let down = down.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(256 << 10);
+            let (mut r, mut w) = tokio::io::split(b);
+            tokio::spawn(async move {
+                let _ = w.write_all(&down).await;
+                let _ = w.shutdown().await;
+                std::future::pending::<()>().await;
+                drop(w);
+            });
+            tokio::spawn(async move {
+                let mut sink = Vec::new();
+                let _ = r.read_to_end(&mut sink).await;
+                std::future::pending::<()>().await;
+                drop(r);
+            });
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    })
+}
+
 /// An echo site.
 fn echo_site() -> SiteConnector {
     Arc::new(|_t, _k| {
@@ -1740,8 +1767,9 @@ fn echo_site() -> SiteConnector {
     })
 }
 
-/// Upload `len` bytes through a carrier moving `chunk` per `every` each
-/// way, echoed back, with the default timing and the client's elastic
+/// Upload `len` bytes and download `len` (sent by the site in large
+/// writes, so in full frames) through a carrier moving `chunk` per `every`
+/// each way, with the default timing and the client's elastic
 /// blocks spent (every frame is charged to the transport region and so
 /// under its hold). Returns the session's end, the time, and the dials.
 async fn slow_echo(len: usize, chunk: usize, every: Duration) -> (CloseReason, Duration, usize) {
@@ -1755,7 +1783,8 @@ async fn slow_echo(len: usize, chunk: usize, every: Duration) -> (CloseReason, D
         INSTANCE,
     );
     let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(16);
-    let relay = tokio::spawn(run_relay(table, accept_rx, echo_site(), None));
+    let want = Arc::new(pattern(len, 7));
+    let relay = tokio::spawn(run_relay(table, accept_rx, bulk_site(want.clone()), None));
     let dials = Arc::new(AtomicUsize::new(0));
     let connector = throttled_connector(accept_tx, dials.clone(), chunk, every);
     let s = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
@@ -1800,8 +1829,8 @@ async fn slow_echo(len: usize, chunk: usize, every: Duration) -> (CloseReason, D
     done.store(true, Ordering::SeqCst);
     let hogged = hog.await.unwrap();
     assert!(hogged > 100, "the pool was never spent ({hogged} blocks)");
-    assert!(r.len() == len, "echo {} of {len} bytes", r.len());
-    assert!(r == up, "echo differs");
+    assert!(r.len() == len, "download {} of {len} bytes", r.len());
+    assert!(r == *want, "download differs");
     relay.abort();
     (reason, took, dials.load(Ordering::SeqCst))
 }
