@@ -224,6 +224,7 @@ expected_job_headers="$(cat <<'EXPECTED'
   secrets:
   candidate-ci:
   rust:
+  tproxy-linux:
   go-oracles:
   rc-interop:
   scheduled-pinned-interop:
@@ -410,10 +411,6 @@ expected_rust="$(cat <<'EXPECTED'
         run: cargo test --workspace --exclude segue-fuzz --all-targets --locked
       - name: Replay fuzz seed corpora
         run: bash scripts/replay-fuzz-corpus.sh
-      - name: Verify Linux transparent TCP and UDP interception
-        run: |
-          test_binary="$(cargo test --locked -p segue-engine --test tproxy_tests --no-run --message-format=json | python3 -c 'import json,sys; print(next(v["executable"] for v in map(json.loads,sys.stdin) if v.get("reason")=="compiler-artifact" and v.get("executable")))')"
-          sudo env XRAY_TPROXY_ISOLATED_NETWORK=1 XRAY_TPROXY_TEST_BINARY="$test_binary" unshare --net bash scripts/check-tproxy-linux.sh
       - name: Build public API documentation
         env:
           RUSTDOCFLAGS: -D warnings
@@ -438,6 +435,7 @@ expected_publish_needs="$(cat <<'EXPECTED'
       - release-evidence
       - secrets
       - rust
+      - tproxy-linux
       - go-oracles
       - rc-interop
       - host-hardening

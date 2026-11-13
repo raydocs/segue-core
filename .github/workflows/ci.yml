@@ -336,11 +336,6 @@ jobs:
       - name: Replay fuzz seed corpora
         run: bash scripts/replay-fuzz-corpus.sh
 
-      - name: Verify Linux transparent TCP and UDP interception
-        run: |
-          test_binary="$(cargo test --locked -p segue-engine --test tproxy_tests --no-run --message-format=json | python3 -c 'import json,sys; print(next(v["executable"] for v in map(json.loads,sys.stdin) if v.get("reason")=="compiler-artifact" and v.get("executable")))')"
-          sudo env XRAY_TPROXY_ISOLATED_NETWORK=1 XRAY_TPROXY_TEST_BINARY="$test_binary" unshare --net bash scripts/check-tproxy-linux.sh
-
       - name: Build public API documentation
         env:
           RUSTDOCFLAGS: -D warnings
@@ -358,6 +353,31 @@ jobs:
 
       - name: Test mobile build-script guards
         run: bash scripts/tests/check-mobile-toolchains.test.sh
+
+  tproxy-linux:
+    # Moved out of the rust job on 2026-11-13. The Instabox kernel
+    # (6.18.60-instabox) is built without TPROXY (CONFIG_NETFILTER_XT_TARGET_TPROXY
+    # and CONFIG_NFT_TPROXY are unset and it loads no modules), so this check
+    # needs a GitHub-hosted runner. Stable promotion still requires it.
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.96.0
+
+      - name: Verify Linux transparent TCP and UDP interception
+        run: |
+          test_binary="$(cargo test --locked -p segue-engine --test tproxy_tests --no-run --message-format=json | python3 -c 'import json,sys; print(next(v["executable"] for v in map(json.loads,sys.stdin) if v.get("reason")=="compiler-artifact" and v.get("executable")))')"
+          sudo env XRAY_TPROXY_ISOLATED_NETWORK=1 XRAY_TPROXY_TEST_BINARY="$test_binary" unshare --net bash scripts/check-tproxy-linux.sh
 
   go-oracles:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
@@ -976,6 +996,7 @@ jobs:
       - release-evidence
       - secrets
       - rust
+      - tproxy-linux
       - go-oracles
       - rc-interop
       - host-hardening

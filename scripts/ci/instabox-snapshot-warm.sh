@@ -35,8 +35,8 @@ if [[ ! -x "$go_dir/bin/go" ]]; then
   sudo install -d -o "$(id -u)" -g "$(id -g)" "$go_dir"
   tar -xzf "$archive" -C "$go_dir" --strip-components=1
   rm -f "$archive"
-  touch "$go_dir.complete"
 fi
+[[ -e "$go_dir.complete" ]] || sudo install -m 0644 -o "$(id -u)" -g "$(id -g)" /dev/null "$go_dir.complete"
 export PATH="$go_dir/bin:$PATH"
 go version
 
