@@ -171,10 +171,28 @@ struct CarrierSlot {
 /// Control frames queued per control stream; PINGs beyond this are not
 /// answered (a peer that never reads cannot grow the queue).
 const CTRL_QUEUE: usize = 64;
-/// Live control streams one device may hold on this relay (one per exit
-/// in the kernel; a few spare for a stream being replaced). The oldest is
-/// closed when another arrives, so one ticket cannot take carrier slots.
-pub const MAX_CTRL_PER_DEVICE: usize = 4;
+/// Live control streams one device may hold on this relay.
+///
+/// The kernel keeps one control stream per configured exit, and nothing
+/// limits how many exits of one device point at the same relay; during a
+/// network change the replacement streams arrive while the old ones are
+/// still open. So the cap is not "a few" (review r6 R8: with 4, a fifth
+/// exit kicked the first, whose reconnect kicked another, forever) but
+/// 2 × 16 exits: comfortably above any real configuration, still a small
+/// fraction of the relay's carrier slots (`max_carriers`, 4096 by default).
+///
+/// At the cap a newcomer replaces only a stream that has gone quiet
+/// ([`ctrl_quiet`]); a stream that is still pinging is never kicked, the
+/// newcomer is closed instead (without a reply, so the client just
+/// retries and does not treat a channel as dead).
+pub const MAX_CTRL_PER_DEVICE: usize = 32;
+
+/// A control stream that sent nothing for this long may be replaced by a
+/// new one of the same device: a third of `t_ctrl_idle` (10 s by default,
+/// two missed kernel PINGs at 5 s).
+pub fn ctrl_quiet(t: &crate::Timing) -> std::time::Duration {
+    t.t_ctrl_idle / 3
+}
 /// STALL entries per frame (20 bytes each, under MAX_PAYLOAD).
 const STALL_BATCH: usize = 512;
 
@@ -362,16 +380,31 @@ impl RelayTable {
             Ok(d) => d,
             Err(c) => return self.reject(cid, c, 0, None),
         };
-        // Newest wins: close the device's oldest streams beyond the cap.
-        let mut mine: Vec<(Instant, CarrierId)> = self
+        // At the cap, replace the device's quietest streams, but only ones
+        // that stopped sending; never kick a live one (review r6 R8).
+        let mut mine: Vec<(Instant, Instant, CarrierId)> = self
             .carriers
             .iter()
             .filter(|(c, x)| **c != cid && x.control == Some(device) && !x.close_after)
-            .map(|(c, x)| (x.ctrl_since.unwrap_or(now), *c))
+            .map(|(c, x)| {
+                let since = x.ctrl_since.unwrap_or(now);
+                (x.ctrl_seen.unwrap_or(since), since, *c)
+            })
             .collect();
         if mine.len() >= MAX_CTRL_PER_DEVICE {
             mine.sort_unstable();
-            for &(_, old) in &mine[..=mine.len() - MAX_CTRL_PER_DEVICE] {
+            let quiet = ctrl_quiet(&self.cfg.timing);
+            let over = mine.len() + 1 - MAX_CTRL_PER_DEVICE;
+            let stale: Vec<CarrierId> = mine
+                .iter()
+                .take(over)
+                .take_while(|(seen, _, _)| now.saturating_duration_since(*seen) >= quiet)
+                .map(|&(_, _, c)| c)
+                .collect();
+            if stale.len() < over {
+                return self.close_carrier_now(cid);
+            }
+            for old in stale {
                 self.close_carrier_now(old);
             }
         }
