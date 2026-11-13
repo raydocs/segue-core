@@ -111,18 +111,25 @@ pub const MAX_FRUITLESS: u32 = 8;
 pub const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 pub const RECONNECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// While data keeps moving, [`Health::Up`] is reported again at most
+/// this often: the caller's evidence of recent success (r10 N6).
+pub const HEALTH_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Session-level health, for the caller's exit health (r9 F5): the
 /// carrier dial succeeding says nothing about whether sessions work over
 /// it, so these are reported from the protocol itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Health {
     /// A valid answer that proves the path: OPENED, or new data moved end
-    /// to end (received DATA, or an ACK of new bytes). A bare RESUMED does
-    /// not count: a path that answers RESUME and then stalls is not up.
+    /// to end (received DATA, or an ACK of new bytes), repeated every
+    /// [`HEALTH_REFRESH`] while data keeps moving. A bare RESUMED does not
+    /// count: a path that answers RESUME and then stalls is not up.
     Up,
-    /// A carrier was given up with something expected on it and nothing
-    /// moved (stall, STALL hint, hold timeout, unanswered attach, closed
-    /// mid-frame): the session is backing off to redial.
+    /// A carrier was given up with something expected on it (stall, STALL
+    /// hint, hold timeout, unanswered attach, closed mid-frame), whether
+    /// or not data moved on it earlier: the session is redialling. Only
+    /// a carrier on which nothing moved counts against the recovery
+    /// budget (r10 N6: budget and health are separate).
     Failed,
     /// The session gave up ([`LOCAL_GIVE_UP`]).
     GaveUp,
@@ -184,6 +191,8 @@ pub struct ClientSession {
     rx_partial: bool,
     /// Latest health report not yet taken (see [`Health`]).
     health: Option<Health>,
+    /// When [`Health::Up`] was last reported (see [`HEALTH_REFRESH`]).
+    up_reported: Option<Instant>,
     /// When the current carrier's attach was answered.
     confirmed_at: Option<Instant>,
     /// When a frame last went out, and a keepalive ACK is owed (see
@@ -261,6 +270,7 @@ impl ClientSession {
             fruitless: 0,
             rx_partial: false,
             health: None,
+            up_reported: None,
             confirmed_at: None,
             last_sent: now,
             ka_due: false,
@@ -519,10 +529,6 @@ impl ClientSession {
         if self.is_closed() || self.carrier.is_none() {
             return;
         }
-        if self.progressed {
-            self.fruitless = 0;
-            return;
-        }
         // Anything outstanding, sent or not: bytes that arrived after the
         // last carrier that took data died are never sent before an
         // attach is answered, and must still count.
@@ -530,14 +536,30 @@ impl ClientSession {
         // anything counts too: otherwise a path that accepts RESUME and
         // drops the carrier at once is redialled in a tight loop. A carrier
         // that served an idle session for longer and then closed does not.
-        let brief = self
-            .confirmed_at
-            .is_some_and(|c| now < c + self.cfg.timing.t_live);
-        if !(expected || !self.confirmed || brief || self.send.pending() || self.rx_partial) {
+        let brief = !self.progressed
+            && self
+                .confirmed_at
+                .is_some_and(|c| now < c + self.cfg.timing.t_live);
+        let failed =
+            expected || !self.confirmed || brief || self.send.pending() || self.rx_partial;
+        if failed && (expected || !self.progressed) {
+            // Health: this carrier failed. A stall, a hold timeout or an
+            // unanswered attach is a failure even if data moved on it
+            // before (r10 N6); a carrier that moved data and was then
+            // closed or left for a network change proves nothing either
+            // way (the next one shows).
+            self.health = Some(Health::Failed);
+            self.up_reported = None;
+        }
+        if self.progressed {
+            // Budget: a carrier that moved data resets it.
+            self.fruitless = 0;
+            return;
+        }
+        if !failed {
             return;
         }
         self.fruitless += 1;
-        self.health = Some(Health::Failed);
         if self.fruitless >= MAX_FRUITLESS {
             self.close(CloseReason::Reset(LOCAL_GIVE_UP));
             return;
@@ -648,6 +670,7 @@ impl ClientSession {
                 // OPENED comes once per session, so it cannot reset the
                 // budget in a loop (RESUMED never resets it).
                 self.fruitless = 0;
+                self.up_reported = Some(now);
                 self.health = Some(Health::Up);
             }
             Frame::Resumed(r) => {
@@ -668,7 +691,7 @@ impl ClientSession {
                 // acknowledged are progress.
                 self.established(now);
                 if self.send.acked() > acked {
-                    self.made_progress();
+                    self.made_progress(now);
                 }
             }
             Frame::Reject(rj) => {
@@ -707,7 +730,7 @@ impl ClientSession {
             Frame::Pad(_) | Frame::Dgram { .. } => {}
             Frame::Data { offset, data, .. } if self.confirmed => {
                 if self.recv.on_data(offset, &data, now)? > 0 {
-                    self.made_progress();
+                    self.made_progress(now);
                 }
             }
             Frame::Ack {
@@ -715,7 +738,7 @@ impl ClientSession {
                 max_offset,
             } if self.confirmed => {
                 if self.send.on_ack(recv_offset, max_offset)? {
-                    self.made_progress();
+                    self.made_progress(now);
                 }
             }
             Frame::Fin { offset } if self.confirmed => self.recv.on_fin(offset, now)?,
@@ -725,10 +748,15 @@ impl ClientSession {
     }
 
     /// New data moved end to end on the current carrier.
-    fn made_progress(&mut self) {
+    fn made_progress(&mut self, now: Instant) {
         if !self.progressed {
             self.progressed = true;
             self.fruitless = 0;
+        }
+        // Proof of the path, refreshed while data keeps moving so the
+        // caller can tell recent success from old (r10 N6).
+        if self.up_reported.is_none_or(|t| now >= t + HEALTH_REFRESH) {
+            self.up_reported = Some(now);
             self.health = Some(Health::Up);
         }
     }

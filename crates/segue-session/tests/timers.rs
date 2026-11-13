@@ -622,3 +622,56 @@ fn opened_resets_the_recovery_budget_and_resumed_does_not() {
     .unwrap();
     assert_eq!(c.fruitless_carriers(), 1, "RESUMED is not progress");
 }
+
+/// r10 N6: health and the recovery budget are separate. A carrier that
+/// moved data and then stalls is a failure for health (before, it
+/// reported nothing), though it does not count against the budget; and
+/// while data keeps moving, `Up` is reported again every
+/// `HEALTH_REFRESH`, so the exit sees recent proof.
+#[test]
+fn a_stall_after_success_reports_failed_and_progress_refreshes_up() {
+    use segue_session::client::{Health, HEALTH_REFRESH};
+    use segue_session::codec::Opened;
+    let t0 = Instant::now();
+    let mut c = client(t0);
+    c.attach(1, t0);
+    while c.poll_transmit(1, t0).is_some() {}
+    c.on_frame(
+        1,
+        Frame::Opened(Opened {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            recv_offset: 0,
+            max_offset: 1 << 20,
+            window_cap: 1 << 20,
+            ack_bytes: 0,
+        }),
+        t0,
+    )
+    .unwrap();
+    assert_eq!(c.take_health(), Some(Health::Up));
+    let data = |off: u64| Frame::Data {
+        offset: off,
+        data: vec![1; 100],
+        pad: 0,
+    };
+    // Data within the refresh interval: no new report.
+    let t = t0 + Duration::from_millis(100);
+    c.on_frame(1, data(0), t).unwrap();
+    assert_eq!(c.take_health(), None);
+    // After it: Up again.
+    let t = t0 + HEALTH_REFRESH;
+    c.on_frame(1, data(100), t).unwrap();
+    assert_eq!(c.take_health(), Some(Health::Up), "no refreshed proof");
+    // Upload, never acknowledged, nothing received: a stall.
+    assert_eq!(c.write(b"hello"), 5);
+    while c.poll_transmit(1, t).is_some() {}
+    let t = t + Config::default().timing.t_stall + Duration::from_millis(1);
+    c.handle_timeout(t);
+    assert_eq!(
+        c.take_health(),
+        Some(Health::Failed),
+        "a stall after earlier success went unreported"
+    );
+    assert_eq!(c.fruitless_carriers(), 0, "budget counted a carrier that moved data");
+}

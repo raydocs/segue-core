@@ -1031,3 +1031,234 @@ async fn session_config_with_a_too_short_stall_is_refused() {
     let d = lab.d.with_session_config(cfg).unwrap();
     roundtrip(d.dial(Some("overseas"), &site(), 443).await.unwrap()).await;
 }
+
+/// r10 N6: exit health aggregates its sessions. Reports are fed in
+/// directly, with explicit times.
+mod exit_health {
+    use super::*;
+    use segue_session::client::Health as S;
+
+    fn exit() -> Health {
+        let mut h = Health::new();
+        h.ks.on_event(Event::UserConnect);
+        h
+    }
+
+    fn feed(h: &mut Health, id: u64, r: S, at: Instant) -> Posture {
+        session_health(h, id, r, at);
+        h.ks.posture()
+    }
+
+    #[test]
+    fn one_bad_session_among_good_ones_does_not_take_the_exit_down() {
+        let t = Instant::now();
+        let mut h = exit();
+        assert_eq!(feed(&mut h, 1, S::Up, t), Posture::Connected);
+        assert_eq!(feed(&mut h, 2, S::Up, t), Posture::Connected);
+        // Session 2 stalls and redials while 1 keeps moving data.
+        let t = t + Duration::from_secs(1);
+        assert_eq!(feed(&mut h, 2, S::Failed, t), Posture::Connected);
+        assert_eq!(h.failing(), 1);
+        assert!(!h.unproven);
+        assert!(h.last_fail.is_none(), "strict flows would be refused");
+    }
+
+    #[test]
+    fn interleaved_reports_do_not_flap() {
+        let t = Instant::now();
+        let mut h = exit();
+        // A alone: its failure takes the exit down.
+        feed(&mut h, 1, S::Up, t);
+        assert_eq!(feed(&mut h, 1, S::Failed, t), Posture::Reconnecting);
+        // B's OPENED proves the path.
+        let t = t + Duration::from_millis(500);
+        assert_eq!(feed(&mut h, 2, S::Up, t), Posture::Connected);
+        // A, still backing off, fails again, and again: B's proof is
+        // fresh, the exit stays up.
+        for k in 1..4 {
+            let t = t + Duration::from_millis(400 * k);
+            assert_eq!(feed(&mut h, 1, S::Failed, t), Posture::Connected, "flapped");
+        }
+        // B keeps proving (refreshed while data moves).
+        let t = t + Duration::from_secs(3);
+        feed(&mut h, 2, S::Up, t);
+        let t = t + PROOF_FRESH - Duration::from_millis(1);
+        assert_eq!(feed(&mut h, 1, S::Failed, t), Posture::Connected);
+        // B's proof went stale (it stopped moving data): A's next failure
+        // is no longer outweighed.
+        let t = t + Duration::from_millis(2);
+        assert_eq!(feed(&mut h, 1, S::Failed, t), Posture::Reconnecting);
+    }
+
+    #[test]
+    fn a_session_that_failed_after_success_takes_its_proof_with_it() {
+        let t = Instant::now();
+        let mut h = exit();
+        feed(&mut h, 1, S::Up, t);
+        feed(&mut h, 2, S::Up, t);
+        let t = t + Duration::from_millis(100);
+        assert_eq!(feed(&mut h, 1, S::Failed, t), Posture::Connected);
+        // The other one fails too: nothing proves the exit any more.
+        assert_eq!(feed(&mut h, 2, S::Failed, t), Posture::Reconnecting);
+        assert_eq!(h.failing(), 2);
+        assert!(h.unproven);
+    }
+
+    #[test]
+    fn failing_sessions_that_end_stop_counting() {
+        let t = Instant::now();
+        let mut h = exit();
+        h.sessions.insert(1, SessionMark::default());
+        h.sessions.insert(2, SessionMark::default());
+        // Worked once (else a failure is `Error`: never connected).
+        feed(&mut h, 1, S::Up, t);
+        feed(&mut h, 1, S::Failed, t);
+        feed(&mut h, 2, S::Failed, t);
+        assert_eq!(h.failing(), 2);
+        // 1 gives up; 2 ends otherwise (its reporter is dropped).
+        assert_eq!(feed(&mut h, 1, S::GaveUp, t), Posture::Reconnecting);
+        assert_eq!(h.failing(), 1);
+        h.sessions.remove(&2);
+        assert_eq!(h.failing(), 0);
+        // Down still, until a valid answer.
+        assert_eq!(h.ks.posture(), Posture::Reconnecting);
+        assert!(h.unproven);
+        assert_eq!(feed(&mut h, 3, S::Up, t), Posture::Connected);
+        assert!(!h.unproven);
+    }
+
+    #[test]
+    fn reporters_leave_the_exit_when_dropped() {
+        let st = Arc::new(Mutex::new(State {
+            user_off: false,
+            revoked: None,
+            choice: None,
+            health: vec![exit()],
+        }));
+        let a = HealthReporter::new(st.clone(), 0);
+        let b = HealthReporter::new(st.clone(), 0);
+        a.report(S::Up);
+        b.report(S::Failed);
+        assert_eq!(st.lock().unwrap().health[0].sessions.len(), 2);
+        assert_eq!(st.lock().unwrap().health[0].failing(), 1);
+        drop(b);
+        assert_eq!(st.lock().unwrap().health[0].failing(), 0);
+        drop(a);
+        assert!(st.lock().unwrap().health[0].sessions.is_empty());
+    }
+}
+
+/// r10 N6, end to end: on one exit, a good session keeps downloading
+/// while another one's carriers stall. The exit stays `Connected` (AI
+/// flows open) through the bad one's failures and its give-up; when the
+/// good one fails too the exit goes down; with no session left, the
+/// healed exit recovers through an AI request alone.
+#[tokio::test]
+async fn one_good_and_one_bad_session_on_an_exit() {
+    let (l, good, _at) = download_lab_cfg(quick_stall_relay()).await;
+    l.d.set_exit("la").unwrap();
+    let moved = Arc::new(AtomicUsize::new(0));
+    let good = {
+        let moved = moved.clone();
+        let mut s = good;
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 16 << 10];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => {
+                        moved.fetch_add(n, Ordering::SeqCst);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+    };
+    // The bad session: works at first, then its carrier is black-holed
+    // and every carrier after it stalls after RESUME.
+    let mut bad = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    bad.write_all(b"GET /big HTTP/1.1\r\n\r\n").await.unwrap();
+    let mut bad_at = 0;
+    read_pattern(&mut bad, &mut bad_at, 8 << 10, Duration::from_secs(5)).await;
+    l.la_cut.store(120, Ordering::SeqCst);
+    {
+        let holes = l.la_holes.lock().unwrap();
+        let (hole, _) = holes
+            .iter()
+            .rev()
+            .find(|(_, c)| !c.load(Ordering::SeqCst))
+            .expect("no session carrier");
+        hole.store(true, Ordering::SeqCst);
+    }
+    // Through the bad session's failures and give-up: the exit stays up.
+    let bad_end =
+        tokio::spawn(async move { read_to_end_within(&mut bad, Duration::from_secs(60)).await });
+    let mut checked_ai = false;
+    let t0 = Instant::now();
+    while !bad_end.is_finished() {
+        assert_eq!(
+            l.d.posture(),
+            Posture::Connected,
+            "one bad session took the exit down after {:?}",
+            t0.elapsed()
+        );
+        if !checked_ai && t0.elapsed() > Duration::from_secs(2) {
+            let ai = l.d.dial(Some("ai"), &site(), 443).await;
+            assert!(
+                ai.is_ok(),
+                "AI refused while a session on the exit is healthy"
+            );
+            checked_ai = true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let e = bad_end
+        .await
+        .unwrap()
+        .expect("bad session never gave up")
+        .expect_err("bad session ended clean");
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(checked_ai);
+    let before = moved.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        moved.load(Ordering::SeqCst) > before,
+        "good session stopped"
+    );
+    assert_eq!(l.d.posture(), Posture::Connected);
+    // The good session's path breaks too: nothing proves the exit.
+    l.blackhole_la(false);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while l.d.posture() == Posture::Connected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("exit stayed up with every session failing");
+    let r = l.d.dial(Some("ai"), &site(), 443).await;
+    assert!(r.is_err_and(|e| e.0.contains("strict")), "AI not refused");
+    let e = tokio::time::timeout(Duration::from_secs(60), good)
+        .await
+        .expect("good session never gave up")
+        .unwrap()
+        .expect_err("good session ended clean");
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+    assert_ne!(l.d.posture(), Posture::Connected);
+    // The path heals; no session is left. Once the strict retry interval
+    // has passed, an AI request is let through, and its OPENED brings
+    // the exit back.
+    l.la_cut.store(0, Ordering::SeqCst);
+    tokio::time::sleep(STRICT_RETRY_AFTER + Duration::from_millis(200)).await;
+    let mut ai =
+        l.d.dial(Some("ai"), &site(), 443)
+            .await
+            .expect("AI never let through to recover");
+    assert_eq!(l.d.posture(), Posture::Connected);
+    ai.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    let mut b = [0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), ai.read(&mut b))
+        .await
+        .expect("AI flow after recovery got nothing")
+        .unwrap();
+    assert!(n > 0);
+}
