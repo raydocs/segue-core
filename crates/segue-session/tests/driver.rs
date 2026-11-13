@@ -891,3 +891,120 @@ fn the_8mb_pool_admits_hundreds_of_flows() {
     assert!(sessions >= 280, "{sessions} session flows");
     assert!(tun_flows >= 220, "{tun_flows} TUN flows");
 }
+
+/// Poll `f` until it returns true or `limit` passes.
+async fn settle(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let end = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < end {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    f()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_sessions_hold_only_their_floors_before_and_after_a_burst() {
+    // r7 #7: run N sessions to steady state and look at what the pool
+    // holds, not at object counts. An idle session holds its receive
+    // credit (the 16 KiB initial window it advertised, which cannot be
+    // revoked) and one send-floor block, nothing else: before, every idle
+    // driver asked `write_capacity()` for a 16 KiB read-ahead with no data
+    // to send, so each idle connection kept 12 KiB more, and after an
+    // upload burst the unused promise was never given back.
+    use segue_session::pool::BLOCK;
+    const N: usize = 6;
+    const BURST: usize = 256 << 10;
+    const IDLE: Duration = Duration::from_secs(10);
+    let cfg = Config::default();
+    let floor = cfg.limits.initial_credit + BLOCK;
+    let pool = Pool::new(8 << 20);
+    let relay_pool = Pool::new(8 << 20);
+    let table = RelayTable::new(cfg.clone(), relay_pool, Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(16);
+    // The site takes the upload and sends nothing back, so the receive
+    // side never earns a window beyond the initial credit.
+    let got = Arc::new(AtomicUsize::new(0));
+    let sink: SiteConnector = {
+        let got = got.clone();
+        Arc::new(move |_t, _k| {
+            let got = got.clone();
+            Box::pin(async move {
+                let (a, mut b) = tokio::io::duplex(64 << 10);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 << 10];
+                    while let Ok(n) = b.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        got.fetch_add(n, Ordering::SeqCst);
+                    }
+                    drop(b);
+                });
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    let relay = tokio::spawn(run_relay(table, accept_rx, sink, None));
+    let connector: Connector = Arc::new(move || {
+        let accept_tx = accept_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(64 << 10);
+            accept_tx
+                .send(Box::new(b))
+                .await
+                .map_err(|_| std::io::Error::other("gone"))?;
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let mut apps = Vec::new();
+    let mut clients = Vec::new();
+    for _ in 0..N {
+        let s = ClientSession::new(cfg.clone(), &pool, params(), Instant::now()).unwrap();
+        let (app, far) = tokio::io::duplex(64 << 10);
+        clients.push(tokio::spawn(run_client(s, far, connector.clone())));
+        apps.push(app);
+    }
+    // A small request each, then idle: the steady state new sessions are
+    // admitted against.
+    for a in &mut apps {
+        a.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    }
+    let want = N * 18;
+    assert!(
+        settle(IDLE, || got.load(Ordering::SeqCst) == want).await,
+        "requests not delivered"
+    );
+    let ok = settle(IDLE, || pool.used_bytes() == N * floor).await;
+    assert!(
+        ok,
+        "idle: pool holds {} bytes, floors are {}",
+        pool.used_bytes(),
+        N * floor
+    );
+    // Burst, then idle again: everything above the floors goes back.
+    for (i, a) in apps.iter_mut().enumerate() {
+        a.write_all(&pattern(BURST, i as u8)).await.unwrap();
+    }
+    let want = want + N * BURST;
+    assert!(
+        settle(IDLE, || got.load(Ordering::SeqCst) == want).await,
+        "burst not delivered: {} of {want}",
+        got.load(Ordering::SeqCst)
+    );
+    let ok = settle(IDLE, || pool.used_bytes() == N * floor).await;
+    assert!(
+        ok,
+        "after burst then idle: pool holds {} bytes, floors are {}",
+        pool.used_bytes(),
+        N * floor
+    );
+    // And the pool still admits as before.
+    assert!(ClientSession::new(cfg, &pool, params(), Instant::now()).is_some());
+    drop(apps);
+    for c in clients {
+        let _ = tokio::time::timeout(Duration::from_secs(10), c).await;
+    }
+    relay.abort();
+}

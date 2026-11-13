@@ -142,10 +142,44 @@ impl SendHalf {
         cap
     }
 
+    /// Like [`write_capacity`](Self::write_capacity), but promises at most
+    /// `max` bytes and holds no more than the data plus that promise: the
+    /// grant grows to `buffered + max` (as far as the pool allows) and
+    /// shrinks back when it holds more, never below the send floor. An idle
+    /// session that asks for a small read keeps only the floor, not a
+    /// 16 KiB prefetch (r7 #7).
+    pub fn write_capacity_for(&mut self, max: usize) -> usize {
+        if self.fin.is_some() {
+            self.promised = 0;
+            return 0;
+        }
+        let want = self.replay_cap.min(self.buf.len() + max);
+        if self.grant.bytes() < want {
+            self.grant.grow_towards(want);
+        } else {
+            let keep = want.max(SEND_FLOOR.min(self.replay_cap));
+            if self.grant.bytes() > keep {
+                self.grant.try_resize(keep);
+                fit(&mut self.buf, self.grant.bytes());
+            }
+        }
+        let cap = self
+            .grant
+            .bytes()
+            .min(self.replay_cap)
+            .saturating_sub(self.buf.len())
+            .min(max);
+        self.promised = cap;
+        cap
+    }
+
     /// Queue application bytes. Returns how many were accepted (backpressure:
-    /// bounded by the replay cap and the pool).
+    /// bounded by the replay cap and the pool). Grows the grant only for
+    /// `data` (and what is still promised), no read-ahead.
     pub fn write(&mut self, data: &[u8]) -> usize {
-        let n = data.len().min(self.write_capacity());
+        let n = data
+            .len()
+            .min(self.write_capacity_for(data.len().max(self.promised)));
         reserve_within(&mut self.buf, n, self.grant.bytes());
         self.buf.extend(&data[..n]);
         self.promised = self.promised.saturating_sub(n);
@@ -819,5 +853,42 @@ mod tests {
             0,
             "idle drained receive buffer keeps {peak} bytes"
         );
+    }
+
+    #[test]
+    fn burst_then_idle_keeps_only_the_send_floor_and_advertised_credit() {
+        // r7 #7, at the half level: after a burst the send grant is back to
+        // the floor (no 16 KiB read-ahead promise left behind), an idle
+        // small-read promise fits in the floor, and the receive grant is
+        // exactly the advertised credit still outstanding (never revoked).
+        let (mut s, mut r, now) = halves(8 << 20);
+        let pool = s.pool().clone();
+        let floor = SEND_FLOOR;
+        assert_eq!(s.grant_bytes(), floor);
+        assert_eq!(s.write_capacity_for(512), 512);
+        assert_eq!(s.grant_bytes(), floor, "idle small read grew the grant");
+        let mut out = vec![0u8; 64 * 1024];
+        let mut sent = 0;
+        while sent < 512 * 1024 {
+            let cap = s.write_capacity_for(16 * 1024);
+            let n = s.write(&vec![3u8; cap.min(16 * 1024)]);
+            sent += n;
+            pump(&mut s, &mut r, now);
+            while r.read(&mut out, now) > 0 {}
+            pump(&mut s, &mut r, now);
+        }
+        assert!(r.max_offset() - r.consumed() > crate::INITIAL_CREDIT as u64);
+        assert_eq!(s.buffered(), 0);
+        assert_eq!(s.write_capacity_for(512), 512);
+        assert_eq!(s.grant_bytes(), floor, "send grant after burst");
+        let later = now + Timing::default().idle_after * 2;
+        r.update_credit(later);
+        let outstanding = (r.max_offset() - r.consumed()) as usize;
+        assert_eq!(
+            r.grant_bytes(),
+            outstanding.max(Limits::default().min_credit).div_ceil(crate::pool::BLOCK) * crate::pool::BLOCK
+        );
+        assert_eq!(r.held_bytes(), 0);
+        assert_eq!(pool.used_bytes(), s.grant_bytes() + r.grant_bytes());
     }
 }

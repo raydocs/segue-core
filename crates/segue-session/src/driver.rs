@@ -655,7 +655,10 @@ where
         let cap = if app_eof {
             0
         } else {
-            s.write_capacity().min(CHUNK)
+            // Promise (and hold) only what the next app read can fill: an
+            // idle session's 512-byte read fits in its send floor, no
+            // 16 KiB prefetch per connection (r7 #7).
+            s.write_capacity_for(abuf.len().min(CHUNK))
         };
         let deadline = s.poll_timeout().map(tokio::time::Instant::from_std);
         let backoff = connect_backoff.filter(|_| !connecting);
