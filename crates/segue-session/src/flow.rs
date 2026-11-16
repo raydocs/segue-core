@@ -660,6 +660,10 @@ impl RecvHalf {
                 self.fin = Some(offset);
                 self.recv = offset + 1;
                 self.touch(now);
+                // Nothing more arrives: give back credit (and growth) now,
+                // even if the buffer is already drained and no read will
+                // follow (a half-closed session keeps living).
+                self.update_credit(now);
                 Ok(())
             }
         }
@@ -739,10 +743,13 @@ impl RecvHalf {
             // budget only (GROWTH_SHARE_DIV): the sum over all sessions of
             // credit above their initial credit. Floors and initial
             // credits do not count against it.
+            // Reserved atomically before the grant grows, so sessions on
+            // other tasks cannot spend the same room twice; settled to the
+            // grant actually taken by `sync_grown` below.
             let budget = pool.limit(Tier::Elastic) * BLOCK / GROWTH_SHARE_DIV;
-            let others = pool.grown_bytes().saturating_sub(self.grown);
-            let mine = budget.saturating_sub(others);
-            need = need.min(base.max(self.win_init + mine));
+            let want = need - self.win_init;
+            self.grown = pool.reserve_grown(self.grown, want, budget);
+            need = need.min(base.max(self.win_init + self.grown));
         }
         if need <= self.grant.bytes() {
             self.grant.try_resize(need);

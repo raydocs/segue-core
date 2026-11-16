@@ -492,3 +492,67 @@ fn a_transfer_grows_while_other_sessions_hold_their_initial_credit() {
     drop(f);
     assert_eq!(pool.grown_bytes(), 0);
 }
+
+#[test]
+fn a_fin_after_the_buffer_drained_gives_the_growth_back() {
+    // astra review r3 P2-3: the receive side grew, the app read
+    // everything, then the FIN arrives (the other direction stays open).
+    // No read follows, so the FIN itself must return the credit.
+    let pool = Pool::new(8 << 20);
+    let t0 = Instant::now();
+    let mut f = Flow::new(
+        &Pool::new(64 << 20),
+        &pool,
+        Duration::from_millis(50),
+        Some(10.0 * MB),
+        t0,
+    )
+    .unwrap();
+    let mut now = t0;
+    while now < t0 + Duration::from_secs(2) {
+        f.step(now);
+        now += TICK;
+    }
+    assert!(pool.grown_bytes() > 256 * 1024, "did not grow");
+    // Source stops, everything in flight arrives and is read.
+    f.sending = false;
+    while now < t0 + Duration::from_secs(3) {
+        f.step(now);
+        now += TICK;
+    }
+    assert_eq!(f.r.buffered(), 0);
+    let fin = f.r.recv_offset();
+    f.r.on_fin(fin, now).unwrap();
+    assert_eq!(pool.grown_bytes(), 0, "growth kept after FIN");
+    assert_eq!(f.r.grant_bytes(), 0, "credit kept after FIN");
+}
+
+#[test]
+fn growth_reservations_from_many_threads_stay_within_the_budget() {
+    // astra review r3 P2-4: sessions on other tasks reserve at the same
+    // time; their sum never passes the budget.
+    let pool = Pool::new(8 << 20);
+    let budget = 1 << 20;
+    let peak = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..8 {
+            sc.spawn(|| {
+                let mut have = 0;
+                for i in 0..20_000 {
+                    let want = if i % 3 == 0 { 0 } else { 512 * 1024 };
+                    if want < have {
+                        pool.set_grown(have, want);
+                        have = want;
+                    } else {
+                        have = pool.reserve_grown(have, want, budget);
+                    }
+                    peak.fetch_max(pool.grown_bytes(), std::sync::atomic::Ordering::Relaxed);
+                }
+                pool.set_grown(have, 0);
+            });
+        }
+    });
+    let peak = peak.into_inner();
+    assert!(peak <= budget, "growth sum {peak} over budget {budget}");
+    assert_eq!(pool.grown_bytes(), 0);
+}

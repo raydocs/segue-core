@@ -183,6 +183,29 @@ impl Pool {
         self.grown.load(Ordering::Acquire)
     }
 
+    /// Reserve growth for a session that holds `have` bytes of it and
+    /// wants `want`, within `budget` for the sum over all sessions; returns
+    /// what it holds now (`have` when nothing is free). Atomic against
+    /// other sessions reserving at the same time.
+    pub fn reserve_grown(&self, have: usize, want: usize, budget: usize) -> usize {
+        let mut cur = self.grown.load(Ordering::Acquire);
+        loop {
+            let to = want.min(have + budget.saturating_sub(cur));
+            if to <= have {
+                return have;
+            }
+            match self.grown.compare_exchange_weak(
+                cur,
+                cur + (to - have),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return to,
+                Err(c) => cur = c,
+            }
+        }
+    }
+
     /// A session's growth changed from `old` to `new` bytes.
     pub fn set_grown(&self, old: usize, new: usize) {
         if new > old {
