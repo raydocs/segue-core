@@ -16,6 +16,13 @@ use segue_transport::{TlsClientConfig, TlsConnector};
 pub const SALAMANDER_PASSWORD: &str = "synthetic-salamander-password";
 pub const AUTH: &str = "synthetic-local-hysteria-test-auth";
 pub const DEADLINE: Duration = Duration::from_secs(8);
+/// How long a reference process may take to report that it listens. Startup
+/// is fixture time, not behavior under test, so it is bounded on its own and
+/// generously: a stalled CI host once took seconds just to exec the binary.
+pub const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
+/// A reference loses its reserved port when a concurrent test binds that port
+/// between the reservation's drop and the reference's own bind.
+const STARTUP_ATTEMPTS: usize = 5;
 
 pub fn tls_settings() -> TlsClientConfig {
     TlsClientConfig {
@@ -146,6 +153,24 @@ impl ReferenceServer {
         bandwidth: Option<(&str, &str)>,
         udp_masks: Option<serde_json::Value>,
     ) -> Self {
+        for _ in 0..STARTUP_ATTEMPTS {
+            if let Some(server) =
+                Self::try_start(udp_enabled, salamander, bandwidth, udp_masks.clone()).await
+            {
+                return server;
+            }
+        }
+        panic!("Hysteria reference lost its reserved port {STARTUP_ATTEMPTS} times");
+    }
+
+    /// `None` when another socket took the reserved port first; any other
+    /// startup failure panics with the reference's log.
+    async fn try_start(
+        udp_enabled: bool,
+        salamander: Option<Option<(u16, u16)>>,
+        bandwidth: Option<(&str, &str)>,
+        udp_masks: Option<serde_json::Value>,
+    ) -> Option<Self> {
         let (binary, native) = match (
             std::env::var_os("XRAY_HYSTERIA_BINARY"),
             std::env::var_os("NATIVE_HYSTERIA_BINARY"),
@@ -262,25 +287,32 @@ impl ReferenceServer {
             certificate_sha256,
             native,
         };
-        let deadline = tokio::time::Instant::now() + DEADLINE;
+        let started = tokio::time::Instant::now();
         loop {
-            assert!(
-                server.child.try_wait().unwrap().is_none(),
-                "Hysteria reference exited at startup"
-            );
-            if std::fs::read_to_string(server.directory.join("server.log"))
-                .unwrap()
-                .contains(startup_message)
-            {
+            let log = std::fs::read_to_string(server.directory.join("server.log")).unwrap();
+            if server.child.try_wait().unwrap().is_some() {
+                if log.contains("address already in use") {
+                    eprintln!("Hysteria reference lost port {}; retrying", server.address);
+                    return None;
+                }
+                panic!("Hysteria reference exited at startup");
+            }
+            if log.contains(startup_message) {
                 break;
             }
             assert!(
-                tokio::time::Instant::now() < deadline,
+                started.elapsed() < STARTUP_DEADLINE,
                 "Hysteria reference startup deadline"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        server
+        if started.elapsed() > Duration::from_secs(1) {
+            eprintln!(
+                "Hysteria reference took {:?} to start; the host is slow",
+                started.elapsed()
+            );
+        }
+        Some(server)
     }
 
     pub fn config(&self) -> HysteriaConfig {
