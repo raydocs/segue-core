@@ -544,7 +544,7 @@ fn growth_reservations_from_many_threads_stay_within_the_budget() {
                         pool.set_grown(have, want);
                         have = want;
                     } else {
-                        have = pool.reserve_grown(have, want, budget);
+                        have = pool.reserve_grown(have, want, budget, BLOCK);
                     }
                     peak.fetch_max(pool.grown_bytes(), std::sync::atomic::Ordering::Relaxed);
                 }
@@ -555,4 +555,21 @@ fn growth_reservations_from_many_threads_stay_within_the_budget() {
     let peak = peak.into_inner();
     assert!(peak <= budget, "growth sum {peak} over budget {budget}");
     assert_eq!(pool.grown_bytes(), 0);
+}
+
+#[test]
+fn growth_to_a_target_off_the_block_size_stays_within_the_budget() {
+    // astra review r4: targets that are not whole blocks; the grant is
+    // taken in blocks, so the reservation must be too.
+    let pool = Pool::new(8 << 20);
+    let budget = pool.limit(Tier::Elastic) * BLOCK / GROWTH_SHARE_DIV;
+    let a = pool.reserve_grown(0, budget - 6 * BLOCK, budget, BLOCK);
+    assert_eq!(a, budget - 6 * BLOCK);
+    let want = (2 * BLOCK + 2).div_ceil(BLOCK) * BLOCK;
+    let b = pool.reserve_grown(0, want, budget, BLOCK);
+    let c = pool.reserve_grown(0, want, budget, BLOCK);
+    let d = pool.reserve_grown(0, want, budget, BLOCK);
+    assert_eq!(b + c + d, 6 * BLOCK, "{b} {c} {d}");
+    assert!(pool.grown_bytes() <= budget);
+    assert_eq!(pool.grown_bytes() % BLOCK, 0);
 }

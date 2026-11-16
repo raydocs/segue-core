@@ -184,13 +184,16 @@ impl Pool {
     }
 
     /// Reserve growth for a session that holds `have` bytes of it and
-    /// wants `want`, within `budget` for the sum over all sessions; returns
+    /// wants `want` (both multiples of `unit`), within `budget` for the
+    /// sum over all sessions, in whole `unit`s; returns
     /// what it holds now (`have` when nothing is free). Atomic against
     /// other sessions reserving at the same time.
-    pub fn reserve_grown(&self, have: usize, want: usize, budget: usize) -> usize {
+    pub fn reserve_grown(&self, have: usize, want: usize, budget: usize, unit: usize) -> usize {
         let mut cur = self.grown.load(Ordering::Acquire);
         loop {
-            let to = want.min(have + budget.saturating_sub(cur));
+            // Room rounded down to `unit`: a partial unit is not taken.
+            let room = budget.saturating_sub(cur) / unit * unit;
+            let to = want.min(have + room);
             if to <= have {
                 return have;
             }

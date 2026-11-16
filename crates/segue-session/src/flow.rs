@@ -746,9 +746,11 @@ impl RecvHalf {
             // Reserved atomically before the grant grows, so sessions on
             // other tasks cannot spend the same room twice; settled to the
             // grant actually taken by `sync_grown` below.
+            // In whole blocks, as the grant is taken: the reservation is
+            // never smaller than what `sync_grown` settles.
             let budget = pool.limit(Tier::Elastic) * BLOCK / GROWTH_SHARE_DIV;
-            let want = need - self.win_init;
-            self.grown = pool.reserve_grown(self.grown, want, budget);
+            let want = need.div_ceil(BLOCK) * BLOCK - self.win_init;
+            self.grown = pool.reserve_grown(self.grown, want, budget, BLOCK);
             need = need.min(base.max(self.win_init + self.grown));
         }
         if need <= self.grant.bytes() {
@@ -768,6 +770,13 @@ impl RecvHalf {
     /// Report this session's credit above the initial credit to the pool.
     fn sync_grown(&mut self) {
         let g = self.grant.bytes().saturating_sub(self.win_init);
+        // The grant never grows past the reservation (whole blocks, and
+        // `win_init` is a whole number of blocks), only up to it.
+        debug_assert!(
+            g <= self.grown,
+            "growth {g} past reservation {}",
+            self.grown
+        );
         if g != self.grown {
             self.grant.pool().set_grown(self.grown, g);
             self.grown = g;
