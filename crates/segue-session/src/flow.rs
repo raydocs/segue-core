@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::codec::{max_data_len, Frame};
-use crate::pool::{Grant, Pool};
+use crate::pool::{Grant, Pool, Tier, BLOCK};
 use crate::{Limits, ProtoError, Timing};
 
 /// Make room for `add` more bytes without growing past `limit` (the grant):
@@ -366,9 +366,11 @@ fn deque_range(buf: &VecDeque<u8>, start: usize, n: usize) -> [&[u8]; 2] {
 /// has the next, larger advertisement. So when data first ends beyond M,
 /// at least one round trip has passed since that next advertisement went
 /// out: `now − t(next)` is an RTT sample, exact when the sender was
-/// waiting on the window and larger otherwise. Samples feed an RFC 6298
-/// style smoothed RTT, each clamped to four times the minimum seen so
-/// that a slow sender does not inflate the window.
+/// waiting on the window and larger otherwise, never smaller. The
+/// estimate is therefore a windowed minimum of the samples (between one
+/// and two halves of [`RTT_WINDOW`] old): a slow sender's large samples do not count while the
+/// path still shows its real RTT, and a path whose RTT went up is learned
+/// within the window. A new carrier ([`RecvHalf::new_path`]) starts over.
 ///
 /// Delivery rate: bytes handed to the application per epoch of at least
 /// one SRTT.
@@ -376,14 +378,24 @@ fn deque_range(buf: &VecDeque<u8>, start: usize, n: usize) -> [&[u8]; 2] {
 struct RateRtt {
     /// Advertised `max_offset` values and when each went out, ascending.
     adv: VecDeque<(Instant, u64)>,
-    srtt: Option<std::time::Duration>,
-    min_rtt: Option<std::time::Duration>,
+    /// Windowed minimum of the RTT samples: the minimum of the current
+    /// half-window bucket (since `bucket_start`) and of the previous one,
+    /// so samples count for between one and two halves of [`RTT_WINDOW`].
+    /// Microseconds, 0 = no sample (samples are at least 100 µs).
+    cur_min: u32,
+    prev_min: u32,
+    bucket_start: Instant,
+    /// `min(cur_min, prev_min)` in microseconds, 0 = none yet.
+    srtt_us: u32,
     epoch: (Instant, u64),
 }
 
 /// Advertisements remembered for RTT samples; older ones are dropped
 /// (fewer samples, never wrong ones).
-const ADV_LOG: usize = 64;
+const ADV_LOG: usize = 8;
+
+/// How long an RTT sample counts towards the minimum.
+pub const RTT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// RTT samples above this are clamped: a sender that paused for seconds
 /// at a window edge says nothing about the path.
@@ -391,12 +403,14 @@ const MAX_RTT_SAMPLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl RateRtt {
     fn new(initial_max: u64, now: Instant) -> Self {
-        let mut adv = VecDeque::with_capacity(8);
+        let mut adv = VecDeque::with_capacity(2);
         adv.push_back((now, initial_max));
         Self {
             adv,
-            srtt: None,
-            min_rtt: None,
+            cur_min: 0,
+            prev_min: 0,
+            bucket_start: now,
+            srtt_us: 0,
             epoch: (now, 0),
         }
     }
@@ -419,32 +433,55 @@ impl RateRtt {
             self.adv.pop_front();
         }
         if let Some(s) = sample {
-            self.add_sample(s);
+            self.add_sample(s, now);
         }
     }
 
-    fn add_sample(&mut self, s: std::time::Duration) {
+    fn add_sample(&mut self, s: std::time::Duration, now: Instant) {
         let s = s.clamp(std::time::Duration::from_micros(100), MAX_RTT_SAMPLE);
-        let min = self.min_rtt.map_or(s, |m| m.min(s));
-        self.min_rtt = Some(min);
-        let s = s.min(min * 4);
-        self.srtt = Some(match self.srtt {
-            None => s,
-            Some(v) => (v * 7 + s) / 8,
-        });
+        let half = RTT_WINDOW / 2;
+        let age = now.saturating_duration_since(self.bucket_start);
+        if age >= half * 2 {
+            self.prev_min = 0;
+            self.cur_min = 0;
+            self.bucket_start = now;
+        } else if age >= half {
+            self.prev_min = std::mem::take(&mut self.cur_min);
+            self.bucket_start = now;
+        }
+        let us = s.as_micros() as u32;
+        let min = |a: u32, b: u32| match (a, b) {
+            (0, x) | (x, 0) => x,
+            (a, b) => a.min(b),
+        };
+        self.cur_min = min(self.cur_min, us);
+        self.srtt_us = min(self.cur_min, self.prev_min);
+    }
+
+    /// A new carrier: its path may have another RTT. The window keeps its
+    /// size until the new path has been measured.
+    fn new_path(&mut self, consumed: u64, now: Instant) {
+        self.cur_min = 0;
+        self.prev_min = 0;
+        self.bucket_start = now;
+        self.srtt_us = 0;
+        self.epoch = (now, consumed);
     }
 
     /// A new epoch starts here (after idle: the old rate says nothing).
-    /// The minimum is learned again too: the carrier, and with it the
-    /// path, may have changed while the session was idle.
+    /// The logs give their memory back, as the buffers do.
     fn restart(&mut self, consumed: u64, now: Instant) {
         self.epoch = (now, consumed);
-        self.min_rtt = None;
+        self.adv.shrink_to_fit();
+    }
+
+    fn srtt(&self) -> Option<std::time::Duration> {
+        (self.srtt_us > 0).then(|| std::time::Duration::from_micros(self.srtt_us.into()))
     }
 
     /// The window target when an epoch of at least one SRTT has ended.
     fn on_consumed(&mut self, consumed: u64, now: Instant) -> Option<usize> {
-        let srtt = self.srtt?;
+        let srtt = self.srtt()?;
         let dt = now.saturating_duration_since(self.epoch.0);
         if dt < srtt {
             return None;
@@ -456,6 +493,14 @@ impl RateRtt {
     }
 }
 
+/// Receive credit above the initial credit (window growth) is taken only
+/// while the pool's elastic part is less than this fraction (1/n) in use:
+/// credit once advertised cannot be revoked (§4 rule 8), so sessions that
+/// grew and then went quiet without closing must not pin what admission
+/// needs. The other half always stays for floors, initial credits and
+/// fresh sessions.
+pub const GROWTH_SHARE_DIV: usize = 2;
+
 #[derive(Debug)]
 pub struct RecvHalf {
     consumed: u64,
@@ -466,14 +511,15 @@ pub struct RecvHalf {
     grant: Grant,
     min_credit: usize,
     window_cap: usize,
-    /// Receive window aimed for while active (§4 rule 8): `clamp(2 ×
-    /// delivery_rate × SRTT, initial credit, window_cap)`, measured here
-    /// (see [`RateRtt`]). A window-limited sender delivers about `win` per
-    /// RTT, so the target is about `2 × win` and the window doubles each
-    /// round trip until the link, the reader or the cap limits it; a
-    /// session that moves a few bytes keeps a small window it does not
-    /// have to take back (`max_offset` never moves back). Back to the
-    /// initial credit when idle.
+    /// Receive window aimed for while active (§4 rule 8): the largest
+    /// `clamp(2 × delivery_rate × SRTT, initial credit, window_cap)` seen
+    /// since the session last went idle, measured here (see [`RateRtt`]).
+    /// A window-limited sender delivers about `win` per RTT, so the
+    /// target is about `2 × win` and the window doubles each round trip
+    /// until the link, the reader or the cap limits it; a session that
+    /// moves a few bytes keeps a small window it does not have to take
+    /// back (`max_offset` never moves back). Back to the initial credit
+    /// when idle.
     win: usize,
     win_init: usize,
     est: RateRtt,
@@ -652,7 +698,12 @@ impl RecvHalf {
             self.win = self.win_init;
             self.est.restart(self.consumed, now);
         } else if let Some(target) = self.est.on_consumed(self.consumed, now) {
-            self.win = target.clamp(self.win_init, self.window_cap);
+            // Grows only while active, like TCP receive autotuning: an
+            // epoch in which the app read little (it is busy, or a burst
+            // ended) does not take back a window the path has shown it
+            // needs. It falls back when the session goes idle, and the
+            // pool limits it under pressure (fair share, growth budget).
+            self.win = self.win.max(target.min(self.window_cap));
         }
         let mut desired = if active { self.win } else { self.min_credit };
         if !active {
@@ -667,7 +718,15 @@ impl RecvHalf {
         if pool.under_pressure() {
             desired = desired.min(pool.fair_share_bytes());
         }
-        let need = desired.max(self.min_credit).max(outstanding);
+        let base = self.win_init.max(self.min_credit).max(outstanding);
+        let mut need = desired.max(self.min_credit).max(outstanding);
+        if need > base && need > self.grant.bytes() {
+            // Growth past the initial credit comes out of the growth
+            // budget only (GROWTH_SHARE_DIV).
+            let budget = pool.limit(Tier::Elastic) * BLOCK / GROWTH_SHARE_DIV;
+            let room = budget.saturating_sub(pool.used_bytes());
+            need = need.min(self.grant.bytes().max(base) + room);
+        }
         if need <= self.grant.bytes() {
             self.grant.try_resize(need);
             fit(&mut self.buf, self.grant.bytes());
@@ -736,12 +795,19 @@ impl RecvHalf {
 
     /// Smoothed RTT measured from window advertisements, if any yet.
     pub fn srtt(&self) -> Option<std::time::Duration> {
-        self.est.srtt
+        self.est.srtt()
     }
 
     /// Receive window currently aimed for (before pool limits).
     pub fn target_window(&self) -> usize {
         self.win
+    }
+
+    /// The session moved to a new carrier (RESUME / attach): RTT is
+    /// measured again on the new path.
+    pub fn new_path(&mut self, now: Instant) {
+        self.now_hint = self.now_hint.max(now);
+        self.est.new_path(self.consumed, now);
     }
 
     /// Idle check for timeouts: lets credit fall back when no data arrives.

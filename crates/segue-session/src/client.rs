@@ -393,6 +393,7 @@ impl ClientSession {
             }
         } else {
             self.state = State::Attaching;
+            self.recv.new_path(now);
             self.recv.mark_acked();
             Frame::Resume(Resume {
                 version: VERSION,

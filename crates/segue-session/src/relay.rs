@@ -648,6 +648,9 @@ impl RelayTable {
             return Err(e);
         }
         let old = s.carrier.replace(cid);
+        if old.is_some_and(|o| o != cid) {
+            s.recv.new_path(now);
+        }
         s.cur_gen = gen;
         s.reply = Some(reply);
         s.detached_since = None;

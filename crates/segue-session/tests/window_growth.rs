@@ -8,12 +8,16 @@
 //! rate and a one-way delay; time advances in 100 µs ticks.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use segue_session::codec::Frame;
-use segue_session::flow::{RecvHalf, SendHalf};
-use segue_session::pool::Pool;
+use segue_session::flow::{RecvHalf, SendHalf, GROWTH_SHARE_DIV, RTT_WINDOW};
+use segue_session::pool::{Pool, Tier, BLOCK};
 use segue_session::{Limits, Timing};
+
+const MB: f64 = 1_000_000.0;
+const TICK: Duration = Duration::from_micros(100);
 
 struct Link {
     /// One-way propagation delay.
@@ -48,7 +52,9 @@ impl Link {
             None => Duration::ZERO,
         };
         self.free_at = start + ser;
-        self.q.push_back((start + ser + self.delay, f));
+        // FIFO: a shorter delay set later does not overtake what is queued.
+        let at = (start + ser + self.delay).max(self.q.back().map_or(now, |b| b.0));
+        self.q.push_back((at, f));
     }
 
     fn recv(&mut self, now: Instant) -> Option<Frame> {
@@ -56,6 +62,99 @@ impl Link {
             return self.q.pop_front().map(|(_, f)| f);
         }
         None
+    }
+}
+
+/// One bulk flow: an unlimited source, a link each way, a receiving app
+/// that reads everything at once unless `read_rate` limits it.
+struct Flow {
+    s: SendHalf,
+    r: RecvHalf,
+    fwd: Link,
+    back: Link,
+    read_rate: Option<f64>,
+    read_budget: f64,
+    /// The source has more to send.
+    sending: bool,
+    max_grant: usize,
+}
+
+impl Flow {
+    fn new(
+        pool_s: &Arc<Pool>,
+        pool_r: &Arc<Pool>,
+        rtt: Duration,
+        rate: Option<f64>,
+        now: Instant,
+    ) -> Option<Self> {
+        let limits = Limits::default();
+        Some(Self {
+            s: SendHalf::new(pool_s, &limits)?,
+            r: RecvHalf::new(pool_r, &limits, &Timing::default(), now)?,
+            fwd: Link::new(rtt / 2, rate, now),
+            back: Link::new(rtt / 2, None, now),
+            read_rate: None,
+            read_budget: 0.0,
+            sending: true,
+            max_grant: 0,
+        })
+    }
+
+    fn set_rtt(&mut self, rtt: Duration) {
+        self.fwd.delay = rtt / 2;
+        self.back.delay = rtt / 2;
+    }
+
+    fn step(&mut self, now: Instant) {
+        let src = [0x5au8; 16 * 1024];
+        while self.sending {
+            let cap = self.s.write_capacity();
+            if cap == 0 {
+                break;
+            }
+            self.s.write(&src[..cap.min(src.len())]);
+        }
+        while self.fwd.ready(now) {
+            let Some(f) = self.s.poll_frame() else { break };
+            let len = match &f {
+                Frame::Data { data, .. } => data.len() + 16,
+                _ => 16,
+            };
+            self.fwd.send(now, f, len);
+        }
+        while let Some(f) = self.fwd.recv(now) {
+            if let Frame::Data { offset, data, .. } = f {
+                self.r.on_data(offset, &data, now).unwrap();
+            }
+        }
+        match self.read_rate {
+            None => {
+                let n = self.r.buffered();
+                self.r.consume(n, now);
+            }
+            Some(rr) => {
+                self.read_budget += rr * TICK.as_secs_f64();
+                let n = (self.read_budget as usize).min(self.r.buffered());
+                self.read_budget -= n as f64;
+                if self.r.buffered() == 0 {
+                    self.read_budget = self.read_budget.min(64.0 * 1024.0);
+                }
+                self.r.consume(n, now);
+            }
+        }
+        if let Some(a) = self.r.poll_ack(now, false) {
+            self.back.send(now, a, 16);
+        }
+        self.max_grant = self.max_grant.max(self.r.grant_bytes());
+        while let Some(f) = self.back.recv(now) {
+            if let Frame::Ack {
+                recv_offset,
+                max_offset,
+            } = f
+            {
+                self.s.on_ack(recv_offset, max_offset).unwrap();
+            }
+        }
     }
 }
 
@@ -67,93 +166,28 @@ struct Run {
     steady: f64,
 }
 
-/// Unlimited-source bulk transfer for `dur`; the receiving app reads
-/// everything as soon as it arrives unless `read_rate` limits it.
 fn bulk(rtt: Duration, rate: Option<f64>, read_rate: Option<f64>, dur: Duration) -> Run {
-    let pool_s = Pool::new(8 << 20);
-    let pool_r = Pool::new(8 << 20);
-    let limits = Limits::default();
-    let timing = Timing::default();
     let t0 = Instant::now();
-    let mut s = SendHalf::new(&pool_s, &limits).unwrap();
-    let mut r = RecvHalf::new(&pool_r, &limits, &timing, t0).unwrap();
-    let mut fwd = Link::new(rtt / 2, rate, t0);
-    let mut back = Link::new(rtt / 2, None, t0);
-    let src = vec![0x5au8; 64 * 1024];
-    let tick = Duration::from_micros(100);
+    let mut f = Flow::new(&Pool::new(8 << 20), &Pool::new(8 << 20), rtt, rate, t0).unwrap();
+    f.read_rate = read_rate;
     let mut now = t0;
     let mut half_mark = None;
-    let mut max_grant = 0;
-    let mut read_budget = 0.0f64;
-    let end = t0 + dur;
-    while now < end {
-        // Sender: keep the send buffer full, push frames while the wire is free.
-        loop {
-            let cap = s.write_capacity();
-            if cap == 0 {
-                break;
-            }
-            s.write(&src[..cap.min(src.len())]);
-        }
-        while fwd.ready(now) {
-            let Some(f) = s.poll_frame() else { break };
-            let len = match &f {
-                Frame::Data { data, .. } => data.len() + 16,
-                _ => 16,
-            };
-            fwd.send(now, f, len);
-        }
-        // Receiver.
-        while let Some(f) = fwd.recv(now) {
-            if let Frame::Data { offset, data, .. } = f {
-                r.on_data(offset, &data, now).unwrap();
-            }
-        }
-        match read_rate {
-            None => {
-                let n = r.buffered();
-                r.consume(n, now);
-            }
-            Some(rr) => {
-                read_budget += rr * tick.as_secs_f64();
-                let n = (read_budget as usize).min(r.buffered());
-                read_budget -= n as f64;
-                if r.buffered() == 0 {
-                    read_budget = read_budget.min(64.0 * 1024.0);
-                }
-                r.consume(n, now);
-            }
-        }
-        if let Some(a) = r.poll_ack(now, false) {
-            back.send(now, a, 16);
-        }
-        max_grant = max_grant.max(r.grant_bytes());
-        // Sender gets ACKs.
-        while let Some(f) = back.recv(now) {
-            if let Frame::Ack {
-                recv_offset,
-                max_offset,
-            } = f
-            {
-                s.on_ack(recv_offset, max_offset).unwrap();
-            }
-        }
-        now += tick;
+    while now < t0 + dur {
+        f.step(now);
+        now += TICK;
         if half_mark.is_none() && now >= t0 + dur / 2 {
-            half_mark = Some(r.consumed());
+            half_mark = Some(f.r.consumed());
         }
     }
     let secs = (now - t0).as_secs_f64();
-    let bytes = r.consumed();
+    let bytes = f.r.consumed();
     Run {
         bytes,
         secs,
-        max_grant,
+        max_grant: f.max_grant,
         steady: (bytes - half_mark.unwrap()) as f64 / (secs / 2.0),
     }
 }
-
-const MB: f64 = 1_000_000.0;
 
 #[test]
 fn window_grows_to_the_link_rate_over_50ms() {
@@ -234,5 +268,116 @@ fn a_slow_reader_does_not_get_a_large_window() {
         run.steady >= 150_000.0,
         "steady {:.0} KB/s",
         run.steady / 1000.0
+    );
+}
+
+/// Throughput over `[from, to)` of a run whose RTT goes from `before` to
+/// `after` at 2 s, with or without the session being told of a new path.
+fn path_change(before: Duration, after: Duration, tell: bool) -> (f64, usize) {
+    let t0 = Instant::now();
+    let mut f = Flow::new(
+        &Pool::new(8 << 20),
+        &Pool::new(8 << 20),
+        before,
+        Some(10.0 * MB),
+        t0,
+    )
+    .unwrap();
+    let switch = t0 + Duration::from_secs(2);
+    let settle = switch + RTT_WINDOW + Duration::from_secs(1);
+    let end = settle + Duration::from_secs(2);
+    let mut now = t0;
+    let mut mark = 0;
+    let mut switched = false;
+    while now < end {
+        if !switched && now >= switch {
+            f.set_rtt(after);
+            if tell {
+                f.r.new_path(now);
+            }
+            switched = true;
+        }
+        if mark == 0 && now >= settle {
+            mark = f.r.consumed().max(1);
+        }
+        f.step(now);
+        now += TICK;
+    }
+    let rate = (f.r.consumed() - mark) as f64 / (end - settle).as_secs_f64();
+    (rate, f.r.target_window())
+}
+
+#[test]
+fn a_higher_rtt_on_the_same_session_is_learned_again() {
+    // astra review: a 1 ms path, then 50 ms without a carrier switch. The
+    // old minimum must not keep the window at the 1 ms size.
+    for tell in [false, true] {
+        let (rate, win) = path_change(Duration::from_millis(1), Duration::from_millis(50), tell);
+        eprintln!(
+            "1 ms -> 50 ms (new_path {tell}): {:.2} MB/s, window {} KiB",
+            rate / MB,
+            win / 1024
+        );
+        assert!(rate >= 8.0 * MB, "new_path {tell}: {:.2} MB/s", rate / MB);
+    }
+}
+
+#[test]
+fn quiet_grown_sessions_leave_the_pool_to_admission() {
+    // astra review: sessions that grew their window on a fast long path
+    // and then went quiet without closing keep the credit they last
+    // advertised (it cannot be revoked). Growth comes out of half the
+    // elastic pool only, so fresh sessions are still admitted.
+    let pool_s = Pool::new(64 << 20);
+    let pool_r = Pool::new(8 << 20);
+    let t0 = Instant::now();
+    let mut flows: Vec<Flow> = (0..12)
+        .map(|_| {
+            Flow::new(
+                &pool_s,
+                &pool_r,
+                Duration::from_millis(50),
+                Some(10.0 * MB),
+                t0,
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut now = t0;
+    let stop = t0 + Duration::from_secs(3);
+    while now < stop + Duration::from_millis(500) {
+        if now >= stop {
+            for f in &mut flows {
+                f.sending = false;
+            }
+        }
+        for f in &mut flows {
+            f.step(now);
+        }
+        now += TICK;
+    }
+    let grown = flows.iter().filter(|f| f.max_grant > 256 * 1024).count();
+    let elastic = pool_r.limit(Tier::Elastic) * BLOCK;
+    let held = pool_r.used_bytes();
+    let mut fresh = Vec::new();
+    while let Some(r) = RecvHalf::new(&pool_r, &Limits::default(), &Timing::default(), now) {
+        fresh.push(r);
+    }
+    eprintln!(
+        "{} sessions ({grown} grew past 256 KiB) hold {} KiB after going quiet; {} fresh admitted",
+        flows.len(),
+        held / 1024,
+        fresh.len()
+    );
+    assert!(grown >= 2, "only {grown} sessions grew");
+    let init = Limits::default().initial_credit;
+    assert!(
+        held <= elastic / GROWTH_SHARE_DIV + flows.len() * (init + BLOCK),
+        "quiet sessions hold {held} bytes"
+    );
+    assert!(
+        fresh.len() * init >= elastic / 2 - flows.len() * init,
+        "{} fresh sessions",
+        fresh.len()
     );
 }

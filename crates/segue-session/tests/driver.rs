@@ -1131,11 +1131,15 @@ fn failing_site(
     })
 }
 
-/// #9 (writer queue full): the site never reads and the upload (112 KiB)
-/// is more than the blocked site write plus the full writer queue hold, so
-/// when the client's FIN arrives ~16 KiB still sit in the relay's receive
-/// buffer and the shutdown cannot even be queued (checked by
-/// instrumenting the driver: queue capacity 0, shutdown not queued, at
+/// #9 (writer queue full): the site never reads and the upload (96 KiB)
+/// is more than the blocked site write plus the full writer queue hold
+/// (74-90 KiB measured), so when the client's FIN arrives some KiB still
+/// sit in the relay's receive buffer and the shutdown cannot even be
+/// queued. (It was 112 KiB while the receive window doubled on every
+/// read; with the window following delivery rate × SRTT (§4 rule 8) a
+/// stalled reader keeps it near the initial 16 KiB, so the upload must
+/// fit in hold + 16 KiB for the FIN to arrive at all.) Checked by
+/// instrumenting the driver (112 KiB): queue capacity 0, shutdown not queued, at
 /// both drain start and reset). Before, the 30 s timer started only once the shutdown was
 /// queued, i.e. never: the session hung. Now it is reset after
 /// `site_flush_idle` without progress, never CLEAN, and the relay's
@@ -1151,7 +1155,7 @@ async fn a_site_that_never_reads_resets_the_drain_even_with_a_full_writer_queue(
         },
         deaf_site(keep.clone()),
     );
-    let (reason, took) = upload_and_fin(app, &pattern(112 << 10, 1), client).await;
+    let (reason, took) = upload_and_fin(app, &pattern(96 << 10, 1), client).await;
     assert_eq!(reason, CloseReason::Reset(code::SITE_RESET));
     assert_eq!(closed_code(&mut notes).await, code::SITE_RESET);
     assert!(
