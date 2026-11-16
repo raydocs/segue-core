@@ -291,7 +291,7 @@ Full licence texts: crates.io packages ship them in their source archives; vendo
 | tinyvec | 1.13.3 | Zlib OR Apache-2.0 OR MIT | crates.io |
 | tokio | 1.54.1 | MIT | crates.io |
 | tokio-macros | 2.7.2 | MIT | crates.io |
-| tokio-rustls | 0.26.6 | MIT OR Apache-2.0 | crates.io |
+| tokio-rustls | 0.26.4 | MIT OR Apache-2.0 | crates.io |
 | tokio-util | 0.7.20 | MIT | crates.io |
 | tracing | 0.1.44 | MIT | crates.io |
 | tracing-attributes | 0.1.31 | MIT | crates.io |

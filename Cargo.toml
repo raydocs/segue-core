@@ -80,7 +80,11 @@ sha2 = "0.11"
 smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 thiserror = "2"
 tokio = { version = "1.53.3", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "logging", "ring", "tls12"] }
+# tokio-rustls 0.26.5+ fills the caller's buffer from several TLS records in
+# one poll_read. The encrypted Vision path through REALITY then fails with
+# DecryptError (local_xray_interop_tests full_xray_encrypted_*), so stay on
+# 0.26.4 until Vision no longer depends on one record per read (2026-11-15).
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "logging", "ring", "tls12"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 webpki-roots = "1.0.11"
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
