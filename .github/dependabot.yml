@@ -9,6 +9,13 @@ updates:
       time: "06:00"
       timezone: America/Chicago
     open-pull-requests-limit: 5
+    ignore:
+      # rand 0.9+ renames the API (thread_rng, gen_range, distributions) and
+      # moves to rand_core 0.9, which the dalek/RustCrypto crates we use do
+      # not accept as CryptoRng yet; about 160 files call rand. Upgrade by
+      # hand with those crates, not through a Dependabot PR (2026-11-15).
+      - dependency-name: rand
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: github-actions
     directory: /
