@@ -360,12 +360,16 @@ jobs:
         run: bash scripts/tests/check-mobile-toolchains.test.sh
 
   tproxy-linux:
-    # Moved out of the rust job on 2026-11-13. The Instabox kernel
-    # (6.18.60-instabox) is built without TPROXY (CONFIG_NETFILTER_XT_TARGET_TPROXY
-    # and CONFIG_NFT_TPROXY are unset and it loads no modules), so this check
-    # needs a GitHub-hosted runner. Stable promotion still requires it.
-    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: ubuntu-24.04
+    # disabled: owner 2026-11-15, CI runs on Instabox only, no GitHub-hosted
+    # runners. The Instabox kernel (6.18.60-instabox) is built without TPROXY
+    # (CONFIG_NETFILTER_XT_TARGET_TPROXY and CONFIG_NFT_TPROXY are unset and it
+    # loads no modules), so iptables -j TPROXY fails there. Restore this
+    # condition once an Instabox image has TPROXY:
+    # github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    # publish-prerelease and stable promotion still need this job, so releases
+    # wait for it.
+    if: false
+    runs-on: instabox-medium
     timeout-minutes: 30
     steps:
       - name: Check out repository

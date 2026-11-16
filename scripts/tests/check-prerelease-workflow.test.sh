@@ -268,7 +268,7 @@ done
 # A stable tag skips exactly the gates its candidate run proved, and only
 # after its own history scan and evidence pass does it bind to that run.
 stable_tag_skip="    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')"
-for job in rust tproxy-linux go-oracles android supply-chain; do
+for job in rust go-oracles android supply-chain; do
   grep -Fxq "$stable_tag_skip" <<<"$(job_body "$job")" || \
     die "$job does not run for every event except a stable tag push"
 done
@@ -281,6 +281,16 @@ if ! grep -Fxq "$stable_tag_skip" <<<"$apple_job"; then
     die "apple does not run for every event except a stable tag push"
   grep -Fxq '      - apple' <<<"$(job_body publish-prerelease)" || \
     die "publish-prerelease no longer waits for the disabled apple job"
+fi
+# The owner moved CI to Instabox only (2026-11-15). The Instabox kernel has
+# no TPROXY, so tproxy-linux keeps the stable-tag condition or is off
+# outright; while it is off, publish-prerelease cannot run either.
+tproxy_job="$(job_body tproxy-linux)"
+if ! grep -Fxq "$stable_tag_skip" <<<"$tproxy_job"; then
+  grep -Fxq '    if: false' <<<"$tproxy_job" || \
+    die "tproxy-linux does not run for every event except a stable tag push"
+  grep -Fxq '      - tproxy-linux' <<<"$(job_body publish-prerelease)" || \
+    die "publish-prerelease no longer waits for the disabled tproxy-linux job"
 fi
 candidate_job="$(job_body candidate-ci)"
 grep -Fxq "    if: needs.release-metadata.outputs.bind_candidate_ci == 'true'" <<<"$candidate_job" || \
