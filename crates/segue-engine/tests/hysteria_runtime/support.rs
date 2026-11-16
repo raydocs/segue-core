@@ -5,6 +5,13 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 pub use server::{ReferenceServer, Task, AUTH};
 pub const DEADLINE: std::time::Duration = server::DEADLINE;
+/// Whole-test bound for the live TUN tests: it only catches hangs. Each wait
+/// inside keeps its own tighter deadline; the reference starts outside it.
+pub const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+/// A wait that includes the QUIC carrier's dial. Lost Initials back off
+/// (1 s, 2 s, 4 s ...): a stalled CI runner once needed 7.7 s for the
+/// handshake, so these waits get more room than local TUN steps.
+pub const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 use segue_engine::Core;
 use segue_transport::{
     DnsResolver, SocketHandle, SocketProtector, TransportDialer, TransportError,

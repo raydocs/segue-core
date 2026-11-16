@@ -10809,9 +10809,18 @@ async fn pump_tun_until_with_timeout(
 async fn pump_multi_tun_until(
     client: &mut TunTcpMultiClient,
     tun: &TunEndpoint,
+    is_done: impl FnMut(&mut TunTcpMultiClient) -> bool,
+) {
+    pump_multi_tun_until_with_timeout(client, tun, Duration::from_millis(1500), is_done).await;
+}
+
+async fn pump_multi_tun_until_with_timeout(
+    client: &mut TunTcpMultiClient,
+    tun: &TunEndpoint,
+    wait: Duration,
     mut is_done: impl FnMut(&mut TunTcpMultiClient) -> bool,
 ) {
-    let deadline = TokioInstant::now() + Duration::from_millis(1500);
+    let deadline = TokioInstant::now() + wait;
     loop {
         client.poll();
         while let Some(packet) = client.device.pop_outbound() {
@@ -13071,9 +13080,9 @@ mod hysteria_support;
 #[tokio::test]
 #[ignore = "requires pinned reference; use check-hysteria-interop.sh or check-native-hysteria-interop.sh"]
 async fn hysteria_runtime_tun_raised_budget_keeps_96_tcp_flows_on_one_session() {
-    timeout(Duration::from_secs(30), async {
+    let server = hysteria_support::ReferenceServer::start().await;
+    timeout(hysteria_support::HANG_GUARD, async {
         const FLOWS: usize = 96;
-        let server = hysteria_support::ReferenceServer::start().await;
         let (target, _echo) = hysteria_support::tcp_echo().await;
         let (mut core, protector, bootstrap, _) = hysteria_support::core_with_options(
             &server,
@@ -13091,12 +13100,18 @@ async fn hysteria_runtime_tun_raised_budget_keeps_96_tcp_flows_on_one_session() 
             clients.send_payload(i, &[i as u8; 32]);
         }
         let mut replies = vec![Vec::new(); FLOWS];
-        pump_multi_tun_until(&mut clients, core.tun(), |clients| {
-            for (i, reply) in replies.iter_mut().enumerate() {
-                reply.extend(clients.recv_available(i));
-            }
-            replies.iter().all(|reply| reply.len() == 32)
-        })
+        // The replies wait for the QUIC carrier's dial, not only local TUN work.
+        pump_multi_tun_until_with_timeout(
+            &mut clients,
+            core.tun(),
+            hysteria_support::DIAL_DEADLINE,
+            |clients| {
+                for (i, reply) in replies.iter_mut().enumerate() {
+                    reply.extend(clients.recv_available(i));
+                }
+                replies.iter().all(|reply| reply.len() == 32)
+            },
+        )
         .await;
         for (i, reply) in replies.iter().enumerate() {
             assert_eq!(reply, &[i as u8; 32]);
@@ -13116,12 +13131,18 @@ async fn hysteria_runtime_tun_raised_budget_keeps_96_tcp_flows_on_one_session() 
             clients.send_payload(i, &[255 - i as u8; 32]);
         }
         let mut replies = vec![Vec::new(); FLOWS];
-        pump_multi_tun_until(&mut clients, core.tun(), |clients| {
-            for (i, reply) in replies.iter_mut().enumerate() {
-                reply.extend(clients.recv_available(i));
-            }
-            replies.iter().all(|reply| reply.len() == 32)
-        })
+        // The replies wait for the QUIC carrier's dial, not only local TUN work.
+        pump_multi_tun_until_with_timeout(
+            &mut clients,
+            core.tun(),
+            hysteria_support::DIAL_DEADLINE,
+            |clients| {
+                for (i, reply) in replies.iter_mut().enumerate() {
+                    reply.extend(clients.recv_available(i));
+                }
+                replies.iter().all(|reply| reply.len() == 32)
+            },
+        )
         .await;
         for (i, reply) in replies.iter().enumerate() {
             assert_eq!(reply, &[255 - i as u8; 32]);
@@ -13137,8 +13158,8 @@ async fn hysteria_runtime_tun_raised_budget_keeps_96_tcp_flows_on_one_session() 
 #[tokio::test]
 #[ignore = "requires pinned reference; use check-hysteria-interop.sh or check-native-hysteria-interop.sh"]
 async fn hysteria_runtime_tun_tcp_udp_and_host_close() {
-    timeout(hysteria_support::DEADLINE, async {
-        let server = hysteria_support::ReferenceServer::start().await;
+    let server = hysteria_support::ReferenceServer::start().await;
+    timeout(hysteria_support::HANG_GUARD, async {
         let (tcp_address, _tcp) = hysteria_support::tcp_echo().await;
         let (udp_address, _udp) = hysteria_support::udp_echo().await;
         let (mut core, protector, bootstrap, _) = hysteria_support::core(&server);
@@ -13149,10 +13170,16 @@ async fn hysteria_runtime_tun_tcp_udp_and_host_close() {
         let payload = b"tun tcp over hysteria";
         client.send_payload(payload);
         let mut received = Vec::new();
-        pump_tun_until(&mut client, core.tun(), |client| {
-            received.extend_from_slice(&client.recv_available());
-            received.len() >= payload.len()
-        })
+        // The echo waits for the QUIC carrier's dial, not only local TUN work.
+        pump_tun_until_with_timeout(
+            &mut client,
+            core.tun(),
+            hysteria_support::DIAL_DEADLINE,
+            |client| {
+                received.extend_from_slice(&client.recv_available());
+                received.len() >= payload.len()
+            },
+        )
         .await;
         assert_eq!(received, payload);
         let client_ip = Ipv4Addr::new(10, 10, 0, 2);
@@ -13169,7 +13196,7 @@ async fn hysteria_runtime_tun_tcp_udp_and_host_close() {
             .unwrap();
         let reply = poll_tun_outbound_until_with_timeout(
             core.tun(),
-            hysteria_support::DEADLINE,
+            hysteria_support::DIAL_DEADLINE,
             |packet| ipv4_udp_payload(packet).is_some_and(|p| p == udp_payload),
         )
         .await;
@@ -13210,8 +13237,8 @@ async fn hysteria_runtime_tun_tcp_udp_and_host_close() {
 #[tokio::test]
 #[ignore = "requires pinned reference; use check-hysteria-interop.sh or check-native-hysteria-interop.sh"]
 async fn hysteria_runtime_tun_dns_wire_and_managed_destination_lookup() {
-    timeout(hysteria_support::DEADLINE, async {
-        let server = hysteria_support::ReferenceServer::start().await;
+    let server = hysteria_support::ReferenceServer::start().await;
+    timeout(hysteria_support::HANG_GUARD, async {
         let upstream = spawn_observed_udp_dns_a_server(Ipv4Addr::LOCALHOST).await;
         let upstream_probe = upstream.probe();
         let (echo_address, _tcp) = hysteria_support::tcp_echo().await;
@@ -13228,7 +13255,7 @@ async fn hysteria_runtime_tun_dns_wire_and_managed_destination_lookup() {
         let anchor = Ipv4Addr::new(198,18,0,1);
         let client_ip = Ipv4Addr::new(10,10,0,2);
         core.tun().push_inbound(Bytes::from(ipv4_udp_packet(client_ip, 53044, anchor, 53, &query))).await.unwrap();
-        let reply = poll_tun_outbound_until_with_timeout(core.tun(), hysteria_support::DEADLINE, |packet| ipv4_udp_payload(packet).is_some_and(|p| p.get(..2) == Some(&0x7262_u16.to_be_bytes()))).await;
+        let reply = poll_tun_outbound_until_with_timeout(core.tun(), hysteria_support::DIAL_DEADLINE, |packet| ipv4_udp_payload(packet).is_some_and(|p| p.get(..2) == Some(&0x7262_u16.to_be_bytes()))).await;
         let response = ipv4_udp_payload(&reply).unwrap();
         assert_eq!(dns_response_answer_ipv4(response), Some(Ipv4Addr::LOCALHOST));
         assert_ipv4_udp_packet(&reply, anchor, 53, client_ip, 53044, response);
