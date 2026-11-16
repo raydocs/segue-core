@@ -585,7 +585,7 @@ fn flow_control_bounds_memory_when_the_app_stops_reading() {
         s.max_relay_send_buffered
     );
     assert!(
-        s.down_written < 2_000_000,
+        s.down_written < cfg.limits.window_cap + cfg.limits.replay_cap + (256 << 10),
         "site was drained regardless of the app: {}",
         s.down_written
     );
@@ -606,7 +606,7 @@ fn site_that_stops_reading_bounds_relay_memory() {
     let cfg = Config::default();
     assert!(s.relay.recv_half(&s.site.unwrap()).unwrap().buffered() <= cfg.limits.window_cap);
     assert!(s.client.send_half().buffered() <= cfg.limits.replay_cap);
-    assert!(s.up_written < 2_000_000);
+    assert!(s.up_written < cfg.limits.window_cap + cfg.limits.replay_cap + (256 << 10));
     s.site_reads = true;
     s.run(400_000);
     s.assert_exact();

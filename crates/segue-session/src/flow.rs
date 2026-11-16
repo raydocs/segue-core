@@ -360,6 +360,102 @@ fn deque_range(buf: &VecDeque<u8>, start: usize, n: usize) -> [&[u8]; 2] {
     }
 }
 
+/// Receiver-side SRTT and delivery-rate estimate for §4 rule 8.
+///
+/// RTT: the sender cannot send past an advertised `max_offset` M before it
+/// has the next, larger advertisement. So when data first ends beyond M,
+/// at least one round trip has passed since that next advertisement went
+/// out: `now − t(next)` is an RTT sample, exact when the sender was
+/// waiting on the window and larger otherwise. Samples feed an RFC 6298
+/// style smoothed RTT, each clamped to four times the minimum seen so
+/// that a slow sender does not inflate the window.
+///
+/// Delivery rate: bytes handed to the application per epoch of at least
+/// one SRTT.
+#[derive(Debug)]
+struct RateRtt {
+    /// Advertised `max_offset` values and when each went out, ascending.
+    adv: VecDeque<(Instant, u64)>,
+    srtt: Option<std::time::Duration>,
+    min_rtt: Option<std::time::Duration>,
+    epoch: (Instant, u64),
+}
+
+/// Advertisements remembered for RTT samples; older ones are dropped
+/// (fewer samples, never wrong ones).
+const ADV_LOG: usize = 64;
+
+/// RTT samples above this are clamped: a sender that paused for seconds
+/// at a window edge says nothing about the path.
+const MAX_RTT_SAMPLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl RateRtt {
+    fn new(initial_max: u64, now: Instant) -> Self {
+        let mut adv = VecDeque::with_capacity(8);
+        adv.push_back((now, initial_max));
+        Self {
+            adv,
+            srtt: None,
+            min_rtt: None,
+            epoch: (now, 0),
+        }
+    }
+
+    fn on_advertised(&mut self, max: u64, now: Instant) {
+        if self.adv.back().is_some_and(|&(_, m)| m >= max) {
+            return;
+        }
+        if self.adv.len() == ADV_LOG {
+            self.adv.pop_front();
+        }
+        self.adv.push_back((now, max));
+    }
+
+    fn on_data(&mut self, end: u64, now: Instant) {
+        let mut sample = None;
+        while self.adv.len() >= 2 && end > self.adv[0].1 {
+            let (t_next, _) = self.adv[1];
+            sample = Some(now.saturating_duration_since(t_next));
+            self.adv.pop_front();
+        }
+        if let Some(s) = sample {
+            self.add_sample(s);
+        }
+    }
+
+    fn add_sample(&mut self, s: std::time::Duration) {
+        let s = s.clamp(std::time::Duration::from_micros(100), MAX_RTT_SAMPLE);
+        let min = self.min_rtt.map_or(s, |m| m.min(s));
+        self.min_rtt = Some(min);
+        let s = s.min(min * 4);
+        self.srtt = Some(match self.srtt {
+            None => s,
+            Some(v) => (v * 7 + s) / 8,
+        });
+    }
+
+    /// A new epoch starts here (after idle: the old rate says nothing).
+    /// The minimum is learned again too: the carrier, and with it the
+    /// path, may have changed while the session was idle.
+    fn restart(&mut self, consumed: u64, now: Instant) {
+        self.epoch = (now, consumed);
+        self.min_rtt = None;
+    }
+
+    /// The window target when an epoch of at least one SRTT has ended.
+    fn on_consumed(&mut self, consumed: u64, now: Instant) -> Option<usize> {
+        let srtt = self.srtt?;
+        let dt = now.saturating_duration_since(self.epoch.0);
+        if dt < srtt {
+            return None;
+        }
+        let bytes = consumed - self.epoch.1;
+        self.epoch = (now, consumed);
+        let target = 2.0 * bytes as f64 * srtt.as_secs_f64() / dt.as_secs_f64();
+        Some(target.min(usize::MAX as f64 / 2.0) as usize)
+    }
+}
+
 #[derive(Debug)]
 pub struct RecvHalf {
     consumed: u64,
@@ -370,15 +466,20 @@ pub struct RecvHalf {
     grant: Grant,
     min_credit: usize,
     window_cap: usize,
-    /// Receive window aimed for while active: starts at the initial credit
-    /// and doubles (up to `window_cap`) only while the sender keeps
-    /// running into it, so a session that moved a few bytes does not pin
-    /// a full window it cannot take back (§4 rule 8: `max_offset` never
-    /// moves back). Back to the initial credit when idle.
+    /// Receive window aimed for while active (§4 rule 8): `clamp(2 ×
+    /// delivery_rate × SRTT, initial credit, window_cap)`, measured here
+    /// (see [`RateRtt`]). A window-limited sender delivers about `win` per
+    /// RTT, so the target is about `2 × win` and the window doubles each
+    /// round trip until the link, the reader or the cap limits it; a
+    /// session that moves a few bytes keeps a small window it does not
+    /// have to take back (`max_offset` never moves back). Back to the
+    /// initial credit when idle.
     win: usize,
     win_init: usize,
-    /// The sender came within a quarter window of `max_offset`.
-    limited: bool,
+    est: RateRtt,
+    /// Latest time any call saw; stamps ACKs sent without one
+    /// ([`force_ack`](Self::force_ack), [`mark_acked`](Self::mark_acked)).
+    now_hint: Instant,
     idle_after: std::time::Duration,
     ack_delay: std::time::Duration,
     last_ack: (u64, u64),
@@ -406,7 +507,8 @@ impl RecvHalf {
             window_cap: limits.window_cap.max(limits.initial_credit),
             win: limits.initial_credit,
             win_init: limits.initial_credit,
-            limited: false,
+            est: RateRtt::new(initial, now),
+            now_hint: now,
             idle_after: timing.idle_after,
             ack_delay: timing.ack_delay,
             last_ack: (0, initial),
@@ -483,9 +585,8 @@ impl RecvHalf {
         reserve_within(&mut self.buf, fresh.len(), self.grant.bytes());
         self.buf.extend(fresh);
         self.recv = end;
-        if self.adv_max - end <= (self.win / 4) as u64 {
-            self.limited = true;
-        }
+        self.now_hint = self.now_hint.max(now);
+        self.est.on_data(end, now);
         self.last_data = now;
         self.touch(now);
         Ok(fresh.len())
@@ -543,15 +644,15 @@ impl RecvHalf {
             fit(&mut self.buf, self.grant.bytes());
             return;
         }
+        self.now_hint = self.now_hint.max(now);
         let outstanding = (self.adv_max - self.consumed) as usize;
         let active =
             !self.buf.is_empty() || now.saturating_duration_since(self.last_data) < self.idle_after;
         if !active {
             self.win = self.win_init;
-            self.limited = false;
-        } else if self.limited {
-            self.win = (self.win * 2).min(self.window_cap);
-            self.limited = false;
+            self.est.restart(self.consumed, now);
+        } else if let Some(target) = self.est.on_consumed(self.consumed, now) {
+            self.win = target.clamp(self.win_init, self.window_cap);
         }
         let mut desired = if active { self.win } else { self.min_credit };
         if !active {
@@ -609,6 +710,7 @@ impl RecvHalf {
 
     /// ACK frame if due by `now` (or any pending one when `piggyback`).
     pub fn poll_ack(&mut self, now: Instant, piggyback: bool) -> Option<Frame> {
+        self.now_hint = self.now_hint.max(now);
         let due = self.ack_deadline()?;
         if due > now && !piggyback {
             return None;
@@ -629,6 +731,17 @@ impl RecvHalf {
     pub fn mark_acked(&mut self) {
         self.last_ack = (self.recv, self.adv_max);
         self.pending_since = None;
+        self.est.on_advertised(self.adv_max, self.now_hint);
+    }
+
+    /// Smoothed RTT measured from window advertisements, if any yet.
+    pub fn srtt(&self) -> Option<std::time::Duration> {
+        self.est.srtt
+    }
+
+    /// Receive window currently aimed for (before pool limits).
+    pub fn target_window(&self) -> usize {
+        self.win
     }
 
     /// Idle check for timeouts: lets credit fall back when no data arrives.
@@ -869,19 +982,23 @@ mod tests {
         assert_eq!(s.grant_bytes(), floor, "idle small read grew the grant");
         let mut out = vec![0u8; 64 * 1024];
         let mut sent = 0;
+        // Each exchange takes a millisecond, so the window has an RTT and a
+        // delivery rate to grow from (§4 rule 8).
+        let mut t = now;
         while sent < 512 * 1024 {
             let cap = s.write_capacity_for(16 * 1024);
             let n = s.write(&vec![3u8; cap.min(16 * 1024)]);
             sent += n;
-            pump(&mut s, &mut r, now);
-            while r.read(&mut out, now) > 0 {}
-            pump(&mut s, &mut r, now);
+            t += std::time::Duration::from_millis(1);
+            pump(&mut s, &mut r, t);
+            while r.read(&mut out, t) > 0 {}
+            pump(&mut s, &mut r, t);
         }
         assert!(r.max_offset() - r.consumed() > crate::INITIAL_CREDIT as u64);
         assert_eq!(s.buffered(), 0);
         assert_eq!(s.write_capacity_for(512), 512);
         assert_eq!(s.grant_bytes(), floor, "send grant after burst");
-        let later = now + Timing::default().idle_after * 2;
+        let later = t + Timing::default().idle_after * 2;
         r.update_credit(later);
         let outstanding = (r.max_offset() - r.consumed()) as usize;
         assert_eq!(

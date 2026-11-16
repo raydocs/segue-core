@@ -160,8 +160,8 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             pool_bytes: 256 << 20,
-            window_cap: 256 * 1024,
-            replay_cap: 512 * 1024,
+            window_cap: 1024 * 1024,
+            replay_cap: 2 * 1024 * 1024,
             max_carriers: 4096,
             max_sessions_per_device: 256,
             first_frame_timeout: Duration::from_secs(10),
