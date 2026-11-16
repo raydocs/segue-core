@@ -69,7 +69,7 @@ itertools = "0.14"
 log = { version = "0.4.8" }
 macro_rules_attribute = "0.2"
 mio = { version = "1", features = ["net", "os-poll"] }
-num-bigint = "0.4.4"
+num-bigint = "0.5.1"
 once_cell = { version = "1.16", default-features = false, features = ["alloc", "race"] }
 openssl = "0.10"
 p256 = { version = "0.13.2", default-features = false, features = ["alloc", "ecdsa", "pkcs8"] }
