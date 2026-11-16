@@ -7,7 +7,7 @@ readonly TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 unset GOFLAGS GOEXPERIMENT
-export GOENV=off GOWORK=off GOTOOLCHAIN=go1.27.3 CGO_ENABLED=0
+export GOENV=off GOWORK=off GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
 python3 "$WORKSPACE_ROOT/scripts/verify-wireguard-reference.py"
 go -C "$MODULE" build -mod=readonly -trimpath -o "$TEST_ROOT/wireguard-reference" .
 go -C "$MODULE" mod verify

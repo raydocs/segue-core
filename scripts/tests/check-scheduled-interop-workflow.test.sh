@@ -260,7 +260,7 @@ expected_rc_interop="$(cat <<'EXPECTED'
       - name: Install pinned Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
           cache-dependency-path: Xray-core/go.sum
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
@@ -293,7 +293,7 @@ expected_scheduled_pinned="$(cat <<'EXPECTED'
       - name: Install pinned Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
           cache-dependency-path: Xray-core/go.sum
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
