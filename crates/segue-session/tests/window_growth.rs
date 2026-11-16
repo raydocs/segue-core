@@ -573,3 +573,26 @@ fn growth_to_a_target_off_the_block_size_stays_within_the_budget() {
     assert!(pool.grown_bytes() <= budget);
     assert_eq!(pool.grown_bytes() % BLOCK, 0);
 }
+
+#[test]
+fn odd_limits_keep_the_growth_ledger_consistent() {
+    // astra review r5: a credit floor above the initial credit, and an
+    // initial credit that is not a whole number of blocks. Growth is
+    // counted above max(initial, floor) in whole blocks; the debug
+    // assertion in the ledger checks every update.
+    for (initial, min) in [(16 * 1024, 20 * 1024), (16 * 1024 + 1, BLOCK)] {
+        let limits = Limits {
+            initial_credit: initial,
+            min_credit: min,
+            ..Limits::default()
+        };
+        let pool = Pool::new(8 << 20);
+        let t0 = Instant::now();
+        let mut r = RecvHalf::new(&pool, &limits, &Timing::default(), t0).unwrap();
+        r.on_data(0, &[1], t0).unwrap();
+        r.consume(1, t0);
+        assert_eq!(pool.grown_bytes(), 0, "{initial}/{min}");
+        drop(r);
+        assert_eq!(pool.grown_bytes(), 0);
+    }
+}

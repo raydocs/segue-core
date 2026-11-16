@@ -538,6 +538,10 @@ pub struct RecvHalf {
     now_hint: Instant,
     /// Credit above the initial credit, as reported to the pool.
     grown: usize,
+    /// What growth is counted above: the initial credit or the credit
+    /// floor, whichever is larger, in whole blocks (as grants are taken).
+    /// Any `Limits` keep the growth ledger consistent with it.
+    grow_base: usize,
     idle_after: std::time::Duration,
     ack_delay: std::time::Duration,
     last_ack: (u64, u64),
@@ -568,6 +572,8 @@ impl RecvHalf {
             est: RateRtt::new(initial, now),
             now_hint: now,
             grown: 0,
+            grow_base: crate::pool::blocks_for(limits.initial_credit.max(limits.min_credit))
+                * BLOCK,
             idle_after: timing.idle_after,
             ack_delay: timing.ack_delay,
             last_ack: (0, initial),
@@ -736,7 +742,7 @@ impl RecvHalf {
         if pool.under_pressure() {
             desired = desired.min(pool.fair_share_bytes());
         }
-        let base = self.win_init.max(self.min_credit).max(outstanding);
+        let base = self.grow_base.max(outstanding);
         let mut need = desired.max(self.min_credit).max(outstanding);
         if need > base && need > self.grant.bytes() {
             // Growth past the initial credit comes out of the growth
@@ -749,9 +755,9 @@ impl RecvHalf {
             // In whole blocks, as the grant is taken: the reservation is
             // never smaller than what `sync_grown` settles.
             let budget = pool.limit(Tier::Elastic) * BLOCK / GROWTH_SHARE_DIV;
-            let want = need.div_ceil(BLOCK) * BLOCK - self.win_init;
+            let want = need.div_ceil(BLOCK) * BLOCK - self.grow_base;
             self.grown = pool.reserve_grown(self.grown, want, budget, BLOCK);
-            need = need.min(base.max(self.win_init + self.grown));
+            need = need.min(base.max(self.grow_base + self.grown));
         }
         if need <= self.grant.bytes() {
             self.grant.try_resize(need);
@@ -769,7 +775,7 @@ impl RecvHalf {
 
     /// Report this session's credit above the initial credit to the pool.
     fn sync_grown(&mut self) {
-        let g = self.grant.bytes().saturating_sub(self.win_init);
+        let g = self.grant.bytes().saturating_sub(self.grow_base);
         // The grant never grows past the reservation (whole blocks, and
         // `win_init` is a whole number of blocks), only up to it.
         debug_assert!(
