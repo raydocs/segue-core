@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuilds the Instabox snapshot that the rust, go-oracles and android CI jobs
+# Rebuilds the Instabox snapshot that the rust, tproxy-linux, go-oracles and android CI jobs
 # start from (runs-on: instabox-large-snapshot-segue-warm).
 #
 # Refresh it at least every 30 days: a snapshot keeps the GitHub Actions

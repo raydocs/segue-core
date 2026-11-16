@@ -357,7 +357,7 @@ EXPECTED
 expected_rust="$(cat <<'EXPECTED'
   rust:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
+    runs-on: instabox-large-snapshot-segue-warm
     timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"

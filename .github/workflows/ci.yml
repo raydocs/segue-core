@@ -268,7 +268,7 @@ jobs:
 
   rust:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
+    runs-on: instabox-large-snapshot-segue-warm
     timeout-minutes: 45
     # Full debug info for the workspace tests and the fuzz replay filled the
     # Instabox root disk (about 44 GiB free); line tables keep panic locations.
@@ -377,7 +377,7 @@ jobs:
     # has only a loopback interface, which is the isolated network the script
     # asks for. Stable promotion still requires this job.
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
+    runs-on: instabox-large-snapshot-segue-warm
     timeout-minutes: 30
     steps:
       - name: Check out repository
@@ -410,7 +410,7 @@ jobs:
 
   go-oracles:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
+    runs-on: instabox-large-snapshot-segue-warm
     # The pinned-interop steps run about 31 minutes (29 on main dbf1360f, 23-27
     # on the v26.11.9 stack before it); leave room for a slow runner.
     timeout-minutes: 45
@@ -906,7 +906,7 @@ jobs:
 
   android:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
+    runs-on: instabox-large-snapshot-segue-warm
     timeout-minutes: 75
     steps:
       - name: Check out repository

@@ -58,6 +58,12 @@ mountpoint -q target || sudo mount --bind "$target_dir" target
 # one set of warm outputs.
 export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=line-tables-only
 
+log "tproxy-linux guest: QEMU, virtme-ng and Ubuntu's generic kernel (TPROXY modules)"
+sudo apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+  qemu-system-x86 virtme-ng linux-image-generic iptables iproute2 busybox-static
+sudo apt-get clean
+
 log "rust job"
 cargo fetch --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::perf -W clippy::suspicious
