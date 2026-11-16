@@ -1161,9 +1161,9 @@ fn android_adapter_build_script_covers_gradle_sdk_and_artifacts() {
     assert!(root
         .join("platform/android/gradle/verification-metadata.xml")
         .is_file());
-    assert!(wrapper.contains("gradle-9.8.1-bin.zip"));
+    assert!(wrapper.contains("gradle-9.9.1-bin.zip"));
     assert!(wrapper.contains(
-        "distributionSha256Sum=dce76f55f8e251a3a1f130eb120f30b3d271de2b76c9b0729d316b5a1b6dc01f"
+        "distributionSha256Sum=d8a18a7a841dd5df825d35a685fad6f2d7f12ac0c280e57b67c27b4a520ba228"
     ));
 }
 
