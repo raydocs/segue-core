@@ -1,5 +1,5 @@
 use super::*;
-use sha3::{
+use shake::{
     digest::{ExtendableOutput, Update, XofReader},
     Shake128, Shake128Reader,
 };

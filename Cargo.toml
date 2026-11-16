@@ -38,9 +38,9 @@ publish = false
 aho-corasick = "1.1.4"
 aes = { version = "0.9", features = ["zeroize"] }
 aes-gcm = { version = "0.11", features = ["zeroize"] }
-async-compression = { version = "=0.4.42", default-features = false, features = ["gzip", "tokio"] }
+async-compression = { version = "=0.4.52", default-features = false, features = ["gzip", "tokio"] }
 async-trait = "0.1"
-aws-lc-rs = { version = "=1.18.1", default-features = false, features = ["alloc", "non-fips", "prebuilt-nasm"] }
+aws-lc-rs = { version = "=1.19.0", default-features = false, features = ["alloc", "non-fips", "prebuilt-nasm"] }
 base64 = "0.23.1"
 blake2 = "=0.11.0"
 blake3 = { version = "=1.8.5", features = ["zeroize", "pure"] }
@@ -49,8 +49,8 @@ chacha20 = { version = "0.10.2", default-features = false, features = ["xchacha"
 chacha20poly1305 = "0.11.0"
 crc32fast = "1.5"
 md-5 = { version = "0.11", features = ["zeroize"] }
-num-bigint = { version = "0.4", default-features = false, features = ["std"] }
-sha3 = { version = "0.11", features = ["zeroize"] }
+num-bigint = { version = "0.5", default-features = false, features = ["std"] }
+shake = { version = "0.1", features = ["zeroize"] }
 ctr = { version = "0.10.1", features = ["zeroize"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ghash = { version = "0.6", features = ["zeroize"] }
@@ -80,7 +80,11 @@ sha2 = "0.11"
 smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 thiserror = "2"
 tokio = { version = "1.53.3", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "logging", "ring", "tls12"] }
+# tokio-rustls 0.26.5+ fills the caller's buffer from several TLS records in
+# one poll_read. The encrypted Vision path through REALITY then fails with
+# DecryptError (local_xray_interop_tests full_xray_encrypted_*), so stay on
+# 0.26.4 until Vision no longer depends on one record per read (2026-11-15).
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "logging", "ring", "tls12"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 webpki-roots = "1.0.11"
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
