@@ -437,7 +437,7 @@ jobs:
       - name: Install pinned Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
           cache-dependency-path: |
             go.sum
             tools/reality-oracle/masquerade/go.sum
@@ -584,7 +584,7 @@ jobs:
       - name: Install pinned Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
           cache-dependency-path: Xray-core/go.sum
 
       - name: Install pinned Rust toolchain
@@ -619,7 +619,7 @@ jobs:
       - name: Install pinned Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
           cache-dependency-path: Xray-core/go.sum
 
       - name: Install pinned Rust toolchain
@@ -767,7 +767,7 @@ jobs:
       - name: Install pinned Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
           cache-dependency-path: Xray-core/go.sum
 
       - name: Install pinned Rust toolchain
