@@ -77,6 +77,10 @@ struct Flow {
     /// The source has more to send.
     sending: bool,
     max_grant: usize,
+    /// Deliver DATA to the receiver in pieces of at most this many bytes.
+    piece: usize,
+    /// Every ACK rides on reverse traffic (`poll_ack(now, true)`).
+    piggyback: bool,
 }
 
 impl Flow {
@@ -97,6 +101,8 @@ impl Flow {
             read_budget: 0.0,
             sending: true,
             max_grant: 0,
+            piece: usize::MAX,
+            piggyback: false,
         })
     }
 
@@ -124,7 +130,19 @@ impl Flow {
         }
         while let Some(f) = self.fwd.recv(now) {
             if let Frame::Data { offset, data, .. } = f {
-                self.r.on_data(offset, &data, now).unwrap();
+                for (i, part) in data.chunks(self.piece).enumerate() {
+                    let off = offset + (i * self.piece.min(data.len())) as u64;
+                    self.r.on_data(off, part, now).unwrap();
+                    if self.read_rate.is_none() {
+                        let n = self.r.buffered();
+                        self.r.consume(n, now);
+                        if self.piggyback {
+                            if let Some(a) = self.r.poll_ack(now, true) {
+                                self.back.send(now, a, 16);
+                            }
+                        }
+                    }
+                }
             }
         }
         match self.read_rate {
@@ -142,7 +160,7 @@ impl Flow {
                 self.r.consume(n, now);
             }
         }
-        if let Some(a) = self.r.poll_ack(now, false) {
+        if let Some(a) = self.r.poll_ack(now, self.piggyback) {
             self.back.send(now, a, 16);
         }
         self.max_grant = self.max_grant.max(self.r.grant_bytes());
@@ -375,9 +393,102 @@ fn quiet_grown_sessions_leave_the_pool_to_admission() {
         held <= elastic / GROWTH_SHARE_DIV + flows.len() * (init + BLOCK),
         "quiet sessions hold {held} bytes"
     );
+    // Every byte the quiet sessions left goes to fresh sessions.
     assert!(
-        fresh.len() * init >= elastic / 2 - flows.len() * init,
-        "{} fresh sessions",
-        fresh.len()
+        (fresh.len() + 1) * init > elastic - held,
+        "{} fresh sessions in {} KiB",
+        fresh.len(),
+        (elastic - held) / 1024
     );
+    assert!(fresh.len() >= 200, "{} fresh sessions", fresh.len());
+}
+
+#[test]
+fn small_frames_with_piggybacked_acks_still_measure_rtt() {
+    // astra review r2 P1-4: 1 KiB frames each handled on its own, every
+    // ACK piggybacked on reverse traffic, so every 1 KiB read is a new
+    // advertisement. The advertisement log must keep the boundary data
+    // crosses next, or no RTT is ever sampled and the window stays 16 KiB.
+    let t0 = Instant::now();
+    let mut f = Flow::new(
+        &Pool::new(8 << 20),
+        &Pool::new(8 << 20),
+        Duration::from_millis(50),
+        Some(10.0 * MB),
+        t0,
+    )
+    .unwrap();
+    f.piece = 1024;
+    f.piggyback = true;
+    let mut now = t0;
+    let end = t0 + Duration::from_secs(4);
+    let mut mark = None;
+    while now < end {
+        f.step(now);
+        now += TICK;
+        if mark.is_none() && now >= t0 + Duration::from_secs(2) {
+            mark = Some(f.r.consumed());
+        }
+    }
+    let rate = (f.r.consumed() - mark.unwrap()) as f64 / 2.0;
+    eprintln!(
+        "1 KiB frames, piggybacked ACKs: {:.2} MB/s, srtt {:?}, window {} KiB",
+        rate / MB,
+        f.r.srtt(),
+        f.r.target_window() / 1024
+    );
+    assert!(f.r.srtt().is_some(), "no RTT sample");
+    assert!(rate >= 5.0 * MB, "{:.2} MB/s", rate / MB);
+}
+
+#[test]
+fn a_transfer_grows_while_other_sessions_hold_their_initial_credit() {
+    // astra review r2 P1-3: 145 open sessions that never grew already
+    // hold half the elastic pool in initial credits, send floors and
+    // pipes. Their credit is not growth: one of them starting a long
+    // download must still grow its window.
+    let pool = Pool::new(8 << 20);
+    let limits = Limits::default();
+    let t0 = Instant::now();
+    let mut idle = Vec::new();
+    while pool.used_bytes() < pool.limit(Tier::Elastic) * BLOCK / 2 + 64 * 1024 {
+        idle.push((
+            RecvHalf::new(&pool, &limits, &Timing::default(), t0).unwrap(),
+            SendHalf::new(&pool, &limits).unwrap(),
+            segue_session::pool::Grant::fixed(&pool, 2 * BLOCK).unwrap(),
+        ));
+    }
+    let mut f = Flow::new(
+        &Pool::new(64 << 20),
+        &pool,
+        Duration::from_millis(50),
+        Some(10.0 * MB),
+        t0,
+    )
+    .unwrap();
+    let mut now = t0;
+    let end = t0 + Duration::from_secs(4);
+    let mut mark = None;
+    while now < end {
+        f.step(now);
+        now += TICK;
+        if mark.is_none() && now >= t0 + Duration::from_secs(2) {
+            mark = Some(f.r.consumed());
+        }
+    }
+    let rate = (f.r.consumed() - mark.unwrap()) as f64 / 2.0;
+    eprintln!(
+        "{} sessions at their initial credit ({} KiB of the pool): {:.2} MB/s, max grant {} KiB",
+        idle.len(),
+        (pool.used_bytes() - f.r.grant_bytes()) / 1024,
+        rate / MB,
+        f.max_grant / 1024
+    );
+    assert!(rate >= 8.0 * MB, "{:.2} MB/s", rate / MB);
+    assert_eq!(
+        pool.grown_bytes(),
+        f.r.grant_bytes() - limits.initial_credit
+    );
+    drop(f);
+    assert_eq!(pool.grown_bytes(), 0);
 }

@@ -648,7 +648,9 @@ impl RelayTable {
             return Err(e);
         }
         let old = s.carrier.replace(cid);
-        if old.is_some_and(|o| o != cid) {
+        // A carrier other than the current one, including after the old
+        // one already closed (`carrier` is None then): another path.
+        if old != Some(cid) {
             s.recv.new_path(now);
         }
         s.cur_gen = gen;

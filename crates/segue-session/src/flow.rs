@@ -390,8 +390,8 @@ struct RateRtt {
     epoch: (Instant, u64),
 }
 
-/// Advertisements remembered for RTT samples; older ones are dropped
-/// (fewer samples, never wrong ones).
+/// Advertisements remembered for RTT samples; past this, new ones are
+/// folded into the newest entry (fewer samples, never wrong ones).
 const ADV_LOG: usize = 8;
 
 /// How long an RTT sample counts towards the minimum.
@@ -420,7 +420,17 @@ impl RateRtt {
             return;
         }
         if self.adv.len() == ADV_LOG {
-            self.adv.pop_front();
+            // Full: fold this advertisement into the newest entry, keeping
+            // that entry's time. The entries still pending (the oldest,
+            // which data crosses next) stay, so sampling never stalls,
+            // and every sample remains a lower bound on the time since
+            // the first advertisement past the crossed value: the folded
+            // entry's time is that of the first advertisement above the
+            // entry before it, and the next entry recorded is the first
+            // one above the folded value. Only samples for the folded
+            // values are lost.
+            self.adv.back_mut().unwrap().1 = max;
+            return;
         }
         self.adv.push_back((now, max));
     }
@@ -526,6 +536,8 @@ pub struct RecvHalf {
     /// Latest time any call saw; stamps ACKs sent without one
     /// ([`force_ack`](Self::force_ack), [`mark_acked`](Self::mark_acked)).
     now_hint: Instant,
+    /// Credit above the initial credit, as reported to the pool.
+    grown: usize,
     idle_after: std::time::Duration,
     ack_delay: std::time::Duration,
     last_ack: (u64, u64),
@@ -555,6 +567,7 @@ impl RecvHalf {
             win_init: limits.initial_credit,
             est: RateRtt::new(initial, now),
             now_hint: now,
+            grown: 0,
             idle_after: timing.idle_after,
             ack_delay: timing.ack_delay,
             last_ack: (0, initial),
@@ -688,6 +701,7 @@ impl RecvHalf {
             // Nothing more can arrive: hold only what is buffered.
             self.grant.try_resize(self.buf.len());
             fit(&mut self.buf, self.grant.bytes());
+            self.sync_grown();
             return;
         }
         self.now_hint = self.now_hint.max(now);
@@ -722,10 +736,13 @@ impl RecvHalf {
         let mut need = desired.max(self.min_credit).max(outstanding);
         if need > base && need > self.grant.bytes() {
             // Growth past the initial credit comes out of the growth
-            // budget only (GROWTH_SHARE_DIV).
+            // budget only (GROWTH_SHARE_DIV): the sum over all sessions of
+            // credit above their initial credit. Floors and initial
+            // credits do not count against it.
             let budget = pool.limit(Tier::Elastic) * BLOCK / GROWTH_SHARE_DIV;
-            let room = budget.saturating_sub(pool.used_bytes());
-            need = need.min(self.grant.bytes().max(base) + room);
+            let others = pool.grown_bytes().saturating_sub(self.grown);
+            let mine = budget.saturating_sub(others);
+            need = need.min(base.max(self.win_init + mine));
         }
         if need <= self.grant.bytes() {
             self.grant.try_resize(need);
@@ -733,10 +750,20 @@ impl RecvHalf {
         } else {
             self.grant.grow_towards(need);
         }
+        self.sync_grown();
         let new_max = self.consumed + self.grant.bytes() as u64;
         if new_max > self.adv_max {
             self.adv_max = new_max;
             self.touch(now);
+        }
+    }
+
+    /// Report this session's credit above the initial credit to the pool.
+    fn sync_grown(&mut self) {
+        let g = self.grant.bytes().saturating_sub(self.win_init);
+        if g != self.grown {
+            self.grant.pool().set_grown(self.grown, g);
+            self.grown = g;
         }
     }
 
@@ -823,6 +850,12 @@ impl RecvHalf {
             return None;
         }
         Some(self.last_data + self.idle_after)
+    }
+}
+
+impl Drop for RecvHalf {
+    fn drop(&mut self) {
+        self.grant.pool().set_grown(self.grown, 0);
     }
 }
 

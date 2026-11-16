@@ -1131,31 +1131,35 @@ fn failing_site(
     })
 }
 
-/// #9 (writer queue full): the site never reads and the upload (96 KiB)
+/// #9 (writer queue full): the site never reads and the upload (112 KiB)
 /// is more than the blocked site write plus the full writer queue hold
-/// (74-90 KiB measured), so when the client's FIN arrives some KiB still
+/// (74-90 KiB measured), so when the client's FIN arrives 22-38 KiB still
 /// sit in the relay's receive buffer and the shutdown cannot even be
-/// queued. (It was 112 KiB while the receive window doubled on every
-/// read; with the window following delivery rate × SRTT (§4 rule 8) a
-/// stalled reader keeps it near the initial 16 KiB, so the upload must
-/// fit in hold + 16 KiB for the FIN to arrive at all.) Checked by
-/// instrumenting the driver (112 KiB): queue capacity 0, shutdown not queued, at
-/// both drain start and reset). Before, the 30 s timer started only once the shutdown was
-/// queued, i.e. never: the session hung. Now it is reset after
-/// `site_flush_idle` without progress, never CLEAN, and the relay's
-/// record (tombstone code) says `site_reset`.
+/// queued (checked by instrumenting the driver: queue capacity 0,
+/// shutdown not queued, at both drain start and reset). Both ends use a
+/// 64 KiB initial credit here: the receive window follows delivery rate
+/// × SRTT (§4 rule 8), so a relay whose site stopped reading keeps it
+/// near the initial credit, and with the default 16 KiB the last part of
+/// the upload (and the FIN) would not always reach the relay. With 64 KiB
+/// the FIN arrives whatever the queue holds (hold + 64 KiB > 112 KiB) and
+/// data is left over (hold < 112 KiB). Before, the 30 s timer started only
+/// once the shutdown was queued, i.e. never: the session hung. Now it is
+/// reset after `site_flush_idle` without progress, never CLEAN, and the
+/// relay's record (tombstone code) says `site_reset`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_site_that_never_reads_resets_the_drain_even_with_a_full_writer_queue() {
     use segue_session::codec::code;
     let keep = Arc::new(Mutex::new(Vec::new()));
-    let (app, client, relay, mut notes) = flush_pair(
-        |t| {
-            t.site_flush_idle = Duration::from_secs(1);
-            t.site_flush_max = Duration::from_secs(60);
-        },
-        deaf_site(keep.clone()),
-    );
-    let (reason, took) = upload_and_fin(app, &pattern(96 << 10, 1), client).await;
+    let mut cfg = Config::default();
+    cfg.timing.t_stall = Duration::from_secs(60);
+    cfg.timing.t_live = Duration::from_secs(60);
+    cfg.timing.t_attach = Duration::from_secs(60);
+    cfg.timing.site_flush_idle = Duration::from_secs(1);
+    cfg.timing.site_flush_max = Duration::from_secs(60);
+    cfg.limits.initial_credit = 64 << 10;
+    let (app, client, relay, mut notes) =
+        flush_pair_cfg(cfg, deaf_site(keep.clone()), Arc::new(AtomicUsize::new(0)));
+    let (reason, took) = upload_and_fin(app, &pattern(112 << 10, 1), client).await;
     assert_eq!(reason, CloseReason::Reset(code::SITE_RESET));
     assert_eq!(closed_code(&mut notes).await, code::SITE_RESET);
     assert!(

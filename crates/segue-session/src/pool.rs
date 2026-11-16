@@ -92,6 +92,9 @@ pub struct Pool {
     limits: [usize; 3],
     /// Blocks taken outside the transport region.
     used: AtomicUsize,
+    /// Receive credit held above the initial credit (window growth),
+    /// bytes; bounded by the growth budget (see `flow::GROWTH_SHARE_DIV`).
+    grown: AtomicUsize,
     /// Size of the transport region, and the blocks taken from it.
     transport: usize,
     transport_used: AtomicUsize,
@@ -125,6 +128,7 @@ impl Pool {
             blocks,
             limits: [elastic, relay_top, blocks],
             used: AtomicUsize::new(0),
+            grown: AtomicUsize::new(0),
             transport: blocks - relay_top,
             transport_used: AtomicUsize::new(0),
             queue: Mutex::new(TicketQueue::default()),
@@ -172,6 +176,20 @@ impl Pool {
 
     pub fn used_bytes(&self) -> usize {
         self.used_blocks() * BLOCK
+    }
+
+    /// Receive credit all sessions hold above their initial credit.
+    pub fn grown_bytes(&self) -> usize {
+        self.grown.load(Ordering::Acquire)
+    }
+
+    /// A session's growth changed from `old` to `new` bytes.
+    pub fn set_grown(&self, old: usize, new: usize) {
+        if new > old {
+            self.grown.fetch_add(new - old, Ordering::AcqRel);
+        } else if old > new {
+            self.grown.fetch_sub(old - new, Ordering::AcqRel);
+        }
     }
 
     /// Fewer than 25 % of the elastic blocks free.
