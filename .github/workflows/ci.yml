@@ -360,15 +360,16 @@ jobs:
         run: bash scripts/tests/check-mobile-toolchains.test.sh
 
   tproxy-linux:
-    # disabled: owner 2026-11-15, CI runs on Instabox only, no GitHub-hosted
-    # runners. The Instabox kernel (6.18.60-instabox) is built without TPROXY
+    # The Instabox kernel (6.18.60-instabox) is built without TPROXY
     # (CONFIG_NETFILTER_XT_TARGET_TPROXY and CONFIG_NFT_TPROXY are unset and it
-    # loads no modules), so iptables -j TPROXY fails there. Restore this
-    # condition once an Instabox image has TPROXY:
-    # github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    # publish-prerelease and stable promotion still need this job, so releases
-    # wait for it.
-    if: false
+    # loads no modules), and CI runs on Instabox only (owner 2026-11-15). The
+    # check therefore boots Ubuntu's generic kernel, which ships TPROXY as
+    # modules, in QEMU with virtme-ng. Instabox exposes no /dev/kvm, so QEMU
+    # runs under TCG; the guest boots in about 15 s and shares the runner's
+    # root file system, so the test binary built here runs unchanged. The guest
+    # has only a loopback interface, which is the isolated network the script
+    # asks for. Stable promotion still requires this job.
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
     runs-on: instabox-medium
     timeout-minutes: 30
     steps:
@@ -383,10 +384,22 @@ jobs:
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
 
+      - name: Install QEMU, virtme-ng and a kernel with TPROXY
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            qemu-system-x86 virtme-ng linux-image-generic iptables iproute2 busybox-static
+          kernel="$(ls /boot/vmlinuz-*-generic | sort -V | tail -n 1)"
+          test -n "$kernel"
+          echo "TPROXY_KERNEL=$kernel" >> "$GITHUB_ENV"
+
       - name: Verify Linux transparent TCP and UDP interception
         run: |
           test_binary="$(cargo test --locked -p segue-engine --test tproxy_tests --no-run --message-format=json | python3 -c 'import json,sys; print(next(v["executable"] for v in map(json.loads,sys.stdin) if v.get("reason")=="compiler-artifact" and v.get("executable")))')"
-          sudo env XRAY_TPROXY_ISOLATED_NETWORK=1 XRAY_TPROXY_TEST_BINARY="$test_binary" unshare --net bash scripts/check-tproxy-linux.sh
+          log="$RUNNER_TEMP/tproxy-vm.log"
+          sudo vng --run "$TPROXY_KERNEL" --disable-kvm --cpus 4 --memory 4G --user root --rwdir "$RUNNER_TEMP" \
+            --exec "set -e; modprobe xt_TPROXY; modprobe nft_tproxy; cd '$PWD'; XRAY_TPROXY_ISOLATED_NETWORK=1 XRAY_TPROXY_TEST_BINARY='$test_binary' bash scripts/check-tproxy-linux.sh; echo TPROXY_VM_OK" 2>&1 | tee "$log"
+          grep -Fxq TPROXY_VM_OK "$log"
 
   go-oracles:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
