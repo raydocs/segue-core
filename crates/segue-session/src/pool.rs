@@ -92,6 +92,9 @@ pub struct Pool {
     limits: [usize; 3],
     /// Blocks taken outside the transport region.
     used: AtomicUsize,
+    /// Receive credit held above the initial credit (window growth),
+    /// bytes; bounded by the growth budget (see `flow::GROWTH_SHARE_DIV`).
+    grown: AtomicUsize,
     /// Size of the transport region, and the blocks taken from it.
     transport: usize,
     transport_used: AtomicUsize,
@@ -125,6 +128,7 @@ impl Pool {
             blocks,
             limits: [elastic, relay_top, blocks],
             used: AtomicUsize::new(0),
+            grown: AtomicUsize::new(0),
             transport: blocks - relay_top,
             transport_used: AtomicUsize::new(0),
             queue: Mutex::new(TicketQueue::default()),
@@ -172,6 +176,46 @@ impl Pool {
 
     pub fn used_bytes(&self) -> usize {
         self.used_blocks() * BLOCK
+    }
+
+    /// Receive credit all sessions hold above their initial credit.
+    pub fn grown_bytes(&self) -> usize {
+        self.grown.load(Ordering::Acquire)
+    }
+
+    /// Reserve growth for a session that holds `have` bytes of it and
+    /// wants `want` (both multiples of `unit`), within `budget` for the
+    /// sum over all sessions, in whole `unit`s; returns
+    /// what it holds now (`have` when nothing is free). Atomic against
+    /// other sessions reserving at the same time.
+    pub fn reserve_grown(&self, have: usize, want: usize, budget: usize, unit: usize) -> usize {
+        let mut cur = self.grown.load(Ordering::Acquire);
+        loop {
+            // Room rounded down to `unit`: a partial unit is not taken.
+            let room = budget.saturating_sub(cur) / unit * unit;
+            let to = want.min(have + room);
+            if to <= have {
+                return have;
+            }
+            match self.grown.compare_exchange_weak(
+                cur,
+                cur + (to - have),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return to,
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// A session's growth changed from `old` to `new` bytes.
+    pub fn set_grown(&self, old: usize, new: usize) {
+        if new > old {
+            self.grown.fetch_add(new - old, Ordering::AcqRel);
+        } else if old > new {
+            self.grown.fetch_sub(old - new, Ordering::AcqRel);
+        }
     }
 
     /// Fewer than 25 % of the elastic blocks free.

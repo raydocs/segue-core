@@ -155,8 +155,8 @@ impl Default for Limits {
         Self {
             initial_credit: INITIAL_CREDIT,
             min_credit: pool::BLOCK,
-            window_cap: 256 * 1024,
-            replay_cap: 512 * 1024,
+            window_cap: 1024 * 1024,
+            replay_cap: 2 * 1024 * 1024,
         }
     }
 }

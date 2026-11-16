@@ -1132,25 +1132,33 @@ fn failing_site(
 }
 
 /// #9 (writer queue full): the site never reads and the upload (112 KiB)
-/// is more than the blocked site write plus the full writer queue hold, so
-/// when the client's FIN arrives ~16 KiB still sit in the relay's receive
-/// buffer and the shutdown cannot even be queued (checked by
-/// instrumenting the driver: queue capacity 0, shutdown not queued, at
-/// both drain start and reset). Before, the 30 s timer started only once the shutdown was
-/// queued, i.e. never: the session hung. Now it is reset after
-/// `site_flush_idle` without progress, never CLEAN, and the relay's
-/// record (tombstone code) says `site_reset`.
+/// is more than the blocked site write plus the full writer queue hold
+/// (74-90 KiB measured), so when the client's FIN arrives 22-38 KiB still
+/// sit in the relay's receive buffer and the shutdown cannot even be
+/// queued (checked by instrumenting the driver: queue capacity 0,
+/// shutdown not queued, at both drain start and reset). Both ends use a
+/// 64 KiB initial credit here: the receive window follows delivery rate
+/// × SRTT (§4 rule 8), so a relay whose site stopped reading keeps it
+/// near the initial credit, and with the default 16 KiB the last part of
+/// the upload (and the FIN) would not always reach the relay. With 64 KiB
+/// the FIN arrives whatever the queue holds (hold + 64 KiB > 112 KiB) and
+/// data is left over (hold < 112 KiB). Before, the 30 s timer started only
+/// once the shutdown was queued, i.e. never: the session hung. Now it is
+/// reset after `site_flush_idle` without progress, never CLEAN, and the
+/// relay's record (tombstone code) says `site_reset`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_site_that_never_reads_resets_the_drain_even_with_a_full_writer_queue() {
     use segue_session::codec::code;
     let keep = Arc::new(Mutex::new(Vec::new()));
-    let (app, client, relay, mut notes) = flush_pair(
-        |t| {
-            t.site_flush_idle = Duration::from_secs(1);
-            t.site_flush_max = Duration::from_secs(60);
-        },
-        deaf_site(keep.clone()),
-    );
+    let mut cfg = Config::default();
+    cfg.timing.t_stall = Duration::from_secs(60);
+    cfg.timing.t_live = Duration::from_secs(60);
+    cfg.timing.t_attach = Duration::from_secs(60);
+    cfg.timing.site_flush_idle = Duration::from_secs(1);
+    cfg.timing.site_flush_max = Duration::from_secs(60);
+    cfg.limits.initial_credit = 64 << 10;
+    let (app, client, relay, mut notes) =
+        flush_pair_cfg(cfg, deaf_site(keep.clone()), Arc::new(AtomicUsize::new(0)));
     let (reason, took) = upload_and_fin(app, &pattern(112 << 10, 1), client).await;
     assert_eq!(reason, CloseReason::Reset(code::SITE_RESET));
     assert_eq!(closed_code(&mut notes).await, code::SITE_RESET);
@@ -2092,8 +2100,13 @@ async fn admission_is_measured_after_sessions_reach_steady_state() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Since the receive window grows with delivery rate × SRTT (§4 rule
+    // 8), a session that ran keeps the window it last advertised, which
+    // the peer has not used and which cannot be revoked: its floors plus
+    // at most one grown window (in practice ~90 KiB here, never the cap
+    // for all 24 since growth stops at the fair share under pressure).
     let held = pool.used_bytes();
-    let bound = N * (floor + cfg.limits.initial_credit);
+    let bound = N * floor + pool.capacity_bytes() * 3 / 4;
     assert!(
         held <= bound,
         "idle after the burst: {N} sessions hold {held} bytes, more than {bound}"
@@ -2115,9 +2128,16 @@ async fn admission_is_measured_after_sessions_reach_steady_state() {
         more.len()
     );
     // Fresh pools admit at least 280 (the_8mb_pool_admits_hundreds_of_
-    // flows); the 24 that ran keep at most one more window each. With
+    // flows, ~29 KiB each); what the 24 that ran still hold is taken at
+    // that same rate: every 32 KiB left in the pool is another flow. With
     // every session having run, the figure is ~181 (see above).
-    assert!(total >= 260, "{total} flows (24 that ran, the rest fresh)");
+    let free = pool.capacity_bytes() - held;
+    assert!(
+        more.len() * (32 << 10) >= free,
+        "{} fresh flows in {free} free bytes",
+        more.len()
+    );
+    assert!(total >= 200, "{total} flows (24 that ran, the rest fresh)");
     drop(more);
     drop(done);
     for c in clients {
