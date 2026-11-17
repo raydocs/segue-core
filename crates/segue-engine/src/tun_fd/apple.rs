@@ -4,8 +4,8 @@
 //! not part of the public SDK headers, so they are declared here by hand, the
 //! way sing-tun does in `internal/rawfile_darwin/rawfile.go`. The symbol is
 //! exported by `libSystem` on both macOS and iOS (`_recvmsg_x` in
-//! `libSystem.tbd`), and the layout below was checked against the running
-//! kernel: 56 bytes on 64-bit, with `msg_datalen` a `size_t` at offset 48.
+//! `libSystem.tbd`). The layout below follows xnu's declaration: 56 bytes on
+//! 64-bit, with `msg_datalen` a `size_t` at offset 48 (asserted below).
 //!
 //! Only the read direction is declared. `sendmsg_x` is deliberately absent:
 //! write batching is a separate change.
@@ -44,6 +44,12 @@ pub(super) struct MsgHdrX {
 // another thread. Sending the reader to another thread therefore sends the
 // pointers with their targets, and no other thread can observe them.
 unsafe impl Send for MsgHdrX {}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<MsgHdrX>() == 56);
+    assert!(std::mem::offset_of!(MsgHdrX, msg_datalen) == 48);
+};
 
 impl MsgHdrX {
     /// An all-zero header, which is what the kernel expects for a slot that
