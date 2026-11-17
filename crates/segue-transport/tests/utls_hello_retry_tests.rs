@@ -97,6 +97,7 @@ async fn dial(fingerprint: &str, alpn: &[String], addr: SocketAddr) {
         verify_peer_cert_by_name: Vec::new(),
         alpn: alpn.to_vec(),
         fingerprint: Some(fingerprint.to_owned()),
+        ech_config_list: None,
     };
     // The handshake cannot finish against a server that stops after the
     // second ClientHello; how it ends is not what this is about.
@@ -369,6 +370,7 @@ async fn shaped_handshakes_complete_through_openssl_hello_retry_requests() {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: Some(fingerprint.to_owned()),
+                ech_config_list: None,
             };
             let outcome = tokio::time::timeout(
                 Duration::from_secs(10),

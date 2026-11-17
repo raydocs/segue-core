@@ -93,6 +93,7 @@ async fn protect_rejection_sends_no_tcp_tls_or_reality_bytes() {
             verify_peer_cert_by_name: vec![],
             alpn: vec![],
             fingerprint: None,
+            ech_config_list: None,
         }),
         ConnectorConfig::Reality(RealityClientConfig {
             server_name: "example.com".into(),

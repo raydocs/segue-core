@@ -138,6 +138,7 @@ fn http() -> HttpShared {
         verify_peer_cert_by_name: Vec::new(),
         alpn: Vec::new(),
         fingerprint: None,
+        ech_config_list: None,
     };
     let dialer = ServiceDialer {
         dialer: TransportDialer::system().unwrap(),
@@ -177,6 +178,7 @@ fn storage_configs_keep_drive_secrets_out_of_debug() {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: None,
+                ech_config_list: None,
             },
             fronting: None,
             xmux: XhttpXmuxPolicy {

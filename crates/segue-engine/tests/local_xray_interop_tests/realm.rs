@@ -176,6 +176,7 @@ async fn realm_introduces_xhttp_h3_to_xray() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: vec!["h3".to_owned()],
+            ech_config_list: None,
         }),
         XhttpMode::StreamOne,
     );

@@ -289,6 +289,7 @@ impl MasqueOutbound {
                     verify_peer_cert_by_name: tls.verify_peer_cert_by_name.clone(),
                     alpn: vec!["h3".into()],
                     fingerprint: None,
+                    ech_config_list: None,
                 },
                 quic: Box::new(quic),
                 warp,

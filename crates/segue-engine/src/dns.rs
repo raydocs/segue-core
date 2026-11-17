@@ -533,6 +533,7 @@ pub(crate) fn dns_tls_client_config(server: &NameServer) -> TlsClientConfig {
         verify_peer_cert_by_name: Vec::new(),
         alpn: Vec::new(),
         fingerprint: None,
+        ech_config_list: None,
     }
 }
 
@@ -2463,6 +2464,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 quic_params: None,
                 tcp_fragment: None,
@@ -2532,6 +2534,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 quic_params: None,
                 tcp_fragment: None,
@@ -2652,6 +2655,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 quic_params: None,
                 tcp_fragment: None,
@@ -2730,6 +2734,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 quic_params: None,
                 tcp_fragment: None,

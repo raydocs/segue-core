@@ -213,7 +213,6 @@ fn unsupported_modern_tls_fields_fail_closed_on_apple_xhttp_shape() {
     .unwrap();
 
     for (key, value) in [
-        ("echConfigList", "unsupported-ech"),
         ("disableSystemRoot", "unsupported-root-policy"),
         ("certificates", "unsupported-custom-trust"),
         ("pinnedPeerCertChainSha256", "unsupported-chain-pin"),

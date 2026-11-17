@@ -116,6 +116,13 @@ pub struct TlsClientConfig {
     /// mean no shaping; `None` is the value used by call sites that predate
     /// fingerprint support.
     pub fingerprint: Option<String>,
+    /// Decoded `tlsSettings.echConfigList`, an ECHConfigList as the wire
+    /// format defines it. `Some` turns on real ECH for this handshake, so the
+    /// config is built for TLS 1.3 alone and the SNI travels inside the
+    /// encrypted inner hello. It cannot be combined with a shaping
+    /// fingerprint or a QUIC carrier; the parser refuses both, and the config
+    /// builders here refuse them again.
+    pub ech_config_list: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]

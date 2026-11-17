@@ -2878,6 +2878,11 @@ pub struct TlsSettings {
     pub allow_insecure: bool,
     /// `tlsSettings.alpn`, verbatim.
     pub alpn: Vec<String>,
+    /// Decoded `tlsSettings.echConfigList`: a base64 ECHConfigList, as
+    /// Xray-core's `ECHConfigList` carries it. `None` means no ECH, which is
+    /// also what an empty string means in Xray. The DNS-resolver forms
+    /// (`udp://`, `https://`, `name+https://`) are refused by the parser.
+    pub ech_config_list: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

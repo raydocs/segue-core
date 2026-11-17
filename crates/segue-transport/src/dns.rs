@@ -2663,6 +2663,7 @@ fn dns_tls_client_config(server: &NameServer) -> TlsClientConfig {
         verify_peer_cert_by_name: Vec::new(),
         alpn: Vec::new(),
         fingerprint: None,
+        ech_config_list: None,
     }
 }
 

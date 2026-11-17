@@ -18,6 +18,7 @@ async fn xhttp_h3_salamander_and_gecko() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: vec!["h3".to_owned()],
+            ech_config_list: None,
         })
     };
     let salamander = |password: &str, packet_size: Option<&str>| {

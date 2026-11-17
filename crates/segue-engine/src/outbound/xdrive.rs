@@ -110,6 +110,7 @@ pub(super) fn http_config(
                 verify_peer_cert_by_name: tls.verify_peer_cert_by_name.clone(),
                 alpn: tls.alpn.clone(),
                 fingerprint: tls.fingerprint.clone(),
+                ech_config_list: tls.ech_config_list.clone(),
             }
         }
         // The parser refuses REALITY under XDRIVE, as Xray-core does.
@@ -121,6 +122,7 @@ pub(super) fn http_config(
             alpn: Vec::new(),
             // `tls.GetFingerprint("")`: Chrome.
             fingerprint: Some("chrome".to_owned()),
+            ech_config_list: None,
         },
     };
     let xmux = &settings.xmux;
@@ -303,6 +305,7 @@ mod tests {
             verify_peer_cert_by_name: vec!["alt.example".to_owned()],
             allow_insecure: false,
             alpn: vec!["h2".to_owned()],
+            ech_config_list: None,
         });
         let shaped = http_config(&template, &stream(&template, tls)).unwrap();
         assert!(shaped.h3.is_none());
@@ -325,6 +328,7 @@ mod tests {
                 verify_peer_cert_by_name: Vec::new(),
                 allow_insecure: false,
                 alpn: alpn.iter().map(|p| (*p).to_owned()).collect(),
+                ech_config_list: None,
             })
         };
         let h3 = http_config(&template, &stream(&template, tls(&["h3"]))).unwrap();
