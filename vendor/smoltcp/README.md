@@ -267,7 +267,7 @@ Size of the buffer used for fragmenting outgoing packets larger than the MTU. Pa
 
 ### `ASSEMBLER_MAX_SEGMENT_COUNT`
 
-Maximum number of non-contiguous segments the assembler can hold. Used for both packet reassembly and TCP stream reassembly. Default: 4.
+Maximum number of non-contiguous segments the assembler can hold. Used for both packet reassembly and TCP stream reassembly. Default: 16.
 
 ### `REASSEMBLY_BUFFER_SIZE`
 

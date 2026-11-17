@@ -224,3 +224,17 @@ waits for the timer, duplicate ACKs after a timeout start a fast retransmit,
 SACK blocks start none, and no FIN is resent for duplicates. Controller tests
 cover the partial ACK. With the adapter's features the library suite runs 471
 tests.
+
+## Sixteen disjoint reassembly ranges
+
+`ASSEMBLER_MAX_SEGMENT_COUNT` is 16 instead of upstream's 4, in `build.rs`
+(the value the library is built with) and in the `#[cfg(test)]` copy in
+`src/lib.rs`, so the tests exercise the shipped value. The assembler is a
+fixed array of `Contig` (two `usize`s), so a socket's reassembly state grows
+from 64 to 256 bytes; nothing is allocated. A lossy mobile path that delivers
+several segments out of order no longer exhausts the four ranges and forces
+the peer to retransmit data it already sent. The SACK reporting patch above
+still reports at most three blocks, as RFC 2018 allows, so the extra ranges
+are retained for reassembly rather than advertised. `README.md` records the
+new default. The assembler tests derive their bounds from the constant, so
+they pass at 16 unchanged.

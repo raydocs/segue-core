@@ -71,6 +71,12 @@ const DNS_RCODE_SERVFAIL: u16 = 2;
 pub(crate) const TUN_DNS_ANCHOR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 pub(crate) const TUN_CLIENT_IPV4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 const TCP_BUFFER_SIZE: usize = 32 * 1024;
+/// Largest receive ring a runtime profile may give a TUN TCP socket. smoltcp
+/// fixes the window scale from the ring at creation, so the ceiling a flow can
+/// advertise is the ring itself: 256 KiB needs shift 3 and lifts one flow's
+/// `ring / RTT` from 2.6 Mbit/s to 21 Mbit/s at 100 ms. Idle flows cost the
+/// ring, so only the profiles that size for throughput allocate it.
+const TCP_MAX_RECEIVE_BUFFER_SIZE: usize = 256 * 1024;
 /// IPv4 and TCP headers without options: the largest MSS a link MTU admits.
 const TCP_IPV4_HEADERS_LEN: usize = 40;
 const TUN_TCP_SNIFF_BUFFER_SIZE: usize = 8 * 1024;
@@ -199,6 +205,11 @@ struct FlowBudgetPolicy {
     tcp_remote: TcpRemoteBufferPolicy,
     tcp: TcpFlowBudgetPolicy,
     udp: UdpFlowBudgetPolicy,
+    /// Receive ring of a TUN TCP socket, before the MTU floor. smoltcp fixes
+    /// the window scale from the ring when the socket is created, so this is
+    /// also the largest window the flow can advertise. The engine allocates
+    /// the ring eagerly, so a phone profile keeps 32 KiB.
+    tcp_receive_buffer_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,8 +230,9 @@ const MOBILE_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
     tcp_remote: MOBILE_TCP_REMOTE_BUFFER_POLICY,
     tcp: TcpFlowBudgetPolicy {
         // Every smoltcp TCP flow owns a 32 KiB send buffer and a receive
-        // buffer of max(32 KiB, 4 × MSS). Pending opens also retain TLS
-        // state, so bound both dimensions independently.
+        // buffer of the profile's ring (32 KiB here) raised to 4 × MSS.
+        // Pending opens also retain TLS state, so bound both dimensions
+        // independently.
         max_active_flows: 256,
         max_pending_opens: 64,
     },
@@ -229,6 +241,9 @@ const MOBILE_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
         // flows; dropping fresh flows shows up as failed probes.
         max_active_flows: 512,
     },
+    // A phone extension is jetsam-limited and the ring is allocated eagerly,
+    // so the receive window stays at the 32 KiB it has always been.
+    tcp_receive_buffer_size: TCP_BUFFER_SIZE,
 };
 
 const MOBILE_PLUS_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
@@ -240,6 +255,7 @@ const MOBILE_PLUS_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
     udp: UdpFlowBudgetPolicy {
         max_active_flows: 512,
     },
+    tcp_receive_buffer_size: TCP_BUFFER_SIZE,
 };
 
 const DESKTOP_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
@@ -251,6 +267,12 @@ const DESKTOP_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
     udp: UdpFlowBudgetPolicy {
         max_active_flows: 1024,
     },
+    // A desktop is not jetsam-limited, and a 32 KiB ring caps one flow at
+    // 32 KiB per round trip: 2.6 Mbit/s at 100 ms. 256 KiB lifts that to
+    // 21 Mbit/s and needs window scale 3, which smoltcp derives from the ring.
+    // The ring is allocated per live flow, so the flow limit above is what
+    // bounds a host that opens thousands of them.
+    tcp_receive_buffer_size: TCP_MAX_RECEIVE_BUFFER_SIZE,
 };
 
 const LOW_MEMORY_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
@@ -268,6 +290,7 @@ const LOW_MEMORY_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
     udp: UdpFlowBudgetPolicy {
         max_active_flows: 128,
     },
+    tcp_receive_buffer_size: TCP_BUFFER_SIZE,
 };
 
 const THROUGHPUT_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
@@ -279,6 +302,7 @@ const THROUGHPUT_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
     udp: UdpFlowBudgetPolicy {
         max_active_flows: 2048,
     },
+    tcp_receive_buffer_size: TCP_MAX_RECEIVE_BUFFER_SIZE,
 };
 
 const DEFAULT_TCP_UPLOAD_BRIDGE_POLICY: TcpUploadBridgePolicy = TcpUploadBridgePolicy {
@@ -2763,7 +2787,11 @@ fn read_socket_data_to_remote(
     flows: &mut HashMap<SocketHandle, TcpFlow>,
     flow_budget_state: &mut FlowBudgetState,
 ) {
-    let rx_buffer_size = tcp_rx_buffer_size(tun.mtu());
+    // Upload reads stay in 32 KiB chunks whatever the profile's window is:
+    // the ring is the advertised window, and draining it in one copy per
+    // chunk keeps each transient allocation bounded while the outbound
+    // drains.
+    let rx_buffer_size = tcp_rx_buffer_size(tun.mtu(), TCP_BUFFER_SIZE);
     flow_budget_state
         .tcp_upload
         .capacity_waiting
@@ -5765,14 +5793,26 @@ fn admit_tcp_listener(
         return;
     }
 
-    add_tcp_listener(sockets, listeners, endpoint, context.tun.mtu());
+    add_tcp_listener(
+        sockets,
+        listeners,
+        endpoint,
+        context.tun.mtu(),
+        context.runtime_policy.flows.tcp_receive_buffer_size,
+    );
 }
 
-/// Receive buffer of a TUN TCP socket. Linux, Android and Darwin senders put
-/// only whole segments into the advertised window, so a window smaller than a
-/// few MSS stalls them on every burst; 32 KiB covers that up to MTU ~8232.
-fn tcp_rx_buffer_size(mtu: usize) -> usize {
-    TCP_BUFFER_SIZE.max(4 * mtu.saturating_sub(TCP_IPV4_HEADERS_LEN))
+/// Receive buffer of a TUN TCP socket: the profile's ring, raised for a link
+/// whose segments are large. Linux, Android and Darwin senders put only whole
+/// segments into the advertised window, so a window smaller than a few MSS
+/// stalls them on every burst; 32 KiB covers that up to MTU ~8232.
+///
+/// The ring is also what smoltcp scales the window by: it takes the shift from
+/// the capacity when the socket is created, so a ring above 64 KiB advertises
+/// a window above 64 KiB (256 KiB is shift 3). A larger ring therefore raises
+/// the ceiling of one flow's throughput, `ring / RTT`, directly.
+fn tcp_rx_buffer_size(mtu: usize, configured: usize) -> usize {
+    configured.max(4 * mtu.saturating_sub(TCP_IPV4_HEADERS_LEN))
 }
 
 fn tcp_listener_capacity_available(
@@ -5788,9 +5828,10 @@ fn add_tcp_listener(
     listeners: &mut HashMap<IpEndpoint, TcpListenerState>,
     endpoint: IpEndpoint,
     mtu: usize,
+    receive_buffer_size: usize,
 ) {
     let mut socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; tcp_rx_buffer_size(mtu)]),
+        tcp::SocketBuffer::new(vec![0; tcp_rx_buffer_size(mtu, receive_buffer_size)]),
         tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]),
     );
     socket.set_nagle_enabled(false);
@@ -7482,6 +7523,7 @@ mod tests {
             udp: UdpFlowBudgetPolicy {
                 max_active_flows: max_active_udp_flows,
             },
+            tcp_receive_buffer_size: MOBILE_FLOW_BUDGET_POLICY.tcp_receive_buffer_size,
         })
     }
 
@@ -8254,7 +8296,7 @@ mod tests {
         let endpoint = IpEndpoint::new(IpAddress::Ipv4(Ipv4Addr::new(203, 0, 113, 7)), 443);
         let mut sockets = SocketSet::new(Vec::new());
         let mut listeners = HashMap::new();
-        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500);
+        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
         let socket = sockets.get::<tcp::Socket>(listeners.get(&endpoint).unwrap().handle);
         // The tunnels' stacks turn these on for a lossy path; the host's
         // own link keeps what it had.
@@ -8279,7 +8321,7 @@ mod tests {
         iface.set_any_ip(true);
         let mut sockets = SocketSet::new(Vec::new());
         let mut listeners = HashMap::new();
-        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500);
+        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
         let handle = listeners.get(&endpoint).unwrap().handle;
         let packet = |seq: u32, ack: u32, flags: u8, data: &[u8]| {
             Bytes::from(build_ipv4_tcp_packet(
@@ -8369,7 +8411,7 @@ mod tests {
         iface.set_any_ip(true);
         let mut sockets = SocketSet::new(Vec::new());
         let mut listeners = HashMap::new();
-        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500);
+        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
         let handle = listeners.get(&endpoint).unwrap().handle;
 
         device.push_inbound(Bytes::from(build_ipv4_tcp_packet(
@@ -8892,7 +8934,7 @@ mod tests {
         iface.set_any_ip(true);
         let mut sockets = SocketSet::new(Vec::new());
         let mut listeners = HashMap::new();
-        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500);
+        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
         let handle = listeners.get(&endpoint).unwrap().handle;
 
         device.push_inbound(Bytes::from(build_ipv4_tcp_packet(
@@ -9006,7 +9048,7 @@ mod tests {
         iface.set_any_ip(true);
         let mut sockets = SocketSet::new(Vec::new());
         let mut listeners = HashMap::new();
-        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500);
+        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
         let handle = listeners.get(&endpoint).unwrap().handle;
 
         device.push_inbound(Bytes::from(build_ipv4_tcp_packet(
@@ -9120,7 +9162,7 @@ mod tests {
             iface.set_any_ip(true);
             let mut sockets = SocketSet::new(Vec::new());
             let mut listeners = HashMap::new();
-            add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500);
+            add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
             let handle = listeners.get(&endpoint).unwrap().handle;
 
             let (to_remote, _from_stack) = mpsc::channel(1);
@@ -9770,7 +9812,36 @@ mod tests {
         flags: u8,
         payload: &[u8],
     ) -> Vec<u8> {
-        let tcp_len = 20 + payload.len();
+        build_ipv4_tcp_packet_with_options(
+            source,
+            source_port,
+            destination,
+            destination_port,
+            sequence,
+            acknowledgement,
+            flags,
+            &[],
+            payload,
+        )
+    }
+
+    /// A TCP segment with options, padded to a four-byte boundary as the wire
+    /// requires.
+    #[allow(clippy::too_many_arguments)]
+    fn build_ipv4_tcp_packet_with_options(
+        source: Ipv4Addr,
+        source_port: u16,
+        destination: Ipv4Addr,
+        destination_port: u16,
+        sequence: u32,
+        acknowledgement: u32,
+        flags: u8,
+        options: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let options_len = options.len().div_ceil(4) * 4;
+        let header_len = 20 + options_len;
+        let tcp_len = header_len + payload.len();
         let total_len = 20 + tcp_len;
         let mut packet = vec![0; total_len];
         packet[0] = 0x45;
@@ -9785,10 +9856,11 @@ mod tests {
         tcp[2..4].copy_from_slice(&destination_port.to_be_bytes());
         tcp[4..8].copy_from_slice(&sequence.to_be_bytes());
         tcp[8..12].copy_from_slice(&acknowledgement.to_be_bytes());
-        tcp[12] = 5 << 4;
+        tcp[12] = (header_len / 4) as u8 << 4;
         tcp[13] = flags;
         tcp[14..16].copy_from_slice(&u16::MAX.to_be_bytes());
-        tcp[20..].copy_from_slice(payload);
+        tcp[20..20 + options.len()].copy_from_slice(options);
+        tcp[header_len..].copy_from_slice(payload);
         let tcp_checksum = ipv4_tcp_checksum(source, destination, tcp);
         tcp[16..18].copy_from_slice(&tcp_checksum.to_be_bytes());
 
@@ -9811,6 +9883,36 @@ mod tests {
     pub(super) fn ipv4_tcp_sequence(packet: &[u8]) -> Option<u32> {
         let tcp = ipv4_tcp_header_and_payload(packet)?;
         Some(u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]))
+    }
+
+    /// The receive window a segment advertises and, when it carries one, its
+    /// window-scale option.
+    fn ipv4_tcp_window_and_scale(packet: &[u8]) -> Option<(u16, Option<u8>)> {
+        let tcp = ipv4_tcp_header_and_payload(packet)?;
+        let window = u16::from_be_bytes([tcp[14], tcp[15]]);
+        let mut scale = None;
+        let mut options = tcp.get(20..usize::from(tcp[12] >> 4) * 4)?;
+        while let Some((&kind, rest)) = options.split_first() {
+            match kind {
+                0 => break,
+                1 => options = rest,
+                _ => {
+                    // `rest` starts at the length byte; the option occupies
+                    // `len` bytes in all, kind and length included, so its
+                    // body is the `len - 2` bytes after the length.
+                    let (&len, rest) = rest.split_first()?;
+                    let len = usize::from(len);
+                    if len < 2 || len - 2 > rest.len() {
+                        return None;
+                    }
+                    if kind == 3 && len == 3 {
+                        scale = Some(rest[0]);
+                    }
+                    options = &rest[len - 2..];
+                }
+            }
+        }
+        Some((window, scale))
     }
 
     fn ipv4_tcp_payload_len(packet: &[u8]) -> Option<usize> {
@@ -9887,15 +9989,23 @@ mod tests {
 
     #[test]
     fn tcp_rx_buffer_holds_four_full_segments_at_every_mtu() {
-        assert_eq!(tcp_rx_buffer_size(1500), TCP_BUFFER_SIZE);
+        assert_eq!(tcp_rx_buffer_size(1500, TCP_BUFFER_SIZE), TCP_BUFFER_SIZE);
         // 32 KiB alone covers four segments up to MTU 8232.
-        assert_eq!(tcp_rx_buffer_size(8232), TCP_BUFFER_SIZE);
-        assert_eq!(tcp_rx_buffer_size(9000), 4 * 8960);
+        assert_eq!(tcp_rx_buffer_size(8232, TCP_BUFFER_SIZE), TCP_BUFFER_SIZE);
+        assert_eq!(tcp_rx_buffer_size(9000, TCP_BUFFER_SIZE), 4 * 8960);
         for mtu in crate::TunMtu::MIN..=crate::TunMtu::MAX {
             let mtu = mtu as usize;
-            let rx = tcp_rx_buffer_size(mtu);
+            let rx = tcp_rx_buffer_size(mtu, TCP_BUFFER_SIZE);
             assert!(rx >= TCP_BUFFER_SIZE);
             assert!(rx >= 4 * (mtu - TCP_IPV4_HEADERS_LEN), "{mtu}");
+        }
+        // A larger configured ring is never lowered by the MSS floor.
+        for mtu in crate::TunMtu::MIN..=crate::TunMtu::MAX {
+            let mtu = mtu as usize;
+            assert!(
+                tcp_rx_buffer_size(mtu, TCP_MAX_RECEIVE_BUFFER_SIZE)
+                    >= TCP_MAX_RECEIVE_BUFFER_SIZE
+            );
         }
     }
 
@@ -9905,15 +10015,110 @@ mod tests {
             mtu: crate::TunMtu::new(crate::TunMtu::MAX).unwrap(),
             ..TunRuntimeOptions::default()
         };
-        let growth = tcp_rx_buffer_size(jumbo.mtu.get()) - TCP_BUFFER_SIZE;
         for (profile, budget) in [
             (TunRuntimeProfile::LowMemory, 512 * 1024),
             (TunRuntimeProfile::Mobile, 1024 * 1024),
             (TunRuntimeProfile::MobilePlus, 1536 * 1024),
         ] {
             let policy = tun_runtime_policy_for_options(TunRuntimeOptions { profile, ..jumbo });
+            // The profile's ring is the baseline; only the MTU floor above it
+            // is growth these budgets have to carry.
+            let ring = policy.flows.tcp_receive_buffer_size;
+            let growth = tcp_rx_buffer_size(jumbo.mtu.get(), ring) - ring;
             let worst = policy.flows.tcp.max_active_flows * growth;
             assert!(worst <= budget, "{profile:?}: {worst}");
+        }
+    }
+
+    #[test]
+    fn phone_profiles_keep_the_32_kib_receive_ring() {
+        for profile in [
+            TunRuntimeProfile::Mobile,
+            TunRuntimeProfile::MobilePlus,
+            TunRuntimeProfile::LowMemory,
+        ] {
+            let policy = tun_runtime_policy_for_options(TunRuntimeOptions::with_profile(profile));
+            assert_eq!(
+                policy.flows.tcp_receive_buffer_size, TCP_BUFFER_SIZE,
+                "{profile:?}"
+            );
+        }
+        // `Default` follows the target, as it does for every other budget.
+        assert_eq!(
+            tun_runtime_policy_for_options(TunRuntimeOptions::with_profile(
+                TunRuntimeProfile::Default
+            ))
+            .flows
+            .tcp_receive_buffer_size,
+            TUN_RUNTIME_POLICY.flows.tcp_receive_buffer_size
+        );
+    }
+
+    /// The advertised window of a new flow follows the profile's ring: a
+    /// socket created with 256 KiB negotiates window scaling and offers the
+    /// whole ring in its SYN|ACK, where one created with 32 KiB offers 32 KiB
+    /// and no scaling.
+    #[test]
+    fn new_tcp_flow_advertises_the_profile_receive_window() {
+        for (profile, expected_ring, expected_scale) in [
+            (TunRuntimeProfile::Mobile, TCP_BUFFER_SIZE, 0),
+            (TunRuntimeProfile::LowMemory, TCP_BUFFER_SIZE, 0),
+            (TunRuntimeProfile::Desktop, TCP_MAX_RECEIVE_BUFFER_SIZE, 3),
+            (TunRuntimeProfile::Throughput, TCP_MAX_RECEIVE_BUFFER_SIZE, 3),
+        ] {
+            let policy = tun_runtime_policy_for_options(TunRuntimeOptions::with_profile(profile));
+            assert_eq!(policy.flows.tcp_receive_buffer_size, expected_ring, "{profile:?}");
+
+            let server_ip = Ipv4Addr::new(203, 0, 113, 7);
+            let endpoint = IpEndpoint::new(IpAddress::Ipv4(server_ip), 443);
+            let mut device = PacketDevice::new(1500);
+            let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
+            iface_config.random_seed = DEFAULT_RANDOM_SEED;
+            let mut iface = Interface::new(iface_config, &mut device, Instant::now());
+            iface.set_any_ip(true);
+            let mut sockets = SocketSet::new(Vec::new());
+            let mut listeners = HashMap::new();
+            add_tcp_listener(
+                &mut sockets,
+                &mut listeners,
+                endpoint,
+                1500,
+                policy.flows.tcp_receive_buffer_size,
+            );
+
+            // A client that offers window scaling, as Linux, Android and
+            // Darwin do; without the option smoltcp keeps shift 0.
+            device.push_inbound(Bytes::from(build_ipv4_tcp_packet_with_options(
+                Ipv4Addr::new(10, 10, 0, 2),
+                49_152,
+                server_ip,
+                443,
+                1_000,
+                0,
+                TCP_SYN,
+                &[3, 3, 7],
+                &[],
+            )));
+            iface.poll(Instant::now(), &mut device, &mut sockets);
+
+            let syn_ack = device.pop_outbound().expect("SYN|ACK");
+            let (window_len, window_scale) = ipv4_tcp_window_and_scale(&syn_ack).unwrap();
+            // The offered shift is the ring's: 32 KiB needs none, 256 KiB
+            // three, and smoltcp takes it from the capacity at creation.
+            assert_eq!(window_scale, Some(expected_scale), "{profile:?}");
+            assert_eq!(
+                sockets
+                    .get::<tcp::Socket>(listeners.get(&endpoint).unwrap().handle)
+                    .recv_capacity(),
+                expected_ring
+            );
+            // The SYN|ACK's window field is unscaled (RFC 7323 §2.2) and
+            // saturates at 65535; later segments scale by the shift.
+            assert_eq!(
+                window_len as usize,
+                expected_ring.min(usize::from(u16::MAX)),
+                "{profile:?}"
+            );
         }
     }
 
