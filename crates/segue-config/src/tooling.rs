@@ -134,6 +134,7 @@ pub fn configuration_examples() -> Value {
         "vmess": serde_json::from_str::<Value>(include_str!("../../../tests/fixtures/configs/vmess.json")).expect("canonical VMess example"),
         "trojan": serde_json::from_str::<Value>(include_str!("../../../tests/fixtures/configs/trojan.json")).expect("canonical Trojan example"),
         "anytls": serde_json::from_str::<Value>(include_str!("../../../tests/fixtures/configs/anytls.json")).expect("canonical AnyTLS example"),
+        "tuic": serde_json::from_str::<Value>(include_str!("../../../tests/fixtures/configs/tuic.json")).expect("canonical TUIC example"),
         "hysteria2": serde_json::from_str::<Value>(include_str!("../../../tests/fixtures/configs/hysteria2.json")).expect("canonical Hysteria example"),
         "xhttp-download": {"inbounds": [socks], "outbounds": [download]},
         "dns-routing": {

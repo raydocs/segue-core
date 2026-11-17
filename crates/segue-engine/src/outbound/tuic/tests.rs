@@ -245,4 +245,3 @@ fn config_defaults_and_never_treats_quic_as_a_tcp_stream() {
     config.stream.network = Network::Tcp;
     assert!(TuicOutbound::new(&config).is_err());
 }
-

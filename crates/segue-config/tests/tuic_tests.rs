@@ -120,4 +120,3 @@ fn bad_settings_unknown_fields_and_the_wrong_transport_are_rejected() {
         "streamSettings":{"security":"tls","tlsSettings":{"allowInsecure":true}}}]});
     assert!(parse_xray_json(&insecure.to_string()).is_err());
 }
-
