@@ -34,6 +34,13 @@ impl Parser<'_> {
         // Xray permits REALITY on raw, XHTTP and gRPC
         // (`infra/conf/transport_internet.go`). The alias `splithttp` is
         // normalized to the XHTTP variant by `parse_network` below.
+        if matches!(security, StreamSecurity::ShadowTls(_)) && stream_network != StreamNetwork::Raw {
+            self.error(
+                format!("$.outbounds[{index}].streamSettings.security"),
+                "ShadowTLS v3 only supports raw/tcp as the inner stream transport",
+            );
+        }
+
         if matches!(security, StreamSecurity::Reality(_))
             && !matches!(
                 stream_network,
@@ -1553,6 +1560,9 @@ impl Parser<'_> {
                     self.parse_tls_object(tls_settings, &path),
                 ))
             }
+            "shadowtls" => self
+                .parse_shadow_tls_settings(stream, index)
+                .map(StreamSecurity::ShadowTls),
             "reality" => self
                 .parse_reality_settings(stream, index)
                 .map(StreamSecurity::Reality),
@@ -1583,6 +1593,14 @@ impl Parser<'_> {
         path: &str,
     ) -> TlsSettings {
         self.validate_tls_settings(tls_settings, path);
+        self.parse_tls_fields(tls_settings, path)
+    }
+
+    fn parse_tls_fields(
+        &mut self,
+        tls_settings: Option<&Value>,
+        path: &str,
+    ) -> TlsSettings {
         let allow_insecure_path = format!("{path}.allowInsecure");
         let allow_insecure = match tls_settings.and_then(|settings| settings.get("allowInsecure")) {
             None | Some(Value::Null) | Some(Value::Bool(false)) => false,
@@ -1866,6 +1884,56 @@ impl Parser<'_> {
                 );
             }
         }
+    }
+
+    fn parse_shadow_tls_settings(
+        &mut self,
+        stream: Option<&Value>,
+        index: usize,
+    ) -> Option<ShadowTlsSettings> {
+        let settings = stream.and_then(|stream| stream.get("shadowtlsSettings"));
+        let path = format!("$.outbounds[{index}].streamSettings.shadowtlsSettings");
+        let Some(settings) = settings.filter(|settings| settings.is_object()) else {
+            self.error(path, "ShadowTLS v3 settings must be an object");
+            return None;
+        };
+        self.reject_unknown_fields(settings, &path, &surface::SHADOWTLS);
+        let password_path = format!("{path}.password");
+        let Some(password) = self.optional_string_at(settings, "password", password_path.clone())
+        else {
+            if settings.get("password").is_none() {
+                self.error(password_path, "ShadowTLS v3 requires a password");
+            }
+            return None;
+        };
+        if password.is_empty() || password.len() > 4096 {
+            self.error(
+                password_path,
+                "ShadowTLS password must contain 1 to 4096 UTF-8 bytes",
+            );
+            return None;
+        }
+        let version_path = format!("{path}.version");
+        if self.optional_u64_at(settings, "version", version_path.clone()).unwrap_or(3) != 3 {
+            self.error(version_path, "only ShadowTLS version 3 is supported");
+        }
+        let tls = self.parse_tls_fields(Some(settings), &path);
+        if tls.server_name.as_deref().is_none_or(str::is_empty) {
+            self.error(
+                format!("{path}.serverName"),
+                "ShadowTLS requires the real TLS server's name for SNI and certificate verification",
+            );
+        }
+        if tls.fingerprint.as_deref() == Some("unsafe") {
+            self.error(
+                format!("{path}.fingerprint"),
+                "ShadowTLS v3 requires a uTLS fingerprint, not `unsafe`",
+            );
+        }
+        Some(ShadowTlsSettings {
+            password: zeroize::Zeroizing::new(password.to_owned()),
+            tls,
+        })
     }
 
     pub(super) fn parse_reality_settings(

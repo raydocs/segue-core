@@ -2316,6 +2316,43 @@ fn rejects_tls_from_mitm_context_sentinels_with_paths() {
 }
 
 #[test]
+fn parses_shadowtls_v3_relay_settings() {
+    let raw = raw_with_stream_settings(
+        r#""network": "tcp", "security": "shadowtls", "shadowtlsSettings": {
+          "password": "fixture-password", "version": 3,
+          "serverName": "cover.example", "fingerprint": "chrome"
+        }"#,
+    );
+    let parsed = parse_xray_json(&raw).expect("v3 raw TCP settings must parse");
+    let StreamSecurity::ShadowTls(shadow) = &parsed.config.outbounds[0].stream.security else {
+        panic!("expected ShadowTLS");
+    };
+    assert_eq!(shadow.password.as_str(), "fixture-password");
+    assert_eq!(shadow.tls.server_name.as_deref(), Some("cover.example"));
+    assert_eq!(shadow.tls.fingerprint.as_deref(), Some("chrome"));
+}
+
+#[test]
+fn rejects_shadowtls_old_versions_missing_names_and_non_raw_streams() {
+    for (extra, path) in [
+        (r#""password": "p", "version": 2, "serverName": "cover.example""#, "version"),
+        (r#""password": "p", "version": 3"#, "serverName"),
+        (r#""password": "p", "version": 3, "serverName": "cover.example", "fingerprint": "unsafe""#, "fingerprint"),
+    ] {
+        let raw = raw_with_stream_settings(&format!(
+            r#""security": "shadowtls", "shadowtlsSettings": {{ {extra} }}"#,
+        ));
+        assert_parse_error_path(&raw, &format!("$.outbounds[0].streamSettings.shadowtlsSettings.{path}"));
+    }
+    let raw = raw_with_stream_settings(
+        r#""network": "ws", "security": "shadowtls", "shadowtlsSettings": {
+          "password": "p", "version": 3, "serverName": "cover.example"
+        }"#,
+    );
+    assert_parse_error_path(&raw, "$.outbounds[0].streamSettings.security");
+}
+
+#[test]
 fn parses_tls_fingerprint() {
     let raw = raw_with_tls_settings(r#""serverName": "server.example", "fingerprint": "firefox""#);
     let parsed = parse_xray_json(&raw).expect("a TLS fingerprint should be accepted");

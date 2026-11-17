@@ -2856,6 +2856,7 @@ pub enum StreamSecurity {
     None,
     Tls(TlsSettings),
     Reality(RealitySettings),
+    ShadowTls(ShadowTlsSettings),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2888,6 +2889,13 @@ pub struct RealitySettings {
     pub short_id: RealityShortId,
     pub spider_x: String,
     pub mldsa65_verify: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowTlsSettings {
+    pub password: zeroize::Zeroizing<String>,
+    /// The real TLS server's options. Raw TCP only, always version 3.
+    pub tls: TlsSettings,
 }
 
 #[derive(Clone, PartialEq, Eq)]

@@ -263,6 +263,20 @@ pub(super) fn build_connector(
             spider_x: reality.spider_x.clone(),
             mldsa65_verify: reality.mldsa65_verify.clone(),
         }),
+        StreamSecurity::ShadowTls(shadow) => ConnectorConfig::ShadowTls(segue_transport::ShadowTlsConfig {
+            password: shadow.password.clone(),
+            tls: TlsClientConfig {
+                server_name: shadow.tls.server_name.clone().unwrap_or_else(|| match destination {
+                    TargetAddr::Domain(domain) => domain.clone(),
+                    TargetAddr::Ip(ip) => ip.to_string(),
+                }),
+                allow_insecure: shadow.tls.allow_insecure,
+                pinned_peer_cert_sha256: shadow.tls.pinned_peer_cert_sha256.clone(),
+                verify_peer_cert_by_name: shadow.tls.verify_peer_cert_by_name.clone(),
+                alpn: shadow.tls.alpn.clone(),
+                fingerprint: shadow.tls.fingerprint.clone(),
+            },
+        }),
     }
 }
 
@@ -593,7 +607,7 @@ fn configured_tls_server_name(security: &StreamSecurity) -> Option<&str> {
             .server_name
             .as_deref()
             .filter(|server_name| !server_name.is_empty()),
-        StreamSecurity::None | StreamSecurity::Reality(_) => None,
+        StreamSecurity::None | StreamSecurity::Reality(_) | StreamSecurity::ShadowTls(_) => None,
     }
 }
 
