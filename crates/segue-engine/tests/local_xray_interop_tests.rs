@@ -1763,9 +1763,8 @@ fn write_xray_vless_client_config(
 }
 
 /// Xray-core's binary: `XRAY_VLESS_FULL_BINARY` when the interop scripts
-/// built it once, else a fresh `go build` into `directory`. One build serves
-/// every attempt of a start, so a retry does not rebuild it; the child has
-/// the file open by the time `directory` goes away, which Unix allows.
+/// built it once, else a fresh `go build` into `directory`, which the
+/// started server keeps alive for as long as it runs.
 fn xray_vless_binary(xray_checkout: &Path, directory: &TempDir) -> PathBuf {
     if let Some(built) = env::var_os("XRAY_VLESS_FULL_BINARY") {
         return PathBuf::from(built);
