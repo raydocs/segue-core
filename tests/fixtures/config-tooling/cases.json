@@ -2470,6 +2470,55 @@
       }
     },
     {
+      "name": "tuic",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": {}
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "tuic",
+            "settings": {
+              "server": "tuic.example",
+              "port": 443,
+              "uuid": "00010203-0405-0607-0809-0a0b0c0d0e0f",
+              "password": "synthetic-tuic-example-password",
+              "congestion_control": "bbr",
+              "udp_relay_mode": "native",
+              "zero_rtt_handshake": true,
+              "heartbeat": "10s"
+            },
+            "streamSettings": {
+              "network": "udp",
+              "security": "tls",
+              "tlsSettings": {
+                "serverName": "tuic.example",
+                "alpn": [
+                  "h3"
+                ]
+              }
+            }
+          }
+        ],
+        "dns": {
+          "queryStrategy": "UseIPv4"
+        },
+        "routing": {
+          "domainStrategy": "AsIs",
+          "rules": []
+        }
+      },
+      "objects": {
+        "TUIC": "/outbounds/0/settings"
+      }
+    },
+    {
       "name": "trojan-legacy",
       "accepted": true,
       "config": {

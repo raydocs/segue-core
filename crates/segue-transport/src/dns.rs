@@ -1150,7 +1150,7 @@ pub async fn exchange_dns_quic_candidates(
             network_changes: None,
         };
         let (endpoint, connection, _, _) =
-            match crate::stream::connect_quic_transport(config, b"doq").await {
+            match crate::stream::connect_quic_transport(config, Some(b"doq")).await {
                 Ok(connected) => connected,
                 Err(error) => {
                     last_error = Some(io::Error::other(error));

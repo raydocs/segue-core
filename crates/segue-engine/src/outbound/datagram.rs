@@ -10,6 +10,7 @@ pub(crate) enum Session {
     Vmess(vmess::UdpSession),
     Shadowsocks2022(Box<shadowsocks::UdpSession>),
     Hysteria(HysteriaUdpSession),
+    Tuic(super::tuic::UdpAssociation),
     Wireguard {
         session: segue_wireguard::UdpSession,
         requested: Target,
@@ -59,6 +60,7 @@ pub(crate) async fn open(
         UdpOutbound::Hysteria(outbound) => Ok(Session::Hysteria(
             outbound.open_udp(bootstrap, dialer).await?,
         )),
+        UdpOutbound::Tuic(outbound) => Ok(Session::Tuic(outbound.open_udp(bootstrap, dialer).await?)),
         UdpOutbound::Wireguard(outbound) => Ok(Session::Wireguard {
             session: outbound
                 .open_udp(target, destination, bootstrap, dialer)
@@ -95,7 +97,10 @@ pub(crate) async fn open_within_handshake(
         UdpOutbound::Socks(outbound) => outbound.level(),
         UdpOutbound::Vmess(outbound) => outbound.level(),
         UdpOutbound::Shadowsocks2022(outbound) => outbound.level(),
-        UdpOutbound::Hysteria(_) | UdpOutbound::Wireguard(_) | UdpOutbound::Masque(_) => 0,
+            UdpOutbound::Hysteria(_)
+            | UdpOutbound::Wireguard(_)
+            | UdpOutbound::Masque(_)
+            | UdpOutbound::Tuic(_) => 0,
         UdpOutbound::Freedom(_) => return Err(CoreError::UnsupportedOutboundNetwork),
     };
     let mut handshake = effective_policy_for_level(config, Some(level)).handshake;
@@ -142,7 +147,7 @@ impl Session {
             Self::Shadowsocks2022(session) => session.max_payload(target),
             // SOCKS carries what fits one IP datagram, and Hysteria fragments
             // a datagram across QUIC datagrams.
-            Self::Socks(_) | Self::Hysteria(_) => usize::MAX,
+            Self::Socks(_) | Self::Hysteria(_) | Self::Tuic(_) => usize::MAX,
         }
     }
     /// Whether a datagram of this session can be lost on its way with
@@ -155,6 +160,7 @@ impl Session {
             Self::Socks(_) | Self::Hysteria(_) | Self::Wireguard { .. } | Self::Masque { .. } => {
                 true
             }
+            Self::Tuic(_) => true,
         }
     }
     pub(crate) async fn send(&self, target: &Target, payload: &[u8]) -> Result<(), CoreError> {
@@ -166,6 +172,7 @@ impl Session {
             Self::Vmess(session) => session.send(target, payload).await,
             Self::Shadowsocks2022(session) => session.send(target, payload).await,
             Self::Hysteria(session) => Ok(session.send(target, payload).await?),
+            Self::Tuic(session) => Ok(session.send(target, payload).await?),
             Self::Wireguard { session, requested } => {
                 if target != requested {
                     return Err(segue_wireguard::Error::NoRoute.into());
@@ -195,6 +202,10 @@ impl Session {
                     source: packet.source,
                     payload: packet.payload,
                 })
+            }
+            Self::Tuic(session) => {
+                let (source, payload) = session.recv().await?;
+                Ok(Datagram { source, payload })
             }
             Self::Wireguard { session, .. } => {
                 let peer = session.peer_addr();

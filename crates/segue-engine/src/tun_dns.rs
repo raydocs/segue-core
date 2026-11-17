@@ -3296,7 +3296,7 @@ async fn open_raw_dns_tcp_candidate(
         return RawDnsTcpOpenResult::TimedOut;
     }
     let policy_timeout = match outbound.primary() {
-        TcpOutbound::Hysteria(_) | TcpOutbound::Wireguard(_) => {
+        TcpOutbound::Tuic(_) | TcpOutbound::Hysteria(_) | TcpOutbound::Wireguard(_) => {
             effective_policy_for_level(&context.config, Some(0)).handshake
         }
         TcpOutbound::Masque(_) => crate::outbound::masque::open_timeout(
@@ -3589,7 +3589,7 @@ async fn proxy_udp_payload(
                     | UdpOutbound::Vmess(_)
                     | UdpOutbound::Shadowsocks2022(_)
                     | UdpOutbound::Vless(_)
-                    | UdpOutbound::Hysteria(_)
+                    | UdpOutbound::Tuic(_) | UdpOutbound::Hysteria(_)
                     | UdpOutbound::Wireguard(_)
                     | UdpOutbound::Masque(_) => DNS_PROXY_VLESS_ATTEMPT_TIMEOUT,
                 };

@@ -60,10 +60,12 @@ enum QuicClientConfigKey {
         allow_insecure: bool,
         pinned_peer_cert_sha256: Vec<[u8; 32]>,
         verify_peer_cert_by_name: Vec<String>,
-        alpn: Vec<u8>,
+        alpns: Vec<Vec<u8>>,
+        early_data: bool,
     },
     Pinned {
-        alpn: Vec<u8>,
+        alpns: Vec<Vec<u8>>,
+        early_data: bool,
     },
     /// Xray's ChromeParrot ClientHello, on the same trust policy as `System`
     Chrome {
@@ -195,6 +197,25 @@ impl TlsConnector {
         config: &TlsClientConfig,
         alpn: &[u8],
     ) -> Result<Arc<rustls::ClientConfig>, TransportError> {
+        self.quic_client_config_for_alpns_and_early_data(config, &[alpn], false)
+    }
+
+    /// Builds unshaped QUIC TLS 1.3 with one application ALPN fallback order.
+    pub fn quic_client_config_for_alpns(
+        &self,
+        config: &TlsClientConfig,
+        alpns: &[&[u8]],
+        enable_early_data: bool,
+    ) -> Result<Arc<rustls::ClientConfig>, TransportError> {
+        self.quic_client_config_for_alpns_and_early_data(config, alpns, enable_early_data)
+    }
+
+    fn quic_client_config_for_alpns_and_early_data(
+        &self,
+        config: &TlsClientConfig,
+        alpns: &[&[u8]],
+        enable_early_data: bool,
+    ) -> Result<Arc<rustls::ClientConfig>, TransportError> {
         // A prebuilt config cannot carry Xray's per-outbound verification
         // policy. Reject before consulting its shape-independent QUIC cache so
         // a previously cached permissive config cannot bypass this guard.
@@ -215,10 +236,12 @@ impl TlsConnector {
                 allow_insecure: config.allow_insecure,
                 pinned_peer_cert_sha256: config.pinned_peer_cert_sha256.clone(),
                 verify_peer_cert_by_name: config.verify_peer_cert_by_name.clone(),
-                alpn: alpn.to_vec(),
+                alpns: alpns.iter().map(|alpn| alpn.to_vec()).collect(),
+                early_data: enable_early_data,
             },
             ConfigSource::Pinned(_) => QuicClientConfigKey::Pinned {
-                alpn: alpn.to_vec(),
+                alpns: alpns.iter().map(|alpn| alpn.to_vec()).collect(),
+                early_data: enable_early_data,
             },
         };
         let mut configs = self
@@ -239,9 +262,12 @@ impl TlsConnector {
             )?,
             ConfigSource::Pinned(pinned) => (**pinned).clone(),
         };
-        client_config.alpn_protocols = vec![alpn.to_vec()];
+        client_config.alpn_protocols = alpns.iter().map(|alpn| alpn.to_vec()).collect();
         client_config.client_hello_customizer = None;
         validate_quic_client_config(&client_config)?;
+        if enable_early_data {
+            client_config.enable_early_data = true;
+        }
         let client_config = Arc::new(client_config);
         configs.insert(key, Arc::clone(&client_config));
         Ok(client_config)

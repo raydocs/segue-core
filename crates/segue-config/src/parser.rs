@@ -22,6 +22,7 @@ mod stream;
 mod sudoku;
 mod tproxy;
 mod trojan;
+mod tuic;
 mod vless;
 mod vmess;
 mod wireguard;
@@ -1118,6 +1119,7 @@ impl Parser<'_> {
             Some("masque") => OutboundProtocol::Masque,
             // Not an Xray-core protocol; the name is sing-box's and mihomo's.
             Some("anytls") => OutboundProtocol::AnyTls,
+            Some("tuic") => OutboundProtocol::Tuic,
             Some(protocol) => {
                 self.error(
                     protocol_path,
@@ -1174,6 +1176,9 @@ impl Parser<'_> {
             }
             OutboundProtocol::AnyTls => {
                 OutboundSettings::AnyTls(self.parse_anytls_settings(outbound, index)?)
+            }
+            OutboundProtocol::Tuic => {
+                OutboundSettings::Tuic(self.parse_tuic_settings(outbound, index)?)
             }
         };
         let target_strategy = self.domain_strategy_at(
@@ -1257,6 +1262,7 @@ impl Parser<'_> {
         self.validate_masque_pair(&settings, &stream, proxy_settings.is_some(), index);
         self.validate_trojan_stream(&settings, &stream, index);
         self.validate_anytls_stream(&settings, &stream, index);
+        self.validate_tuic_stream(&mut settings, &mut stream, proxy_settings.is_some(), index);
 
         // Xray v26.7.28 applies this policy only to its simplified top-level
         // VLESS settings. Its legacy `vnext` path bypasses that validation.
@@ -1289,7 +1295,8 @@ impl Parser<'_> {
             // MASQUE requires TLS.
             | OutboundSettings::Masque(_)
             // AnyTLS requires TLS; `validate_anytls_stream` refuses plaintext.
-            | OutboundSettings::AnyTls(_) => false,
+            | OutboundSettings::AnyTls(_)
+            | OutboundSettings::Tuic(_) => false,
         };
         if rejects_plaintext_server {
             self.error(
