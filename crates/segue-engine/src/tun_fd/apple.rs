@@ -1,14 +1,13 @@
-//! The private Darwin socket API the utun read path batches with.
+//! The private Darwin socket API the utun path batches with.
 //!
-//! `recvmsg_x` and `struct msghdr_x` live in xnu's `bsd/sys/socket.h` but are
-//! not part of the public SDK headers, so they are declared here by hand, the
-//! way sing-tun does in `internal/rawfile_darwin/rawfile.go`. The symbol is
-//! exported by `libSystem` on both macOS and iOS (`_recvmsg_x` in
+//! `recvmsg_x`, `sendmsg_x` and `struct msghdr_x` live in xnu's
+//! `bsd/sys/socket.h` but are not part of the public SDK headers, so they are
+//! declared here by hand, the way sing-tun does in
+//! `internal/rawfile_darwin/rawfile.go`. Both symbols are exported by
+//! `libSystem` on macOS and iOS (`_recvmsg_x` and `_sendmsg_x` in
 //! `libSystem.tbd`). The layout below follows xnu's declaration: 56 bytes on
-//! 64-bit, with `msg_datalen` a `size_t` at offset 48 (asserted below).
-//!
-//! Only the read direction is declared. `sendmsg_x` is deliberately absent:
-//! write batching is a separate change.
+//! 64-bit, with `msg_datalen` a `size_t` at offset 48 (asserted below). The
+//! same struct is the argument to both directions.
 
 use libc::{c_int, c_uint, c_void, iovec, size_t, socklen_t, ssize_t};
 
@@ -73,4 +72,15 @@ extern "C" {
     /// packet is pending for it, so `cnt` must be the batch size, not the
     /// number of packets believed to be queued.
     pub(super) fn recvmsg_x(fd: c_int, msgp: *mut MsgHdrX, cnt: c_uint, flags: c_int) -> ssize_t;
+
+    /// `ssize_t sendmsg_x(int s, struct msghdr_x *msgp, u_int cnt, int flags)`.
+    ///
+    /// Sends up to `cnt` datagrams, one per header slot. A non-negative return
+    /// is how many slots were accepted, which may be less than `cnt`: the tail
+    /// was not sent. A failure returns `-1` and sets errno, with no count —
+    /// `EAGAIN` and `ENOBUFS` mean none of the slots were sent (`sendit_x`
+    /// builds every packet before sending any, and `ENOBUFS` is that
+    /// allocation failing). Other errnos can mean the kernel already took the
+    /// whole submission.
+    pub(super) fn sendmsg_x(fd: c_int, msgp: *mut MsgHdrX, cnt: c_uint, flags: c_int) -> ssize_t;
 }
