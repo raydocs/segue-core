@@ -1688,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "quinn"
-version = "0.11.9"
+version = "0.11.12"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -1707,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.19"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",

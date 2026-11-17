@@ -1,7 +1,7 @@
-# quinn-proto 0.11.16: bounded Hysteria DATAGRAMs, BBR corrections and ChromeParrot
+# quinn-proto 0.11.19: bounded Hysteria DATAGRAMs, BBR corrections and ChromeParrot
 
-Source: the complete unchanged-version crates.io `quinn-proto` **0.11.16** archive,
-SHA256 `2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560`.
+Source: the complete unchanged-version crates.io `quinn-proto` **0.11.19** archive,
+SHA256 `0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe`.
 Upstream licenses and the published lockfile remain intact. `XRAY-PATCH.diff`
 reconstructs the local source from that archive with zero fuzz. Run
 `scripts/check-vendored-sources.sh` to verify the archive, exact reconstruction,
@@ -246,3 +246,78 @@ credits nothing for a stream already in `ResetRecvd`.
 `reset_then_stop_credits_unread_bytes_once` receives 4,096 bytes, resets at
 5,120 and then stops, and checks the window grew by exactly 5,120; it fails
 with 9,216 without the correction.
+
+0.11.19 fixes the first half itself: `received_reset` credits a stopped
+stream only `final_offset - end`, as this patch did, so that part is now
+upstream's and only the two tests above are kept. The second half is still
+ours: 0.11.19's `Recv::stop` credits `end - bytes_read` whatever the state,
+so a stream reset before the application stops it is credited twice.
+
+## A ChromeParrot Handshake ACK alone elicits no acknowledgement
+
+`poll_transmit` decides whether a packet is ack-eliciting before it is
+filled, from what is pending in its space. A ChromeParrot client sends its
+Handshake ACK in a packet of its own while the Finished is still pending, so
+that packet was tracked as ack-eliciting: 50 bytes in flight, the loss timer
+armed for it and a delivery token taken, for a packet the server never has
+to acknowledge. quic-go tracks it as the ACK-only packet it is. After `populate_packet`, a Handshake packet of an unconfirmed
+ChromeParrot handshake that carries an ACK alone clears the builder's
+`ack_eliciting`; it is then reported through `on_sent_not_ack_eliciting`.
+`chrome_parrot_handshake_ack_alone_is_not_ack_eliciting` checks that the
+second ack-eliciting packet a controller is told of is the Finished; without
+the change it is the 50-byte ACK.
+
+## Lost MTU probes have their own callback
+
+`Controller::on_mtu_probe_lost_with_token` reports a lost MTU probe. Its
+default calls `on_packet_lost_with_token`, so every controller sees what it
+saw before; a controller that reacts to each loss it is told of overrides it
+and leaves the probe out, as RFC 9000 section 14.4 asks. The port of Xray's
+BBR sender does. `lost_mtu_probes_are_reported_per_packet_only` also checks
+that every lost probe comes through the new callback. The complete 313-test
+library suite passes in the reconstruction.
+
+A Retry was checked and left as it is: `space.take(0)` finds no packet under
+ChromeParrot, whose Initial numbers start at 1, so the first Initial is not
+credited to the congestion controller as acknowledged, which is what quic-go's
+`ResetForRetry` does; `discard_space` takes every sent Initial out of the
+bytes in flight once, and the ClientHello is queued again whole.
+
+## Rebased from 0.11.16 onto 0.11.19
+
+0.11.16 is affected by RUSTSEC-2026-0338, 0339, 0340, 0341, 0342, 0523 and
+0524, fixed in 0.11.17 to 0.11.19. The local changes
+above were moved onto the 0.11.19 archive with a three-way merge from
+0.11.16: four files conflicted, on imports, on the renamed `try_populate_acks`
+and on `RttEstimator::new`, which upstream made `pub(crate)`.
+
+The upstream fixes, on quinn's 0.11.x branch: 0338 `4c929554`, 0339
+`6a984b8d` and `b37ced30`, 0340 `9a66201e`, 0341 `499dba84`, 0342 `3a78b607`,
+`31ca5d2a` and `d7bf3d0c` (with `f650e0f2` for RUSTSEC-2026-0343, which they
+introduced in 0.11.17), 0523 `73114d82`, 0524 `74c33ff7` and `a6e78d1c`.
+
+Upstream changes that meet local ones:
+
+- Initial datagrams are padded to the configured minimum MTU rather than
+  1,200 bytes, and loss probes are clamped to it (upstream `8ada074d`). A
+  ChromeParrot handshake keeps its own sizes, the current MTU and
+  `min_mtu.max(INITIAL_MTU)`, so its datagrams are unchanged.
+- ACKs ride along with STREAM and DATAGRAM frames at most once per RTT plus
+  the peer's ACK delay (upstream `912d648e`). The ACK's place in the packet
+  is recorded for ChromeParrot's chaos protection as for a leading ACK, and a
+  ChromeParrot client bundles 1-RTT ACKs only: its Initial and Handshake
+  packets carry an ACK first or alone, as quic-go's do.
+- An ACK frame that does not fit is left out (`try_populate_acks`, from the
+  same commit), and a close after a long Initial token keeps room for its
+  CONNECTION_CLOSE (RUSTSEC-2026-0524, `a6e78d1c`): the ready-ACK path that
+  bypasses a full congestion window passes the packet's room like the others.
+- Each queued DATAGRAM is charged its payload plus `size_of::<Datagram>()`
+  against the send and receive buffers (RUSTSEC-2026-0342, `31ca5d2a`,
+  `d7bf3d0c`, `f650e0f2`), so the 256 KiB
+  Hysteria and MASQUE queues hold slightly fewer small datagrams; the
+  advertised frame size and its cap are unchanged.
+
+The complete 361-test library suite (313 before, plus upstream's new tests,
+including `oversized_retry_token`, `oversized_cached_initial_token`,
+`large_initial_token_leaves_room_for_close`, `max_stream_data_over_stream_limit`
+and the DATAGRAM accounting tests) passes in the reconstruction.
