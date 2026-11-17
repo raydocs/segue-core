@@ -207,11 +207,22 @@ impl Pool {
     }
 
     pub(super) async fn join(&self) {
-        let sessions = std::mem::take(&mut *lock(&self.0.sessions));
+        // A `std` mutex guard is `!Send`. Drop it before any `.await`, including
+        // the `if let` scrutinee, whose temporary would otherwise live across
+        // the cleanup task's join and make `OutboundFactory::join_sessions`
+        // unsendable.
+        let sessions = {
+            let mut sessions = lock(&self.0.sessions);
+            std::mem::take(&mut *sessions)
+        };
         for session in sessions {
             session.join().await;
         }
-        if let Some(task) = lock(&self.0.cleanup).take() {
+        let task = {
+            let mut cleanup = lock(&self.0.cleanup);
+            cleanup.take()
+        };
+        if let Some(task) = task {
             let _ = task.await;
         }
     }
@@ -417,9 +428,13 @@ impl Session {
 
     async fn join(&self) {
         // The router closes before it joins; closing here too makes a join on
-        // its own terminate instead of waiting for the carrier.
+        // its own terminate instead of waiting for the carrier. The task-list
+        // guard is dropped before the awaits: it is a `std` mutex guard.
         self.close();
-        let tasks = std::mem::take(&mut *lock(&self.inner.tasks));
+        let tasks = {
+            let mut tasks = lock(&self.inner.tasks);
+            std::mem::take(&mut *tasks)
+        };
         for task in tasks {
             let _ = task.await;
         }
@@ -631,7 +646,14 @@ async fn dispatch(
             if payload.is_empty() {
                 return true;
             }
-            let Some(tx) = lock(&inner.streams).get(&frame.stream_id).cloned() else {
+            // Clone the sender out from under the mutex. The guard is a `std`
+            // `MutexGuard` and must not be live across `send`'s await, or the
+            // reader task (and anything that joins it) is not `Send`.
+            let tx = {
+                let streams = lock(&inner.streams);
+                streams.get(&frame.stream_id).cloned()
+            };
+            let Some(tx) = tx else {
                 // A frame for a stream that already ended is discarded.
                 return true;
             };
