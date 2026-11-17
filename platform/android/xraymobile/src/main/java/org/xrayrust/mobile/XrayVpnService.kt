@@ -534,6 +534,45 @@ internal fun reportUnscheduledStart(
     }
 }
 
+/** Stop reason reported when Android revokes VPN consent. Explicit stops leave it unset. */
+internal const val XRAY_VPN_STOP_REASON_REVOKED = "revoked"
+
+/**
+ * Always-on and lockdown as a host can read them. Both properties exist only on API 29+;
+ * earlier releases report null rather than a guessed false.
+ */
+internal data class XrayVpnLockdownStatus(
+    val isAlwaysOn: Boolean?,
+    val isLockdownEnabled: Boolean?,
+)
+
+internal fun xrayVpnLockdownStatus(
+    sdkInt: Int,
+    isAlwaysOn: Boolean,
+    isLockdownEnabled: Boolean,
+): XrayVpnLockdownStatus {
+    if (sdkInt < 29) {
+        return XrayVpnLockdownStatus(isAlwaysOn = null, isLockdownEnabled = null)
+    }
+    return XrayVpnLockdownStatus(
+        isAlwaysOn = isAlwaysOn,
+        isLockdownEnabled = isLockdownEnabled,
+    )
+}
+
+/**
+ * Revoke uses the same stop an explicit [XrayVpnService.stopXrayTunnel] does, then reports
+ * [XRAY_VPN_STOP_REASON_REVOKED]. The report runs after stop returns, including when stop throws,
+ * so the host learns the consent was revoked even if teardown failed.
+ */
+internal fun handleXrayVpnRevoke(stop: () -> Unit, report: (String) -> Unit) {
+    try {
+        stop()
+    } finally {
+        report(XRAY_VPN_STOP_REASON_REVOKED)
+    }
+}
+
 /** A point-in-time, credential-free view of the reference VPN service runtime. */
 data class XrayVpnRuntimeSnapshot(
     val running: Boolean,
@@ -541,6 +580,12 @@ data class XrayVpnRuntimeSnapshot(
     val tunStats: XrayTunStats?,
     val activeConnections: Int,
     val fatalTunErrors: Long,
+    /** `"revoked"` after [XrayVpnService.onRevoke]; null after an explicit stop or a new session. */
+    val stopReason: String? = null,
+    /** API 29+. Null on older releases, where the platform does not expose the toggle. */
+    val isAlwaysOn: Boolean? = null,
+    /** API 29+. Null on older releases. True means "Block connections without VPN". */
+    val isLockdownEnabled: Boolean? = null,
 )
 
 open class XrayVpnService : VpnService() {
@@ -579,6 +624,8 @@ open class XrayVpnService : VpnService() {
     // Set by onDestroy before the workers shut down; a late start worker must not recreate them.
     @Volatile
     private var destroyed = false
+    @Volatile
+    private var stopReason: String? = null
     private val runtimeGeneration = AtomicLong()
     private val fatalTunErrors = AtomicLong()
 
@@ -846,6 +893,8 @@ open class XrayVpnService : VpnService() {
                 session.shutdown()
                 return XrayTunnelStartOutcome.Cancelled
             } else {
+                // A session that actually came up is not the revoked one.
+                stopReason = null
                 return XrayTunnelStartOutcome.Started(session)
             }
         } catch (error: Throwable) {
@@ -917,6 +966,12 @@ open class XrayVpnService : VpnService() {
     protected open fun onXrayTunnelFatalError(error: Throwable) = Unit
 
     /**
+     * Called after the tunnel has been torn down for a reason other than [stopXrayTunnel].
+     * Revocation passes `"revoked"`. An explicit stop does not call this.
+     */
+    protected open fun onXrayTunnelStopped(reason: String) = Unit
+
+    /**
      * Returns a read-only snapshot suitable for host telemetry and physical-device reports.
      * A concurrent stop may make the native counters temporarily unavailable; callers should
      * sample again rather than treating a null [XrayVpnRuntimeSnapshot.tunStats] as a reset.
@@ -927,13 +982,53 @@ open class XrayVpnService : VpnService() {
         val activeConnections = session?.let {
             runCatching { it.core.connectionSnapshot().connections.size }.getOrDefault(0)
         } ?: 0
+        val lockdown = currentLockdownStatus()
         return XrayVpnRuntimeSnapshot(
             running = session != null && stats != null,
             runtimeGeneration = session?.runtimeGeneration ?: runtimeGeneration.get(),
             tunStats = stats,
             activeConnections = activeConnections,
             fatalTunErrors = fatalTunErrors.get(),
+            stopReason = stopReason,
+            isAlwaysOn = lockdown.isAlwaysOn,
+            isLockdownEnabled = lockdown.isLockdownEnabled,
         )
+    }
+
+    private fun currentLockdownStatus(): XrayVpnLockdownStatus =
+        if (Build.VERSION.SDK_INT < 29) {
+            xrayVpnLockdownStatus(
+                sdkInt = Build.VERSION.SDK_INT,
+                isAlwaysOn = false,
+                isLockdownEnabled = false,
+            )
+        } else {
+            xrayVpnLockdownStatus(
+                sdkInt = Build.VERSION.SDK_INT,
+                isAlwaysOn = isAlwaysOn,
+                isLockdownEnabled = isLockdownEnabled,
+            )
+        }
+
+    /**
+     * Android has already torn the VPN interface down. Stop the core the same way an explicit
+     * [stopXrayTunnel] does, then tell the host the reason was revocation. [VpnService.onRevoke]
+     * still runs so the service stops itself.
+     */
+    override fun onRevoke() {
+        try {
+            handleXrayVpnRevoke(
+                stop = this::stopXrayTunnel,
+                report = this::reportXrayVpnStopReason,
+            )
+        } finally {
+            super.onRevoke()
+        }
+    }
+
+    private fun reportXrayVpnStopReason(reason: String) {
+        stopReason = reason
+        runCatching { onXrayTunnelStopped(reason) }
     }
 
     /**

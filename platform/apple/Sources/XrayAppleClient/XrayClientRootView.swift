@@ -41,6 +41,9 @@ public struct XrayClientRootView: View {
             Form {
                 connectionSection
                 profileSection
+                #if os(iOS) || os(macOS)
+                killSwitchSection
+                #endif
                 XrayDNSTestSettingsView(
                     mode: $viewModel.profile.dnsTestMode,
                     transport: $viewModel.profile.dnsTestTransport,
@@ -168,6 +171,16 @@ public struct XrayClientRootView: View {
             }
         }
     }
+
+    #if os(iOS) || os(macOS)
+    private var killSwitchSection: some View {
+        Section("Kill Switch") {
+            Toggle("Include All Networks", isOn: $viewModel.profile.includeAllNetworks)
+            Toggle("Exclude Local Networks", isOn: $viewModel.profile.excludeLocalNetworks)
+                .disabled(!viewModel.profile.includeAllNetworks)
+        }
+    }
+    #endif
 
     private var regionalRoutingSection: some View {
         Section("Regional Routing") {

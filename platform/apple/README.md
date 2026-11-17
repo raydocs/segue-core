@@ -518,6 +518,31 @@ Prebuilt, versioned XCFramework releases for remote Swift Package Manager
 integration are published from
 [`xray-rust-mobile`](https://github.com/aimalygin/xray-rust-mobile).
 
+## Kill switch
+
+Opt-in, and off by default. `XrayClientProfile.includeAllNetworks` is carried in
+the provider configuration (`includeAllNetworks`) and in start options
+(`xrayIncludeAllNetworks`) the same way the other provider options are.
+`excludeLocalNetworks` travels beside it and defaults to true. While the
+setting is off, `NetworkExtensionTunnelController` does not assign
+`includeAllNetworks`, `excludeLocalNetworks`, `excludeAPNs`,
+`excludeCellularServices` or `enforceRoutes`, so a saved protocol keeps the
+system defaults.
+
+While it is on, the controller sets those flags on the
+`NETunnelProviderProtocol` it saves (not in the packet tunnel provider):
+
+- `includeAllNetworks = true`
+- `excludeLocalNetworks` from the profile (default true, so LAN stays outside)
+- `excludeAPNs = true` and `excludeCellularServices = true` on iOS 16.4+ and
+  macOS 13.3+, so push notifications and carrier services are not dropped
+- `enforceRoutes = true` on iOS and macOS
+
+tvOS has none of these properties (`includeAllNetworks` is unavailable), so the
+setting is stored and otherwise ignored there. This is not a lockdown that
+survives quit or reboot: when the tunnel is down, the system stops enforcing
+it. Turning it on does not enable on-demand rules.
+
 ## Current limits
 
 - The local package in this repository expects a locally built XCFramework;

@@ -587,12 +587,11 @@ public final class NetworkExtensionTunnelController: XrayClientTunnelControlling
         let tunnelProtocol = NETunnelProviderProtocol()
         tunnelProtocol.providerBundleIdentifier = profile.providerBundleIdentifier
         tunnelProtocol.serverAddress = profile.serverAddress
-        tunnelProtocol.providerConfiguration = [
-            XrayTunnelProviderMessage.providerConfigReferenceKey: configReference,
-            XrayTunnelProviderMessage.providerDebugLoggingKey: profile.debugLoggingEnabled,
-            XrayTunnelProviderMessage.providerUseTunFileDescriptorKey: profile.useTunFileDescriptor,
-            XrayTunnelProviderMessage.providerTunRuntimeProfileKey: profile.tunRuntimeProfile.rawValue,
-        ]
+        tunnelProtocol.providerConfiguration = Self.providerConfiguration(
+            for: profile,
+            configReference: configReference
+        )
+        Self.applyKillSwitch(to: tunnelProtocol, profile: profile)
 
         manager.localizedDescription = managerDescription
         manager.protocolConfiguration = tunnelProtocol
@@ -600,7 +599,7 @@ public final class NetworkExtensionTunnelController: XrayClientTunnelControlling
 
         XrayAppleLog.info(
             "TunnelController",
-            "Saving preferences description=\(managerDescription) provider=\(profile.providerBundleIdentifier) server=\(profile.serverAddress) debugLogging=\(profile.debugLoggingEnabled) useTunFileDescriptor=\(profile.useTunFileDescriptor) tunRuntimeProfile=\(profile.tunRuntimeProfile.rawValue)"
+            "Saving preferences description=\(managerDescription) provider=\(profile.providerBundleIdentifier) server=\(profile.serverAddress) debugLogging=\(profile.debugLoggingEnabled) useTunFileDescriptor=\(profile.useTunFileDescriptor) tunRuntimeProfile=\(profile.tunRuntimeProfile.rawValue) includeAllNetworks=\(profile.includeAllNetworks) excludeLocalNetworks=\(profile.excludeLocalNetworks)"
         )
         try await manager.saveToPreferencesAsync()
         XrayAppleLog.info("TunnelController", "Saved preferences; reloading")
@@ -638,6 +637,49 @@ public final class NetworkExtensionTunnelController: XrayClientTunnelControlling
         ] as? String
     }
 
+    static func providerConfiguration(
+        for profile: XrayClientProfile,
+        configReference: String
+    ) -> [String: Any] {
+        [
+            XrayTunnelProviderMessage.providerConfigReferenceKey: configReference,
+            XrayTunnelProviderMessage.providerDebugLoggingKey: profile.debugLoggingEnabled,
+            XrayTunnelProviderMessage.providerUseTunFileDescriptorKey: profile.useTunFileDescriptor,
+            XrayTunnelProviderMessage.providerTunRuntimeProfileKey: profile.tunRuntimeProfile.rawValue,
+            XrayTunnelProviderMessage.providerIncludeAllNetworksKey: profile.includeAllNetworks,
+            XrayTunnelProviderMessage.providerExcludeLocalNetworksKey: profile.excludeLocalNetworks,
+        ]
+    }
+
+    /// Writes the OS kill-switch flags onto the protocol the client saves.
+    /// Off is a no-op so an existing configuration stays byte-identical: the
+    /// properties are not assigned `false`. On routes every packet into the
+    /// tunnel (`includeAllNetworks`, `enforceRoutes`) while keeping LAN,
+    /// APNs and cellular services outside it. Those exclusions are what keep
+    /// notifications and carrier features working; `includeAllNetworks` drops
+    /// them otherwise. tvOS has none of these properties.
+    static func applyKillSwitch(
+        to tunnelProtocol: NETunnelProviderProtocol,
+        profile: XrayClientProfile
+    ) {
+        guard profile.includeAllNetworks else {
+            return
+        }
+        #if os(iOS) || os(macOS)
+        tunnelProtocol.includeAllNetworks = true
+        tunnelProtocol.excludeLocalNetworks = profile.excludeLocalNetworks
+        if #available(iOS 16.4, macOS 13.3, *) {
+            tunnelProtocol.excludeAPNs = true
+            tunnelProtocol.excludeCellularServices = true
+        }
+        if #available(iOS 14.2, macOS 11.0, *) {
+            tunnelProtocol.enforceRoutes = true
+        }
+        #else
+        _ = profile.excludeLocalNetworks
+        #endif
+    }
+
     static func startTunnelOptions(
         for profile: XrayClientProfile,
         configReference: String
@@ -653,6 +695,12 @@ public final class NetworkExtensionTunnelController: XrayClientTunnelControlling
             XrayTunnelProviderMessage.tunRuntimeProfileOptionKey: profile
                 .tunRuntimeProfile
                 .rawValue as NSString,
+            XrayTunnelProviderMessage.includeAllNetworksOptionKey: NSNumber(
+                value: profile.includeAllNetworks
+            ),
+            XrayTunnelProviderMessage.excludeLocalNetworksOptionKey: NSNumber(
+                value: profile.excludeLocalNetworks
+            ),
         ]
     }
 

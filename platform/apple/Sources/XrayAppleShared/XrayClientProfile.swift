@@ -466,6 +466,10 @@ public struct XrayClientProfile: Codable, Equatable, Identifiable, Sendable {
     public var dnsTestUpstream: String
     public var regionalRoutingMode: XrayRegionalRoutingMode
     public var regionalRoutingRegions: [XrayRegionalRoutingRegion]
+    /// Opt-in OS kill switch. Off leaves `NETunnelProviderProtocol` routing flags unset.
+    public var includeAllNetworks: Bool
+    /// Applied only while `includeAllNetworks` is on. Defaults to keeping LAN traffic outside the tunnel.
+    public var excludeLocalNetworks: Bool
 
     public init(
         id: UUID = UUID(),
@@ -480,7 +484,9 @@ public struct XrayClientProfile: Codable, Equatable, Identifiable, Sendable {
         regionalRoutingRegions: [XrayRegionalRoutingRegion] = [],
         dnsTestMode: XrayClientDNSTestMode = .configuration,
         dnsTestTransport: XrayClientDNSTestTransport = .classic,
-        dnsTestUpstream: String = ""
+        dnsTestUpstream: String = "",
+        includeAllNetworks: Bool = false,
+        excludeLocalNetworks: Bool = true
     ) {
         self.id = id
         self.name = name
@@ -495,6 +501,8 @@ public struct XrayClientProfile: Codable, Equatable, Identifiable, Sendable {
         self.dnsTestMode = dnsTestMode
         self.dnsTestTransport = dnsTestTransport
         self.dnsTestUpstream = dnsTestUpstream
+        self.includeAllNetworks = includeAllNetworks
+        self.excludeLocalNetworks = excludeLocalNetworks
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -511,6 +519,8 @@ public struct XrayClientProfile: Codable, Equatable, Identifiable, Sendable {
         case dnsTestUpstream
         case regionalRoutingMode
         case regionalRoutingRegions
+        case includeAllNetworks
+        case excludeLocalNetworks
     }
 
     public init(from decoder: Decoder) throws {
@@ -557,6 +567,14 @@ public struct XrayClientProfile: Codable, Equatable, Identifiable, Sendable {
                 forKey: .regionalRoutingRegions
             ) ?? []
         )
+        includeAllNetworks = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .includeAllNetworks
+        ) ?? false
+        excludeLocalNetworks = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .excludeLocalNetworks
+        ) ?? true
     }
 
     public static func defaultProfile(

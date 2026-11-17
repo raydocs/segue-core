@@ -21,6 +21,10 @@ public enum XrayTunnelProviderMessage {
     public static let providerDNSServersKey = "dnsServers"
     public static let providerGeodataAppGroupIdentifierKey = "geodataAppGroupIdentifier"
     public static let providerGeodataRelativeDirectoryKey = "geodataRelativeDirectory"
+    public static let includeAllNetworksOptionKey = "xrayIncludeAllNetworks"
+    public static let excludeLocalNetworksOptionKey = "xrayExcludeLocalNetworks"
+    public static let providerIncludeAllNetworksKey = "includeAllNetworks"
+    public static let providerExcludeLocalNetworksKey = "excludeLocalNetworks"
     public static let statsRequest = "stats"
     public static let closeConnectionsRequest = "close-connections"
 #if DEBUG
