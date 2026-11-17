@@ -2,6 +2,7 @@
 
 use std::{io, net::SocketAddr, time::Duration};
 
+use hmac::KeyInit;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{
     io::{self as tokio_io, AsyncReadExt, AsyncWriteExt},
@@ -208,7 +209,7 @@ async fn relay(
                     assert_eq!(&frame[TLS_HMAC_HEADER_LEN..], REQUEST);
                     break;
                 }
-                let mut handshake = <Sha1Hmac as Mac>::new_from_slice(PASSWORD).unwrap();
+                let mut handshake = <Sha1Hmac as KeyInit>::new_from_slice(PASSWORD).unwrap();
                 handshake.update(&random);
                 handshake.update(&frame[TLS_HMAC_HEADER_LEN..]);
                 let expected = handshake.finalize().into_bytes()[..HMAC_LEN].to_vec();
@@ -221,7 +222,7 @@ async fn relay(
         io::Result::Ok(())
     });
 
-    let mut handshake = <Sha1Hmac as Mac>::new_from_slice(PASSWORD).unwrap();
+    let mut handshake = <Sha1Hmac as KeyInit>::new_from_slice(PASSWORD).unwrap();
     handshake.update(&random);
     let xor_key = xor_wrap_key(PASSWORD, &random);
     let mut next = record(&mut upstream_read).await?;

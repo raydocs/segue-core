@@ -17,7 +17,7 @@ use std::{
 };
 
 use bytes::{Buf, BytesMut};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rand::{rngs::OsRng, RngCore};
 use rustls::{
     client::{
@@ -234,7 +234,7 @@ fn seal_session_id(
     }
     let mut session_id = [0u8; TLS_SESSION_ID_LEN];
     session_id[..TLS_SESSION_ID_LEN - HMAC_LEN].copy_from_slice(&random);
-    let mut hmac = <Sha1Hmac as Mac>::new_from_slice(password)
+    let mut hmac = <Sha1Hmac as KeyInit>::new_from_slice(password)
         .map_err(|_| "ShadowTLS password could not initialize HMAC")?;
     hmac.update(&hello[..CLIENT_HELLO_SESSION_ID_START]);
     hmac.update(&session_id);
@@ -257,7 +257,7 @@ fn client_hello_tag_valid(password: &[u8], record: &[u8]) -> bool {
     {
         return false;
     }
-    let mut hmac = match <Sha1Hmac as Mac>::new_from_slice(password) {
+    let mut hmac = match <Sha1Hmac as KeyInit>::new_from_slice(password) {
         Ok(hmac) => hmac,
         Err(_) => return false,
     };
@@ -345,7 +345,7 @@ struct FrameMac {
 
 impl FrameMac {
     fn new(password: &[u8], server_random: &[u8; 32], direction: u8) -> Self {
-        let mut inner = <Sha1Hmac as Mac>::new_from_slice(password)
+        let mut inner = <Sha1Hmac as KeyInit>::new_from_slice(password)
             .expect("HMAC-SHA1 accepts a key of every length");
         inner.update(server_random);
         inner.update(&[direction]);
@@ -553,7 +553,7 @@ impl HandshakeRelay {
         if record[0] == HANDSHAKE {
             if self.handshake_mac.is_none() {
                 if let Some(random) = server_random(&record) {
-                    let mut mac = <Sha1Hmac as Mac>::new_from_slice(self.password.as_bytes())
+                    let mut mac = <Sha1Hmac as KeyInit>::new_from_slice(self.password.as_bytes())
                         .expect("HMAC-SHA1 accepts every key length");
                     mac.update(&random);
                     self.xor_key = Some(xor_wrap_key(self.password.as_bytes(), &random));
