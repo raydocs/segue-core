@@ -94,6 +94,44 @@ struct ConnectionEntry {
     close: watch::Sender<bool>,
     host_close_requested: bool,
     traffic: Arc<ConnectionTraffic>,
+    /// The byte counters and time last seen moving, for the memory watchdog's
+    /// idle test. It is updated only when the watchdog looks, so the relay
+    /// path pays nothing for it.
+    idle_mark: IdleMark,
+}
+
+/// What the watchdog last saw of a connection's traffic.
+#[derive(Debug, Clone, Copy)]
+struct IdleMark {
+    uplink_bytes: u64,
+    downlink_bytes: u64,
+    /// When the counters last differed from these. `None` until the watchdog
+    /// has looked once, so a connection that opened long ago and is still
+    /// moving data is not mistaken for an idle one on the first pass.
+    changed_unix_ms: Option<u64>,
+}
+
+/// What one shedding pass may close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShedRequest {
+    /// The current time, so the caller controls the clock.
+    pub(crate) now_unix_ms: u64,
+    /// How long a connection must have relayed nothing to count as idle.
+    pub(crate) idle_after_ms: u64,
+    /// The most connections to close in this pass.
+    pub(crate) max_connections: usize,
+    /// Whether connections that are still moving data may be closed too. The
+    /// watchdog sets this only above the hard limit.
+    pub(crate) include_active: bool,
+}
+
+/// What one shedding pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ShedOutcome {
+    /// Connections asked to close.
+    pub(crate) closed: usize,
+    /// Idle connections left open because the pass hit its cap.
+    pub(crate) remaining: usize,
 }
 
 #[derive(Debug, Default)]
@@ -198,6 +236,70 @@ impl ConnectionRegistry {
         Ok(close.1)
     }
 
+    /// Asks the oldest idle connections to close, for the memory watchdog.
+    ///
+    /// A connection is idle when neither byte counter has moved since the
+    /// previous pass and it has been quiet for `idle_after_ms`. Idle
+    /// connections are closed oldest first, up to `max_connections`; a
+    /// connection that is still moving data is closed only when
+    /// `include_active` is set, which the watchdog does above the hard limit.
+    /// These closes are not host closes, so they do not count in
+    /// `host_closed_connections`.
+    pub(crate) fn shed_idle(&self, request: ShedRequest) -> ShedOutcome {
+        let mut closes = Vec::new();
+        let mut outcome = ShedOutcome::default();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut candidates = Vec::new();
+            for (id, entry) in state.active.iter_mut() {
+                let uplink = entry.traffic.uplink_bytes.load(Ordering::Acquire);
+                let downlink = entry.traffic.downlink_bytes.load(Ordering::Acquire);
+                let mark = &mut entry.idle_mark;
+                if mark.uplink_bytes != uplink || mark.downlink_bytes != downlink {
+                    mark.uplink_bytes = uplink;
+                    mark.downlink_bytes = downlink;
+                    mark.changed_unix_ms = Some(request.now_unix_ms);
+                } else if mark.changed_unix_ms.is_none() {
+                    // The first look at a connection that has relayed nothing
+                    // yet: it has been idle since it opened. One that has
+                    // relayed bytes before this pass is quiet only from now
+                    // on, because when it last moved is not known.
+                    mark.changed_unix_ms = Some(if uplink == 0 && downlink == 0 {
+                        entry.info.started_unix_ms
+                    } else {
+                        request.now_unix_ms
+                    });
+                }
+                let quiet_ms = mark
+                    .changed_unix_ms
+                    .map_or(0, |changed| request.now_unix_ms.saturating_sub(changed));
+                if quiet_ms >= request.idle_after_ms || request.include_active {
+                    candidates.push((entry.info.started_unix_ms, *id));
+                }
+            }
+            // Oldest first, so the connections that have been open longest
+            // and are least likely to be missed go first.
+            candidates.sort_unstable();
+            for (_, id) in candidates.iter().take(request.max_connections) {
+                if let Some(entry) = state.active.get(id) {
+                    closes.push(entry.close.clone());
+                }
+            }
+            outcome.closed = closes.len();
+            outcome.remaining = candidates.len().saturating_sub(closes.len());
+            if !closes.is_empty() {
+                state.revision = state.revision.saturating_add(1);
+            }
+        }
+        for close in closes {
+            let _ = close.send(true);
+        }
+        outcome
+    }
+
     pub(crate) fn register(
         self: &Arc<Self>,
         inbound_tag: Option<String>,
@@ -212,6 +314,7 @@ impl ConnectionRegistry {
         };
         let (close, close_receiver) = watch::channel(false);
         let traffic = Arc::new(ConnectionTraffic::default());
+        let started_unix_ms = unix_millis();
         let info = ConnectionInfo {
             id,
             state: ConnectionState::Opening,
@@ -219,7 +322,7 @@ impl ConnectionRegistry {
             outbound_tag: outbound_tag.clone(),
             network: target.network,
             target,
-            started_unix_ms: unix_millis(),
+            started_unix_ms,
         };
         let mut state = self
             .state
@@ -232,6 +335,11 @@ impl ConnectionRegistry {
                 close,
                 host_close_requested: false,
                 traffic: Arc::clone(&traffic),
+                idle_mark: IdleMark {
+                    uplink_bytes: 0,
+                    downlink_bytes: 0,
+                    changed_unix_ms: None,
+                },
             },
         );
         let accounting = state
@@ -337,7 +445,7 @@ impl Drop for ConnectionLease {
     }
 }
 
-fn unix_millis() -> u64 {
+pub(crate) fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -363,7 +471,9 @@ mod tests {
 
     use segue_routing::{Network, Target, TargetAddr};
 
-    use super::{ConnectionCloseError, ConnectionRegistry, ConnectionState};
+    use super::{
+        unix_millis, ConnectionCloseError, ConnectionRegistry, ConnectionState, ShedRequest,
+    };
 
     fn target() -> Target {
         Target::new(
@@ -498,5 +608,98 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(totals, [(3, 0, 0, 0), (0, 7, 0, 0), (11, 120, 0, 0)]);
+    }
+
+    fn shed_request(now_unix_ms: u64, max_connections: usize) -> ShedRequest {
+        ShedRequest {
+            now_unix_ms,
+            idle_after_ms: 30_000,
+            max_connections,
+            include_active: false,
+        }
+    }
+
+    #[test]
+    fn shedding_closes_the_oldest_idle_connections_first() {
+        let registry = Arc::new(ConnectionRegistry::new());
+        let oldest = registry.register(None, None, target());
+        let middle = registry.register(None, None, target());
+        let newest = registry.register(None, None, target());
+        let (oldest_close, middle_close, newest_close) = (
+            oldest.close_receiver(),
+            middle.close_receiver(),
+            newest.close_receiver(),
+        );
+        // The registry stamps `started_unix_ms` from the wall clock, so the
+        // order is the registration order; the pass runs well after it.
+        let now = unix_millis() + 60_000;
+
+        let outcome = registry.shed_idle(shed_request(now, 2));
+
+        assert_eq!(outcome.closed, 2);
+        assert_eq!(outcome.remaining, 1);
+        assert!(oldest_close.has_changed().unwrap());
+        assert!(middle_close.has_changed().unwrap());
+        assert!(!newest_close.has_changed().unwrap());
+        // Shedding is not a host close.
+        drop((oldest, middle, newest));
+        let accounting = registry.accounting_snapshot();
+        assert_eq!(accounting.outbounds[0].host_closed_connections, 0);
+    }
+
+    #[test]
+    fn shedding_skips_connections_that_are_still_moving_data() {
+        let registry = Arc::new(ConnectionRegistry::new());
+        let busy = registry.register(None, None, target());
+        let quiet = registry.register(None, None, target());
+        let (busy_close, quiet_close) = (busy.close_receiver(), quiet.close_receiver());
+        // Both opened before this moment, so the quiet one's clock runs from
+        // its open time.
+        let now = unix_millis() + 60_000;
+
+        // The first pass only marks them; it closes none because the cap is
+        // zero.
+        assert_eq!(registry.shed_idle(shed_request(now, 0)).closed, 0);
+        // The busy one relays between passes, which skips it in the next one.
+        busy.traffic.record_uplink(1);
+
+        let outcome = registry.shed_idle(shed_request(now + 1_000, 8));
+
+        assert_eq!(outcome.closed, 1);
+        assert!(quiet_close.has_changed().unwrap());
+        assert!(!busy_close.has_changed().unwrap());
+    }
+
+    #[test]
+    fn above_the_hard_limit_active_connections_are_shed_too() {
+        let registry = Arc::new(ConnectionRegistry::new());
+        let busy = registry.register(None, None, target());
+        let close = busy.close_receiver();
+        let now = unix_millis() + 60_000;
+        assert_eq!(registry.shed_idle(shed_request(now, 0)).closed, 0);
+        busy.traffic.record_downlink(1);
+
+        let outcome = registry.shed_idle(ShedRequest {
+            include_active: true,
+            ..shed_request(now + 1_000, 8)
+        });
+
+        assert_eq!(outcome.closed, 1);
+        assert!(close.has_changed().unwrap());
+    }
+
+    #[test]
+    fn a_shedding_pass_advances_the_revision_only_when_it_closes() {
+        let registry = Arc::new(ConnectionRegistry::new());
+        let lease = registry.register(None, None, target());
+        let now = unix_millis() + 60_000;
+        let revision = registry.snapshot().revision;
+
+        assert_eq!(registry.shed_idle(shed_request(now, 0)).closed, 0);
+        assert_eq!(registry.snapshot().revision, revision);
+
+        assert_eq!(registry.shed_idle(shed_request(now, 8)).closed, 1);
+        assert!(registry.snapshot().revision > revision);
+        drop(lease);
     }
 }

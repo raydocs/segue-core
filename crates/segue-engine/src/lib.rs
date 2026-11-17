@@ -32,6 +32,7 @@ mod fake_dns;
 mod health;
 mod http;
 mod http_forward;
+mod memory_watch;
 mod outbound;
 mod policy;
 mod reverse;
@@ -97,6 +98,12 @@ pub struct TunRuntimeOptions {
     /// MTU of the host's TUN interface. The host must give the interface the
     /// same value (`VpnService.Builder.setMtu`, `NEPacketTunnelNetworkSettings.mtu`).
     pub mtu: TunMtu,
+    /// The process memory budget the platform kills the extension for
+    /// exceeding, in bytes: 50 MiB on iOS. When set, a watchdog samples the
+    /// process footprint about once a second and sheds idle connections and
+    /// pooled relay buffers as it approaches the limit. `None` (the default)
+    /// starts no watchdog.
+    pub memory_limit: Option<u64>,
 }
 
 /// MTU of the TUN link, validated to [`TunMtu::MIN`]..=[`TunMtu::MAX`].
@@ -1517,6 +1524,16 @@ impl Core {
             ) {
                 tasks.push(task);
             }
+        }
+        // Only a host that set a memory limit gets a watchdog; without one no
+        // task is spawned and nothing is sampled.
+        if let Some(task) = memory_watch::spawn_memory_watchdog(
+            Arc::clone(&self.connection_registry),
+            self.tun_runtime_options.memory_limit,
+            self.runtime_logger.clone(),
+            self.shutdown.subscribe(),
+        ) {
+            tasks.push(task);
         }
 
         self.runtime = Some(RuntimeState {

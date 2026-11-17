@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use crate::connection::ConnectionTraffic;
 
 mod relay_buffer;
+pub(crate) use relay_buffer::release_idle_relay_buffers;
 #[cfg(target_os = "linux")]
 mod splice;
 mod split_relay;
