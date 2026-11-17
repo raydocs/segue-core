@@ -5,11 +5,26 @@
 //! every state except a user disconnect. The type is pure state; the shell
 //! that owns the tunnel interface reads [`KillSwitch::hold_tunnel`].
 //!
+//! The dialer and the SOCKS/TUN admission ask [`KillSwitch::verdict`] (or
+//! [`decide`] for the aggregate posture). [`Verdict::Wait`] holds a TCP flow
+//! ([`wait_out`]) until the posture changes or [`WAIT_DEADLINE`] passes, and
+//! then the caller refuses it the same way it refuses a failed dial. UDP is
+//! not held: see [`admission`].
+//!
 //! The invariant is structural: [`KillSwitch::verdict`] for a proxied
 //! action can only return [`Verdict::Proxy`], [`Verdict::Refuse`] or
 //! [`Verdict::Wait`]; no state maps it to [`Verdict::Direct`].
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::rules::Action;
+
+/// `exit_class` of an overseas session route (`session::EXIT_OVERSEAS`).
+const EXIT_CLASS_OVERSEAS: u8 = 0;
+/// `exit_class` of an AI / home session route (`session::EXIT_AI`).
+const EXIT_CLASS_AI: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Posture {
@@ -33,6 +48,34 @@ pub enum Protection {
     /// Overseas routes: may wait for a reconnect (§7) before refusing.
     Wait,
 }
+
+/// Protection for a session route's `exit_class`.
+///
+/// AI is [`Protection::Strict`]. Overseas is [`Protection::Wait`]. Any other
+/// class is not a documented waitable route (the protocol only has those two),
+/// so it fails closed as Strict: a proxied flow is refused rather than sent
+/// direct or held.
+pub fn protection_for_exit_class(exit_class: u8) -> Protection {
+    match exit_class {
+        EXIT_CLASS_OVERSEAS => Protection::Wait,
+        EXIT_CLASS_AI => Protection::Strict,
+        _ => Protection::Strict,
+    }
+}
+
+/// How long one TCP flow may sit in [`Verdict::Wait`] before it is refused
+/// the same way a failed dial is refused. One carrier dial is 10s; this is
+/// that long plus a small margin, so a reconnect that succeeds on the next
+/// attempt still delivers the flow, and one that does not does not pin the
+/// accepted flow any longer than that.
+pub const WAIT_DEADLINE: Duration = Duration::from_secs(12);
+
+/// Most TCP flows held in [`Verdict::Wait`] at once. A reconnect burst past
+/// this is refused immediately, so the wait queue cannot grow with SYNs.
+pub const WAIT_CAP: usize = 64;
+
+/// How often a held flow re-reads the posture.
+const WAIT_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -107,35 +150,141 @@ impl KillSwitch {
 
     /// What to do with a new flow whose rule matched `action`.
     pub fn verdict(&self, action: &Action, protection: Protection) -> Verdict {
-        match action {
-            Action::Reject => {
-                if self.posture == Posture::Disconnected {
-                    Verdict::Release
-                } else {
-                    Verdict::Refuse
-                }
+        decide(self.posture, action, protection)
+    }
+}
+
+/// [`KillSwitch::verdict`] for an explicit posture. Admission uses the
+/// aggregate posture (user off, device revoked), which is not always one
+/// exit's own switch.
+pub fn decide(posture: Posture, action: &Action, protection: Protection) -> Verdict {
+    match action {
+        Action::Reject => {
+            if posture == Posture::Disconnected {
+                Verdict::Release
+            } else {
+                Verdict::Refuse
             }
-            // Domestic direct keeps working in every state (L1).
-            Action::Direct => {
-                if self.posture == Posture::Disconnected {
-                    Verdict::Release
-                } else {
-                    Verdict::Direct
-                }
+        }
+        // Domestic direct keeps working in every state (L1).
+        Action::Direct => {
+            if posture == Posture::Disconnected {
+                Verdict::Release
+            } else {
+                Verdict::Direct
             }
-            Action::Proxy(tag) => match (self.posture, protection) {
-                (Posture::Connected, _) => Verdict::Proxy(tag.clone()),
-                // Segue is off: the flow never reaches the kernel.
-                (Posture::Disconnected, _) => Verdict::Release,
-                (Posture::Connecting | Posture::Reconnecting, Protection::Wait) => Verdict::Wait,
-                _ => Verdict::Refuse,
-            },
+        }
+        Action::Proxy(tag) => match (posture, protection) {
+            (Posture::Connected, _) => Verdict::Proxy(tag.clone()),
+            // Segue is off: the flow never reaches the kernel.
+            (Posture::Disconnected, _) => Verdict::Release,
+            (Posture::Connecting | Posture::Reconnecting, Protection::Wait) => Verdict::Wait,
+            _ => Verdict::Refuse,
+        },
+    }
+}
+
+/// What admission should do with [`decide`]'s answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// Dial now.
+    Proceed,
+    /// RST, drop, or a SOCKS refusal, the same as a failed dial today.
+    Refuse,
+    /// TCP only: hold one [`HoldGuard`] until [`wait_out`] returns.
+    Hold,
+}
+
+/// Map a verdict onto admission.
+///
+/// UDP is never held. A datagram flow has no handshake the application is
+/// blocked on, and queueing datagrams until the tunnel returns would pin
+/// memory for a flow most apps have already abandoned (they time out and
+/// retry). [`Verdict::Wait`] on UDP is a refusal, the same as a down strict
+/// route. [`Verdict::Release`] of a direct flow still proceeds: domestic
+/// direct is dialled as before, and the shell is what stops capturing when
+/// the user disconnects. A released proxy or reject is refused.
+pub fn admission(verdict: Verdict, action: &Action, udp: bool) -> Admission {
+    match verdict {
+        Verdict::Proxy(_) | Verdict::Direct => Admission::Proceed,
+        Verdict::Release => match action {
+            Action::Direct => Admission::Proceed,
+            _ => Admission::Refuse,
+        },
+        Verdict::Wait if udp => Admission::Refuse,
+        Verdict::Wait => Admission::Hold,
+        Verdict::Refuse => Admission::Refuse,
+    }
+}
+
+/// One held TCP flow, counting against [`WAIT_CAP`]. Dropped when the wait
+/// ends (dial, refuse, or the flow is gone).
+pub struct HoldGuard {
+    count: Arc<AtomicUsize>,
+}
+
+impl HoldGuard {
+    /// `None` when `cap` flows are already held.
+    pub fn try_acquire(count: &Arc<AtomicUsize>, cap: usize) -> Option<Self> {
+        let mut cur = count.load(Ordering::Relaxed);
+        loop {
+            if cur >= cap {
+                return None;
+            }
+            match count.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        count: count.clone(),
+                    })
+                }
+                Err(observed) => cur = observed,
+            }
         }
     }
 }
 
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Re-read `current` until it is no longer [`Verdict::Wait`], or
+/// [`WAIT_DEADLINE`] has passed (then [`Verdict::Refuse`]).
+pub async fn wait_out(mut current: impl FnMut() -> Verdict) -> Verdict {
+    let deadline = tokio::time::Instant::now() + WAIT_DEADLINE;
+    loop {
+        let verdict = current();
+        if !matches!(verdict, Verdict::Wait) {
+            return verdict;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Verdict::Refuse;
+        }
+        tokio::time::sleep(WAIT_POLL).await;
+    }
+}
+
+/// Posture and per-tag protection the SOCKS/TUN front ends read. Implemented
+/// by the session dialer; absent on a kernel whose dialer has no kill switch.
+pub trait FlowPosture: Send + Sync {
+    fn posture(&self) -> Posture;
+    /// `None`: `tag` is not a session route (an engine outbound).
+    fn protection(&self, tag: &str) -> Option<Protection>;
+    fn try_hold(&self) -> Option<HoldGuard>;
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use super::*;
 
     const ALL: [Posture; 5] = [
@@ -229,5 +378,105 @@ mod tests {
             "stays off until the user connects"
         );
         assert_eq!(k.on_event(Event::UserConnect), Posture::Connecting);
+    }
+
+    #[test]
+    fn protection_follows_exit_class() {
+        use crate::session::{EXIT_AI, EXIT_OVERSEAS};
+        assert_eq!(protection_for_exit_class(EXIT_AI), Protection::Strict);
+        assert_eq!(protection_for_exit_class(EXIT_OVERSEAS), Protection::Wait);
+        // Not a documented class: fail closed, never Wait.
+        assert_eq!(protection_for_exit_class(2), Protection::Strict);
+        assert_eq!(protection_for_exit_class(255), Protection::Strict);
+        assert_eq!(EXIT_OVERSEAS, 0);
+        assert_eq!(EXIT_AI, 1);
+    }
+
+    #[test]
+    fn admission_holds_tcp_wait_and_refuses_udp() {
+        let action = Action::Proxy("overseas".into());
+        let wait = decide(Posture::Reconnecting, &action, Protection::Wait);
+        assert_eq!(wait, Verdict::Wait);
+        assert_eq!(admission(wait.clone(), &action, false), Admission::Hold);
+        assert_eq!(admission(wait, &action, true), Admission::Refuse, "UDP is not held");
+        let ai = Action::Proxy("ai".into());
+        let refused = decide(Posture::Reconnecting, &ai, Protection::Strict);
+        assert_eq!(refused, Verdict::Refuse);
+        assert_eq!(admission(refused, &ai, false), Admission::Refuse);
+        let direct = Action::Direct;
+        let released = decide(Posture::Disconnected, &direct, Protection::Wait);
+        assert_eq!(released, Verdict::Release);
+        assert_eq!(admission(released, &direct, false), Admission::Proceed);
+        let proxy = Action::Proxy("overseas".into());
+        let off = decide(Posture::Disconnected, &proxy, Protection::Wait);
+        assert_eq!(admission(off, &proxy, false), Admission::Refuse);
+    }
+
+    #[test]
+    fn hold_cap_refuses_past_the_bound() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut held = Vec::new();
+        for _ in 0..WAIT_CAP {
+            held.push(HoldGuard::try_acquire(&count, WAIT_CAP).expect("under the cap"));
+        }
+        assert!(HoldGuard::try_acquire(&count, WAIT_CAP).is_none());
+        held.pop();
+        assert!(HoldGuard::try_acquire(&count, WAIT_CAP).is_some());
+    }
+
+    #[tokio::test]
+    async fn wait_holds_until_connected_then_proxies() {
+        // Park the hold before advancing: the deadline is measured from the
+        // first poll, so the clock must not jump first.
+        tokio::time::pause();
+        let posture = Arc::new(std::sync::Mutex::new(Posture::Reconnecting));
+        let watch = posture.clone();
+        let handle = tokio::spawn(async move {
+            let action = Action::Proxy("overseas".into());
+            wait_out(|| decide(*watch.lock().unwrap(), &action, Protection::Wait)).await
+        });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(!handle.is_finished(), "overseas flow was not held");
+        tokio::time::advance(WAIT_POLL).await;
+        assert!(
+            !handle.is_finished(),
+            "held flow completed before Connected"
+        );
+        *posture.lock().unwrap() = Posture::Connected;
+        tokio::time::advance(WAIT_POLL).await;
+        let verdict = handle.await.expect("hold task");
+        assert_eq!(verdict, Verdict::Proxy("overseas".into()));
+    }
+
+    #[tokio::test]
+    async fn wait_refuses_when_the_deadline_passes() {
+        tokio::time::pause();
+        let handle = tokio::spawn(async {
+            let action = Action::Proxy("overseas".into());
+            wait_out(|| decide(Posture::Reconnecting, &action, Protection::Wait)).await
+        });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(!handle.is_finished(), "flow was not held");
+        tokio::time::advance(WAIT_DEADLINE).await;
+        let verdict = handle.await.expect("hold task");
+        assert_eq!(verdict, Verdict::Refuse);
+    }
+
+    #[tokio::test]
+    async fn ai_while_reconnecting_is_refused_immediately() {
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let verdict = wait_out(|| {
+            decide(
+                Posture::Reconnecting,
+                &Action::Proxy("ai".into()),
+                Protection::Strict,
+            )
+        })
+        .await;
+        assert_eq!(verdict, Verdict::Refuse);
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 }
