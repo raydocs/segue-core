@@ -9,6 +9,7 @@ use segue_config::{TuicCongestionControl, TuicSettings, TuicUdpRelayMode};
 use segue_proxy::tuic::{self as wire, Command, Packet};
 use segue_transport::stream::H3ConnectConfig;
 use std::collections::HashMap;
+use std::fmt;
 use std::task;
 
 use std::time::Instant;
@@ -403,12 +404,26 @@ impl TuicOutbound {
         let StreamSecurity::Tls(tls) = &config.stream.security else {
             return Err(CoreError::UnsupportedOutboundSecurity);
         };
+        let stream = &config.stream;
+        let unsupported_mask = stream.tcp_fragment.is_some()
+            || stream.tcp_header_custom.is_some()
+            || stream.tcp_sudoku.is_some()
+            || stream.tcp_xmc.is_some()
+            || stream.udp_header_custom.is_some()
+            || stream.udp_sudoku.is_some()
+            || stream.udp_xdns.is_some()
+            || stream.udp_realm.is_some()
+            || stream.udp_xicmp.is_some()
+            || stream.udp_noise.is_some()
+            || stream.udp_salamander.is_some();
         if settings.port == 0
             || settings.password.is_empty()
-            || config.stream.network != Network::Udp
+            || settings.password.len() > 4096
+            || stream.network != Network::Udp
             || config.proxy_settings.is_some()
-            || !matches!(config.stream.transport, StreamTransport::Raw)
-            || config.stream.tcp_fragment.is_some()
+            || !matches!(stream.transport, StreamTransport::Raw)
+            || unsupported_mask
+            || tls.ech_config_list.is_some()
         {
             return Err(CoreError::UnsupportedOutboundNetwork);
         }
