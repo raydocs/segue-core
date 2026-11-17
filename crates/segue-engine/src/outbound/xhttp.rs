@@ -234,21 +234,24 @@ pub(super) fn xhttp_endpoint(
         StreamSecurity::Tls(_) | StreamSecurity::Reality(_) => XhttpScheme::Https,
         StreamSecurity::ShadowTls(_) => return Err(CoreError::UnsupportedOutboundSecurity),
     };
+    // `return` here is the function's, not a closure's. Inside `Option::or_else`
+    // the same `Err` is type-checked as the closure result (`Option<&str>`).
+    let server_name = match security {
+        StreamSecurity::Tls(tls) => tls
+            .server_name
+            .as_deref()
+            .filter(|server_name| !server_name.is_empty()),
+        StreamSecurity::Reality(reality) => {
+            (!reality.server_name.is_empty()).then_some(reality.server_name.as_str())
+        }
+        StreamSecurity::None => None,
+        StreamSecurity::ShadowTls(_) => return Err(CoreError::UnsupportedOutboundSecurity),
+    };
     let authority = settings
         .host
         .as_deref()
         .filter(|host| !host.is_empty())
-        .or_else(|| match security {
-            StreamSecurity::Tls(tls) => tls
-                .server_name
-                .as_deref()
-                .filter(|server_name| !server_name.is_empty()),
-            StreamSecurity::Reality(reality) => {
-                (!reality.server_name.is_empty()).then_some(reality.server_name.as_str())
-            }
-            StreamSecurity::None => None,
-            StreamSecurity::ShadowTls(_) => return Err(CoreError::UnsupportedOutboundSecurity),
-        })
+        .or(server_name)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| xhttp_destination_authority(destination));
 
