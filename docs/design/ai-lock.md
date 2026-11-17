@@ -76,10 +76,14 @@ the product path is the signed bundle.
 **IP and SNI.** A connection whose address is in an AI CIDR, or whose
 sniffed TLS SNI (or QUIC-shaped TCP ClientHello SNI) is an AI suffix, is
 AI-class. A non-AI SNI does not pull an AI address onto another proxy.
-`sniffed_route` does this for SOCKS and TUN. No client-facing CIDR is
-shipped: Anthropic and OpenAI do not publish the addresses clients dial
-(see the TODOs in `data/ai-lock.txt`). An IP literal with no SNI and no
-CIDR is still whatever the IP rules say. That is the remaining kernel gap.
+`sniffed_route` does this for SOCKS and TUN. The built-in CIDRs are
+Anthropic's published inbound ranges only (`160.79.104.0/23`,
+`153.61.224.0/22`, `2607:6bc0::/48`). Those are Anthropic, PBC allocations,
+not a shared CDN. OpenAI, Cursor, Copilot, Gemini, and xAI are CDN- or
+cloud-fronted and have no vendor-owned destination prefix safe to ship
+(see `docs/research/ai-destinations.md`). An IP literal with no SNI and no
+matching CIDR is still whatever the IP rules say. That remains the gap for
+every CDN-fronted AI host.
 
 **DNS.** An AI name is `Class::Fake`. A is a fake IPv4. AAAA is an empty
 NOERROR: the fake-IP pool has no v6 range, so the client uses v4 through
