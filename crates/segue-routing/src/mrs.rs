@@ -703,7 +703,15 @@ mod tests {
         assert!(!matches_domain(rule, "b.baidu.com"));
         assert!(!matches_domain(rule, "a.b.c.baidu.com"));
         assert!(matches_domain(rule, "www.baidu.com"));
-        assert!(!matches_domain(rule, "www.baidu.com.cn"));
+        // `.com.cn` is the dot wildcard, which mihomo stores as `+.com.cn`
+        // (`DomainSetBuilder.insert` rewrites the empty first label to `+`) and
+        // whose `Has` returns true at the `+` node for any remaining labels
+        // (mihomo `component/trie/domain_set.go`). So a deeper name under
+        // com.cn matches too.
+        assert!(matches_domain(rule, "www.baidu.com.cn"));
+        // `www.baidu.*` is one label only, so a two-label TLD under baidu is
+        // not matched by it.
+        assert!(!matches_domain(rule, "www.baidu.co.uk"));
         assert!(matches_domain(rule, "пример.рф"));
         assert!(!matches_domain(rule, "www.пример.рф"));
         assert!(matches_domain(rule, "Mijia Cloud"));
