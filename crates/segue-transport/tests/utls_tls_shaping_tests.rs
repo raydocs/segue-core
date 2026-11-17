@@ -1267,9 +1267,8 @@ mod utls_tls_shaping_tests {
         );
         assert!(record_len <= 16_384, "{what}: record is {record_len} bytes");
         assert_eq!(hello[5], 0x01, "{what}: not a ClientHello");
-        let handshake_len = (usize::from(hello[6]) << 16)
-            | (usize::from(hello[7]) << 8)
-            | usize::from(hello[8]);
+        let handshake_len =
+            (usize::from(hello[6]) << 16) | (usize::from(hello[7]) << 8) | usize::from(hello[8]);
         assert_eq!(
             handshake_len + 4,
             record_len,
@@ -1340,21 +1339,22 @@ mod utls_tls_shaping_tests {
     fn key_share_entries(payload: &[u8], what: &str) -> Vec<(u16, usize)> {
         assert!(payload.len() >= 2, "{what}: key share extension is short");
         let list_len = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
-        assert_eq!(
-            payload.len(),
-            2 + list_len,
-            "{what}: key share list length"
-        );
+        assert_eq!(payload.len(), 2 + list_len, "{what}: key share list length");
         let mut cursor = 2;
         let end = 2 + list_len;
         let mut shares = Vec::new();
         while cursor < end {
             assert!(cursor + 4 <= end, "{what}: truncated key share");
             let group = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]);
-            let key_len =
-                usize::from(u16::from_be_bytes([payload[cursor + 2], payload[cursor + 3]]));
+            let key_len = usize::from(u16::from_be_bytes([
+                payload[cursor + 2],
+                payload[cursor + 3],
+            ]));
             cursor += 4;
-            assert!(cursor + key_len <= end, "{what}: key share {group:#06x} overruns");
+            assert!(
+                cursor + key_len <= end,
+                "{what}: key share {group:#06x} overruns"
+            );
             assert!(key_len > 0, "{what}: empty key share {group:#06x}");
             shares.push((group, key_len));
             cursor += key_len;

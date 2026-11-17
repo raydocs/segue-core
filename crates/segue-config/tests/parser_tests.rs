@@ -2061,11 +2061,9 @@ fn parses_least_ping_and_least_load_ping_tolerance() {
     let parsed = parse_xray_json(&least_ping).expect("leastPing tolerance should parse");
     assert_eq!(
         parsed.config.routing.balancers[0].strategy,
-        segue_config::RoutingBalancerStrategy::LeastPing(
-            segue_config::RoutingLeastPingSettings {
-                ping_tolerance: Some(Duration::from_millis(80)),
-            }
-        )
+        segue_config::RoutingBalancerStrategy::LeastPing(segue_config::RoutingLeastPingSettings {
+            ping_tolerance: Some(Duration::from_millis(80)),
+        })
     );
 
     let least_load = raw_with_routing(
@@ -2474,14 +2472,23 @@ fn parses_shadowtls_v3_relay_settings() {
 #[test]
 fn rejects_shadowtls_old_versions_missing_names_and_non_raw_streams() {
     for (extra, path) in [
-        (r#""password": "p", "version": 2, "serverName": "cover.example""#, "version"),
+        (
+            r#""password": "p", "version": 2, "serverName": "cover.example""#,
+            "version",
+        ),
         (r#""password": "p", "version": 3"#, "serverName"),
-        (r#""password": "p", "version": 3, "serverName": "cover.example", "fingerprint": "unsafe""#, "fingerprint"),
+        (
+            r#""password": "p", "version": 3, "serverName": "cover.example", "fingerprint": "unsafe""#,
+            "fingerprint",
+        ),
     ] {
         let raw = raw_with_stream_settings(&format!(
             r#""security": "shadowtls", "shadowtlsSettings": {{ {extra} }}"#,
         ));
-        assert_parse_error_path(&raw, &format!("$.outbounds[0].streamSettings.shadowtlsSettings.{path}"));
+        assert_parse_error_path(
+            &raw,
+            &format!("$.outbounds[0].streamSettings.shadowtlsSettings.{path}"),
+        );
     }
     let raw = raw_with_stream_settings(
         r#""network": "ws", "security": "shadowtls", "shadowtlsSettings": {

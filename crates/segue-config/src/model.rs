@@ -116,8 +116,7 @@ impl RoutingLeastPingSettings {
     pub const DEFAULT_PING_TOLERANCE: Duration = Duration::from_millis(50);
 
     pub fn effective_ping_tolerance(self) -> Duration {
-        self.ping_tolerance
-            .unwrap_or(Self::DEFAULT_PING_TOLERANCE)
+        self.ping_tolerance.unwrap_or(Self::DEFAULT_PING_TOLERANCE)
     }
 }
 

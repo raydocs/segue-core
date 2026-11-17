@@ -2797,12 +2797,7 @@ fn action_of(dial: &Dial) -> Action {
 /// `None`: refuse — the deadline passed, the posture left Wait for a
 /// refusal, or the application reset the flow. The guard is dropped either
 /// way, so the cap slot does not outlive the wait.
-async fn hold_dial(
-    ctx: &Ctx,
-    dial: Dial,
-    guard: HoldGuard,
-    up: &mpsc::Sender<Up>,
-) -> Option<Dial> {
+async fn hold_dial(ctx: &Ctx, dial: Dial, guard: HoldGuard, up: &mpsc::Sender<Up>) -> Option<Dial> {
     let action = action_of(&dial);
     let verdict = tokio::select! {
         verdict = crate::killswitch::wait_out(|| ctx.router.flow_verdict(&action)) => verdict,

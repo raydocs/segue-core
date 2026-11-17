@@ -231,12 +231,7 @@ impl HoldGuard {
             if cur >= cap {
                 return None;
             }
-            match count.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match count.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => {
                     return Some(Self {
                         count: count.clone(),
@@ -398,7 +393,11 @@ mod tests {
         let wait = decide(Posture::Reconnecting, &action, Protection::Wait);
         assert_eq!(wait, Verdict::Wait);
         assert_eq!(admission(wait.clone(), &action, false), Admission::Hold);
-        assert_eq!(admission(wait, &action, true), Admission::Refuse, "UDP is not held");
+        assert_eq!(
+            admission(wait, &action, true),
+            Admission::Refuse,
+            "UDP is not held"
+        );
         let ai = Action::Proxy("ai".into());
         let refused = decide(Posture::Reconnecting, &ai, Protection::Strict);
         assert_eq!(refused, Verdict::Refuse);

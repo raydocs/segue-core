@@ -103,9 +103,8 @@ pub(super) fn run(command: ImportCommand) -> Result<(), CliError> {
     // `import_profile` already runs the linked parser over its output.
     let result = import_profile(&bytes, format)
         .map_err(|error| CliError::ImportFailed(format!("{}: {error}", path.display())))?;
-    let json = serde_json::to_string_pretty(&result.config).map_err(|error| {
-        CliError::ImportFailed(format!("serialize converted config: {error}"))
-    })?;
+    let json = serde_json::to_string_pretty(&result.config)
+        .map_err(|error| CliError::ImportFailed(format!("serialize converted config: {error}")))?;
 
     for warning in &result.warnings {
         eprintln!("warning: {}: {}", warning.path, warning.message);

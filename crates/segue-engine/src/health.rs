@@ -157,10 +157,7 @@ pub(crate) async fn run_observatory(
 /// Today's loop. Concurrent rounds sleep `probe_interval` after the round.
 /// Sequential rounds sleep after every node inside the round, and this loop
 /// does not add another wait. Lazy mode does not call this.
-async fn run_eager_observatory(
-    runtime: ObservatoryRuntime,
-    shutdown: &mut watch::Receiver<bool>,
-) {
+async fn run_eager_observatory(runtime: ObservatoryRuntime, shutdown: &mut watch::Receiver<bool>) {
     let probe_interval = runtime.config.probe_interval;
     let concurrent = runtime.config.enable_concurrency;
     let mut rounds = RuntimeRounds {
@@ -637,13 +634,7 @@ mod tests {
         // the runtime advances time to the next sleep, which is the same cadence
         // as the historical eager loop: a round, then `probe_interval`, with no
         // touch required.
-        run_eager_schedule(
-            &mut rounds,
-            Duration::from_secs(10),
-            true,
-            &mut shutdown,
-        )
-        .await;
+        run_eager_schedule(&mut rounds, Duration::from_secs(10), true, &mut shutdown).await;
 
         let recorded = stamps_of(&stamps);
         assert_eq!(recorded.len(), 3, "got {recorded:?}");
@@ -662,13 +653,7 @@ mod tests {
             gap: None,
         };
 
-        run_eager_schedule(
-            &mut rounds,
-            Duration::from_secs(10),
-            false,
-            &mut shutdown,
-        )
-        .await;
+        run_eager_schedule(&mut rounds, Duration::from_secs(10), false, &mut shutdown).await;
 
         let recorded = stamps_of(&stamps);
         assert_eq!(recorded.len(), 3);
@@ -687,13 +672,7 @@ mod tests {
             gap: None,
         };
         let schedule = tokio::spawn(async move {
-            run_eager_schedule(
-                &mut rounds,
-                Duration::from_secs(10),
-                true,
-                &mut shutdown,
-            )
-            .await;
+            run_eager_schedule(&mut rounds, Duration::from_secs(10), true, &mut shutdown).await;
         });
 
         drain().await;

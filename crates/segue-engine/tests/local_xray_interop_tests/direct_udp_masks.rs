@@ -68,10 +68,7 @@ async fn xray(config: impl Fn(u16) -> Value) -> XrayServer {
 
 /// One start of [`xray`] on a fresh port: `None` when another socket took
 /// the port first.
-async fn try_xray(
-    checkout: &Path,
-    config: &impl Fn(u16) -> Value,
-) -> Option<XrayServer> {
+async fn try_xray(checkout: &Path, config: &impl Fn(u16) -> Value) -> Option<XrayServer> {
     let temp_dir = create_temp_dir("xray-direct-udp-masks");
     let binary = xray_vless_binary(checkout, &temp_dir);
     let config_path = temp_dir.path.join("config.json");

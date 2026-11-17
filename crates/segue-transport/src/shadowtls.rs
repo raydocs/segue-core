@@ -224,7 +224,9 @@ impl fmt::Debug for ShadowTlsHelloFinalizer {
 impl FinalizesClientHello for ShadowTlsHelloFinalizer {
     fn finalize_client_hello(&self, hello: &mut Vec<u8>) -> Result<(), RustlsError> {
         generate_session_id(self.password.as_bytes(), hello).map_err(|error| {
-            RustlsError::General(format!("ShadowTLS ClientHello authentication failed: {error}"))
+            RustlsError::General(format!(
+                "ShadowTLS ClientHello authentication failed: {error}"
+            ))
         })
     }
 }
@@ -269,8 +271,7 @@ fn client_hello_tag_valid(password: &[u8], record: &[u8]) -> bool {
     if record.len() < hmac_start + HMAC_LEN
         || record[0] != HANDSHAKE
         || record[5] != 1
-        || record[TLS_HEADER_LEN + CLIENT_HELLO_SESSION_ID_START - 1]
-            != TLS_SESSION_ID_LEN as u8
+        || record[TLS_HEADER_LEN + CLIENT_HELLO_SESSION_ID_START - 1] != TLS_SESSION_ID_LEN as u8
     {
         return false;
     }
@@ -415,13 +416,13 @@ where
         let mut scratch = [0u8; 16 * 1024];
         loop {
             if self.buffered.len() >= TLS_HEADER_LEN {
-                let payload_len = usize::from(u16::from_be_bytes([
-                    self.buffered[3],
-                    self.buffered[4],
-                ]));
+                let payload_len =
+                    usize::from(u16::from_be_bytes([self.buffered[3], self.buffered[4]]));
                 if self.buffered.len() >= TLS_HEADER_LEN + payload_len {
                     return Poll::Ready(Ok(Some(
-                        self.buffered.split_to(TLS_HEADER_LEN + payload_len).to_vec(),
+                        self.buffered
+                            .split_to(TLS_HEADER_LEN + payload_len)
+                            .to_vec(),
                     )));
                 }
             }
@@ -444,8 +445,6 @@ where
             }
         }
     }
-
-
 }
 
 fn is_handshake_dummy(record: &[u8], mac: &Sha1Hmac) -> bool {
@@ -591,7 +590,10 @@ impl HandshakeRelay {
         };
         mac.update(&record[TLS_HMAC_HEADER_LEN..]);
         let expected = mac.clone().finalize().into_bytes();
-        if !hmac_equal(&record[TLS_HEADER_LEN..TLS_HMAC_HEADER_LEN], &expected[..HMAC_LEN]) {
+        if !hmac_equal(
+            &record[TLS_HEADER_LEN..TLS_HMAC_HEADER_LEN],
+            &expected[..HMAC_LEN],
+        ) {
             return Err(Self::protocol_error("ShadowTLS handshake HMAC mismatch"));
         }
         xor_wrap(
@@ -662,7 +664,10 @@ struct ShadowTlsStream<S> {
     output_pos: usize,
 }
 
-impl<S> ShadowTlsStream<S> where S: AsyncRead + AsyncWrite + Unpin {
+impl<S> ShadowTlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     fn new(carrier: S, password: Zeroizing<String>, server_random: [u8; 32]) -> Self {
         let write_mac = FrameMac::new(password.as_bytes(), &server_random, b'C');
         let read_mac = FrameMac::new(password.as_bytes(), &server_random, b'S');
@@ -683,8 +688,7 @@ impl<S> ShadowTlsStream<S> where S: AsyncRead + AsyncWrite + Unpin {
 
     fn poll_flush_output(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.output_pos < self.output.len() {
-            match Pin::new(&mut self.records.inner)
-                .poll_write(cx, &self.output[self.output_pos..])
+            match Pin::new(&mut self.records.inner).poll_write(cx, &self.output[self.output_pos..])
             {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -725,17 +729,20 @@ impl<S> ShadowTlsStream<S> where S: AsyncRead + AsyncWrite + Unpin {
             }
         }
         match record[0] {
-            ALERT => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ShadowTLS peer alert")),
-            APPLICATION_DATA
-                if record.len() >= TLS_HMAC_HEADER_LEN && record[1..3] == [3, 3] =>
-            {
+            ALERT => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "ShadowTLS peer alert",
+            )),
+            APPLICATION_DATA if record.len() >= TLS_HMAC_HEADER_LEN && record[1..3] == [3, 3] => {
                 if self.read_mac.open(
                     &record[TLS_HMAC_HEADER_LEN..],
                     &record[TLS_HEADER_LEN..TLS_HMAC_HEADER_LEN],
                 ) {
                     Ok(record[TLS_HMAC_HEADER_LEN..].to_vec())
                 } else {
-                    Err(Self::protocol_error("ShadowTLS application-data HMAC mismatch"))
+                    Err(Self::protocol_error(
+                        "ShadowTLS application-data HMAC mismatch",
+                    ))
                 }
             }
             _ => Err(Self::protocol_error("unexpected ShadowTLS record")),
@@ -743,7 +750,10 @@ impl<S> ShadowTlsStream<S> where S: AsyncRead + AsyncWrite + Unpin {
     }
 }
 
-impl<S> AsyncRead for ShadowTlsStream<S> where S: AsyncRead + AsyncWrite + Unpin {
+impl<S> AsyncRead for ShadowTlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -775,7 +785,10 @@ impl<S> AsyncRead for ShadowTlsStream<S> where S: AsyncRead + AsyncWrite + Unpin
     }
 }
 
-impl<S> AsyncWrite for ShadowTlsStream<S> where S: AsyncRead + AsyncWrite + Unpin {
+impl<S> AsyncWrite for ShadowTlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

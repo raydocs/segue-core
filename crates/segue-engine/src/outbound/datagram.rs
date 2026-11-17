@@ -60,7 +60,9 @@ pub(crate) async fn open(
         UdpOutbound::Hysteria(outbound) => Ok(Session::Hysteria(
             outbound.open_udp(bootstrap, dialer).await?,
         )),
-        UdpOutbound::Tuic(outbound) => Ok(Session::Tuic(outbound.open_udp(bootstrap, dialer).await?)),
+        UdpOutbound::Tuic(outbound) => {
+            Ok(Session::Tuic(outbound.open_udp(bootstrap, dialer).await?))
+        }
         UdpOutbound::Wireguard(outbound) => Ok(Session::Wireguard {
             session: outbound
                 .open_udp(target, destination, bootstrap, dialer)
@@ -97,10 +99,10 @@ pub(crate) async fn open_within_handshake(
         UdpOutbound::Socks(outbound) => outbound.level(),
         UdpOutbound::Vmess(outbound) => outbound.level(),
         UdpOutbound::Shadowsocks2022(outbound) => outbound.level(),
-            UdpOutbound::Hysteria(_)
-            | UdpOutbound::Wireguard(_)
-            | UdpOutbound::Masque(_)
-            | UdpOutbound::Tuic(_) => 0,
+        UdpOutbound::Hysteria(_)
+        | UdpOutbound::Wireguard(_)
+        | UdpOutbound::Masque(_)
+        | UdpOutbound::Tuic(_) => 0,
         UdpOutbound::Freedom(_) => return Err(CoreError::UnsupportedOutboundNetwork),
     };
     let mut handshake = effective_policy_for_level(config, Some(level)).handshake;

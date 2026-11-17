@@ -73,7 +73,10 @@ async fn check(
         // attempt is allowed to end early; the measured one is not.
         let warmup = timeout(
             Duration::from_secs(30),
-            exercise(profile(server.addr.port(), stream.clone(), masks.clone()), false),
+            exercise(
+                profile(server.addr.port(), stream.clone(), masks.clone()),
+                false,
+            ),
         )
         .await;
         if !matches!(warmup, Ok(Ok(()))) {

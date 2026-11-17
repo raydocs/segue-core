@@ -330,9 +330,9 @@ impl GrpcConnectionPool {
         tokio::spawn(async move {
             let timeout = match &connector {
                 ConnectorConfig::Reality(_) => REALITY_COLD_DIAL_TIMEOUT,
-                ConnectorConfig::Tcp
-                | ConnectorConfig::Tls(_)
-                | ConnectorConfig::ShadowTls(_) => pool.cold_dial_timeout,
+                ConnectorConfig::Tcp | ConnectorConfig::Tls(_) | ConnectorConfig::ShadowTls(_) => {
+                    pool.cold_dial_timeout
+                }
             };
             let dialled = tokio::time::timeout(timeout, async {
                 let io = dialer

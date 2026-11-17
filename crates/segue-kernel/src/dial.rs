@@ -179,7 +179,9 @@ impl Dialer for EngineDialer {
         port: u16,
     ) -> Result<Datagrams, DialError> {
         let Some(tag) = tag else {
-            return Ok(Box::new(DirectUdp::connect(&self.transport, addr, port).await?));
+            return Ok(Box::new(
+                DirectUdp::connect(&self.transport, addr, port).await?,
+            ));
         };
         let router = self
             .routers
@@ -380,8 +382,9 @@ mod tests {
         let protector = Arc::new(RecordingProtector::default());
         let mut specs = BTreeMap::new();
         specs.insert("carrier".to_owned(), json!({"protocol": "freedom"}));
-        let dialer = EngineDialer::with_transport_dialer(&specs, protected_dialer(protector.clone()))
-            .unwrap();
+        let dialer =
+            EngineDialer::with_transport_dialer(&specs, protected_dialer(protector.clone()))
+                .unwrap();
         let mut stream = dialer
             .dial(Some("carrier"), &TargetAddr::Ip(addr.ip()), addr.port())
             .await

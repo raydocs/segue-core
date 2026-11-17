@@ -15,8 +15,8 @@ use super::*;
 
 const PASSWORD: &[u8] = b"shadowtls-v3-vector";
 const RANDOM: [u8; 32] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-    23, 24, 25, 26, 27, 28, 29, 30, 31,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31,
 ];
 const DUMMY: &[u8] = b"shadowtls-v3-dummy";
 const REQUEST: &[u8] = b"inner-proxy-request";
@@ -57,16 +57,17 @@ fn client_hello_and_xor_vectors_match_sing_shadowtls() {
 fn framing_vectors_have_directional_chaining_and_transactional_open() {
     let mut write = FrameMac::new(PASSWORD, &RANDOM, b'C');
     let mut read = FrameMac::new(PASSWORD, &RANDOM, b'C');
-    for (payload, expected) in [
-        (&b"first"[..], "6883c0d8"),
-        (&b"second"[..], "0a1ca088"),
-    ] {
+    for (payload, expected) in [(&b"first"[..], "6883c0d8"), (&b"second"[..], "0a1ca088")] {
         let tag = write.seal(payload);
         assert!(read.open(payload, &tag));
         assert_eq!(hex(&tag), expected);
         let mut other = FrameMac::new(PASSWORD, &RANDOM, b'C');
         assert!(other.open(payload, &tag));
-        assert_eq!(other.seal(payload), tag, "next seal includes the previous tag");
+        assert_eq!(
+            other.seal(payload),
+            tag,
+            "next seal includes the previous tag"
+        );
     }
     let mut server = FrameMac::new(PASSWORD, &RANDOM, b'S');
     assert_eq!(hex(&server.seal(b"first")), "212eaef7");
@@ -305,7 +306,11 @@ async fn loopback_handshakes_with_real_tls_then_carries_inner_protocol() {
     let (socket, _) = listener.accept().await.unwrap();
     tokio::time::timeout(
         Duration::from_secs(10),
-        relay(socket, TcpStream::connect(real_addr).await.unwrap(), dummy_done_rx),
+        relay(
+            socket,
+            TcpStream::connect(real_addr).await.unwrap(),
+            dummy_done_rx,
+        ),
     )
     .await
     .expect("ShadowTLS relay must not stall")

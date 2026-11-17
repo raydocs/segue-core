@@ -342,10 +342,15 @@ pub(crate) fn reality_object(
     // default the parser itself applies to an empty name.
     reality.insert(
         "fingerprint".into(),
-        json!(fingerprint.filter(|value| !value.is_empty()).unwrap_or("chrome")),
+        json!(fingerprint
+            .filter(|value| !value.is_empty())
+            .unwrap_or("chrome")),
     );
     if public_key.is_empty() {
-        ctx.warn(path, "REALITY public key is missing; the outbound will be rejected");
+        ctx.warn(
+            path,
+            "REALITY public key is missing; the outbound will be rejected",
+        );
     }
     Value::Object(reality)
 }
@@ -396,9 +401,9 @@ pub(crate) fn xhttp_settings(path: &str, host: Option<&str>, mode: Option<&str>)
     if let Some(host) = host.filter(|host| !host.is_empty()) {
         settings.insert("host".into(), json!(host));
     }
-    if let Some(mode) = mode.filter(|mode| {
-        matches!(*mode, "auto" | "packet-up" | "stream-up" | "stream-one")
-    }) {
+    if let Some(mode) =
+        mode.filter(|mode| matches!(*mode, "auto" | "packet-up" | "stream-up" | "stream-one"))
+    {
         settings.insert("mode".into(), json!(mode));
     }
     Value::Object(settings)
@@ -439,7 +444,10 @@ pub(crate) fn dns_server_string(raw: &str, ctx: &mut Ctx, path: &str) -> Option<
     }
     let lower = address.to_ascii_lowercase();
     if lower == "system" || lower == "localhost" || lower == "fakedns" {
-        ctx.warn(path, format!("DNS server `{address}` is unsupported and was dropped"));
+        ctx.warn(
+            path,
+            format!("DNS server `{address}` is unsupported and was dropped"),
+        );
         return None;
     }
     if lower.starts_with("dhcp://") {

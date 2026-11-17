@@ -475,7 +475,8 @@ impl RoutedDnsQueryTransport {
             | TcpOutbound::Vmess(_)
             | TcpOutbound::Shadowsocks2022(_)
             | TcpOutbound::Vless(_)
-            | TcpOutbound::Tuic(_) | TcpOutbound::Hysteria(_)
+            | TcpOutbound::Tuic(_)
+            | TcpOutbound::Hysteria(_)
             | TcpOutbound::Wireguard(_)
             | TcpOutbound::Masque(_)) => {
                 if server_socket_has_nonzero_scope(server) {

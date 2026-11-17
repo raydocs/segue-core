@@ -66,7 +66,7 @@ pub mod quic {
                 Default::default(),
                 None,
             )
-        .await?;
+            .await?;
         let hop = super::move_udp_carrier(
             &endpoint,
             &connection,

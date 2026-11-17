@@ -38,7 +38,8 @@ impl Parser<'_> {
         // Xray permits REALITY on raw, XHTTP and gRPC
         // (`infra/conf/transport_internet.go`). The alias `splithttp` is
         // normalized to the XHTTP variant by `parse_network` below.
-        if matches!(security, StreamSecurity::ShadowTls(_)) && stream_network != StreamNetwork::Raw {
+        if matches!(security, StreamSecurity::ShadowTls(_)) && stream_network != StreamNetwork::Raw
+        {
             self.error(
                 format!("$.outbounds[{index}].streamSettings.security"),
                 "ShadowTLS v3 only supports raw/tcp as the inner stream transport",
@@ -1569,7 +1570,8 @@ impl Parser<'_> {
         stream: Option<&Value>,
         index: usize,
         outbound: &Value,
-    ) -> Option<StreamSecurity> {        let security_path = format!("$.outbounds[{index}].streamSettings.security");
+    ) -> Option<StreamSecurity> {
+        let security_path = format!("$.outbounds[{index}].streamSettings.security");
         // As with `network`, only an absent key defaults. A silent fallback
         // here is worse than a wrong transport: `"security": 5` would strip a
         // REALITY or TLS outbound down to plaintext.
@@ -1653,11 +1655,7 @@ impl Parser<'_> {
         self.parse_tls_fields(tls_settings, path)
     }
 
-    fn parse_tls_fields(
-        &mut self,
-        tls_settings: Option<&Value>,
-        path: &str,
-    ) -> TlsSettings {
+    fn parse_tls_fields(&mut self, tls_settings: Option<&Value>, path: &str) -> TlsSettings {
         let allow_insecure_path = format!("{path}.allowInsecure");
         let allow_insecure = match tls_settings.and_then(|settings| settings.get("allowInsecure")) {
             // TUIC keeps sing-box's explicit skip-verification option. The
@@ -2057,7 +2055,11 @@ impl Parser<'_> {
             return None;
         }
         let version_path = format!("{path}.version");
-        if self.optional_u64_at(settings, "version", version_path.clone()).unwrap_or(3) != 3 {
+        if self
+            .optional_u64_at(settings, "version", version_path.clone())
+            .unwrap_or(3)
+            != 3
+        {
             self.error(version_path, "only ShadowTLS version 3 is supported");
         }
         let tls = self.parse_tls_fields(Some(settings), &path);

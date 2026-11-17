@@ -4676,7 +4676,10 @@ mod tests {
                 | super::XRAY_FFI_CAPABILITY_KERNEL_STATS
                 | super::XRAY_FFI_CAPABILITY_KERNEL_TUN_FD;
             assert_eq!(expected, (0x1f_u64 << 32) | (1_u64 << 31));
-            assert_eq!(XRAY_FFI_CAPABILITIES ^ super::XRAY_FFI_ENGINE_CAPABILITIES, expected);
+            assert_eq!(
+                XRAY_FFI_CAPABILITIES ^ super::XRAY_FFI_ENGINE_CAPABILITIES,
+                expected
+            );
             let constants = [
                 XRAY_FFI_CAPABILITY_KERNEL,
                 XRAY_FFI_CAPABILITY_KERNEL_KILLSWITCH,

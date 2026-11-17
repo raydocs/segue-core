@@ -190,8 +190,8 @@ impl Client {
             .acquire_owned()
             .await
             .map_err(|_| TuicError::Limit)?;
-        let header = wire::encode(&Command::Connect(target.clone()))
-            .map_err(|_| TuicError::Stream)?;
+        let header =
+            wire::encode(&Command::Connect(target.clone())).map_err(|_| TuicError::Stream)?;
         let (mut write, read) = self
             .inner
             .connection
@@ -382,7 +382,8 @@ impl UdpAssociation {
                 address: Some(wire::Address::from_target(target).map_err(|_| TuicError::Datagram)?),
                 payload: payload.to_vec(),
             };
-            let encoded = wire::encode(&Command::Packet(packet)).map_err(|_| TuicError::Datagram)?;
+            let encoded =
+                wire::encode(&Command::Packet(packet)).map_err(|_| TuicError::Datagram)?;
             self.client.inner.uni(encoded).await?;
         }
         Ok(())
@@ -594,7 +595,9 @@ impl TuicOutbound {
                     });
                     return Ok(client);
                 }
-                Err(error @ (TuicError::Configuration | TuicError::Protection)) => return Err(error),
+                Err(error @ (TuicError::Configuration | TuicError::Protection)) => {
+                    return Err(error)
+                }
                 Err(current) => error = current,
             }
         }
@@ -627,9 +630,9 @@ impl TuicOutbound {
         )
         .await
         .map_err(|error| match error {
-            segue_transport::stream::quic::H3Error::Transport(TransportError::SocketProtection(_)) => {
-                TuicError::Protection
-            }
+            segue_transport::stream::quic::H3Error::Transport(
+                TransportError::SocketProtection(_),
+            ) => TuicError::Protection,
             _ => TuicError::Connect,
         })?;
         // Own both handles until the authenticated client takes over.
@@ -670,10 +673,7 @@ impl TuicOutbound {
             token: *token,
         })
         .map_err(|_| TuicError::Stream)?;
-        let mut stream = connection
-            .open_uni()
-            .await
-            .map_err(|_| TuicError::Stream)?;
+        let mut stream = connection.open_uni().await.map_err(|_| TuicError::Stream)?;
         stream
             .write_all(&auth)
             .await
@@ -724,7 +724,10 @@ impl TuicOutbound {
         dialer: &TransportDialer,
     ) -> Result<BoxedTransportStream, CoreError> {
         Ok(Box::new(
-            self.client(resolver, dialer).await?.open_tcp(target).await?,
+            self.client(resolver, dialer)
+                .await?
+                .open_tcp(target)
+                .await?,
         ))
     }
 
@@ -752,8 +755,10 @@ impl PendingConnection {
 impl Drop for PendingConnection {
     fn drop(&mut self) {
         if self.owned {
-            self.connection.close(quinn::VarInt::from_u32(0xfffffff1), b"");
-            self.endpoint.close(quinn::VarInt::from_u32(0xfffffff1), b"");
+            self.connection
+                .close(quinn::VarInt::from_u32(0xfffffff1), b"");
+            self.endpoint
+                .close(quinn::VarInt::from_u32(0xfffffff1), b"");
         }
     }
 }

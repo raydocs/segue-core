@@ -1979,11 +1979,7 @@ fn xray_logs(stdout_path: &Path, stderr_path: &Path) -> String {
 //
 // `false` when the child exited because another socket took its port — the
 // caller then starts it again on a fresh one; any other exit panics.
-async fn wait_for_xray_startup(
-    child: &mut Child,
-    stdout_path: &Path,
-    stderr_path: &Path,
-) -> bool {
+async fn wait_for_xray_startup(child: &mut Child, stdout_path: &Path, stderr_path: &Path) -> bool {
     xray_startup::wait_ready(
         child,
         || xray_logs(stdout_path, stderr_path),

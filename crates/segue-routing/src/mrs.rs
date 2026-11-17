@@ -313,9 +313,7 @@ impl<R: Read> Reader<R> {
     ) -> Result<(), MrsError> {
         let version = self.read_u8()?;
         if version != SET_VERSION {
-            return Err(MrsError::Invalid(format!(
-                "domain set version {version}"
-            )));
+            return Err(MrsError::Invalid(format!("domain set version {version}")));
         }
         let leaves = self.read_u64_words(MAX_BITMAP_WORDS, "domain leaf bitmap")?;
         let label_bitmap = self.read_u64_words(MAX_BITMAP_WORDS, "domain label bitmap")?;
@@ -521,7 +519,9 @@ fn plain_domain(domain: &str) -> bool {
     {
         return false;
     }
-    !domain.chars().any(|character| character == '*' || character == '+')
+    !domain
+        .chars()
+        .any(|character| character == '*' || character == '+')
 }
 
 fn wildcard_regex(pattern: &str, suffix_wildcard: bool) -> Result<String, MrsError> {

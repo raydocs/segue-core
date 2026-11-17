@@ -58,7 +58,10 @@ fn clash_profile_converts_and_parses() {
     assert_eq!(vmess["protocol"], "vmess");
     assert_eq!(vmess["streamSettings"]["network"], "ws");
     assert_eq!(vmess["streamSettings"]["wsSettings"]["path"], "/ray");
-    assert_eq!(vmess["streamSettings"]["wsSettings"]["host"], "ws.example.com");
+    assert_eq!(
+        vmess["streamSettings"]["wsSettings"]["host"],
+        "ws.example.com"
+    );
 
     let trojan = outbound(&config, "trojan-grpc");
     assert_eq!(trojan["streamSettings"]["network"], "grpc");
@@ -72,7 +75,9 @@ fn clash_profile_converts_and_parses() {
     let hy2 = outbound(&config, "hy2");
     assert_eq!(hy2["protocol"], "hysteria");
     assert_eq!(hy2["streamSettings"]["network"], "hysteria");
-    let masks = hy2["streamSettings"]["finalmask"]["udp"].as_array().unwrap();
+    let masks = hy2["streamSettings"]["finalmask"]["udp"]
+        .as_array()
+        .unwrap();
     assert_eq!(masks[0]["type"], "salamander");
     assert_eq!(masks[1]["type"], "udphop");
 
@@ -158,9 +163,7 @@ fn clash_rules_map_to_xray_conditions() {
     assert_eq!(geosite["outboundTag"], "DIRECT");
 
     // PROCESS-NAME and RULE-SET cannot be expressed and are dropped.
-    assert!(rules
-        .iter()
-        .all(|rule| rule["domain"][0] != "keyword:curl"));
+    assert!(rules.iter().all(|rule| rule["domain"][0] != "keyword:curl"));
 
     // MATCH is the last rule and always holds.
     let last = rules.last().unwrap();
@@ -202,7 +205,10 @@ fn singbox_profile_converts_and_parses() {
 
     let vmess = outbound(&config, "vmess-ws");
     assert_eq!(vmess["streamSettings"]["network"], "ws");
-    assert_eq!(vmess["streamSettings"]["wsSettings"]["host"], "ws.example.com");
+    assert_eq!(
+        vmess["streamSettings"]["wsSettings"]["host"],
+        "ws.example.com"
+    );
 
     assert_eq!(
         outbound(&config, "trojan-grpc")["streamSettings"]["grpcSettings"]["serviceName"],
@@ -211,7 +217,9 @@ fn singbox_profile_converts_and_parses() {
     assert_eq!(outbound(&config, "ss-2022")["protocol"], "shadowsocks");
 
     let hy2 = outbound(&config, "hy2");
-    let masks = hy2["streamSettings"]["finalmask"]["udp"].as_array().unwrap();
+    let masks = hy2["streamSettings"]["finalmask"]["udp"]
+        .as_array()
+        .unwrap();
     assert_eq!(masks[0]["type"], "salamander");
     assert_eq!(masks[1]["settings"]["remotePorts"], "443,8443-8445");
 
@@ -247,9 +255,7 @@ fn singbox_groups_and_rules() {
         .any(|rule| rule["domain"][0] == "ext-srs:rules/ads.srs"));
     assert!(rules.iter().any(|rule| rule["port"] == "8443"));
     // process_name has no Xray equivalent; the rule is dropped.
-    assert!(rules
-        .iter()
-        .all(|rule| rule.get("process_name").is_none()));
+    assert!(rules.iter().all(|rule| rule.get("process_name").is_none()));
     // `route.final` is the last rule.
     assert_eq!(rules.last().unwrap()["balancerTag"], "auto");
 }

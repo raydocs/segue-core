@@ -72,8 +72,8 @@ use segue_config::{
     FreedomRedirect, Network, OutboundConfig, OutboundSettings, ProxyProtocolVersion,
     QuicParamsSettings, RouteContext, RoutingBalancerStrategy, RoutingConfig,
     RoutingDomainStrategy, RoutingLeastLoadSettings, RoutingLeastPingSettings, RoutingRule,
-    RoutingRuleTarget,
-    StreamSecurity, StreamSettings, StreamTransport, TargetAddr, VlessUser, XhttpSettings,
+    RoutingRuleTarget, StreamSecurity, StreamSettings, StreamTransport, TargetAddr, VlessUser,
+    XhttpSettings,
 };
 use segue_proxy::vless::{
     encode_request_header, VisionStream, VisionStreamIo, VlessCommand, VlessRequest,
@@ -2728,9 +2728,7 @@ impl OutboundSelectionOverlay {
             self.clear_health_incumbent(group_index);
             return None;
         };
-        if incumbent_delay
-            .is_some_and(|delay| delay <= best_delay.saturating_add(tolerance_ms))
-        {
+        if incumbent_delay.is_some_and(|delay| delay <= best_delay.saturating_add(tolerance_ms)) {
             return incumbent;
         }
         self.groups[group_index]
@@ -2873,14 +2871,14 @@ impl OutboundSelectionOverlay {
         ranked: &[(u64, OutboundNodeId)],
     ) -> OutboundNodeId {
         let tolerance_ms = duration_millis(settings.effective_ping_tolerance());
-        let incumbent_average = self
-            .health_incumbent_node(group_index, group)
-            .and_then(|incumbent| {
-                ranked
-                    .iter()
-                    .find(|(_, node)| *node == incumbent)
-                    .map(|(average, _)| (incumbent, *average))
-            });
+        let incumbent_average =
+            self.health_incumbent_node(group_index, group)
+                .and_then(|incumbent| {
+                    ranked
+                        .iter()
+                        .find(|(_, node)| *node == incumbent)
+                        .map(|(average, _)| (incumbent, *average))
+                });
         if let Some((incumbent, average)) = incumbent_average {
             let beaten =
                 best_node != incumbent && average > best_average.saturating_add(tolerance_ms);

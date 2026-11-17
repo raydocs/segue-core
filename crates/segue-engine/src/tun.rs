@@ -3036,7 +3036,8 @@ async fn open_tcp_bridge_stream(
             | TcpOutbound::Vmess(_)
             | TcpOutbound::Shadowsocks2022(_)
             | TcpOutbound::Vless(_)
-            | TcpOutbound::Tuic(_) | TcpOutbound::Hysteria(_)
+            | TcpOutbound::Tuic(_)
+            | TcpOutbound::Hysteria(_)
             | TcpOutbound::Wireguard(_)
                 if upstream
                     .socket_addr()
@@ -3055,7 +3056,8 @@ async fn open_tcp_bridge_stream(
             | TcpOutbound::Vmess(_)
             | TcpOutbound::Shadowsocks2022(_)
             | TcpOutbound::Vless(_)
-            | TcpOutbound::Tuic(_) | TcpOutbound::Hysteria(_)
+            | TcpOutbound::Tuic(_)
+            | TcpOutbound::Hysteria(_)
             | TcpOutbound::Wireguard(_)
             | TcpOutbound::Masque(_) => {}
             TcpOutbound::Chained { .. } => {

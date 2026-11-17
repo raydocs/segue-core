@@ -32,7 +32,10 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
     for (index, proxy) in array(root.get("proxies")).iter().enumerate() {
         let path = format!("proxies[{index}]");
         let Some(map) = proxy.as_object() else {
-            ctx.warn(path.as_str(), "proxy entry is not a mapping and was dropped");
+            ctx.warn(
+                path.as_str(),
+                "proxy entry is not a mapping and was dropped",
+            );
             continue;
         };
         let name = string(map, "name").unwrap_or_default().to_owned();
@@ -72,7 +75,10 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
     for (index, group) in array(root.get("proxy-groups")).iter().enumerate() {
         let path = format!("proxy-groups[{index}]");
         let Some(map) = group.as_object() else {
-            ctx.warn(path.as_str(), "proxy group is not a mapping and was dropped");
+            ctx.warn(
+                path.as_str(),
+                "proxy group is not a mapping and was dropped",
+            );
             continue;
         };
         let name = string(map, "name").unwrap_or_default().to_owned();
@@ -107,7 +113,9 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
                 } else {
                     ctx.warn(
                         format!("{path}.proxies"),
-                        format!("member `{member}` is another proxy group; its members were inlined"),
+                        format!(
+                            "member `{member}` is another proxy group; its members were inlined"
+                        ),
                     );
                 }
                 for leaf in nested {
@@ -143,7 +151,11 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
                 ),
             );
         }
-        for unknown in ["include-all", "include-all-proxies", "include-all-providers"] {
+        for unknown in [
+            "include-all",
+            "include-all-proxies",
+            "include-all-providers",
+        ] {
             if boolean(map, unknown) {
                 ctx.warn(
                     format!("{path}.{unknown}"),
@@ -297,7 +309,9 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
 }
 
 fn array(value: Option<&Value>) -> &[Value] {
-    value.and_then(Value::as_array).map_or(&[][..], Vec::as_slice)
+    value
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
 }
 
 /// One rule is either a normal routing rule or Clash's trailing `MATCH`.
@@ -340,7 +354,10 @@ fn convert_rule(
         // A regex payload may itself contain commas, so it takes everything
         // before the target.
         if kind == "DOMAIN-REGEX" {
-            (Some(parts[1..parts.len() - 1].join(",")), parts[parts.len() - 1])
+            (
+                Some(parts[1..parts.len() - 1].join(",")),
+                parts[parts.len() - 1],
+            )
         } else {
             (Some(parts[1].to_owned()), parts[2])
         }
@@ -534,7 +551,9 @@ fn clash_domain_rule_to_xray(entry: &str, ctx: &mut Ctx) -> Option<String> {
     if entry.contains(['*', '(', '[', '\\', '^', '$']) {
         ctx.warn(
             "dns.fake-ip-filter",
-            format!("filter `{entry}` is a regular expression, which is not carried; it was dropped"),
+            format!(
+                "filter `{entry}` is a regular expression, which is not carried; it was dropped"
+            ),
         );
         return None;
     }
@@ -657,12 +676,16 @@ fn vless_outbound(
     }
 
     let (network, transport) = convert_transport(map, path, ctx);
-    if security.as_ref().is_some_and(|security| security["kind"] == "reality")
+    if security
+        .as_ref()
+        .is_some_and(|security| security["kind"] == "reality")
         && !matches!(network, "raw" | "grpc" | "xhttp")
     {
         ctx.warn(
             path,
-            format!("REALITY only runs over raw, gRPC and XHTTP; the `{network}` transport was dropped"),
+            format!(
+                "REALITY only runs over raw, gRPC and XHTTP; the `{network}` transport was dropped"
+            ),
         );
         return None;
     }

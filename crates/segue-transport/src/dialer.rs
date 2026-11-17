@@ -391,7 +391,9 @@ impl TransportDialer {
             }),
             ConnectorConfig::Tcp => Err(TransportError::UnsupportedHttp3Security("TCP")),
             ConnectorConfig::Reality(_) => Err(TransportError::UnsupportedHttp3Security("REALITY")),
-            ConnectorConfig::ShadowTls(_) => Err(TransportError::UnsupportedHttp3Security("ShadowTLS")),
+            ConnectorConfig::ShadowTls(_) => {
+                Err(TransportError::UnsupportedHttp3Security("ShadowTLS"))
+            }
         }
     }
 

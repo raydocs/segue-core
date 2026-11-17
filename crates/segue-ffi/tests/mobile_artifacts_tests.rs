@@ -1247,7 +1247,10 @@ fn native_staticlib_exports_exact_mobile_abi_symbols_in_both_configurations() {
             .map(|symbol| (*symbol).to_owned())
             .collect();
         assert_eq!(symbols, expected, "proprietary-kernel: {enabled}");
-        for symbol in EXPORTED_SYMBOLS.iter().filter(|s| s.starts_with("xray_kernel_")) {
+        for symbol in EXPORTED_SYMBOLS
+            .iter()
+            .filter(|s| s.starts_with("xray_kernel_"))
+        {
             assert!(!symbols.contains(*symbol));
         }
     }

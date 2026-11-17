@@ -159,13 +159,16 @@ pub enum WireError {
 }
 
 pub fn encode(command: &Command) -> Result<Vec<u8>, WireError> {
-    let mut output = vec![VERSION, match command {
-        Command::Authenticate { .. } => AUTHENTICATE,
-        Command::Connect(_) => CONNECT,
-        Command::Packet(_) => PACKET,
-        Command::Dissociate { .. } => DISSOCIATE,
-        Command::Heartbeat => HEARTBEAT,
-    }];
+    let mut output = vec![
+        VERSION,
+        match command {
+            Command::Authenticate { .. } => AUTHENTICATE,
+            Command::Connect(_) => CONNECT,
+            Command::Packet(_) => PACKET,
+            Command::Dissociate { .. } => DISSOCIATE,
+            Command::Heartbeat => HEARTBEAT,
+        },
+    ];
     match command {
         Command::Authenticate { uuid, token } => {
             output.extend_from_slice(uuid);
@@ -173,7 +176,9 @@ pub fn encode(command: &Command) -> Result<Vec<u8>, WireError> {
         }
         Command::Connect(target) => Address::from_target(target)?.encode(&mut output)?,
         Command::Packet(packet) => encode_packet(packet, &mut output)?,
-        Command::Dissociate { association_id } => output.extend_from_slice(&association_id.to_be_bytes()),
+        Command::Dissociate { association_id } => {
+            output.extend_from_slice(&association_id.to_be_bytes())
+        }
         Command::Heartbeat => {}
     }
     Ok(output)
@@ -217,15 +222,25 @@ pub fn decode(input: &[u8]) -> Result<(Command, usize), WireError> {
     if input[0] != VERSION {
         return Err(WireError::Command);
     }
-    let mut reader = Reader { bytes: input, position: 2 };
+    let mut reader = Reader {
+        bytes: input,
+        position: 2,
+    };
     let command = match input[1] {
         AUTHENTICATE => Command::Authenticate {
             uuid: reader.array::<16>()?,
             token: reader.array::<32>()?,
         },
-        CONNECT => Command::Connect(reader.address()?.ok_or(WireError::Address)?.routing(Network::Tcp)),
+        CONNECT => Command::Connect(
+            reader
+                .address()?
+                .ok_or(WireError::Address)?
+                .routing(Network::Tcp),
+        ),
         PACKET => Command::Packet(reader.packet()?),
-        DISSOCIATE => Command::Dissociate { association_id: reader.u16()? },
+        DISSOCIATE => Command::Dissociate {
+            association_id: reader.u16()?,
+        },
         HEARTBEAT => Command::Heartbeat,
         _ => return Err(WireError::Command),
     };
@@ -250,14 +265,23 @@ impl Reader<'_> {
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
         let end = self.position.checked_add(N).ok_or(WireError::Truncated)?;
-        let slice = self.bytes.get(self.position..end).ok_or(WireError::Truncated)?;
+        let slice = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(WireError::Truncated)?;
         self.position = end;
         Ok(slice.try_into().map_err(|_| WireError::Truncated)?)
     }
 
     fn take(&mut self, count: usize) -> Result<Vec<u8>, WireError> {
-        let end = self.position.checked_add(count).ok_or(WireError::Truncated)?;
-        let slice = self.bytes.get(self.position..end).ok_or(WireError::Truncated)?;
+        let end = self
+            .position
+            .checked_add(count)
+            .ok_or(WireError::Truncated)?;
+        let slice = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(WireError::Truncated)?;
         self.position = end;
         Ok(slice.to_vec())
     }
@@ -297,7 +321,11 @@ impl Reader<'_> {
         let length = usize::from(self.u16()?);
         let address = self.address()?;
         let payload = self.take(length)?;
-        let packet = Packet { address, payload, ..packet };
+        let packet = Packet {
+            address,
+            payload,
+            ..packet
+        };
         if packet.fragment_total == 0
             || packet.fragment_id >= packet.fragment_total
             || (packet.fragment_id == 0 && packet.address.is_none())
@@ -338,7 +366,11 @@ pub fn fragment_datagrams(
             packet_id,
             fragment_total: total,
             fragment_id: index as u8,
-            address: if index == 0 { Some(address.clone()) } else { None },
+            address: if index == 0 {
+                Some(address.clone())
+            } else {
+                None
+            },
             payload: chunk.to_vec(),
         });
         result.push(encode(&command)?);
@@ -381,11 +413,17 @@ impl Reassembler {
         if timeout.is_zero() || max_payload == 0 || max_payload > u16::MAX as usize {
             return Err(WireError::ReassemblyLimit);
         }
-        Ok(Self { timeout, max_payload, pending: HashMap::new(), bytes: 0 })
+        Ok(Self {
+            timeout,
+            max_payload,
+            pending: HashMap::new(),
+            bytes: 0,
+        })
     }
 
     pub fn expire(&mut self, now: Instant) {
-        self.pending.retain(|_, partial| now.duration_since(partial.created) < self.timeout);
+        self.pending
+            .retain(|_, partial| now.duration_since(partial.created) < self.timeout);
         self.bytes = self.pending.values().map(|partial| partial.bytes).sum();
     }
 
@@ -415,13 +453,16 @@ impl Reassembler {
             if self.pending.len() >= MAX_PENDING_PACKETS {
                 return Err(WireError::ReassemblyLimit);
             }
-            self.pending.insert(key, PartialPacket {
-                target: packet.address.clone().ok_or(WireError::Fragmentation)?,
-                created: now,
-                fragments: vec![None; usize::from(packet.fragment_total)],
-                received: 0,
-                bytes: 0,
-            });
+            self.pending.insert(
+                key,
+                PartialPacket {
+                    target: packet.address.clone().ok_or(WireError::Fragmentation)?,
+                    created: now,
+                    fragments: vec![None; usize::from(packet.fragment_total)],
+                    received: 0,
+                    bytes: 0,
+                },
+            );
         }
         let partial = self.pending.get_mut(&key).expect("partial inserted");
         if partial.bytes.saturating_add(packet.payload.len()) > self.max_payload

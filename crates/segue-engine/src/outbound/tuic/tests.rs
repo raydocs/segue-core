@@ -78,11 +78,8 @@ async fn server(mode: TuicUdpRelayMode) -> MockEndpoint {
     transport.max_concurrent_uni_streams(128.try_into().unwrap());
     let mut config = tls.server.clone();
     config.transport_config(Arc::new(transport));
-    let endpoint = quinn::Endpoint::server(
-        config,
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-    )
-    .unwrap();
+    let endpoint =
+        quinn::Endpoint::server(config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
     let address = endpoint.local_addr().unwrap();
     let native = mode == TuicUdpRelayMode::Native;
     let task = tokio::spawn(async move {

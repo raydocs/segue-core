@@ -3589,7 +3589,8 @@ async fn proxy_udp_payload(
                     | UdpOutbound::Vmess(_)
                     | UdpOutbound::Shadowsocks2022(_)
                     | UdpOutbound::Vless(_)
-                    | UdpOutbound::Tuic(_) | UdpOutbound::Hysteria(_)
+                    | UdpOutbound::Tuic(_)
+                    | UdpOutbound::Hysteria(_)
                     | UdpOutbound::Wireguard(_)
                     | UdpOutbound::Masque(_) => DNS_PROXY_VLESS_ATTEMPT_TIMEOUT,
                 };

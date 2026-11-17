@@ -333,7 +333,10 @@ impl ReferenceServer {
             if self.child.try_wait().unwrap().is_some() {
                 let log =
                     std::fs::read_to_string(self.directory.join("server.log")).unwrap_or_default();
-                assert!(self::xray_startup::port_taken(&log), "reference exited:\n{log}");
+                assert!(
+                    self::xray_startup::port_taken(&log),
+                    "reference exited:\n{log}"
+                );
                 return false;
             }
             // Xray's gRPC hub binds its listener in a goroutine after the core

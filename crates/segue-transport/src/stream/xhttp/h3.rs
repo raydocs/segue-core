@@ -1534,7 +1534,9 @@ pub(crate) async fn connect_quic_transport_raw(
             return Err(H3Error::InvalidAlpn { expected });
         }
     } else if config.tls_config.alpn_protocols.is_empty() {
-        return Err(H3Error::InvalidAlpn { expected: "h3 or tuic" });
+        return Err(H3Error::InvalidAlpn {
+            expected: "h3 or tuic",
+        });
     }
 
     let own_carrier = config.quic.hop_carrier();
@@ -1865,9 +1867,8 @@ fn build_quinn_config(
             transport.congestion_controller_factory(quinn_bbr());
         }
         H3Congestion::Cubic => {
-            transport.congestion_controller_factory(Arc::new(
-                quinn::congestion::CubicConfig::default(),
-            ));
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
         }
         H3Congestion::Reno => {
             transport.congestion_controller_factory(Arc::new(RenoFactory));

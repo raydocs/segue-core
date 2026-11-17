@@ -25,7 +25,9 @@ fn address_encodings_cover_domains_ips_and_the_fragment_sentinel() {
     for (address, expected) in [
         (
             Target::new(TargetAddr::Domain("a.example".into()), 443, Network::Udp),
-            &[0, 9, b'a', b'.', b'e', b'x', b'a', b'm', b'p', b'l', b'e', 1, 187][..],
+            &[
+                0, 9, b'a', b'.', b'e', b'x', b'a', b'm', b'p', b'l', b'e', 1, 187,
+            ][..],
         ),
         (
             Target::new(
@@ -36,19 +38,27 @@ fn address_encodings_cover_domains_ips_and_the_fragment_sentinel() {
             &[1, 192, 0, 2, 1, 0, 53][..],
         ),
         (
-            Target::new(TargetAddr::Ip("2001:db8::1".parse().unwrap()), 443, Network::Udp),
+            Target::new(
+                TargetAddr::Ip("2001:db8::1".parse().unwrap()),
+                443,
+                Network::Udp,
+            ),
             &[
-                2, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
-                187,
+                2, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 187,
             ][..],
         ),
     ] {
-        let (decoded, consumed) = decode(&encode(&Command::Connect(address.clone())).unwrap()).unwrap();
+        let (decoded, consumed) =
+            decode(&encode(&Command::Connect(address.clone())).unwrap()).unwrap();
         assert_eq!(decoded, Command::Connect(address));
         assert_eq!(consumed, encode(&decoded).unwrap().len());
     }
     assert_eq!(decode(&[5, 1, 0xff, 0]).unwrap_err(), WireError::Address);
-    let target = Target::new(TargetAddr::Ip("2001:db8::1".parse().unwrap()), 443, Network::Udp);
+    let target = Target::new(
+        TargetAddr::Ip("2001:db8::1".parse().unwrap()),
+        443,
+        Network::Udp,
+    );
     let (decoded, _) = decode(&encode(&Command::Connect(target.clone())).unwrap()).unwrap();
     assert_eq!(decoded, Command::Connect(target));
 }
@@ -135,7 +145,10 @@ fn native_fragmentation_respects_datagram_limits_and_timeout_eviction() {
         assert!(reassembly.feed(&decoded[last], now).unwrap().is_none());
         let completed = reassembly.feed(&decoded[last], now).unwrap().unwrap();
         assert_eq!(completed.payload, original);
-        assert_eq!(completed.address.unwrap().routing(Network::Udp), destination);
+        assert_eq!(
+            completed.address.unwrap().routing(Network::Udp),
+            destination
+        );
         // An ID already completed starts an independent subsequent packet,
         // not a ghost delivery of the earlier buffer.
         assert!(reassembly.feed(&decoded[0], now).unwrap().is_none());
@@ -151,7 +164,10 @@ fn native_fragmentation_respects_datagram_limits_and_timeout_eviction() {
         .is_none());
     half.fragment_id = 0;
     half.address = Some(Address::from_target(&target()).unwrap());
-    assert_eq!(expired.feed(&half, now).unwrap_err(), WireError::ReassemblyLimit);
+    assert_eq!(
+        expired.feed(&half, now).unwrap_err(),
+        WireError::ReassemblyLimit
+    );
     let commands = fragment_datagrams(4, 0, &target(), b"", 300).unwrap();
     assert_eq!(commands.len(), 1);
     assert_eq!(
@@ -186,7 +202,10 @@ fn reassembly_orders_fragments_deduplicates_and_rejects_conflicts() {
         .unwrap()
         .is_none());
     assert_eq!(
-        reassembly.feed(&packet(10, 2, 1, b"different"), start + Duration::from_secs(1)),
+        reassembly.feed(
+            &packet(10, 2, 1, b"different"),
+            start + Duration::from_secs(1)
+        ),
         Err(WireError::Fragmentation)
     );
     // A duplicate mismatch is not accepted as an idempotent retransmission.
@@ -217,7 +236,9 @@ fn reassembly_bounds_payload_size_count_and_total_memory() {
         Err(WireError::ReassemblyLimit)
     );
     let mut reassembly = Reassembler::new(Duration::from_secs(30), 100).unwrap();
-    reassembly.feed(&packet(1, 2, 0, &vec![1; 80]), start).unwrap();
+    reassembly
+        .feed(&packet(1, 2, 0, &vec![1; 80]), start)
+        .unwrap();
     assert_eq!(
         reassembly.feed(&packet(1, 2, 1, &vec![2; 21]), start),
         Err(WireError::ReassemblyLimit)

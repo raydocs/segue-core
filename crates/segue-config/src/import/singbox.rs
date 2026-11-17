@@ -168,9 +168,11 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
     let route = root.get("route").and_then(Value::as_object);
     // Local `.srs` rule-sets become `ext-srs:` references by their path; a
     // rule naming a set that is not one is dropped.
-    let mut rule_sets: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    if let Some(sets) = route.and_then(|route| route.get("rule_set")).and_then(Value::as_array) {
+    let mut rule_sets: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(sets) = route
+        .and_then(|route| route.get("rule_set"))
+        .and_then(Value::as_array)
+    {
         for (index, entry) in sets.iter().enumerate() {
             let path = format!("route.rule_set[{index}]");
             let Some(map) = entry.as_object() else {
@@ -227,7 +229,10 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
                     rule.insert("outboundTag".into(), json!(final_tag));
                 }
                 if final_rule.is_some() {
-                    ctx.warn("route.final", "a final rule was already present; `route.final` was dropped");
+                    ctx.warn(
+                        "route.final",
+                        "a final rule was already present; `route.final` was dropped",
+                    );
                 } else {
                     final_rule = Some(Value::Object(rule));
                 }
@@ -290,7 +295,9 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
 }
 
 fn array(value: Option<&Value>) -> &[Value] {
-    value.and_then(Value::as_array).map_or(&[][..], Vec::as_slice)
+    value
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
 }
 
 /// A sing-box duration: a Go duration string, or a number of nanoseconds.
@@ -361,7 +368,9 @@ fn convert_rule(
     } else {
         ctx.warn(
             path,
-            format!("rule targets `{target}`, which is not an imported outbound; the rule was dropped"),
+            format!(
+                "rule targets `{target}`, which is not an imported outbound; the rule was dropped"
+            ),
         );
         return RuleTarget::Dropped;
     }
@@ -663,18 +672,17 @@ fn server_of(map: &Map<String, Value>, path: &str, ctx: &mut Ctx) -> Option<(Str
         return None;
     };
     let Some(server_port) = port(map.get("server_port")) else {
-        ctx.warn(format!("{path}.server_port"), "missing or invalid server port");
+        ctx.warn(
+            format!("{path}.server_port"),
+            "missing or invalid server port",
+        );
         return None;
     };
     Some((server.to_owned(), server_port))
 }
 
 /// The TLS/REALITY security object from sing-box's `tls` block.
-fn security_of(
-    map: &Map<String, Value>,
-    path: &str,
-    ctx: &mut Ctx,
-) -> Option<Value> {
+fn security_of(map: &Map<String, Value>, path: &str, ctx: &mut Ctx) -> Option<Value> {
     let tls = object(map, "tls")?;
     if !boolean(tls, "enabled") {
         return None;
@@ -741,12 +749,16 @@ fn vless_outbound(
         return None;
     }
     let (network, transport) = convert_transport(map, path, ctx);
-    if security.as_ref().is_some_and(|security| security["kind"] == "reality")
+    if security
+        .as_ref()
+        .is_some_and(|security| security["kind"] == "reality")
         && !matches!(network, "raw" | "grpc" | "xhttp")
     {
         ctx.warn(
             path,
-            format!("REALITY only runs over raw, gRPC and XHTTP; the `{network}` transport was dropped"),
+            format!(
+                "REALITY only runs over raw, gRPC and XHTTP; the `{network}` transport was dropped"
+            ),
         );
         return None;
     }
@@ -799,7 +811,9 @@ fn convert_transport(
     let Some(transport) = object(map, "transport") else {
         return ("raw", None);
     };
-    let kind = string(transport, "type").unwrap_or_default().to_ascii_lowercase();
+    let kind = string(transport, "type")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     match kind.as_str() {
         "" => ("raw", None),
         "ws" => {
@@ -812,7 +826,10 @@ fn convert_transport(
                 .collect();
             (
                 "ws",
-                Some(("wsSettings", ws_settings(path_value, host.as_deref(), &rest))),
+                Some((
+                    "wsSettings",
+                    ws_settings(path_value, host.as_deref(), &rest),
+                )),
             )
         }
         "grpc" => {
@@ -842,7 +859,9 @@ fn convert_transport(
         other => {
             ctx.warn(
                 format!("{path}.transport"),
-                format!("transport `{other}` has no Segue equivalent; the outbound dials plain TCP"),
+                format!(
+                    "transport `{other}` has no Segue equivalent; the outbound dials plain TCP"
+                ),
             );
             ("raw", None)
         }
@@ -875,12 +894,7 @@ fn trojan_outbound(
     Some(outbound(tag, "trojan", settings, stream))
 }
 
-fn ss_outbound(
-    tag: &str,
-    map: &Map<String, Value>,
-    path: &str,
-    ctx: &mut Ctx,
-) -> Option<Value> {
+fn ss_outbound(tag: &str, map: &Map<String, Value>, path: &str, ctx: &mut Ctx) -> Option<Value> {
     let Some((server, server_port)) = server_of(map, path, ctx) else {
         return None;
     };
@@ -944,9 +958,8 @@ fn hysteria2_outbound(
         if kind.eq_ignore_ascii_case("salamander") {
             match string(obfs, "password") {
                 Some(password) if (4..=4096).contains(&password.len()) => {
-                    udp_masks.push(
-                        json!({"type": "salamander", "settings": {"password": password}}),
-                    );
+                    udp_masks
+                        .push(json!({"type": "salamander", "settings": {"password": password}}));
                 }
                 _ => ctx.warn(
                     format!("{path}.obfs.password"),
@@ -1035,12 +1048,7 @@ fn anytls_outbound(
     Some(outbound(tag, "anytls", Value::Object(settings), stream))
 }
 
-fn socks_outbound(
-    tag: &str,
-    map: &Map<String, Value>,
-    path: &str,
-    ctx: &mut Ctx,
-) -> Option<Value> {
+fn socks_outbound(tag: &str, map: &Map<String, Value>, path: &str, ctx: &mut Ctx) -> Option<Value> {
     let Some((server, server_port)) = server_of(map, path, ctx) else {
         return None;
     };
@@ -1064,12 +1072,7 @@ fn socks_outbound(
     Some(outbound(tag, "socks", Value::Object(settings), None))
 }
 
-fn http_outbound(
-    tag: &str,
-    map: &Map<String, Value>,
-    path: &str,
-    ctx: &mut Ctx,
-) -> Option<Value> {
+fn http_outbound(tag: &str, map: &Map<String, Value>, path: &str, ctx: &mut Ctx) -> Option<Value> {
     let Some((server, server_port)) = server_of(map, path, ctx) else {
         return None;
     };
@@ -1142,7 +1145,10 @@ fn wireguard_endpoint(
         peers.push(Value::Object(entry));
     }
     if peers.is_empty() {
-        ctx.warn(path, "WireGuard has no usable peer; the outbound was dropped");
+        ctx.warn(
+            path,
+            "WireGuard has no usable peer; the outbound was dropped",
+        );
         return None;
     }
     let mut settings = Map::new();

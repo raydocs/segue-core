@@ -865,7 +865,10 @@ impl Parser<'_> {
         for entry in entries {
             if let Some((file, format)) = ext_rule_set_path(entry.text) {
                 if file.is_empty() {
-                    self.error(&entry.path, format!("{} path cannot be empty", format.label()));
+                    self.error(
+                        &entry.path,
+                        format!("{} path cannot be empty", format.label()),
+                    );
                     return None;
                 }
                 push_srs_ref(&mut spec.srs, file, entry.path, format);
@@ -914,7 +917,10 @@ impl Parser<'_> {
         for entry in entries {
             if let Some((file, format)) = ext_rule_set_path(entry.text) {
                 if file.is_empty() {
-                    self.error(&entry.path, format!("{} path cannot be empty", format.label()));
+                    self.error(
+                        &entry.path,
+                        format!("{} path cannot be empty", format.label()),
+                    );
                     return None;
                 }
                 push_srs_ref(&mut spec.srs, file, entry.path, format);
@@ -1165,11 +1171,7 @@ impl Parser<'_> {
         Some(decoded)
     }
 
-    fn load_mrs(
-        &mut self,
-        file: &str,
-        path: &str,
-    ) -> Option<Arc<segue_routing::mrs::MrsRuleSet>> {
+    fn load_mrs(&mut self, file: &str, path: &str) -> Option<Arc<segue_routing::mrs::MrsRuleSet>> {
         if let Some(cached) = self.mrs_cache.get(file) {
             return Some(Arc::clone(cached));
         }
