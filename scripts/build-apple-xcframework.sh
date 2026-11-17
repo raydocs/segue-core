@@ -139,8 +139,8 @@ use_build_std_for_target() {
   esac
 }
 
-# One cargo invocation per toolchain, with every target of that toolchain:
-# cargo then compiles the targets in parallel and builds the shared host
+# One cargo invocation per toolchain for the given targets: cargo then
+# compiles the targets in parallel and builds the shared host
 # build scripts and proc macros once, instead of one target at a time.
 build_targets() {
   local target
@@ -198,12 +198,11 @@ main() {
   validate_output_paths
   validate_headers
 
-  build_targets \
-    "${IOS_DEVICE_TARGETS[@]}" \
-    "${IOS_SIMULATOR_TARGETS[@]}" \
-    "${TVOS_DEVICE_TARGETS[@]}" \
-    "${TVOS_SIMULATOR_TARGETS[@]}" \
-    "${MACOS_TARGETS[@]}"
+  # One platform at a time, its targets in parallel: each segue-engine
+  # compile peaks near 1.7 GB, so all seven at once would swap a 16 GB Mac.
+  build_targets "${IOS_DEVICE_TARGETS[@]}" "${IOS_SIMULATOR_TARGETS[@]}"
+  build_targets "${TVOS_DEVICE_TARGETS[@]}" "${TVOS_SIMULATOR_TARGETS[@]}"
+  build_targets "${MACOS_TARGETS[@]}"
 
   local ios_device_lib="$OUT_DIR/ios-device/$LIB_NAME"
   local ios_simulator_lib="$OUT_DIR/ios-simulator/$LIB_NAME"
