@@ -81,7 +81,7 @@ fn heartbeat_accepts_nanoseconds_as_a_go_duration() {
 #[test]
 fn bad_settings_unknown_fields_and_the_wrong_transport_are_rejected() {
     let mut cases = vec![json!(null), json!([]), json!({})];
-    for (key, value) in [
+    for (key, bad) in [
         ("server", json!("bad host")),
         ("server", json!(1)),
         ("port", json!(0)),
@@ -101,7 +101,7 @@ fn bad_settings_unknown_fields_and_the_wrong_transport_are_rejected() {
         ("extra", json!(true)),
     ] {
         let mut value = settings();
-        value[key] = value;
+        value[key] = bad;
         cases.push(value);
     }
     for case in cases {
@@ -115,7 +115,7 @@ fn bad_settings_unknown_fields_and_the_wrong_transport_are_rejected() {
         config["outbounds"][0]["streamSettings"]["network"] = network;
         assert!(parse_xray_json(&config.to_string()).is_err());
     }
-    let mut insecure = json!({"outbounds":[{"protocol":"anytls","settings":{
+    let insecure = json!({"outbounds":[{"protocol":"anytls","settings":{
         "address":"example.test","port":443,"password":PASSWORD},
         "streamSettings":{"security":"tls","tlsSettings":{"allowInsecure":true}}}]});
     assert!(parse_xray_json(&insecure.to_string()).is_err());

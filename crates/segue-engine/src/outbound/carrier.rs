@@ -279,6 +279,7 @@ pub(super) fn build_connector(
                     verify_peer_cert_by_name: shadow.tls.verify_peer_cert_by_name.clone(),
                     alpn: shadow.tls.alpn.clone(),
                     fingerprint: shadow.tls.fingerprint.clone(),
+                    ech_config_list: shadow.tls.ech_config_list.clone(),
                 },
             })
         }

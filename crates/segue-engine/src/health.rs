@@ -169,10 +169,13 @@ async fn run_eager_observatory(runtime: ObservatoryRuntime, shutdown: &mut watch
 }
 
 trait ObservatoryRounds {
-    fn probe_round(
-        &mut self,
-        shutdown: &mut watch::Receiver<bool>,
-    ) -> impl std::future::Future<Output = bool> + Send + '_;
+    /// Both borrows share one lifetime: an `async fn` future is valid only for
+    /// the shorter of `&mut self` and `shutdown`, and a single `'_` does not
+    /// name that intersection when the impl captures just one of them.
+    fn probe_round<'a>(
+        &'a mut self,
+        shutdown: &'a mut watch::Receiver<bool>,
+    ) -> impl std::future::Future<Output = bool> + Send + 'a;
 }
 
 struct RuntimeRounds<'a> {
@@ -589,23 +592,35 @@ mod tests {
         gap: Option<Duration>,
     }
 
+    impl ScriptedRounds {
+        /// One probe stamp. The lock stays in this synchronous function so the
+        /// round's future does not capture the guard.
+        fn record_and_finished(&mut self) -> bool {
+            let mut stamps = self.stamps.lock().expect("probe stamps");
+            stamps.push(tokio::time::Instant::now());
+            self.kept.store(stamps.len() as u64, Ordering::SeqCst);
+            stamps.len() >= self.limit
+        }
+    }
+
     impl ObservatoryRounds for ScriptedRounds {
-        async fn probe_round(&mut self, shutdown: &mut watch::Receiver<bool>) -> bool {
-            let stop = {
-                let mut stamps = self.stamps.lock().expect("probe stamps");
-                stamps.push(tokio::time::Instant::now());
-                self.kept.store(stamps.len() as u64, Ordering::SeqCst);
-                stamps.len() >= self.limit
-            };
-            if stop {
-                return false;
-            }
-            if let Some(gap) = self.gap {
-                if wait_interval_or_shutdown(gap, shutdown).await {
+        fn probe_round<'a>(
+            &'a mut self,
+            shutdown: &'a mut watch::Receiver<bool>,
+        ) -> impl std::future::Future<Output = bool> + Send + 'a {
+            let finished = self.record_and_finished();
+            let gap = self.gap;
+            async move {
+                if finished {
                     return false;
                 }
+                if let Some(gap) = gap {
+                    if wait_interval_or_shutdown(gap, shutdown).await {
+                        return false;
+                    }
+                }
+                true
             }
-            true
         }
     }
 

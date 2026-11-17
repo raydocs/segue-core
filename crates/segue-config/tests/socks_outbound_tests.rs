@@ -281,6 +281,7 @@ fn stream_settings_accept_every_transport_and_its_security() {
             StreamSecurity::None => "none",
             StreamSecurity::Tls(_) => "tls",
             StreamSecurity::Reality(_) => "reality",
+            StreamSecurity::ShadowTls(_) => "shadowtls",
         };
         assert_eq!(
             (parsed_transport, parsed_security),

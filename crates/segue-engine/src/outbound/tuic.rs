@@ -723,12 +723,13 @@ impl TuicOutbound {
         resolver: &dyn DnsResolver,
         dialer: &TransportDialer,
     ) -> Result<BoxedTransportStream, CoreError> {
-        Ok(Box::new(
-            self.client(resolver, dialer)
-                .await?
-                .open_tcp(target)
-                .await?,
-        ))
+        // `Client::open_tcp` already returns `BoxedTransportStream`. Boxing it
+        // again would ask `Box<dyn TransportStream>` to implement the trait.
+        Ok(self
+            .client(resolver, dialer)
+            .await?
+            .open_tcp(target)
+            .await?)
     }
 
     pub(crate) async fn open_udp(

@@ -148,6 +148,7 @@ fn compile_vless_tcp_outbound_one_shot(config: &CoreConfig) -> Result<VlessTcpOu
         | TcpOutbound::Wireguard(_)
         | TcpOutbound::Masque(_)
         | TcpOutbound::AnyTls(_)
+        | TcpOutbound::Tuic(_)
         | TcpOutbound::Chained { .. } => Err(CoreError::NoSupportedOutbound),
     }
 }
