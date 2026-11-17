@@ -7,7 +7,6 @@
 //! client's; `scripts/check-http-interop.sh` builds Xray and runs them.
 #[path = "../../../tests/support/xray_startup.rs"]
 #[macro_use]
-#[allow(dead_code)]
 mod xray_startup;
 #[path = "hysteria_runtime/support.rs"]
 mod hysteria_support;

@@ -575,6 +575,7 @@ impl KernelDialer {
     }
 
     /// Lab / tests: put `name` in `group` (AI may move to other exits in it).
+    #[cfg(test)]
     pub(crate) fn set_egress_group(&mut self, name: &str, group: &str) -> Result<(), DialError> {
         let exit = self
             .exits

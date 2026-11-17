@@ -1,7 +1,6 @@
 #![allow(dead_code)]
-#[path = "../../../../tests/support/xray_startup.rs"]
-#[macro_use]
-mod xray_startup;
+// xray_startup is declared once at each test crate's root (see
+// http_runtime/support.rs).
 use crate::hysteria_support as common;
 use common::server as tls;
 pub use common::{echo, socks, tcp_echo, udp_echo, Bootstrap, Protector};
@@ -334,7 +333,7 @@ impl ReferenceServer {
                 let log =
                     std::fs::read_to_string(self.directory.join("server.log")).unwrap_or_default();
                 assert!(
-                    self::xray_startup::port_taken(&log),
+                    crate::xray_startup::port_taken(&log),
                     "reference exited:\n{log}"
                 );
                 return false;

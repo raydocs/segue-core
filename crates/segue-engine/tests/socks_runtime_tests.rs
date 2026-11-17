@@ -7,7 +7,6 @@
 //! resolver accepts nothing but the SOCKS server name.
 #[path = "../../../tests/support/xray_startup.rs"]
 #[macro_use]
-#[allow(dead_code)]
 mod xray_startup;
 #[path = "hysteria_runtime/support.rs"]
 mod hysteria_support;
