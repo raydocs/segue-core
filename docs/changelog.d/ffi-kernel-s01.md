@@ -1,0 +1,2 @@
+- Added `EngineDialer::with_transport_dialer` so kernel outbounds and direct flows can share the host's protected transport; recorded carrier/direct socket coverage in kernel unit tests.
+- Added the opt-in `proprietary-kernel` FFI skeleton (ABI 1.18, guarded kernel declarations and six capability bits). Existing platform builds and the feature-off ABI are unchanged; kernel config loading, symbol implementations and host integration remain staged separately.

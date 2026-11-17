@@ -338,6 +338,9 @@ jobs:
         # would otherwise launch their libFuzzer mains without a run bound.
         run: cargo test --workspace --exclude segue-fuzz --all-targets --locked
 
+      - name: Test proprietary-kernel FFI skeleton
+        run: cargo test -p segue-ffi --features proprietary-kernel
+
       - name: Replay fuzz seed corpora
         run: bash scripts/replay-fuzz-corpus.sh
 

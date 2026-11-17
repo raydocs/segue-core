@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -105,6 +106,24 @@ fn ffi_header_declares_lifecycle_error_and_tun_abi() {
     assert!(header.contains("XRAY_FFI_CAPABILITY_OUTBOUND_PROBE_CANCEL = 1 << 28"));
     assert!(header.contains("XRAY_FFI_CAPABILITY_TUN_MTU = 1 << 29"));
     assert!(header.contains("XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT = 1 << 30"));
+    #[cfg(feature = "proprietary-kernel")]
+    {
+        for token in [
+            "#ifdef XRAY_FFI_WITH_PROPRIETARY_KERNEL",
+            "XRAY_FFI_CAPABILITY_KERNEL (UINT64_C(1) << 31)",
+            "XRAY_FFI_CAPABILITY_KERNEL_TUN_FD (UINT64_C(1) << 36)",
+            "XrayKernelEventKind",
+            "XrayKernelStats",
+            "xray_kernel_set_state_dir",
+            "xray_kernel_load_config_json",
+            "xray_kernel_set_user_enabled",
+            "xray_kernel_install_policy_bundle",
+            "xray_kernel_stats",
+        ] {
+            assert!(header.contains(token), "guarded header missing {token}");
+        }
+        assert_eq!(header.matches("XrayStatus xray_kernel_").count(), 10);
+    }
     assert!(header.contains("uint64_t udp_oversize_datagrams;"));
     // The Rust enum, the JNI result carrier and the Swift mapping all rely on
     // these discriminants staying stable within ABI major 1.
@@ -1169,25 +1188,34 @@ fn android_adapter_build_script_covers_gradle_sdk_and_artifacts() {
 
 #[test]
 fn ffi_header_compiles_as_c_harness() {
-    compile_c_harness();
+    compile_c_harness("xray_ffi_harness.c", &[]);
+    #[cfg(feature = "proprietary-kernel")]
+    compile_c_harness(
+        "xray_ffi_kernel_harness.c",
+        &["-DXRAY_FFI_WITH_PROPRIETARY_KERNEL"],
+    );
 }
 
-#[test]
-fn native_staticlib_exports_mobile_abi_symbols() {
-    assert_native_staticlib_exports_symbols();
-}
-
-fn compile_c_harness() {
+fn compile_c_harness(filename: &str, extra_flags: &[&str]) {
     let root = workspace_root();
     let out_dir = root.join("target/mobile/harness");
     fs::create_dir_all(&out_dir).expect("create C harness output directory");
 
-    let source_path = out_dir.join("xray_ffi_harness.c");
-    let object_path = out_dir.join("xray_ffi_harness.o");
-    fs::write(&source_path, C_HARNESS_SOURCE).expect("write C harness source");
+    let source_path = out_dir.join(filename);
+    let object_path = out_dir.join(filename).with_extension("o");
+    #[cfg(not(feature = "proprietary-kernel"))]
+    let source = C_HARNESS_SOURCE;
+    #[cfg(feature = "proprietary-kernel")]
+    let source = if extra_flags.is_empty() {
+        C_HARNESS_SOURCE
+    } else {
+        KERNEL_C_HARNESS_SOURCE
+    };
+    fs::write(&source_path, source).expect("write C harness source");
 
     let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
     let output = Command::new(compiler)
+        .args(extra_flags)
         .arg("-std=c11")
         .arg("-Wall")
         .arg("-Wextra")
@@ -1209,57 +1237,68 @@ fn compile_c_harness() {
     );
 }
 
-fn assert_native_staticlib_exports_symbols() {
-    let root = workspace_root();
-    // `lto = "thin"` archives contain LLVM bitcode objects that the host
-    // toolchain's `nm` may not be able to read when its LLVM is older than
-    // rustc's; scan a non-LTO build so members are plain machine objects.
-    let build = Command::new("cargo")
-        .current_dir(&root)
-        .args([
-            "build",
-            "--locked",
-            "-p",
-            "segue-ffi",
-            "--release",
-            "--target-dir",
-            "target/ffi-symbol-scan",
-            "--config",
-            "profile.release.lto=\"off\"",
-        ])
-        .output()
-        .expect("run cargo build for native segue-ffi staticlib");
+#[test]
+fn native_staticlib_exports_exact_mobile_abi_symbols_in_both_configurations() {
+    for feature in [None, Some("proprietary-kernel")] {
+        let enabled = feature.is_some();
+        let symbols = build_and_scan_xray_exported_symbols(feature);
+        let expected: BTreeSet<String> = EXPORTED_SYMBOLS
+            .iter()
+            .map(|symbol| (*symbol).to_owned())
+            .collect();
+        assert_eq!(symbols, expected, "proprietary-kernel: {enabled}");
+        for symbol in EXPORTED_SYMBOLS.iter().filter(|s| s.starts_with("xray_kernel_")) {
+            assert!(!symbols.contains(*symbol));
+        }
+    }
+}
 
-    assert_command_success("native segue-ffi release build", &build);
+// Scan a non-LTO build: LLVM bitcode from a thin-LTO archive is not always
+// readable by the installed `nm`. The exact xray_* set also catches accidental
+// additions to the default surface, not just accidental removals.
+fn build_and_scan_xray_exported_symbols(feature: Option<&str>) -> BTreeSet<String> {
+    let root = workspace_root();
+    let mut build = Command::new("cargo");
+    build.current_dir(&root).args([
+        "build",
+        "--locked",
+        "-p",
+        "segue-ffi",
+        "--release",
+        "--target-dir",
+        "target/ffi-symbol-scan",
+        "--config",
+        "profile.release.lto=\"off\"",
+    ]);
+    if let Some(feature) = feature {
+        build.args(["--features", feature]);
+    }
+    assert_command_success(
+        "native segue-ffi ABI-scan build",
+        &build.output().expect("run native ABI-scan build"),
+    );
 
     let library = root.join("target/ffi-symbol-scan/release/libsegue_ffi.a");
-    assert!(
-        library.exists(),
-        "native staticlib missing at {}",
-        library.display()
-    );
-
-    let symbols = Command::new("nm")
-        .arg("-g")
-        .arg(&library)
+    assert!(library.is_file(), "staticlib missing: {library:?}");
+    let nm = Command::new("nm")
+        .args(if cfg!(target_vendor = "apple") {
+            ["-g", "-U"]
+        } else {
+            ["-g", "--defined-only"]
+        })
+        .arg(library)
         .output()
-        .expect("run nm for native segue-ffi staticlib");
-
-    // `nm` exits nonzero when prebuilt std members carry bitcode newer than
-    // its LLVM reader; the crate's own machine-code members still get listed,
-    // so judge the scan by its output rather than the exit status.
-    let stdout = String::from_utf8_lossy(&symbols.stdout);
-    assert!(
-        !stdout.trim().is_empty(),
-        "native segue-ffi nm symbol scan produced no output\nstderr:\n{}",
-        String::from_utf8_lossy(&symbols.stderr)
-    );
-    for symbol in EXPORTED_SYMBOLS {
-        assert!(
-            contains_exported_symbol(&stdout, symbol),
-            "native staticlib missing exported symbol `{symbol}`"
-        );
-    }
+        .expect("run nm for ABI symbol scan");
+    let stdout = String::from_utf8_lossy(&nm.stdout);
+    // Prebuilt std archive members may still contain bitcode an older nm
+    // rejects; all ordinary members are nevertheless scanned into stdout.
+    assert!(!stdout.trim().is_empty(), "empty nm scan: {nm:?}");
+    stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .map(|name| name.strip_prefix('_').unwrap_or(name).to_owned())
+        .filter(|name| name.starts_with("xray_"))
+        .collect()
 }
 
 fn assert_command_success(description: &str, output: &std::process::Output) {
@@ -1269,16 +1308,6 @@ fn assert_command_success(description: &str, output: &std::process::Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-fn contains_exported_symbol(nm_stdout: &str, symbol: &str) -> bool {
-    let underscored = format!("_{symbol}");
-    nm_stdout.lines().any(|line| {
-        let Some(name) = line.split_whitespace().last() else {
-            return false;
-        };
-        name == symbol || name == underscored
-    })
 }
 
 const EXPORTED_SYMBOLS: &[&str] = &[
@@ -1314,6 +1343,9 @@ const EXPORTED_SYMBOLS: &[&str] = &[
     "xray_core_preflight_startup_probe",
     "xray_core_set_tun_fd",
     "xray_core_set_tun_collect_tcp_timings",
+    "xray_core_set_tun_admission",
+    "xray_core_set_hysteria_stream_limits",
+    "xray_core_set_tun_mtu",
     "xray_core_set_tun_runtime_profile",
     "xray_core_set_dns_bootstrap_mode",
     "xray_error_code",
@@ -1325,6 +1357,7 @@ const EXPORTED_SYMBOLS: &[&str] = &[
     "xray_tun_poll_tcp_flow_summary_event",
     "xray_tun_poll_tcp_open_error_event",
     "xray_tun_poll_tcp_slow_flow_event",
+    "xray_tun_poll_tcp_remote_write_slow_event",
     "xray_tun_poll_udp_slow_flow_event",
     "xray_tun_poll_udp_response_gap_event",
     "xray_tun_poll_udp_quic_blocked_event",
@@ -1347,6 +1380,45 @@ const ANDROID_TARGETS: &[&str] = &[
     "i686-linux-android",
     "x86_64-linux-android",
 ];
+
+#[cfg(feature = "proprietary-kernel")]
+const KERNEL_C_HARNESS_SOURCE: &str = r#"
+#include "segue_ffi.h"
+#include <stddef.h>
+#include <stdint.h>
+int main(void) {
+  XrayKernelEvent event = { .struct_size = sizeof(XrayKernelEvent),
+    .kind = XRAY_KERNEL_EVENT_POSTURE_CHANGED };
+  XrayKernelStats stats = { .struct_size = sizeof(XrayKernelStats) };
+  XrayCoreHandle *handle = NULL;
+  XrayError *error = NULL;
+  size_t written = 0;
+  uint64_t version = 0;
+  uint8_t policy[1] = {0};
+  char detail[64] = {0};
+  uint64_t caps = XRAY_FFI_CAPABILITY_KERNEL |
+    XRAY_FFI_CAPABILITY_KERNEL_KILLSWITCH | XRAY_FFI_CAPABILITY_KERNEL_POLICY |
+    XRAY_FFI_CAPABILITY_KERNEL_DNS | XRAY_FFI_CAPABILITY_KERNEL_STATS |
+    XRAY_FFI_CAPABILITY_KERNEL_TUN_FD;
+  (void)event.value; (void)event.timestamp_ms; (void)stats.fakeip_refusals;
+  (void)caps;
+  /* Compile the complete declaration shape. These stage-2..5 calls have no
+   * stage-1 symbol bodies; do not link this harness. */
+  (void)&xray_kernel_load_config_json;
+  (void)&xray_kernel_set_state_dir;
+  (void)&xray_kernel_config_warnings;
+  (void)&xray_kernel_set_user_enabled;
+  (void)&xray_kernel_set_exit;
+  (void)&xray_kernel_probe;
+  (void)&xray_kernel_poll_event;
+  (void)&xray_kernel_install_policy_bundle;
+  (void)&xray_kernel_status_snapshot_json;
+  (void)&xray_kernel_stats;
+  (void)handle; (void)error; (void)written; (void)version; (void)policy;
+  (void)detail;
+  return 0;
+}
+"#;
 
 const C_HARNESS_SOURCE: &str = r#"
 #include "segue_ffi.h"
