@@ -7,7 +7,7 @@ let package = Package(
     platforms: [
         .iOS(.v15),
         .tvOS(.v17),
-        .macOS(.v11),
+        .macOS(.v12),
     ],
     products: [
         .library(name: "XrayMobileAdapter", targets: ["XrayMobileAdapter"]),
