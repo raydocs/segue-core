@@ -262,6 +262,7 @@ async fn world_with(server_cfg: impl FnOnce(&mut quinn::ServerConfig)) -> World 
         sniff: None,
         udp: Some(Arc::new(Udp::new(UdpSettings::default()))),
         hidden: Default::default(),
+        flows: None,
     });
     let (to_stack, rx) = mpsc::channel(256);
     let (tx, mut from_stack) = mpsc::channel::<Bytes>(256);

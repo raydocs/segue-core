@@ -144,6 +144,7 @@ async fn start_kernel_arc(
         }),
         udp: None,
         hidden: Default::default(),
+        flows: None,
     };
     let kernel = Arc::new(kernel);
     tokio::spawn(serve(l, kernel.clone()));
