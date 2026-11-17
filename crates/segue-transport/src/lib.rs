@@ -80,6 +80,7 @@ pub use reality_runtime::{
 pub use reality_rustls::extract_server_hello_for_fuzzing;
 pub use reality_rustls::RustlsRealityTlsSessionProvider;
 pub use route_probe::{RouteFamilies, RouteProbe, SystemRouteProbe};
+pub(crate) use shadowtls::connect_shadow_tls_stream;
 pub use shadowtls::ShadowTlsConfig;
 pub use socket_options::{
     CustomSocketOption, SocketOptions, SocketOptionsProtector, SocketOptionsReport,

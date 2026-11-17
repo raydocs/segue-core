@@ -2,6 +2,7 @@
 
 use std::{io, net::SocketAddr, time::Duration};
 
+use hmac::KeyInit;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{
     io::{self as tokio_io, AsyncReadExt, AsyncWriteExt},
@@ -83,7 +84,8 @@ fn tls13_server_hello() -> Vec<u8> {
     body.push(32);
     body.extend_from_slice(&[7; 32]);
     body.extend_from_slice(&[0x13, 1, 0, 0, 0, 6, 0, 43, 0, 2, 3, 4]);
-    body[2..4].copy_from_slice(&((body.len() - 4) as u16).to_be_bytes());
+    let handshake_len = ((body.len() - 4) as u16).to_be_bytes();
+    body[2..4].copy_from_slice(&handshake_len);
     let mut record = vec![HANDSHAKE, 3, 3, 0, 0];
     record[3..5].copy_from_slice(&(body.len() as u16).to_be_bytes());
     record.extend_from_slice(&body);
@@ -165,6 +167,7 @@ fn client_config() -> ShadowTlsConfig {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("chrome".to_owned()),
+            ech_config_list: None,
         },
     }
 }
@@ -208,7 +211,7 @@ async fn relay(
                     assert_eq!(&frame[TLS_HMAC_HEADER_LEN..], REQUEST);
                     break;
                 }
-                let mut handshake = <Sha1Hmac as Mac>::new_from_slice(PASSWORD).unwrap();
+                let mut handshake = <Sha1Hmac as KeyInit>::new_from_slice(PASSWORD).unwrap();
                 handshake.update(&random);
                 handshake.update(&frame[TLS_HMAC_HEADER_LEN..]);
                 let expected = handshake.finalize().into_bytes()[..HMAC_LEN].to_vec();
@@ -221,7 +224,7 @@ async fn relay(
         io::Result::Ok(())
     });
 
-    let mut handshake = <Sha1Hmac as Mac>::new_from_slice(PASSWORD).unwrap();
+    let mut handshake = <Sha1Hmac as KeyInit>::new_from_slice(PASSWORD).unwrap();
     handshake.update(&random);
     let xor_key = xor_wrap_key(PASSWORD, &random);
     let mut next = record(&mut upstream_read).await?;

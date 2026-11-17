@@ -10,14 +10,15 @@
 //! not hidden behind this connector.
 
 use std::{
-    fmt, io,
+    fmt,
+    io::{self, Read},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 
 use bytes::{Buf, BytesMut};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rand::{rngs::OsRng, RngCore};
 use rustls::{
     client::{
@@ -56,7 +57,9 @@ type Sha1Hmac = Hmac<Sha1>;
 /// The connector's resolved settings. `password` authenticates the handshake
 /// and both directions of the post-switch stream; `tls` controls the genuine
 /// TLS certificate handshake, its SNI and its uTLS fingerprint.
-#[derive(Clone)]
+/// `Eq` exists so [`crate::ConnectorConfig`] can derive it. That comparison is
+/// structural (config identity), not a password check, so it is not constant-time.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ShadowTlsConfig {
     pub password: Zeroizing<String>,
     pub tls: TlsClientConfig,
@@ -130,7 +133,21 @@ pub(crate) async fn connect_shadow_tls_stream(
         .map_err(TransportError::Tls)?;
     let (relay, mut session) = stream.into_inner();
     let mut plaintext = Vec::new();
-    session.reader().read_to_end(&mut plaintext).map_err(TransportError::Tls)?;
+    // `Read::read_to_end` treats rustls' post-handshake `WouldBlock` (buffer
+    // empty, session still open) as failure, and does not promise to keep
+    // bytes already copied. Drain until that signal instead.
+    {
+        let mut reader = session.reader();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => plaintext.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(TransportError::Tls(error)),
+            }
+        }
+    }
     if !plaintext.is_empty() {
         return Err(TransportError::ShadowTls(
             "unconsumed TLS dummy plaintext at the switch".to_owned(),
@@ -234,7 +251,7 @@ fn seal_session_id(
     }
     let mut session_id = [0u8; TLS_SESSION_ID_LEN];
     session_id[..TLS_SESSION_ID_LEN - HMAC_LEN].copy_from_slice(&random);
-    let mut hmac = <Sha1Hmac as Mac>::new_from_slice(password)
+    let mut hmac = <Sha1Hmac as KeyInit>::new_from_slice(password)
         .map_err(|_| "ShadowTLS password could not initialize HMAC")?;
     hmac.update(&hello[..CLIENT_HELLO_SESSION_ID_START]);
     hmac.update(&session_id);
@@ -257,7 +274,7 @@ fn client_hello_tag_valid(password: &[u8], record: &[u8]) -> bool {
     {
         return false;
     }
-    let mut hmac = match <Sha1Hmac as Mac>::new_from_slice(password) {
+    let mut hmac = match <Sha1Hmac as KeyInit>::new_from_slice(password) {
         Ok(hmac) => hmac,
         Err(_) => return false,
     };
@@ -345,7 +362,7 @@ struct FrameMac {
 
 impl FrameMac {
     fn new(password: &[u8], server_random: &[u8; 32], direction: u8) -> Self {
-        let mut inner = <Sha1Hmac as Mac>::new_from_slice(password)
+        let mut inner = <Sha1Hmac as KeyInit>::new_from_slice(password)
             .expect("HMAC-SHA1 accepts a key of every length");
         inner.update(server_random);
         inner.update(&[direction]);
@@ -553,7 +570,7 @@ impl HandshakeRelay {
         if record[0] == HANDSHAKE {
             if self.handshake_mac.is_none() {
                 if let Some(random) = server_random(&record) {
-                    let mut mac = <Sha1Hmac as Mac>::new_from_slice(self.password.as_bytes())
+                    let mut mac = <Sha1Hmac as KeyInit>::new_from_slice(self.password.as_bytes())
                         .expect("HMAC-SHA1 accepts every key length");
                     mac.update(&random);
                     self.xor_key = Some(xor_wrap_key(self.password.as_bytes(), &random));

@@ -694,7 +694,7 @@ impl TransportDialer {
                     }
                 }
             }
-            ConnectorConfig::ShadowTls(config) => Err(TransportError::ShadowTls(
+            ConnectorConfig::ShadowTls(_) => Err(TransportError::ShadowTls(
                 "a ShadowTLS connector needs the raw TCP transport layer".to_owned(),
             )),
             ConnectorConfig::Reality(reality_config) => {
