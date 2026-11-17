@@ -30,14 +30,6 @@ async fn check(
     wrong: Value,
 ) {
     let server_masks = masks.clone();
-    // Not www.google.com. That dest's trusted certificate makes the REALITY
-    // detector's probe succeed and then block, and the first client is the one
-    // that pays for it (`early eof` on the greeting).
-    let cover = if matches!(security, XrayInboundSecurity::Reality) {
-        Some(spawn_reality_cover().await)
-    } else {
-        None
-    };
     let server = start_xray_vless_server_customized(
         checkout,
         XrayVlessServerConfig {
@@ -47,10 +39,6 @@ async fn check(
         },
         |config| {
             config["inbounds"][0]["streamSettings"]["finalmask"] = json!({"tcp": server_masks});
-            if let Some(cover) = cover.as_ref() {
-                let settings = &mut config["inbounds"][0]["streamSettings"]["realitySettings"];
-                settings["dest"] = format!("127.0.0.1:{}", cover.addr.port()).into();
-            }
         },
     )
     .await;
@@ -68,21 +56,6 @@ async fn check(
         XrayInboundSecurity::None => {}
     }
     eprintln!("sudoku over {name}");
-    if cover.is_some() {
-        // The listener may still be on its first contact with the cover. That
-        // attempt is allowed to end early; the measured one is not.
-        let warmup = timeout(
-            Duration::from_secs(30),
-            exercise(
-                profile(server.addr.port(), stream.clone(), masks.clone()),
-                false,
-            ),
-        )
-        .await;
-        if !matches!(warmup, Ok(Ok(()))) {
-            eprintln!("sudoku REALITY detector warmup: {warmup:?}");
-        }
-    }
     let result = timeout(
         Duration::from_secs(60),
         exercise(profile(server.addr.port(), stream.clone(), masks), true),
