@@ -10,6 +10,10 @@ impl Parser<'_> {
     ) -> Option<StreamSettings> {
         let stream = outbound.get("streamSettings");
         let stream_network = self.parse_network(stream, index)?;
+        let tuic = outbound
+            .get("protocol")
+            .and_then(Value::as_str)
+            .is_some_and(|protocol| protocol.eq_ignore_ascii_case("tuic"));
         let mut security = self.parse_security(stream, index, outbound)?;
         if stream_network == StreamNetwork::Hysteria {
             if let StreamSecurity::Tls(tls) = &mut security {
@@ -369,7 +373,7 @@ impl Parser<'_> {
         Some(StreamSettings {
             // Native Hysteria owns a UDP carrier; other transports retain
             // their existing TCP classification (XHTTP selects H3 later).
-            network: if stream_network == StreamNetwork::Hysteria {
+            network: if stream_network == StreamNetwork::Hysteria || tuic {
                 Network::Udp
             } else {
                 Network::Tcp

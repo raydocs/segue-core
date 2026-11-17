@@ -24,6 +24,8 @@ mod http;
 pub use http::HttpOutbound;
 pub(crate) mod hysteria;
 pub use hysteria::HysteriaOutbound;
+mod tuic;
+pub(crate) use tuic::{TuicError, TuicOutbound};
 pub(crate) mod wireguard;
 pub use wireguard::WireguardOutbound;
 pub(crate) mod masque;
@@ -416,6 +418,7 @@ pub enum TcpOutbound {
     Wireguard(WireguardOutbound),
     Masque(MasqueOutbound),
     AnyTls(AnyTlsOutbound),
+    Tuic(TuicOutbound),
     Chained {
         outbound: Box<TcpOutbound>,
         proxy: Box<TcpOutbound>,
@@ -440,6 +443,7 @@ pub enum UdpOutbound {
     Wireguard(WireguardOutbound),
     Masque(MasqueOutbound),
     AnyTls(AnyTlsOutbound),
+    Tuic(TuicOutbound),
 }
 
 impl UdpOutbound {
@@ -1274,6 +1278,7 @@ impl TcpOutbound {
             | Self::Http(_)
             | Self::Shadowsocks2022(_)
             | Self::Hysteria(_)
+            | Self::Tuic(_)
             | Self::Wireguard(_)
             | Self::Masque(_)
             | Self::AnyTls(_) => None,
@@ -1341,6 +1346,9 @@ impl ResolvedTcpConnector for OutboundProxyTcpConnector {
             )),
             TcpOutbound::Hysteria(_) => Err(TransportError::ChainedOutbound(
                 "Hysteria chaining is unsupported".into(),
+            )),
+            TcpOutbound::Tuic(_) => Err(TransportError::ChainedOutbound(
+                "TUIC chaining is unsupported".into(),
             )),
             TcpOutbound::Trojan(outbound) => outbound
                 .open_resolved(
@@ -1485,6 +1493,9 @@ fn prepare_outbound_proxy_dialer<'a>(
             TcpOutbound::Hysteria(_) => {
                 return Err(CoreError::UnsupportedOutboundProxyNetwork("Hysteria"))
             }
+            TcpOutbound::Tuic(_) => {
+                return Err(CoreError::UnsupportedOutboundProxyNetwork("TUIC"));
+            }
             // Ports are filled in per connection, from the next hop's server
             // unless the redirect names one.
             TcpOutbound::Freedom(freedom) => match freedom.redirect_address() {
@@ -1545,6 +1556,7 @@ fn proxy_chain_requires_local_resolution(proxy: &TcpOutbound) -> bool {
 enum CachedOutboundError {
     Trojan(segue_proxy::trojan::WireError),
     AnyTls(segue_proxy::anytls::WireError),
+    Tuic(TuicError),
     NoSupportedOutbound,
     UnsupportedOutboundNetwork,
     UnsupportedOutboundSecurity,
@@ -1564,6 +1576,7 @@ impl CachedOutboundError {
         match error {
             CoreError::Trojan(error) => Self::Trojan(error),
             CoreError::AnyTls(error) => Self::AnyTls(error),
+            CoreError::Tuic(error) => Self::Tuic(error),
             CoreError::NoSupportedOutbound => Self::NoSupportedOutbound,
             CoreError::UnsupportedOutboundNetwork => Self::UnsupportedOutboundNetwork,
             CoreError::UnsupportedOutboundSecurity => Self::UnsupportedOutboundSecurity,
@@ -1590,6 +1603,7 @@ impl CachedOutboundError {
         match self {
             Self::Trojan(error) => CoreError::Trojan(error),
             Self::AnyTls(error) => CoreError::AnyTls(error),
+            Self::Tuic(error) => CoreError::Tuic(error),
             Self::NoSupportedOutbound => CoreError::NoSupportedOutbound,
             Self::UnsupportedOutboundNetwork => CoreError::UnsupportedOutboundNetwork,
             Self::UnsupportedOutboundSecurity => CoreError::UnsupportedOutboundSecurity,
@@ -1623,6 +1637,7 @@ struct CachedOutboundEntry {
     vmess: OnceLock<Result<VmessOutbound, CachedOutboundError>>,
     shadowsocks: OnceLock<Result<Shadowsocks2022Outbound, CachedOutboundError>>,
     hysteria: OnceLock<Result<HysteriaOutbound, CachedOutboundError>>,
+    tuic: OnceLock<Result<TuicOutbound, CachedOutboundError>>,
     wireguard: OnceLock<Result<WireguardOutbound, CachedOutboundError>>,
     masque: OnceLock<Result<MasqueOutbound, CachedOutboundError>>,
 }
@@ -1640,6 +1655,7 @@ pub struct OutboundNodeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundNodeKind {
     Hysteria,
+    Tuic,
     Wireguard,
     Masque,
     AnyTls,
@@ -1861,6 +1877,7 @@ impl OutboundGraph {
                     OutboundSettings::Vless(_) => OutboundNodeKind::Vless,
                     OutboundSettings::Trojan(_) => OutboundNodeKind::Trojan,
                     OutboundSettings::Vmess(_) => OutboundNodeKind::Vmess,
+                    OutboundSettings::Tuic(_) => OutboundNodeKind::Tuic,
                     OutboundSettings::Shadowsocks2022(_) => OutboundNodeKind::Shadowsocks2022,
                     OutboundSettings::Hysteria(_) => OutboundNodeKind::Hysteria,
                     OutboundSettings::Wireguard(_) => OutboundNodeKind::Wireguard,
@@ -2107,6 +2124,7 @@ fn build_outbound_proxy_edges(
             (OutboundSettings::Blackhole(_), _) => Some("blackhole outbounds are not TCP carriers"),
             (OutboundSettings::Loopback(_), _) => Some("loopback outbounds are not TCP carriers"),
             (OutboundSettings::Hysteria(_), _) => Some("Hysteria chaining is unsupported"),
+            (OutboundSettings::Tuic(_), _) => Some("TUIC chaining is unsupported"),
             (OutboundSettings::Wireguard(_), _) => Some("WireGuard chaining is unsupported"),
             (
                 _,
@@ -4014,6 +4032,25 @@ impl OutboundFactory {
         result
     }
 
+    fn cached_tuic_outbound(
+        &self,
+        node: OutboundNodeId,
+    ) -> Result<TuicOutbound, CachedOutboundError> {
+        if self.sessions_closed.load(Ordering::Acquire) {
+            return Err(CachedOutboundError::NoSupportedOutbound);
+        }
+        let configured = self
+            .graph
+            .configured_outbound(node)
+            .ok_or(CachedOutboundError::NoSupportedOutbound)?;
+        self.entry(node)?
+            .tuic
+            .get_or_init(|| {
+                TuicOutbound::new(configured).map_err(CachedOutboundError::from_core_error)
+            })
+            .clone()
+    }
+
     pub(crate) fn close_sessions(&self) {
         self.sessions_closed.store(true, Ordering::Release);
         for entry in &self.entries {
@@ -4042,6 +4079,9 @@ impl OutboundFactory {
                 outbound.close();
             }
             if let Some(Ok(outbound)) = entry.hysteria.get() {
+                outbound.close();
+            }
+            if let Some(Ok(outbound)) = entry.tuic.get() {
                 outbound.close();
             }
         }
@@ -4116,7 +4156,10 @@ impl OutboundFactory {
         }
 
         if outbound.stream.network != Network::Tcp
-            && !matches!(outbound.settings, OutboundSettings::Hysteria(_))
+            && !matches!(
+                outbound.settings,
+                OutboundSettings::Hysteria(_) | OutboundSettings::Tuic(_)
+            )
         {
             return Err(CachedOutboundError::UnsupportedOutboundNetwork);
         }
@@ -4125,6 +4168,7 @@ impl OutboundFactory {
             OutboundSettings::Hysteria(_) => self
                 .cached_hysteria_outbound(node)
                 .map(TcpOutbound::Hysteria),
+            OutboundSettings::Tuic(_) => self.cached_tuic_outbound(node).map(TcpOutbound::Tuic),
             OutboundSettings::Wireguard(_) => self
                 .cached_wireguard_outbound(node)
                 .map(TcpOutbound::Wireguard),
@@ -4219,6 +4263,7 @@ impl OutboundFactory {
             OutboundSettings::Hysteria(_) => self
                 .cached_hysteria_outbound(node)
                 .map(UdpOutbound::Hysteria),
+            OutboundSettings::Tuic(_) => self.cached_tuic_outbound(node).map(UdpOutbound::Tuic),
             OutboundSettings::Wireguard(_) => self
                 .cached_wireguard_outbound(node)
                 .map(UdpOutbound::Wireguard),
@@ -4299,6 +4344,7 @@ impl OutboundFactory {
             OutboundSettings::Freedom(_)
             | OutboundSettings::Vless(_)
             | OutboundSettings::Hysteria(_)
+            | OutboundSettings::Tuic(_)
             | OutboundSettings::Trojan(_)
             | OutboundSettings::Vmess(_)
             | OutboundSettings::Shadowsocks2022(_)
@@ -4341,6 +4387,7 @@ fn build_tcp_outbound(outbound: &OutboundConfig) -> Result<TcpOutbound, CoreErro
 
     match &outbound.settings {
         OutboundSettings::Hysteria(_) => HysteriaOutbound::new(outbound).map(TcpOutbound::Hysteria),
+        OutboundSettings::Tuic(_) => TuicOutbound::new(outbound).map(TcpOutbound::Tuic),
         OutboundSettings::Wireguard(_) => {
             WireguardOutbound::new(outbound).map(TcpOutbound::Wireguard)
         }
@@ -4374,6 +4421,7 @@ fn build_tcp_outbound(outbound: &OutboundConfig) -> Result<TcpOutbound, CoreErro
 fn build_udp_outbound(outbound: &OutboundConfig) -> Result<UdpOutbound, CoreError> {
     match &outbound.settings {
         OutboundSettings::Hysteria(_) => HysteriaOutbound::new(outbound).map(UdpOutbound::Hysteria),
+        OutboundSettings::Tuic(_) => TuicOutbound::new(outbound).map(UdpOutbound::Tuic),
         OutboundSettings::Wireguard(_) => {
             WireguardOutbound::new(outbound).map(UdpOutbound::Wireguard)
         }
@@ -4867,6 +4915,9 @@ async fn open_plain_tcp_stream_with_resolvers_and_dialer(
             } else {
                 Box::pin(outbound.open_resolved(target, &[], &[], transport_dialer)).await
             }
+        }
+        TcpOutbound::Tuic(outbound) => {
+            Box::pin(outbound.open_tcp(target, bootstrap_resolver, transport_dialer)).await
         }
         TcpOutbound::Wireguard(outbound) => {
             // Cold protocol setup contains large async state. Keep it out of

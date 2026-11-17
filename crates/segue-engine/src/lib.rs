@@ -360,6 +360,8 @@ pub enum CoreError {
     #[error(transparent)]
     Hysteria(#[from] segue_transport::hysteria::HysteriaError),
     #[error(transparent)]
+    Tuic(#[from] crate::outbound::TuicError),
+    #[error(transparent)]
     Wireguard(#[from] segue_wireguard::Error),
     #[error(transparent)]
     Masque(#[from] segue_transport::masque::MasqueError),

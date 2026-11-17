@@ -989,7 +989,7 @@ pub(crate) fn tcp_relay_policy(
                 outbound_policy.relay_buffer_size(),
             )
         }
-        TcpOutbound::Hysteria(_) | TcpOutbound::Wireguard(_) => {
+        TcpOutbound::Tuic(_) | TcpOutbound::Hysteria(_) | TcpOutbound::Wireguard(_) => {
             let outbound_policy = effective_policy_for_level(config, Some(0));
             (
                 outbound_policy.handshake,

@@ -39,6 +39,52 @@ mod websocket;
 mod websocket_frame;
 pub(crate) mod xhttp;
 
+/// Raw protected QUIC used by non-HTTP clients, such as TUIC v5.
+pub mod quic {
+    pub use super::xhttp::{H3ConnectConfig, H3Error};
+    pub struct Connected {
+        pub endpoint: quinn::Endpoint,
+        pub connection: quinn::Connection,
+        pub zero_rtt_accepted: Option<quinn::ZeroRttAccepted>,
+        pub rebind: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    pub async fn connect(
+        config: H3ConnectConfig,
+        expected_alpn: Option<&'static [u8]>,
+        datagram_buffers: Option<(usize, usize, u16)>,
+    ) -> Result<Connected, H3Error> {
+        let carrier = config.quic.hop_carrier();
+        let protector = config.socket_protector.clone();
+        let changes = config.network_changes.clone();
+        let (endpoint, connection, _, wire_peer, zero_rtt_accepted) =
+            super::connect_quic_transport_raw(
+                config,
+                expected_alpn,
+                datagram_buffers,
+                None,
+                Default::default(),
+                None,
+            )
+        .await?;
+        let hop = super::move_udp_carrier(
+            &endpoint,
+            &connection,
+            carrier,
+            protector,
+            wire_peer,
+            super::CarrierSocket::Datagrams,
+            changes.as_ref(),
+        );
+        Ok(Connected {
+            endpoint,
+            connection,
+            zero_rtt_accepted,
+            rebind: hop,
+        })
+    }
+}
+
 pub(crate) use xhttp::{
     configure_quic_datagram_socket, connect_h2, connect_quic_transport,
     connect_quic_transport_with_datagrams, move_udp_carrier, CarrierSocket, H3ConnectConfig,
