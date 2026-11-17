@@ -3,7 +3,7 @@ name: Quick check
 # Fast compile feedback for branches written without a local toolchain.
 # Push a commit to any `quick/**` branch: this formats the tree, lints and
 # builds every target (no tests run), and uploads the formatting patch and the
-# compiler output as artifacts. It never pushes and never runs the full gate.
+# compiler output as artifacts (the patch is also printed base64 in the log). It never pushes and never runs the full gate.
 on:
   push:
     branches: ["quick/**"]
@@ -46,6 +46,11 @@ jobs:
           cargo fmt --all || true
           git diff > out/fmt.patch
           git diff --stat
+          # The artifact quota can be full, so the patch is also printed
+          # between markers for `gh run view --log` to recover.
+          echo '=====FMT-PATCH-BEGIN====='
+          base64 -w0 out/fmt.patch; echo
+          echo '=====FMT-PATCH-END====='
 
       - name: Lint and build every target
         run: |
@@ -55,6 +60,7 @@ jobs:
 
       - name: Upload results
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: quick-check
