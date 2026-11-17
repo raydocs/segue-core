@@ -170,21 +170,6 @@ impl Pool {
         None
     }
 
-    fn push_idle(&self, session: &Arc<Session>) {
-        if self.0.closed.load(Ordering::Acquire) || session.closed() {
-            return;
-        }
-        let mut idle = lock(&self.0.idle);
-        if !idle.iter().any(|other| other.seq == session.seq) {
-            idle.push(session.clone());
-        }
-    }
-
-    fn forget(&self, seq: u64) {
-        lock(&self.0.idle).retain(|session| session.seq != seq);
-        lock(&self.0.sessions).retain(|session| session.seq != seq);
-    }
-
     fn start_session(&self, carrier: BoxedTransportStream) -> Result<Arc<Session>, CoreError> {
         if self.0.closed.load(Ordering::Acquire) {
             return Err(closed().into());
@@ -229,6 +214,26 @@ impl Pool {
         if let Some(task) = lock(&self.0.cleanup).take() {
             let _ = task.await;
         }
+    }
+}
+
+impl PoolShared {
+    /// Return a session that has no live stream. Called with `Arc<PoolShared>`
+    /// from `Stream::drop`; `Pool` is only the outbound's handle.
+    fn push_idle(&self, session: &Arc<Session>) {
+        if self.closed.load(Ordering::Acquire) || session.closed() {
+            return;
+        }
+        let mut idle = lock(&self.idle);
+        if !idle.iter().any(|other| other.seq == session.seq) {
+            idle.push(session.clone());
+        }
+    }
+
+    /// Drop a closed session from the idle list and the shutdown list.
+    fn forget(&self, seq: u64) {
+        lock(&self.idle).retain(|session| session.seq != seq);
+        lock(&self.sessions).retain(|session| session.seq != seq);
     }
 }
 
@@ -282,7 +287,7 @@ async fn idle_cleanup(pool: Arc<PoolShared>) {
         // Snapshot under the lock, then decide outside it: `Stream::drop`
         // takes a session's `idle_since` lock before this one, so holding
         // both here would invert that order.
-        let idle = lock(&pool.idle).clone();
+        let mut idle = lock(&pool.idle).clone();
         // Newest first, as the reference's skiplist iterates.
         idle.sort_by(|a, b| b.seq.cmp(&a.seq));
         let mut kept = 0usize;
@@ -499,7 +504,7 @@ impl SessionInner {
         }
     }
 
-    fn arm_synack_watchdog(&self) {
+    fn arm_synack_watchdog(self: &Arc<Self>) {
         let generation = self.syn_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -665,7 +670,8 @@ async fn dispatch(
         Command::Waste | Command::Settings => true,
         Command::ServerSettings => {
             if let Ok(map) = wire::parse_settings(payload) {
-                if let Some(Ok(version)) = map.get("v").map(str::parse::<u8>) {
+                // `str::parse` does not coerce `&String` when passed as a function item.
+                if let Some(Ok(version)) = map.get("v").map(|value| value.parse::<u8>()) {
                     inner.peer_version.store(version, Ordering::Release);
                 }
             }
