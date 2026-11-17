@@ -6387,15 +6387,23 @@ mod tests {
         let mut decoder = DnsTcpFrameDecoder::default();
         decoder.push(&frame[..1]);
 
-        let partial =
-            fake_ip_tcp_responses(&fake_ip_mapper(), fake_ip_test_resolver().as_ref(), &mut decoder).await;
+        let partial = fake_ip_tcp_responses(
+            &fake_ip_mapper(),
+            fake_ip_test_resolver().as_ref(),
+            &mut decoder,
+        )
+        .await;
         assert!(partial.response.is_none());
         assert!(!partial.processed_message);
         assert!(!partial.terminal_error);
 
         decoder.push(&frame[1..]);
-        let decoded =
-            fake_ip_tcp_responses(&fake_ip_mapper(), fake_ip_test_resolver().as_ref(), &mut decoder).await;
+        let decoded = fake_ip_tcp_responses(
+            &fake_ip_mapper(),
+            fake_ip_test_resolver().as_ref(),
+            &mut decoder,
+        )
+        .await;
         let response = decoded.response.unwrap();
         assert!(decoded.processed_message);
         assert!(!decoded.terminal_error);
@@ -6421,7 +6429,8 @@ mod tests {
         let mut decoder = DnsTcpFrameDecoder::default();
         decoder.push(&dns_tcp_frame(&query));
 
-        let decoded = fake_ip_tcp_responses(&mapper, fake_ip_test_resolver().as_ref(), &mut decoder).await;
+        let decoded =
+            fake_ip_tcp_responses(&mapper, fake_ip_test_resolver().as_ref(), &mut decoder).await;
         let response = decoded.response.unwrap();
 
         assert!(!decoded.terminal_error);
@@ -6437,8 +6446,12 @@ mod tests {
             decoder.push(&dns_tcp_frame(&query));
         }
 
-        let decoded =
-            fake_ip_tcp_responses(&fake_ip_mapper(), fake_ip_test_resolver().as_ref(), &mut decoder).await;
+        let decoded = fake_ip_tcp_responses(
+            &fake_ip_mapper(),
+            fake_ip_test_resolver().as_ref(),
+            &mut decoder,
+        )
+        .await;
         let response = decoded.response.unwrap();
         let first_len = usize::from(u16::from_be_bytes([response[0], response[1]]));
         let second_offset = first_len + 2;
@@ -6458,8 +6471,12 @@ mod tests {
         let mut decoder = DnsTcpFrameDecoder::default();
         decoder.push(&u16::MAX.to_be_bytes());
 
-        let decoded =
-            fake_ip_tcp_responses(&fake_ip_mapper(), fake_ip_test_resolver().as_ref(), &mut decoder).await;
+        let decoded = fake_ip_tcp_responses(
+            &fake_ip_mapper(),
+            fake_ip_test_resolver().as_ref(),
+            &mut decoder,
+        )
+        .await;
 
         assert!(decoded.response.is_none());
         assert!(!decoded.processed_message);
@@ -6473,8 +6490,12 @@ mod tests {
         decoder.push(&dns_tcp_frame(&query));
         decoder.push(&u16::MAX.to_be_bytes());
 
-        let decoded =
-            fake_ip_tcp_responses(&fake_ip_mapper(), fake_ip_test_resolver().as_ref(), &mut decoder).await;
+        let decoded = fake_ip_tcp_responses(
+            &fake_ip_mapper(),
+            fake_ip_test_resolver().as_ref(),
+            &mut decoder,
+        )
+        .await;
         let response = decoded.response.unwrap();
 
         assert!(decoded.processed_message);
