@@ -96,12 +96,20 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
                 needs_reject = true;
             } else if group_tags.contains(&member) {
                 // A balancer's selector only expands against leaf outbounds,
-                // so a nested group is flattened into its own members.
+                // so a nested group is flattened into its own members. A
+                // group that appears later in the file has none yet.
                 let nested = group_members.get(&member).cloned().unwrap_or_default();
-                ctx.warn(
-                    format!("{path}.proxies"),
-                    format!("member `{member}` is another proxy group; its members were inlined"),
-                );
+                if nested.is_empty() {
+                    ctx.warn(
+                        format!("{path}.proxies"),
+                        format!("member `{member}` is a proxy group defined later in the file; it was dropped"),
+                    );
+                } else {
+                    ctx.warn(
+                        format!("{path}.proxies"),
+                        format!("member `{member}` is another proxy group; its members were inlined"),
+                    );
+                }
                 for leaf in nested {
                     if !members.contains(&leaf) {
                         members.push(leaf);
