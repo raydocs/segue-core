@@ -227,7 +227,7 @@ impl AnyTlsAuth {
     }
 
     pub fn as_bytes(&self) -> &[u8; PASSWORD_HASH_LENGTH] {
-        &*self.0
+        &self.0
     }
 }
 
@@ -584,7 +584,8 @@ pub fn decode_socksaddr(input: &[u8]) -> Result<Option<(TargetAddr, u16, usize)>
             if input.len() < 2 + length + 2 {
                 return Ok(None);
             }
-            let domain = std::str::from_utf8(&input[2..2 + length]).map_err(|_| WireError::Domain)?;
+            let domain =
+                std::str::from_utf8(&input[2..2 + length]).map_err(|_| WireError::Domain)?;
             if domain.is_empty() || domain.chars().any(|c| c.is_whitespace() || c.is_control()) {
                 return Err(WireError::Domain);
             }

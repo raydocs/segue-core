@@ -68,10 +68,7 @@ fn commands_match_the_pinned_numbering() {
 #[test]
 fn push_frames_split_at_the_uint16_limit() {
     // One frame.
-    assert_eq!(
-        push_frames(7, b"ab"),
-        [0x02, 0, 0, 0, 7, 0, 2, b'a', b'b']
-    );
+    assert_eq!(push_frames(7, b"ab"), [0x02, 0, 0, 0, 7, 0, 2, b'a', b'b']);
     // Empty data writes nothing at all, as the reference `writeDataFrame`.
     assert!(push_frames(7, b"").is_empty());
     // 0xFFFF + 1 bytes become two frames, 0xFFFF and 1.
@@ -119,10 +116,7 @@ fn auth_is_the_sha256_of_the_password() {
     );
     // The digest is a credential: Debug never prints it.
     assert_eq!(format!("{auth:?}"), "AnyTlsAuth(<redacted>)");
-    assert_eq!(
-        AnyTlsAuth::new("").unwrap_err(),
-        WireError::PasswordLength
-    );
+    assert_eq!(AnyTlsAuth::new("").unwrap_err(), WireError::PasswordLength);
 }
 
 #[test]
@@ -236,7 +230,9 @@ fn socksaddr_encodes_each_family_like_sing() {
 
     let mut wire = Vec::new();
     encode_socksaddr(
-        &target_addr(segue_routing::TargetAddr::Ip("2001:db8::1".parse().unwrap())),
+        &target_addr(segue_routing::TargetAddr::Ip(
+            "2001:db8::1".parse().unwrap(),
+        )),
         &mut wire,
     )
     .unwrap();
@@ -255,7 +251,9 @@ fn socksaddr_encodes_each_family_like_sing() {
     // Every encoding decodes back to the same destination.
     for target in [
         target_addr(segue_routing::TargetAddr::Ip("192.0.2.1".parse().unwrap())),
-        target_addr(segue_routing::TargetAddr::Ip("2001:db8::1".parse().unwrap())),
+        target_addr(segue_routing::TargetAddr::Ip(
+            "2001:db8::1".parse().unwrap(),
+        )),
         target_addr(segue_routing::TargetAddr::Domain("example.test".into())),
     ] {
         let wire = encode_stream_target(&target).unwrap();
@@ -303,7 +301,10 @@ fn uot_magic_matches_sing_and_carries_port_zero() {
     // `CreateProxy` writes the magic address as the stream's destination.
     let wire = encode_stream_target(&target).unwrap();
     assert_eq!(wire[0], 0x02);
-    assert_eq!(&wire[2..2 + UOT_MAGIC_ADDRESS.len()], UOT_MAGIC_ADDRESS.as_bytes());
+    assert_eq!(
+        &wire[2..2 + UOT_MAGIC_ADDRESS.len()],
+        UOT_MAGIC_ADDRESS.as_bytes()
+    );
     assert_eq!(&wire[2 + UOT_MAGIC_ADDRESS.len()..], &[0, 0]);
 }
 
@@ -317,7 +318,10 @@ fn uot_requests_and_datagrams_round_trip() {
     // isConnect = true, then the destination.
     let request = encode_uot_request(&destination, true).unwrap();
     assert_eq!(request[0], 1);
-    assert_eq!(&request[1..], &encode_stream_target(&destination).unwrap()[..]);
+    assert_eq!(
+        &request[1..],
+        &encode_stream_target(&destination).unwrap()[..]
+    );
     assert_eq!(encode_uot_request(&destination, false).unwrap()[0], 0);
     let zero = Target::new(destination.addr.clone(), 0, segue_routing::Network::Udp);
     assert_eq!(
@@ -327,7 +331,10 @@ fn uot_requests_and_datagrams_round_trip() {
 
     let frame = encode_uot_datagram(b"hello").unwrap();
     assert_eq!(frame, [0, 5, b'h', b'e', b'l', b'l', b'o']);
-    assert_eq!(decode_uot_datagram(&frame).unwrap(), Some((&b"hello"[..], 7)));
+    assert_eq!(
+        decode_uot_datagram(&frame).unwrap(),
+        Some((&b"hello"[..], 7))
+    );
     // Prefixes are incomplete until the whole frame arrives.
     assert_eq!(decode_uot_datagram(&frame[..1]).unwrap(), None);
     assert_eq!(decode_uot_datagram(&frame[..6]).unwrap(), None);

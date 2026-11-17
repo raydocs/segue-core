@@ -765,9 +765,7 @@ impl AsyncRead for Stream {
                 Poll::Ready(Some(StreamEvent::Finished)) | Poll::Ready(None) => {
                     return Poll::Ready(Ok(()))
                 }
-                Poll::Ready(Some(StreamEvent::Failed(error))) => {
-                    return Poll::Ready(Err(error))
-                }
+                Poll::Ready(Some(StreamEvent::Failed(error))) => return Poll::Ready(Err(error)),
                 Poll::Pending => return Poll::Pending,
             }
         }

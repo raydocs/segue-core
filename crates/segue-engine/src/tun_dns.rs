@@ -1096,8 +1096,8 @@ pub(super) async fn bridge_fake_ip_tcp_flow(
         };
         decoder.push(&data.data);
 
-        let decoded = fake_ip_tcp_responses(&mapper, context.dns_resolver.as_ref(), &mut decoder)
-            .await;
+        let decoded =
+            fake_ip_tcp_responses(&mapper, context.dns_resolver.as_ref(), &mut decoder).await;
         if decoded.processed_message {
             idle_sleep
                 .as_mut()
@@ -6421,8 +6421,7 @@ mod tests {
         let mut decoder = DnsTcpFrameDecoder::default();
         decoder.push(&dns_tcp_frame(&query));
 
-        let decoded =
-            fake_ip_tcp_responses(&mapper, &fake_ip_test_resolver(), &mut decoder).await;
+        let decoded = fake_ip_tcp_responses(&mapper, &fake_ip_test_resolver(), &mut decoder).await;
         let response = decoded.response.unwrap();
 
         assert!(!decoded.terminal_error);

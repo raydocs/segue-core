@@ -1576,12 +1576,16 @@ mod http3_tests {
         const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
         let mut cursor = 5 + 4 + 2 + 32;
         cursor += 1 + usize::from(*hello.get(cursor)?);
-        let cipher_suites_len =
-            usize::from(u16::from_be_bytes([*hello.get(cursor)?, *hello.get(cursor + 1)?]));
+        let cipher_suites_len = usize::from(u16::from_be_bytes([
+            *hello.get(cursor)?,
+            *hello.get(cursor + 1)?,
+        ]));
         cursor += 2 + cipher_suites_len;
         cursor += 1 + usize::from(*hello.get(cursor)?);
-        let extensions_len =
-            usize::from(u16::from_be_bytes([*hello.get(cursor)?, *hello.get(cursor + 1)?]));
+        let extensions_len = usize::from(u16::from_be_bytes([
+            *hello.get(cursor)?,
+            *hello.get(cursor + 1)?,
+        ]));
         cursor += 2;
         let end = cursor + extensions_len;
 

@@ -22,14 +22,14 @@ use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use segue_config::{
     compile_dns_domain_matchers, compile_domain_matchers, default_fake_ip_exempt_domains,
-    parse_xray_json, CoreConfig, DnsConfig, DnsFakeIpConfig, DnsHostTarget, DnsNameServerConfig, DnsOutboundRule, DnsOutboundRuleAction,
-    DnsOutboundSettings, DnsQTypeRange, DnsQueryStrategy, DnsServerConfig, DnsServerEndpoint,
-    DomainHostIndex, DomainMatcher, DomainMatcherSet, InboundConfig, InboundProtocol,
-    InboundSniffingConfig, IpCidr, IpMatcherSet, Network, OutboundConfig, OutboundSettings,
-    PolicyConfig, PolicyLevelConfig, RealitySettings, RealityShortId, RoutingConfig,
-    RoutingDomainStrategy, RoutingPortRange, RoutingRule, RoutingRuleTarget, SniffingDestination,
-    SocksInboundSettings, StreamSecurity, StreamSettings, StreamTransport, TargetAddr, TlsSettings,
-    VlessOutboundSettings, VlessUser,
+    parse_xray_json, CoreConfig, DnsConfig, DnsFakeIpConfig, DnsHostTarget, DnsNameServerConfig,
+    DnsOutboundRule, DnsOutboundRuleAction, DnsOutboundSettings, DnsQTypeRange, DnsQueryStrategy,
+    DnsServerConfig, DnsServerEndpoint, DomainHostIndex, DomainMatcher, DomainMatcherSet,
+    InboundConfig, InboundProtocol, InboundSniffingConfig, IpCidr, IpMatcherSet, Network,
+    OutboundConfig, OutboundSettings, PolicyConfig, PolicyLevelConfig, RealitySettings,
+    RealityShortId, RoutingConfig, RoutingDomainStrategy, RoutingPortRange, RoutingRule,
+    RoutingRuleTarget, SniffingDestination, SocksInboundSettings, StreamSecurity, StreamSettings,
+    StreamTransport, TargetAddr, TlsSettings, VlessOutboundSettings, VlessUser,
 };
 use segue_engine::{
     ConnectionState, Core, CoreError, DnsBootstrapMode, OutboundAccounting, OutboundRouter,

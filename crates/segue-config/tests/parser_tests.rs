@@ -8,10 +8,11 @@ use std::{
 use prost::Message;
 use segue_config::{
     default_fake_ip_exempt_domains, parse_xray_json, parse_xray_json_with_geodata_dirs,
-    DiagnosticSeverity, DnsFakeIpConfig, DnsHostTarget, DnsIpFilter, DnsNameServerConfig, DnsOutboundRuleAction, DnsOutboundSettings,
-    DnsQueryStrategy, DnsServerConfig, DnsServerEndpoint, DnsServerTransport, DomainMatcherSet,
-    HappyEyeballsSettings, InboundProtocol, IpCidr, Network, OutboundSettings, QuicBbrProfile,
-    QuicCongestion, QuicIntervalRange, QuicParamsSettings, QuicUdpHopSettings, RealityShortId,
+    DiagnosticSeverity, DnsFakeIpConfig, DnsHostTarget, DnsIpFilter, DnsNameServerConfig,
+    DnsOutboundRuleAction, DnsOutboundSettings, DnsQueryStrategy, DnsServerConfig,
+    DnsServerEndpoint, DnsServerTransport, DomainMatcherSet, HappyEyeballsSettings,
+    InboundProtocol, IpCidr, Network, OutboundSettings, QuicBbrProfile, QuicCongestion,
+    QuicIntervalRange, QuicParamsSettings, QuicUdpHopSettings, RealityShortId,
     RoutingDomainStrategy, RoutingRuleTarget, SniffingDestination, SocksInboundSettings,
     StreamSecurity, StreamTransport, TargetAddr, XhttpMode, XhttpPaddingMethod,
     XhttpPaddingPlacement, XhttpPlacement, XhttpRange, XhttpSettings, XhttpUplinkDataPlacement,

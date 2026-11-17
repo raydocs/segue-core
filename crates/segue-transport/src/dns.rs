@@ -3289,14 +3289,14 @@ mod tests {
     use tokio::sync::{oneshot, Barrier, Notify};
 
     use super::{
-        build_dns_query_with_id, edns_opt_record, exchange_direct_https_candidates,
-        exchange_direct_tls_candidates, exchange_dns_https_h2, exchange_dns_quic_candidates,
-        parse_dns_response, query_udp_dns_server, select_name_server_indices, CachingDnsResolver,
-        CompiledNameServerPolicies, ConfiguredDnsAddresses, ConfiguredDnsAnswer,
-        ConfiguredDnsResolver, DnsHostTarget, DnsLookup, DnsQueryDispatch, DnsQueryMetadata,
-        DnsQueryStrategy, DnsQueryTransport, DnsQueryTransportKind, DnsRecordType, DnsResolver,
-        NameServer, NameServerPolicy, NameServerTransport, SystemRouteDnsResolver,
-        dns_cache_capacity, DNS_CACHE_MAX_ADDRESSES_PER_ENTRY,
+        build_dns_query_with_id, dns_cache_capacity, edns_opt_record,
+        exchange_direct_https_candidates, exchange_direct_tls_candidates, exchange_dns_https_h2,
+        exchange_dns_quic_candidates, parse_dns_response, query_udp_dns_server,
+        select_name_server_indices, CachingDnsResolver, CompiledNameServerPolicies,
+        ConfiguredDnsAddresses, ConfiguredDnsAnswer, ConfiguredDnsResolver, DnsHostTarget,
+        DnsLookup, DnsQueryDispatch, DnsQueryMetadata, DnsQueryStrategy, DnsQueryTransport,
+        DnsQueryTransportKind, DnsRecordType, DnsResolver, NameServer, NameServerPolicy,
+        NameServerTransport, SystemRouteDnsResolver, DNS_CACHE_MAX_ADDRESSES_PER_ENTRY,
         DNS_CACHE_MAX_ENTRIES_CONSTRAINED, DNS_CACHE_MAX_ENTRIES_STANDARD,
     };
     use crate::MemoryClass;
@@ -5964,11 +5964,7 @@ mod tests {
             Ok(SocketAddr::new(self.addresses[0].ip(), port))
         }
 
-        async fn resolve_all(
-            &self,
-            _domain: &str,
-            port: u16,
-        ) -> Result<DnsLookup, TransportError> {
+        async fn resolve_all(&self, _domain: &str, port: u16) -> Result<DnsLookup, TransportError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(DnsLookup::new(
                 self.addresses

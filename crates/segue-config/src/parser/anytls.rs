@@ -19,7 +19,10 @@ impl Parser<'_> {
         self.reject_unknown_fields(settings, &path, &surface::ANYTLS);
 
         let Some(address) = self.string_at(settings, "address") else {
-            self.error(format!("{path}.address"), "AnyTLS requires a server address");
+            self.error(
+                format!("{path}.address"),
+                "AnyTLS requires a server address",
+            );
             return None;
         };
         let address = normalize_xray_address_text(address);
@@ -42,7 +45,10 @@ impl Parser<'_> {
             return None;
         };
         if password.is_empty() {
-            self.error(format!("{path}.password"), "AnyTLS password must not be empty");
+            self.error(
+                format!("{path}.password"),
+                "AnyTLS password must not be empty",
+            );
             return None;
         }
         let password = zeroize::Zeroizing::new(password.to_owned());
@@ -52,8 +58,7 @@ impl Parser<'_> {
         // reference's thirty-second floor when the pool is built.
         let idle_session_check_interval =
             self.duration_field(settings, "idle_session_check_interval", &path)?;
-        let idle_session_timeout =
-            self.duration_field(settings, "idle_session_timeout", &path)?;
+        let idle_session_timeout = self.duration_field(settings, "idle_session_timeout", &path)?;
         // `optional_u32_at` reports a malformed value itself and answers
         // `None` for both "absent" and "malformed".
         let min_idle_session = self

@@ -55,7 +55,7 @@ jobs:
       - name: Lint and build every target
         run: |
           set -o pipefail
-          cargo clippy --workspace --all-targets --all-features --locked --message-format=short \
+          cargo clippy --keep-going --workspace --all-targets --all-features --locked --message-format=short \
             -- -D warnings -W clippy::perf -W clippy::suspicious 2>&1 | tee out/clippy.txt
 
       - name: Upload results

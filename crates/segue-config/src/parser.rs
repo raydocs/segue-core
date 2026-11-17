@@ -46,10 +46,10 @@ use serde_json::Value;
 
 use crate::model::build_domain_matcher_set;
 use crate::{
+    default_fake_ip_exempt_domains,
     geodata::{default_geodata_dirs, GeodataLoader},
-    default_fake_ip_exempt_domains, AddressPortStrategy, CoreConfig, CustomSocketOption,
-    Diagnostic, DnsConfig, DnsFakeIpConfig, DnsHostTarget, DnsIpFilter, DnsNameServerConfig,
-    DnsOutboundRule, DnsOutboundRuleAction,
+    AddressPortStrategy, CoreConfig, CustomSocketOption, Diagnostic, DnsConfig, DnsFakeIpConfig,
+    DnsHostTarget, DnsIpFilter, DnsNameServerConfig, DnsOutboundRule, DnsOutboundRuleAction,
     DnsOutboundSettings, DnsQTypeRange, DnsQueryStrategy, DnsServerConfig, DnsServerEndpoint,
     DnsServerTransport, DomainHostIndex, DomainMatcher, DomainNameMode, DomainStrategy,
     FreedomOutboundSettings, FreedomRedirect, GrpcSettings, HappyEyeballsSettings,

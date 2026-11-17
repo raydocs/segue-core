@@ -43,13 +43,13 @@ fn every_field_is_read() {
     settings["client_metadata"] = json!("sing-anytls/0.0.13");
     settings["level"] = json!(7);
     let parsed = settings_of(&profile(settings));
-    assert_eq!(
-        parsed.idle_session_check_interval,
-        Duration::from_secs(45)
-    );
+    assert_eq!(parsed.idle_session_check_interval, Duration::from_secs(45));
     assert_eq!(parsed.idle_session_timeout, Duration::from_secs(120));
     assert_eq!(parsed.min_idle_session, 3);
-    assert_eq!(parsed.client_metadata.as_deref(), Some("sing-anytls/0.0.13"));
+    assert_eq!(
+        parsed.client_metadata.as_deref(),
+        Some("sing-anytls/0.0.13")
+    );
     assert_eq!(parsed.level, 7);
 }
 

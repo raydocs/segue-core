@@ -1449,11 +1449,7 @@ mod tests {
             Ok(SocketAddr::new(IpAddr::V4(self.0), port))
         }
 
-        async fn resolve_all(
-            &self,
-            _domain: &str,
-            port: u16,
-        ) -> Result<DnsLookup, TransportError> {
+        async fn resolve_all(&self, _domain: &str, port: u16) -> Result<DnsLookup, TransportError> {
             Ok(DnsLookup::from_ips(
                 [IpAddr::V4(self.0)],
                 port,
@@ -1486,15 +1482,17 @@ mod tests {
 
         let question_end = parse_dns_query(&request).unwrap().question_section_end();
         assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
-        assert_eq!(&response[question_end + 12..question_end + 16], &real.octets());
+        assert_eq!(
+            &response[question_end + 12..question_end + 16],
+            &real.octets()
+        );
         assert_eq!(mapper.lock().unwrap().mapping_count(), 0);
     }
 
     #[tokio::test]
     async fn unexempt_names_still_get_a_fake_ip() {
-        let (runtime, mapper) = test_runtime_with_fake_ip_and_resolver(Ipv4Addr::new(
-            203, 0, 113, 10,
-        ));
+        let (runtime, mapper) =
+            test_runtime_with_fake_ip_and_resolver(Ipv4Addr::new(203, 0, 113, 10));
         let request = query(0x2303, "ordinary.example");
 
         let response = hijack_reply(&runtime, request.clone()).await;
@@ -1516,9 +1514,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_exemption_list_gives_every_name_a_fake_ip() {
-        let (runtime, mapper) = test_runtime_with_fake_ip_and_resolver(Ipv4Addr::new(
-            203, 0, 113, 11,
-        ));
+        let (runtime, mapper) =
+            test_runtime_with_fake_ip_and_resolver(Ipv4Addr::new(203, 0, 113, 11));
         *mapper.lock().unwrap() = FakeIpMapper::from_config(
             &DnsFakeIpConfig {
                 enabled: true,

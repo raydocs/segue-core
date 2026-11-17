@@ -154,7 +154,7 @@ async fn a_server_fin_ends_the_stream_at_eof() {
     read_until_not_waste(&mut server).await; // Settings
     read_until_not_waste(&mut server).await; // Syn
     read_until_not_waste(&mut server).await; // Push
-    // The server answers with data and then Fin.
+                                             // The server answers with data and then Fin.
     let mut reply = wire::push_frames(1, b"pong");
     reply.extend_from_slice(&wire::control_frame(Command::Fin, 1, &[]));
     server.write_all(&reply).await.unwrap();
@@ -224,7 +224,10 @@ async fn a_heartbeat_request_is_answered_on_the_same_stream_id() {
         .await
         .unwrap();
     let (reply, _) = read_until_not_waste(&mut server).await;
-    assert_eq!((reply.command, reply.stream_id), (Command::HeartResponse, 9));
+    assert_eq!(
+        (reply.command, reply.stream_id),
+        (Command::HeartResponse, 9)
+    );
     drop(stream);
     pool.close();
 }
@@ -239,7 +242,7 @@ async fn a_server_padding_scheme_replaces_the_client_one() {
     read_until_not_waste(&mut server).await; // Settings
     read_until_not_waste(&mut server).await; // Syn
     read_until_not_waste(&mut server).await; // Push
-    // A scheme with `stop=1` turns padding off after the first packet.
+                                             // A scheme with `stop=1` turns padding off after the first packet.
     server
         .write_all(&wire::control_frame(
             Command::UpdatePaddingScheme,

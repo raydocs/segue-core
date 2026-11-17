@@ -1802,7 +1802,10 @@ impl fmt::Debug for AnyTlsOutboundSettings {
             .field("server", &self.server)
             .field("port", &self.port)
             .field("password", &"<redacted>")
-            .field("idle_session_check_interval", &self.idle_session_check_interval)
+            .field(
+                "idle_session_check_interval",
+                &self.idle_session_check_interval,
+            )
             .field("idle_session_timeout", &self.idle_session_timeout)
             .field("min_idle_session", &self.min_idle_session)
             .field("client_metadata", &self.client_metadata)

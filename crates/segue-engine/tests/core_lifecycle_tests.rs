@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use segue_config::{
     default_fake_ip_exempt_domains, CoreConfig, DnsFakeIpConfig, InboundConfig, InboundProtocol,
-    IpCidr, Network, OutboundConfig, OutboundProxySettings, OutboundSettings, RoutingBalancer, RoutingBalancerStrategy,
-    RoutingConfig, StreamSecurity, StreamSettings, StreamTransport, TargetAddr,
-    VlessOutboundSettings, VlessUser,
+    IpCidr, Network, OutboundConfig, OutboundProxySettings, OutboundSettings, RoutingBalancer,
+    RoutingBalancerStrategy, RoutingConfig, StreamSecurity, StreamSettings, StreamTransport,
+    TargetAddr, VlessOutboundSettings, VlessUser,
 };
 use segue_engine::{
     Core, CoreError, CoreState, OutboundNodeKind, TunMtu, TunRuntimeOptions, TunRuntimeProfile,

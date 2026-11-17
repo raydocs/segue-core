@@ -68,8 +68,7 @@ impl Parser<'_> {
             _ => None,
         };
         if let Some(tls) = ech_tls {
-            let ech_path =
-                format!("$.outbounds[{index}].streamSettings.tlsSettings.echConfigList");
+            let ech_path = format!("$.outbounds[{index}].streamSettings.tlsSettings.echConfigList");
             let shaped = tls
                 .fingerprint
                 .as_deref()
