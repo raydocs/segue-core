@@ -212,10 +212,8 @@ impl SmartDns {
         match classify(&policy, &q.name) {
             Class::Fake => match proxied_answer(q.qtype) {
                 ProxiedAnswer::FakeV4 => Some(
-                    self.fake_answer(&q, &policy, |p| {
-                        matches!(classify(p, &q.name), Class::Fake)
-                    })
-                    .await,
+                    self.fake_answer(&q, &policy, |p| matches!(classify(p, &q.name), Class::Fake))
+                        .await,
                 ),
                 // AI names take this path too: lookup returns the AI tier, so
                 // they are Fake, never Domestic or Unmatched, and `resolve`

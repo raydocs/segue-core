@@ -1654,7 +1654,7 @@ mod platform {
                     return Err(PacketBatchWriteError::new(0, error));
                 }
                 SendAccount::RetrySmaller => {
-                    let next = (count + 1) / 2;
+                    let next = count.div_ceil(2);
                     if next == 0 || next >= count {
                         let error = result
                             .err()
@@ -1692,7 +1692,7 @@ mod platform {
                                 libc::EIO
                             })
                         }
-                        Some(_) => result.expect("errno was taken from this error"),
+                        Some(_) => result.expect_err("errno was taken from this error"),
                     };
                     // `written_packets` is the whole run: the caller must not
                     // submit it again. The error still backs off whatever

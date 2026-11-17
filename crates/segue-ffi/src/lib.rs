@@ -4668,7 +4668,10 @@ mod tests {
         #[cfg(not(feature = "proprietary-kernel"))]
         {
             assert_eq!(XRAY_FFI_ABI_MINOR, 17);
-            assert_eq!(super::XRAY_FFI_CAPABILITIES, super::XRAY_FFI_ENGINE_CAPABILITIES);
+            assert_eq!(
+                super::XRAY_FFI_CAPABILITIES,
+                super::XRAY_FFI_ENGINE_CAPABILITIES
+            );
         }
         #[cfg(feature = "proprietary-kernel")]
         {
@@ -4692,7 +4695,7 @@ mod tests {
                 super::XRAY_FFI_CAPABILITY_KERNEL_STATS,
                 super::XRAY_FFI_CAPABILITY_KERNEL_TUN_FD,
             ];
-            assert_eq!(expected, constants.into_iter().sum());
+            assert_eq!(expected, constants.into_iter().sum::<u64>());
         }
     }
 
