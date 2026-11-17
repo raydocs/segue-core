@@ -281,7 +281,7 @@ pub trait FlowPosture: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -424,19 +424,29 @@ mod tests {
         assert!(HoldGuard::try_acquire(&count, WAIT_CAP).is_some());
     }
 
+    /// Yield until `flag` is set. The setter runs before [`wait_out`]'s sleep,
+    /// and a current-thread task runs until that await, so the hold is parked
+    /// before the clock jumps. Jumping first would start the deadline late and
+    /// the test would wait forever.
+    async fn parked(flag: &AtomicBool) {
+        while !flag.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test]
     async fn wait_holds_until_connected_then_proxies() {
-        // Park the hold before advancing: the deadline is measured from the
-        // first poll, so the clock must not jump first.
         tokio::time::pause();
         let posture = Arc::new(std::sync::Mutex::new(Posture::Reconnecting));
         let watch = posture.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = started.clone();
         let handle = tokio::spawn(async move {
+            flag.store(true, Ordering::SeqCst);
             let action = Action::Proxy("overseas".into());
             wait_out(|| decide(*watch.lock().unwrap(), &action, Protection::Wait)).await
         });
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        parked(&started).await;
         assert!(!handle.is_finished(), "overseas flow was not held");
         tokio::time::advance(WAIT_POLL).await;
         assert!(
@@ -452,12 +462,14 @@ mod tests {
     #[tokio::test]
     async fn wait_refuses_when_the_deadline_passes() {
         tokio::time::pause();
-        let handle = tokio::spawn(async {
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = started.clone();
+        let handle = tokio::spawn(async move {
+            flag.store(true, Ordering::SeqCst);
             let action = Action::Proxy("overseas".into());
             wait_out(|| decide(Posture::Reconnecting, &action, Protection::Wait)).await
         });
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        parked(&started).await;
         assert!(!handle.is_finished(), "flow was not held");
         tokio::time::advance(WAIT_DEADLINE).await;
         let verdict = handle.await.expect("hold task");
