@@ -52,6 +52,50 @@
   "coreVersion": "0.9.0",
   "documentation": "docs/config-tooling.md",
   "examples": {
+    "anytls": {
+      "dns": {
+        "fakeIp": {
+          "enabled": true,
+          "ipv4Pool": "198.19.0.0/16",
+          "poolSize": 32768,
+          "ttl": 60
+        },
+        "queryStrategy": "UseIPv4"
+      },
+      "inbounds": [
+        {
+          "protocol": "tun",
+          "settings": {},
+          "tag": "tun-in"
+        }
+      ],
+      "outbounds": [
+        {
+          "protocol": "anytls",
+          "settings": {
+            "address": "anytls.example",
+            "client_metadata": "synthetic-client",
+            "idle_session_check_interval": "30s",
+            "idle_session_timeout": "30s",
+            "min_idle_session": 1,
+            "password": "synthetic-example-anytls-password",
+            "port": 443
+          },
+          "streamSettings": {
+            "network": "raw",
+            "security": "tls",
+            "tlsSettings": {
+              "serverName": "anytls.example"
+            }
+          },
+          "tag": "proxy"
+        }
+      ],
+      "routing": {
+        "domainStrategy": "AsIs",
+        "rules": []
+      }
+    },
     "dns-routing": {
       "dns": {
         "hosts": {
@@ -1656,6 +1700,21 @@
       ],
       "id": "TROJAN",
       "notes": "One flattened server or exactly one servers entry; mixing forms is rejected. Password 1..4096 UTF-8 bytes. Empty/absent flow only. Verified TLS/REALITY required except private/test plaintext endpoints."
+    },
+    {
+      "context": "$.outbounds[].settings (anytls)",
+      "fields": [
+        "address",
+        "port",
+        "password",
+        "level",
+        "idle_session_check_interval",
+        "idle_session_timeout",
+        "min_idle_session",
+        "client_metadata"
+      ],
+      "id": "ANYTLS",
+      "notes": "Not an Xray-core protocol: the field names follow sing-box's AnyTLS outbound. One TLS server; a plaintext stream is refused. password is the SHA-256 credential's source and is redacted. Both idle timings are Go durations or nanoseconds, and a zero or absent value takes the reference's thirty-second floor at runtime. min_idle_session is 0..=8, the pool's session bound. client_metadata replaces the version string the settings frame reports and must not contain newlines or `=`."
     },
     {
       "context": "$.outbounds[].settings.servers[0] (trojan)",

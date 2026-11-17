@@ -1160,6 +1160,9 @@ pub enum OutboundProtocol {
     Socks,
     Http,
     Masque,
+    /// AnyTLS, which Xray-core does not have; the spelling follows sing-box's
+    /// `"type": "anytls"`.
+    AnyTls,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1177,6 +1180,7 @@ pub enum OutboundSettings {
     Socks(SocksOutboundSettings),
     Http(HttpOutboundSettings),
     Masque(MasqueOutboundSettings),
+    AnyTls(AnyTlsOutboundSettings),
 }
 
 impl OutboundSettings {
@@ -1195,6 +1199,7 @@ impl OutboundSettings {
             Self::Socks(_) => OutboundProtocol::Socks,
             Self::Http(_) => OutboundProtocol::Http,
             Self::Masque(_) => OutboundProtocol::Masque,
+            Self::AnyTls(_) => OutboundProtocol::AnyTls,
         }
     }
 }
@@ -1717,6 +1722,51 @@ impl fmt::Debug for TrojanOutboundSettings {
             .field("server", &self.server)
             .field("port", &self.port)
             .field("password", &"<redacted>")
+            .field("level", &self.level)
+            .finish()
+    }
+}
+
+/// Sessions one AnyTLS outbound keeps at once, idle and busy. The engine's
+/// pool enforces the same bound; the parser refuses a `min_idle_session` it
+/// could never honour.
+pub const MAX_ANYTLS_IDLE_SESSIONS: usize = 8;
+
+/// AnyTLS outbound settings, named as sing-box and mihomo name them. AnyTLS
+/// has no Xray-core protocol, so the field names follow
+/// `option.AnyTLSOutboundOptions`: `password`,
+/// `idle_session_check_interval`, `idle_session_timeout`, `min_idle_session`
+/// and `client_metadata`, beside the server address and port every outbound
+/// here uses. The server is TLS-only, through the outbound's own
+/// `streamSettings`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AnyTlsOutboundSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    pub password: zeroize::Zeroizing<String>,
+    /// How often the pool retires idle sessions. Zero takes the reference's
+    /// thirty-second floor.
+    pub idle_session_check_interval: Duration,
+    /// How long a session with no stream stays reusable. Zero takes the
+    /// reference's thirty-second floor.
+    pub idle_session_timeout: Duration,
+    /// Idle sessions the cleanup always keeps.
+    pub min_idle_session: usize,
+    /// Replaces the client version string the settings frame reports.
+    pub client_metadata: Option<String>,
+    pub level: u32,
+}
+
+impl fmt::Debug for AnyTlsOutboundSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnyTlsOutboundSettings")
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("password", &"<redacted>")
+            .field("idle_session_check_interval", &self.idle_session_check_interval)
+            .field("idle_session_timeout", &self.idle_session_timeout)
+            .field("min_idle_session", &self.min_idle_session)
+            .field("client_metadata", &self.client_metadata)
             .field("level", &self.level)
             .finish()
     }

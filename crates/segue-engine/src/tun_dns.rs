@@ -3273,6 +3273,9 @@ async fn open_raw_dns_tcp_candidate(
         TcpOutbound::Trojan(outbound) => {
             effective_policy_for_level(&context.config, Some(outbound.level())).handshake
         }
+        TcpOutbound::AnyTls(outbound) => {
+            effective_policy_for_level(&context.config, Some(outbound.level())).handshake
+        }
         TcpOutbound::Socks(outbound) => {
             effective_policy_for_level(&context.config, Some(outbound.level())).handshake
         }
@@ -3525,6 +3528,7 @@ async fn proxy_udp_payload(
                 let outbound_timeout = match &outbound {
                     UdpOutbound::Freedom(_) => DNS_PROXY_FREEDOM_ATTEMPT_TIMEOUT,
                     UdpOutbound::Trojan(_)
+                    | UdpOutbound::AnyTls(_)
                     | UdpOutbound::Socks(_)
                     | UdpOutbound::Vmess(_)
                     | UdpOutbound::Shadowsocks2022(_)
