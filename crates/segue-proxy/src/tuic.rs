@@ -270,7 +270,7 @@ impl Reader<'_> {
             .get(self.position..end)
             .ok_or(WireError::Truncated)?;
         self.position = end;
-        Ok(slice.try_into().map_err(|_| WireError::Truncated)?)
+        slice.try_into().map_err(|_| WireError::Truncated)
     }
 
     fn take(&mut self, count: usize) -> Result<Vec<u8>, WireError> {

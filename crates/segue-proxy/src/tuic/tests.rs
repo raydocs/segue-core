@@ -48,8 +48,9 @@ fn address_encodings_cover_domains_ips_and_the_fragment_sentinel() {
             ][..],
         ),
     ] {
-        let (decoded, consumed) =
-            decode(&encode(&Command::Connect(address.clone())).unwrap()).unwrap();
+        let encoded = encode(&Command::Connect(address.clone())).unwrap();
+        assert_eq!(&encoded[2..], expected);
+        let (decoded, consumed) = decode(&encoded).unwrap();
         assert_eq!(decoded, Command::Connect(address));
         assert_eq!(consumed, encode(&decoded).unwrap().len());
     }
@@ -237,10 +238,10 @@ fn reassembly_bounds_payload_size_count_and_total_memory() {
     );
     let mut reassembly = Reassembler::new(Duration::from_secs(30), 100).unwrap();
     reassembly
-        .feed(&packet(1, 2, 0, &vec![1; 80]), start)
+        .feed(&packet(1, 2, 0, &[1; 80]), start)
         .unwrap();
     assert_eq!(
-        reassembly.feed(&packet(1, 2, 1, &vec![2; 21]), start),
+        reassembly.feed(&packet(1, 2, 1, &[2; 21]), start),
         Err(WireError::ReassemblyLimit)
     );
     assert!(Reassembler::new(Duration::ZERO, 100).is_err());
