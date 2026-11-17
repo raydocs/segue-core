@@ -52,7 +52,7 @@ jobs:
           # The artifact quota can be full, so the patch is also printed
           # between markers for `gh run view --log` to recover.
           echo '=====FMT-PATCH-BEGIN====='
-          base64 -w0 out/fmt.patch; echo
+          base64 -w 3000 out/fmt.patch
           echo '=====FMT-PATCH-END====='
 
       - name: Lint and build every target
@@ -64,11 +64,11 @@ jobs:
       - name: Regenerate checked-in generated files (patch includes fmt and lock)
         if: always()
         run: |
-          cargo run -q -p segue-config --example config_contract > docs/config-contract.json || true
+          if cargo run -q -p segue-config --example config_contract > out/contract.json; then mv out/contract.json docs/config-contract.json; fi
           git diff --stat
           git diff > out/gen.patch
           echo '=====GEN-PATCH-BEGIN====='
-          base64 -w0 out/gen.patch; echo
+          base64 -w 3000 out/gen.patch
           echo '=====GEN-PATCH-END====='
 
       - name: Upload results
