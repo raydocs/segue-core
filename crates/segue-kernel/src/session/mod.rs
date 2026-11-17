@@ -18,11 +18,13 @@
 //! with an error and nothing is ever retried direct.
 //!
 //! Kill switch (KILLSWITCH.md L1): carrier outcomes drive one [`KillSwitch`]
-//! per exit. While a carrier cannot be established (`Reconnecting` /
-//! `Error`), new flows on strict (AI) routes are refused at once; overseas
-//! flows are tried (the session retries OPEN for a bounded time) and refused
-//! if that fails. A user disconnect (L5) refuses every proxied flow and ends
-//! the live sessions.
+//! per exit, and a new flow asks [`KillSwitch::verdict`]. While that exit is
+//! reconnecting or in error, a strict (AI) route is refused at once, except
+//! the pinned fresh OPEN after UNKNOWN_SESSION and a route whose retry window
+//! has elapsed with nothing backing off (that attempt is what brings the exit
+//! back). Overseas is [`crate::killswitch::Protection::Wait`]: the SOCKS/TUN
+//! front end holds TCP; a dial that is asked anyway still tries the OPEN.
+//! A user disconnect (L5) refuses every proxied flow and ends the live sessions.
 //!
 //! Channel health (SESSION_PROTOCOL §3, §5.1): each exit that has sessions
 //! keeps a control stream to its relay. A `STALL` from the relay (it sees
@@ -38,6 +40,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,7 +58,11 @@ use tokio::task::JoinHandle;
 use crate::dial::{Datagrams, DialError, Dialer};
 
 mod stream;
-use crate::killswitch::{Event, KillSwitch, Posture};
+use crate::killswitch::{
+    protection_for_exit_class, Event, FlowPosture, HoldGuard, KillSwitch, Posture, Protection,
+    Verdict, WAIT_CAP,
+};
+use crate::rules::Action;
 pub use stream::SessionStream;
 
 /// `exit_class` hints in OPEN (the relay classifies by itself).
@@ -299,6 +306,8 @@ pub struct KernelDialer {
     control: ControlTiming,
     /// Session timing and limits (validated: [`Self::with_session_config`]).
     session_cfg: segue_session::Config,
+    /// TCP flows currently held in [`crate::killswitch::Verdict::Wait`].
+    holds: Arc<AtomicUsize>,
 }
 
 impl Drop for KernelDialer {
@@ -336,6 +345,7 @@ impl KernelDialer {
             channels: (0..exits_len).map(|_| Channel::default()).collect(),
             control: ControlTiming::default(),
             session_cfg: segue_session::Config::default(),
+            holds: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -671,16 +681,31 @@ impl KernelDialer {
             let i = pinned.unwrap_or_else(|| st.pick());
             *exit = Some((i, st.choice_gen));
             let h = &st.health[i];
-            // Refused at once while the exit's carrier connects fail, or
-            // its sessions are backing off after failures (r9 F5). The
-            // one fresh attempt after UNKNOWN_SESSION is let through.
-            let down = matches!(h.ks.posture(), Posture::Reconnecting | Posture::Error)
-                && (h.recently_failed() || h.failing() > 0);
-            if r.exit_class == EXIT_AI && down && pinned.is_none() {
-                return Err((
-                    DialError("refused: tunnel reconnecting (strict route)".into()),
-                    None,
-                ));
+            // Posture decides. Protection comes from the route's exit class,
+            // not from a second AI check. A strict Refuse is immediate while
+            // the exit's carrier connects are failing or its sessions are
+            // backing off (r9 F5). Two attempts are still made, because they
+            // are what restores the exit: the pinned fresh OPEN after
+            // UNKNOWN_SESSION, and a route whose retry window has elapsed
+            // with nothing backing off. Wait is not an error here — the
+            // front end holds TCP; if a dial is asked anyway, the OPEN is tried.
+            let protection = protection_for_exit_class(r.exit_class);
+            let verdict = h.ks.verdict(&Action::Proxy(String::new()), protection);
+            match verdict {
+                Verdict::Release => {
+                    return Err((DialError("refused: disconnected".into()), None));
+                }
+                Verdict::Refuse
+                    if protection == Protection::Strict
+                        && pinned.is_none()
+                        && (h.recently_failed() || h.failing() > 0) =>
+                {
+                    return Err((
+                        DialError("refused: tunnel reconnecting (strict route)".into()),
+                        None,
+                    ));
+                }
+                _ => {}
             }
             i
         };
@@ -945,6 +970,23 @@ impl Dialer for KernelDialer {
             }
         }
         self.engine.dial_udp(tag, addr, port).await
+    }
+}
+
+impl FlowPosture for KernelDialer {
+    fn posture(&self) -> Posture {
+        // The trait method would recurse; this is the aggregate posture.
+        KernelDialer::posture(self)
+    }
+
+    fn protection(&self, tag: &str) -> Option<Protection> {
+        self.routes
+            .get(tag)
+            .map(|r| protection_for_exit_class(r.exit_class))
+    }
+
+    fn try_hold(&self) -> Option<HoldGuard> {
+        HoldGuard::try_acquire(&self.holds, WAIT_CAP)
     }
 }
 
