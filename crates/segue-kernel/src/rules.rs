@@ -88,7 +88,8 @@ impl RuleSet {
     }
 
     /// Install the AI tier. `suffixes` are already canonical; `cidrs` may
-    /// be empty (no published client-facing ranges).
+    /// be empty. The built-in file ships only Anthropic's published inbound
+    /// ranges (see `data/ai-lock.txt`).
     pub fn with_ai(mut self, suffixes: Vec<String>, cidrs: &[Cidr], action: Action) -> Self {
         self.ai = Some(AiTier {
             suffixes,
@@ -578,9 +579,17 @@ mod tests {
     }
 
     #[test]
-    fn builtin_list_covers_the_named_vendors_and_no_invented_cidrs() {
+    fn builtin_list_covers_the_named_vendors_and_only_published_anthropic_cidrs() {
         let (suffixes, cidrs) = builtin_ai_list();
-        assert!(cidrs.is_empty(), "no published client-facing CIDR");
+        // Inbound ranges from platform.claude.com/docs/en/api/ip-addresses
+        // (2026-11-17). Not the larger outbound blocks, and not a CDN.
+        let published = [
+            "160.79.104.0/23",
+            "153.61.224.0/22",
+            "2607:6bc0::/48",
+        ]
+        .map(|s| Cidr::parse(s).unwrap());
+        assert_eq!(cidrs.as_slice(), published.as_slice());
         let rules = RuleSet::new(Vec::new(), Action::Direct).with_ai(
             suffixes,
             &cidrs,
@@ -593,6 +602,9 @@ mod tests {
             "claude.ai",
             "API.Claude.AI.",
             "claude.com",
+            "platform.claude.com",
+            "downloads.claude.ai",
+            "bridge.claudeusercontent.com",
             "api.openai.com",
             "auth.openai.com",
             "chat.openai.com",
@@ -600,6 +612,16 @@ mod tests {
             "ab.chatgpt.com",
             "cdn.oaistatic.com",
             "files.oaiusercontent.com",
+            "o33249.ingest.us.sentry.io",
+            "api2.cursor.sh",
+            "accounts.spacexsi.com",
+            "api.x.ai",
+            "auth.grok.com",
+            "api.githubcopilot.com",
+            "copilot-proxy.githubusercontent.com",
+            "gemini.google.com",
+            "generativelanguage.googleapis.com",
+            "cloudcode-pa.googleapis.com",
         ] {
             assert_eq!(
                 rules.decide(&d(name)),
@@ -612,9 +634,27 @@ mod tests {
             "example.com",
             "statsigapi.net",
             "sentry.io",
+            "browser-intake-us5-datadoghq.com",
+            "challenges.cloudflare.com",
+            "github.com",
+            "accounts.google.com",
+            "play.googleapis.com",
+            "chatgpt-staging.com",
         ] {
             assert_eq!(rules.decide(&d(name)), &Action::Direct, "{name}");
         }
+        let ai = Action::Proxy("ai".into());
+        let direct = Action::Direct;
+        assert_eq!(rules.decide(&ip("160.79.104.10")), &ai);
+        assert_eq!(rules.decide(&ip("153.61.224.1")), &ai);
+        assert_eq!(rules.decide(&ip("2607:6bc0::10")), &ai);
+        // Outbound-only slice of 160.79.104.0/21, and a Cloudflare address
+        // chatgpt.com resolved to on the retrieval day.
+        assert_eq!(rules.decide(&ip("160.79.106.1")), &direct);
+        assert_eq!(rules.decide(&ip("104.18.32.47")), &direct);
+        // downloads.claude.ai was on Google, not the Anthropic ranges.
+        // The name is locked; this address is not.
+        assert_eq!(rules.decide(&ip("35.190.46.17")), &direct);
     }
 
     #[test]
