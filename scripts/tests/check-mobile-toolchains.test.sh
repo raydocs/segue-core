@@ -34,10 +34,16 @@ test_missing_android_sdk_platform_is_reported() {
 
 test_android_build_rejects_mismatched_api_level() {
   local test_root="$TEST_TMP_ROOT/api-level"
-  mkdir -p "$test_root"
+  mkdir -p "$test_root/bin"
+
+  # The API-level guard must fire before any real toolchain is needed, but
+  # the host running the test suite does not necessarily have cargo
+  # installed, so satisfy the require_command probe with a stub.
+  printf '#!/bin/sh\nexit 0\n' >"$test_root/bin/cargo"
+  chmod +x "$test_root/bin/cargo"
 
   local output_path="$test_root/output.txt"
-  if ANDROID_API_LEVEL=25 \
+  if ANDROID_API_LEVEL=25 PATH="$test_root/bin:$PATH" \
     bash "$REPOSITORY_ROOT/scripts/build-android-libs.sh" >"$output_path" 2>&1; then
     echo "mismatched Android API level was accepted" >&2
     return 1

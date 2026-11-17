@@ -155,8 +155,13 @@ def parse_timestamp(value: Any, label: str) -> dt.datetime:
     timestamp = require_string(value, label, maximum=64)
     if not UTC_TIMESTAMP.fullmatch(timestamp):
         fail(f"{label} must be an RFC 3339 UTC timestamp ending in Z")
+    # datetime.fromisoformat only accepts 3- or 6-digit fractional seconds
+    # before Python 3.11, so normalize the fraction to a fixed 6 digits.
+    body, _, fraction = timestamp[:-1].partition(".")
     try:
-        parsed = dt.datetime.fromisoformat(timestamp[:-1] + "+00:00")
+        parsed = dt.datetime.fromisoformat(
+            f"{body}.{fraction.ljust(6, '0')}+00:00" if fraction else f"{body}+00:00"
+        )
     except ValueError:
         fail(f"{label} is not a valid RFC 3339 timestamp")
     if parsed.utcoffset() != dt.timedelta(0):
