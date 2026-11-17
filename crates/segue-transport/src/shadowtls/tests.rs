@@ -33,12 +33,18 @@ fn hex(bytes: &[u8]) -> String {
 #[test]
 fn client_hello_and_xor_vectors_match_sing_shadowtls() {
     let mut hello: Vec<u8> = (0..=255).collect();
+    // verifyClientHello rejects anything that is not a ClientHello with a
+    // 32-byte session id before it checks the tag (v3_server.go).
+    hello[0] = 1;
+    hello[38] = 32;
     let random: [u8; 28] = (16..=43).collect::<Vec<_>>().try_into().unwrap();
     seal_session_id(PASSWORD, &mut hello, random).unwrap();
     let mut record = vec![HANDSHAKE, 3, 3, 0, 0];
     record[3..5].copy_from_slice(&(hello.len() as u16).to_be_bytes());
     record.extend_from_slice(&hello);
-    assert_eq!(hex(&hello[67..71]), "b77a61e4");
+    // sing-shadowtls generateSessionID (v3_client.go): HMAC-SHA1(password,
+    // hello[:39] || random(28) || 4 zero bytes || hello[71:]) truncated to 4.
+    assert_eq!(hex(&hello[67..71]), "832ac85d");
     assert!(client_hello_tag_valid(PASSWORD, &record));
     assert!(!client_hello_tag_valid(b"wrong", &record));
     let mut wrong = record;
@@ -57,18 +63,24 @@ fn client_hello_and_xor_vectors_match_sing_shadowtls() {
 fn framing_vectors_have_directional_chaining_and_transactional_open() {
     let mut write = FrameMac::new(PASSWORD, &RANDOM, b'C');
     let mut read = FrameMac::new(PASSWORD, &RANDOM, b'C');
-    for (payload, expected) in [(&b"first"[..], "6883c0d8"), (&b"second"[..], "0a1ca088")] {
+    let mut first_tag = [0u8; 4];
+    for (index, (payload, expected)) in [(&b"first"[..], "6883c0d8"), (&b"second"[..], "0a1ca088")]
+        .into_iter()
+        .enumerate()
+    {
         let tag = write.seal(payload);
         assert!(read.open(payload, &tag));
         assert_eq!(hex(&tag), expected);
-        let mut other = FrameMac::new(PASSWORD, &RANDOM, b'C');
-        assert!(other.open(payload, &tag));
-        assert_eq!(
-            other.seal(payload),
-            tag,
-            "next seal includes the previous tag"
-        );
+        if index == 0 {
+            first_tag = tag;
+        }
     }
+    // sing-shadowtls verifiedConn.putHeaderLocked / verifyApplicationData
+    // write the 4-byte tag back into the rolling HMAC. A reader that accepted
+    // "first" therefore seals "second" as the same chained tag, not a fresh one.
+    let mut other = FrameMac::new(PASSWORD, &RANDOM, b'C');
+    assert!(other.open(b"first", &first_tag));
+    assert_eq!(hex(&other.seal(b"second")), "0a1ca088");
     let mut server = FrameMac::new(PASSWORD, &RANDOM, b'S');
     assert_eq!(hex(&server.seal(b"first")), "212eaef7");
     assert_eq!(hex(&server.seal(b"second")), "8b3cff74");
@@ -84,7 +96,10 @@ fn tls13_server_hello() -> Vec<u8> {
     body.extend_from_slice(&RANDOM);
     body.push(32);
     body.extend_from_slice(&[7; 32]);
-    body.extend_from_slice(&[0x13, 1, 0, 0, 0, 6, 0, 43, 0, 2, 3, 4]);
+    // cipher 0x1301, compression 0, extensions length 6, supported_versions
+    // (43) of length 2 carrying 0x0304. An extra zero here makes the
+    // extensions length parse as 0, so the fixture would not be TLS 1.3.
+    body.extend_from_slice(&[0x13, 1, 0, 0, 6, 0, 43, 0, 2, 3, 4]);
     let handshake_len = ((body.len() - 4) as u16).to_be_bytes();
     body[2..4].copy_from_slice(&handshake_len);
     let mut record = vec![HANDSHAKE, 3, 3, 0, 0];
