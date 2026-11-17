@@ -642,10 +642,11 @@
         "enabled",
         "ipv4Pool",
         "poolSize",
-        "ttl"
+        "ttl",
+        "exemptDomains"
       ],
       "id": "FAKE_IP",
-      "notes": "IPv4 only. Positive poolSize must fit the usable pool after reserved addresses; ttl is positive."
+      "notes": "IPv4 only. Positive poolSize must fit the usable pool after reserved addresses; ttl is positive. Segue extension exemptDomains: domain rules as Xray reads them (plain text a substring), whose names keep real answers instead of a fake IP; absent or null selects the built-in captive-portal, NTP and .lan/.local list, and an empty list exempts nothing."
     },
     {
       "context": "streamSettings.finalmask",

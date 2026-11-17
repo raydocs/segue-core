@@ -905,6 +905,17 @@ impl DnsOutboundRuntime {
         if parsed.domain() == "." {
             return Some(HijackResolution::NoData);
         }
+        // A `dns.hosts` entry still answers first, as it did before this
+        // filter. Otherwise an exempt name keeps a real answer: `None` sends
+        // the query on to the configured resolver instead of the mapper.
+        if static_dns_host_target_from_index(&self.static_hosts, parsed.domain()).is_none()
+            && mapper
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_exempt(parsed.domain())
+        {
+            return None;
+        }
 
         let answers = |ipv6| {
             mapper
@@ -1339,8 +1350,9 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use segue_config::{
-        DnsFakeIpConfig, DnsHostTarget, DnsOutboundRule, DnsOutboundRuleAction,
-        DnsOutboundSettings, DomainMatcher, IpCidr, Network, TargetAddr as ConfigTargetAddr,
+        default_fake_ip_exempt_domains, DnsFakeIpConfig, DnsHostTarget, DnsOutboundRule,
+        DnsOutboundRuleAction, DnsOutboundSettings, DomainMatcher, IpCidr, Network,
+        TargetAddr as ConfigTargetAddr,
     };
     use segue_routing::{Network as RoutingNetwork, TargetAddr};
     use segue_transport::{ConfiguredDnsResolver, SystemDnsResolver, TransportDialer};
@@ -1416,6 +1428,7 @@ mod tests {
             ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 29).unwrap(),
             pool_size: 1,
             ttl: 60,
+            exempt_domains: default_fake_ip_exempt_domains(),
         };
         let mapper = Arc::new(Mutex::new(
             FakeIpMapper::from_config(&config, segue_config::DnsQueryStrategy::UseIp, &[]).unwrap(),
@@ -1423,6 +1436,118 @@ mod tests {
         let mut runtime = test_runtime();
         runtime.fake_ip_mapper = Some(Arc::clone(&mapper));
         (runtime, mapper)
+    }
+
+    /// Answers every name with one fixed address, so a test can tell an
+    /// exempt name's real answer from a fake IP.
+    #[derive(Debug)]
+    struct FixedResolver(Ipv4Addr);
+
+    #[async_trait::async_trait]
+    impl DnsResolver for FixedResolver {
+        async fn resolve(&self, _domain: &str, port: u16) -> Result<SocketAddr, TransportError> {
+            Ok(SocketAddr::new(IpAddr::V4(self.0), port))
+        }
+
+        async fn resolve_all(
+            &self,
+            _domain: &str,
+            port: u16,
+        ) -> Result<DnsLookup, TransportError> {
+            Ok(DnsLookup::from_ips(
+                [IpAddr::V4(self.0)],
+                port,
+                Some(Duration::from_secs(60)),
+            ))
+        }
+    }
+
+    fn test_runtime_with_fake_ip_and_resolver(
+        real: Ipv4Addr,
+    ) -> (DnsOutboundRuntime, Arc<Mutex<FakeIpMapper>>) {
+        let (runtime, mapper) = test_runtime_with_fake_ip();
+        let runtime = DnsOutboundRuntime::with_direct_executor_and_fake_ip(
+            Arc::new(FixedResolver(real)),
+            Arc::clone(&runtime.direct_executor),
+            runtime.fake_ip_mapper.clone(),
+            Arc::clone(&runtime.static_hosts),
+            8,
+        );
+        (runtime, mapper)
+    }
+
+    #[tokio::test]
+    async fn exempt_names_keep_a_real_answer_and_allocate_no_fake_ip() {
+        let real = Ipv4Addr::new(203, 0, 113, 9);
+        let (runtime, mapper) = test_runtime_with_fake_ip_and_resolver(real);
+        let request = query(0x2302, "captive.apple.com");
+
+        let response = hijack_reply(&runtime, request.clone()).await;
+
+        let question_end = parse_dns_query(&request).unwrap().question_section_end();
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
+        assert_eq!(&response[question_end + 12..question_end + 16], &real.octets());
+        assert_eq!(mapper.lock().unwrap().mapping_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unexempt_names_still_get_a_fake_ip() {
+        let (runtime, mapper) = test_runtime_with_fake_ip_and_resolver(Ipv4Addr::new(
+            203, 0, 113, 10,
+        ));
+        let request = query(0x2303, "ordinary.example");
+
+        let response = hijack_reply(&runtime, request.clone()).await;
+
+        let question_end = parse_dns_query(&request).unwrap().question_section_end();
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
+        let answer = Ipv4Addr::new(
+            response[question_end + 12],
+            response[question_end + 13],
+            response[question_end + 14],
+            response[question_end + 15],
+        );
+        assert_eq!(
+            u32::from(answer) & 0xffff_fff8,
+            u32::from(Ipv4Addr::new(198, 18, 0, 0))
+        );
+        assert_eq!(mapper.lock().unwrap().mapping_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_exemption_list_gives_every_name_a_fake_ip() {
+        let (runtime, mapper) = test_runtime_with_fake_ip_and_resolver(Ipv4Addr::new(
+            203, 0, 113, 11,
+        ));
+        *mapper.lock().unwrap() = FakeIpMapper::from_config(
+            &DnsFakeIpConfig {
+                enabled: true,
+                ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 29).unwrap(),
+                pool_size: 1,
+                ttl: 60,
+                exempt_domains: segue_config::DomainMatcherSet::default(),
+            },
+            segue_config::DnsQueryStrategy::UseIp,
+            &[],
+        )
+        .unwrap();
+        let request = query(0x2304, "captive.apple.com");
+
+        let response = hijack_reply(&runtime, request.clone()).await;
+
+        let question_end = parse_dns_query(&request).unwrap().question_section_end();
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
+        let answer = Ipv4Addr::new(
+            response[question_end + 12],
+            response[question_end + 13],
+            response[question_end + 14],
+            response[question_end + 15],
+        );
+        assert_eq!(
+            u32::from(answer) & 0xffff_fff8,
+            u32::from(Ipv4Addr::new(198, 18, 0, 0))
+        );
+        assert_eq!(mapper.lock().unwrap().mapping_count(), 1);
     }
 
     fn hijack_outbound() -> DnsOutbound {
@@ -1549,6 +1674,7 @@ mod tests {
                 ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 29).unwrap(),
                 pool_size: 1,
                 ttl: 60,
+                exempt_domains: default_fake_ip_exempt_domains(),
             };
             *guard = FakeIpMapper::from_config(&config, segue_config::DnsQueryStrategy::UseIp, &[])
                 .unwrap()

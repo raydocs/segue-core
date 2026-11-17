@@ -1098,11 +1098,29 @@ impl Parser<'_> {
                 .unwrap_or(DEFAULT_FAKE_IP_POOL_SIZE),
         };
 
+        // A Segue extension: Xray-core has no fake-IP filter, and expresses
+        // one by routing names to another DNS server. Absent or null keeps
+        // the built-in captive-portal/NTP/local exemption list; an empty list
+        // exempts nothing, which is the behaviour without this field.
+        let exempt_domains_path = format!("{fake_ip_path}.exemptDomains");
+        let raw_exempt_domains = fake_ip.get("exemptDomains");
+        let exempt_domains = match raw_exempt_domains {
+            None | Some(Value::Null) => default_fake_ip_exempt_domains(),
+            Some(_) => self
+                .domain_rule_list(
+                    raw_exempt_domains,
+                    &exempt_domains_path,
+                    DomainNameMode::Dns,
+                )?
+                .unwrap_or_default(),
+        };
+
         Some(DnsFakeIpConfig {
             enabled,
             ipv4_pool: pool,
             pool_size,
             ttl,
+            exempt_domains,
         })
     }
 

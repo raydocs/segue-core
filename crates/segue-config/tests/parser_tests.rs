@@ -7,8 +7,8 @@ use std::{
 
 use prost::Message;
 use segue_config::{
-    parse_xray_json, parse_xray_json_with_geodata_dirs, DiagnosticSeverity, DnsFakeIpConfig,
-    DnsHostTarget, DnsIpFilter, DnsNameServerConfig, DnsOutboundRuleAction, DnsOutboundSettings,
+    default_fake_ip_exempt_domains, parse_xray_json, parse_xray_json_with_geodata_dirs,
+    DiagnosticSeverity, DnsFakeIpConfig, DnsHostTarget, DnsIpFilter, DnsNameServerConfig, DnsOutboundRuleAction, DnsOutboundSettings,
     DnsQueryStrategy, DnsServerConfig, DnsServerEndpoint, DnsServerTransport, DomainMatcherSet,
     HappyEyeballsSettings, InboundProtocol, IpCidr, Network, OutboundSettings, QuicBbrProfile,
     QuicCongestion, QuicIntervalRange, QuicParamsSettings, QuicUdpHopSettings, RealityShortId,
@@ -1102,8 +1102,71 @@ fn parses_dns_fake_ip_ipv4_pool() {
             ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
             pool_size: 32_768,
             ttl: 120,
+            exempt_domains: default_fake_ip_exempt_domains(),
         })
     );
+}
+
+#[test]
+fn dns_fake_ip_exempt_domains_default_to_the_built_in_list() {
+    let raw = r#"{
+        "dns": {
+          "fakeIp": { "enabled": true, "ipv4Pool": "198.18.0.0/15" }
+        },
+        "inbounds": [],
+        "outbounds": [{ "tag": "direct", "protocol": "freedom" }]
+    }"#;
+
+    let parsed = parse_xray_json(raw).expect("config should parse");
+    let exempt = parsed.config.dns.fake_ip.unwrap().exempt_domains;
+
+    assert!(exempt.matches("captive.apple.com"));
+    assert!(exempt.matches("pool.ntp.org"));
+    assert!(exempt.matches("printer.lan"));
+    assert!(!exempt.matches("example.com"));
+}
+
+#[test]
+fn dns_fake_ip_exempt_domains_accept_a_custom_list() {
+    let raw = r#"{
+        "dns": {
+          "fakeIp": {
+            "enabled": true,
+            "ipv4Pool": "198.18.0.0/15",
+            "exemptDomains": ["full:only.example", "domain:corp.test"]
+          }
+        },
+        "inbounds": [],
+        "outbounds": [{ "tag": "direct", "protocol": "freedom" }]
+    }"#;
+
+    let parsed = parse_xray_json(raw).expect("config should parse");
+    let exempt = parsed.config.dns.fake_ip.unwrap().exempt_domains;
+
+    assert!(exempt.matches("only.example"));
+    assert!(exempt.matches("host.corp.test"));
+    assert!(!exempt.matches("captive.apple.com"));
+}
+
+#[test]
+fn dns_fake_ip_empty_exempt_domains_exempt_nothing() {
+    let raw = r#"{
+        "dns": {
+          "fakeIp": {
+            "enabled": true,
+            "ipv4Pool": "198.18.0.0/15",
+            "exemptDomains": []
+          }
+        },
+        "inbounds": [],
+        "outbounds": [{ "tag": "direct", "protocol": "freedom" }]
+    }"#;
+
+    let parsed = parse_xray_json(raw).expect("config should parse");
+    let exempt = parsed.config.dns.fake_ip.unwrap().exempt_domains;
+
+    assert!(exempt.is_empty());
+    assert!(!exempt.matches("captive.apple.com"));
 }
 
 #[test]
