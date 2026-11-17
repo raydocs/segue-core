@@ -412,6 +412,8 @@ expected_rust="$(cat <<'EXPECTED'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::perf -W clippy::suspicious
       - name: Test
         run: cargo test --workspace --exclude segue-fuzz --all-targets --locked
+      - name: Test proprietary-kernel FFI skeleton
+        run: cargo test -p segue-ffi --features proprietary-kernel
       - name: Replay fuzz seed corpora
         run: bash scripts/replay-fuzz-corpus.sh
       - name: Build public API documentation

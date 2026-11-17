@@ -857,6 +857,10 @@ jobs:
             {
               echo "CARGO_PROFILE_RELEASE_LTO=false"
               echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
+              # Without LTO the release profile's strip = "symbols" also
+              # strips proc-macro dylibs, and rustc then reports E0463
+              # "can't find crate for `zeroize_derive`". Host code only.
+              echo "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP=none"
             } >> "$GITHUB_ENV"
           fi
           mkdir -p "$cache"

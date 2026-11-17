@@ -72,6 +72,9 @@ APPROVED_TEST_CREDENTIAL_DIGESTS = frozenset(
     {
         # Trojan literal synthetic example password.
         "cbf3b9271fd5b4ab5d1a073abf6786022e2f4ca555aeb5a79c937a75ef372f99",
+        # AnyTLS and TUIC literal synthetic example passwords.
+        "77797d6094146188a00d68b4d8227d9e40906ff640f42a89eac4889f3f54323e",
+        "8f1bf6bc3eb3c9a456ee6be37cc3f12b39c52f0a9bb511ae06f7c5c55e33fb65",
         # SS2022 base64 of sixteen repeated 0x01 bytes.
         "d853bb52c2c2f6631a848e13d2e0ef920973b02dac6b4cdc2bccf8f79b942646",
         # VMess sequential-byte 00112233... test UUID.
