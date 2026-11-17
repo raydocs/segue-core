@@ -719,6 +719,22 @@ bash scripts/tests/check-mobile-toolchains.test.sh
 See [mobile testing](../../docs/mobile-testing.md) for the full native artifact
 matrix and on-device checklist.
 
+## Kill switch
+
+Android's kill switch is the system always-on VPN toggle plus "Block connections
+without VPN" (lockdown). This library does not install its own firewall.
+`XrayVpnService.onRevoke()` runs when the user or the system withdraws VPN
+consent: the interface is already gone, so the service stops the core with the
+same `stopXrayTunnel()` path an explicit stop uses, then calls
+`onXrayTunnelStopped("revoked")`. An explicit `stopXrayTunnel()` does not emit
+that callback. The reason is also on `XrayVpnRuntimeSnapshot.stopReason` until
+the next session is published.
+
+`XrayVpnRuntimeSnapshot.isAlwaysOn` and `isLockdownEnabled` mirror
+`VpnService.isAlwaysOn()` and `isLockdownEnabled()`. Both exist only on API 29
+and later; on older releases the snapshot fields are null, not false. The host
+still has to send the user to the system VPN settings to turn the toggles on.
+
 ## Current limits
 
 - The checked-in host and probe apps are debug release-gate tools, not reusable
