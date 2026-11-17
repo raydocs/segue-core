@@ -1,0 +1,61 @@
+name: Quick check
+
+# Fast compile feedback for branches written without a local toolchain.
+# Push a commit to any `quick/**` branch: this formats the tree, lints and
+# builds every target (no tests run), and uploads the formatting patch and the
+# compiler output as artifacts. It never pushes and never runs the full gate.
+on:
+  push:
+    branches: ["quick/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quick-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: instabox-medium
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Keep build outputs on the root disk
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+          mkdir -p target
+          sudo mount --bind /opt/segue-target target
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.96.0
+
+      - name: Format
+        run: |
+          mkdir -p out
+          cargo fmt --all || true
+          git diff > out/fmt.patch
+          git diff --stat
+
+      - name: Lint and build every target
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --all-features --locked --message-format=short \
+            -- -D warnings -W clippy::perf -W clippy::suspicious 2>&1 | tee out/clippy.txt
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: quick-check
+          path: out/

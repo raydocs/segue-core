@@ -114,9 +114,7 @@ async fn check(server: &XrayServer, config: Value, case: &str) {
     eprintln!("xdns {case}");
     let mut last = None;
     for attempt in 1..=ATTEMPTS {
-        let attempt_result = AssertUnwindSafe(exercise(config.clone(), true))
-            .catch_unwind()
-            .await;
+        let attempt_result = AssertUnwindSafe(exercise(config.clone(), true)).catch_unwind();
         let result = match timeout(Duration::from_secs(90), attempt_result).await {
             Ok(Ok(Ok(()))) => return,
             Ok(Ok(Err(error))) => format!("{error:?}"),
