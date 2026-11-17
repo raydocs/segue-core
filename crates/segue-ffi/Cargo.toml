@@ -16,7 +16,7 @@ bytes.workspace = true
 libc.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-segue-config = { path = "../segue-config" }
+segue-config = { path = "../segue-config", default-features = false }
 segue-engine = { path = "../segue-engine" }
 segue-routing = { path = "../segue-routing" }
 segue-tun = { path = "../segue-tun" }

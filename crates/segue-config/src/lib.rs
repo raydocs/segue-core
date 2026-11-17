@@ -1,5 +1,7 @@
 mod diagnostic;
 mod geodata;
+#[cfg(feature = "import")]
+pub mod import;
 mod model;
 mod parser;
 pub mod profile_import;

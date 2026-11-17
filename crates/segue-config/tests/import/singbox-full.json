@@ -1,0 +1,150 @@
+{
+  "log": {"level": "info"},
+  "dns": {
+    "servers": [
+      {"type": "udp", "tag": "remote", "server": "1.1.1.1"},
+      {"type": "https", "tag": "doh", "server": "dns.example.com", "server_port": 443},
+      {"type": "fakeip", "tag": "fake", "inet4_range": "198.18.0.0/15"}
+    ],
+    "rules": [
+      {"domain_suffix": ["lan", "local"], "server": "local"}
+    ],
+    "final": "remote"
+  },
+  "inbounds": [
+    {"type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30"]}
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality",
+      "server": "edge.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-4000-8000-000000000001",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {"enabled": true, "fingerprint": "chrome"},
+        "reality": {
+          "enabled": true,
+          "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "short_id": "0123456789abcdef"
+        }
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-ws",
+      "server": "ws.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-4000-8000-000000000002",
+      "security": "auto",
+      "tls": {"enabled": true, "server_name": "ws.example.com"},
+      "transport": {
+        "type": "ws",
+        "path": "/ray",
+        "headers": {"Host": "ws.example.com"}
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-grpc",
+      "server": "trojan.example.com",
+      "server_port": 443,
+      "password": "synthetic-trojan-password",
+      "tls": {"enabled": true, "server_name": "trojan.example.com"},
+      "transport": {"type": "grpc", "service_name": "GunService"}
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-2022",
+      "server": "ss.example.com",
+      "server_port": 8388,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "AAAAAAAAAAAAAAAAAAAAAA=="
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2",
+      "server": "hy.example.com",
+      "server_port": 443,
+      "password": "synthetic-hy2-password",
+      "server_ports": ["443", "8443:8445"],
+      "obfs": {"type": "salamander", "password": "synthetic-obfs-password"},
+      "tls": {"enabled": true, "server_name": "hy.example.com"}
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls",
+      "server": "anytls.example.com",
+      "server_port": 443,
+      "password": "synthetic-anytls-password",
+      "client_metadata": "synthetic-client",
+      "tls": {"enabled": true, "server_name": "anytls.example.com"}
+    },
+    {
+      "type": "socks",
+      "tag": "socks",
+      "server": "socks.example.com",
+      "server_port": 1080,
+      "username": "synthetic-user",
+      "password": "synthetic-pass"
+    },
+    {
+      "type": "http",
+      "tag": "http-proxy",
+      "server": "http.example.com",
+      "server_port": 8080,
+      "username": "synthetic-user",
+      "password": "synthetic-pass"
+    },
+    {"type": "direct", "tag": "direct"},
+    {"type": "block", "tag": "block"},
+    {
+      "type": "selector",
+      "tag": "manual",
+      "outbounds": ["vless-reality", "vmess-ws", "direct"]
+    },
+    {
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": ["vless-reality", "vmess-ws", "trojan-grpc"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "5m"
+    }
+  ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "wg",
+      "address": ["10.0.0.2/32"],
+      "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "peers": [
+        {
+          "address": "wg.example.com",
+          "port": 51820,
+          "public_key": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+          "allowed_ips": ["0.0.0.0/0", "::/0"]
+        }
+      ]
+    }
+  ],
+  "route": {
+    "rule_set": [
+      {"type": "local", "tag": "ads", "format": "binary", "path": "./rules/ads.srs"}
+    ],
+    "rules": [
+      {"domain_suffix": ["example.com"], "outbound": "auto"},
+      {"domain": ["exact.example.org"], "outbound": "manual"},
+      {"domain_keyword": ["ads"], "outbound": "block"},
+      {"ip_cidr": ["192.0.2.0/24"], "outbound": "direct"},
+      {"geoip": ["cn"], "outbound": "direct"},
+      {"rule_set": ["ads"], "outbound": "block"},
+      {"process_name": ["curl"], "outbound": "direct"},
+      {"port": [8443], "outbound": "auto"}
+    ],
+    "final": "auto"
+  },
+  "experimental": {"cache_file": {"enabled": true}}
+}

@@ -8,8 +8,16 @@ repository.workspace = true
 publish.workspace = true
 description = "Bounded Xray JSON and geodata parser for xray-rust"
 
+[features]
+default = ["import"]
+# Profile import (Clash YAML / sing-box JSON). segue-ffi turns it off, since
+# its mobile consumers import share links instead; segue-cli and the
+# workspace tests use it.
+import = ["dep:serde_yaml_ng"]
+
 [dependencies]
 base64.workspace = true
+serde_yaml_ng = { version = "0.10", optional = true }
 libc.workspace = true
 num-bigint = { version = "0.5.1", default-features = false, features = ["std"] }
 prost.workspace = true
