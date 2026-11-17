@@ -991,7 +991,10 @@ fn apple_adapter_link_script_covers_mobile_triples() {
     assert!(script.contains("XRAY_USE_PREBUILT_ARTIFACTS"));
     assert!(script.contains("EXPECTED_XCFRAMEWORK_PATH"));
     assert!(script.contains("custom XCFRAMEWORK_PATH is unsupported"));
-    assert!(script.contains("lipo \"$binary\" -verify_arch arm64 x86_64"));
+    assert!(
+        script.contains("for arch in arm64 x86_64; do")
+            && script.contains("lipo \"$binary\" -verify_arch \"$arch\"")
+    );
 }
 
 #[test]
