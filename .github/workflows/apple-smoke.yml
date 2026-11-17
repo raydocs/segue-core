@@ -1,0 +1,112 @@
+name: Apple smoke (temporary)
+
+on:
+  push:
+    branches: ['quick/apple-smoke']
+
+permissions:
+  contents: read
+
+jobs:
+  apple:
+    # Runs on the owner's Mac mini (self-hosted runner `segue-macos`, owner
+    # 2026-11-17). Its work directory, CARGO_HOME, RUSTUP_HOME and TMPDIR are
+    # on the external disk (/Volumes/dev/ci; see the runner's .env), because
+    # the internal disk is small. It is not ephemeral: every step must clean
+    # up after itself and never rely on state left by a previous run.
+    runs-on: [self-hosted, macOS, ARM64, segue-macos]
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install rustup on the self-hosted runner if missing
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            : "${CARGO_HOME:?the runner .env must set CARGO_HOME on the external disk}"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          fi
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned Rust toolchains
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+          rustup target add --toolchain 1.96.0 \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            aarch64-apple-ios \
+            aarch64-apple-ios-sim \
+            x86_64-apple-ios
+          rustup toolchain install nightly-2026-05-22 \
+            --profile minimal \
+            --component rust-src
+
+      - name: Build Apple XCFramework
+        run: bash scripts/build-apple-xcframework.sh
+
+      # Ahead of the Swift tests: the regional-routing test builds a real core
+      # over rules carrying geosite/geoip matchers, so it needs the .dat files
+      # that are gitignored and fetched here.
+      - name: Install pinned Apple sample geodata
+        run: bash scripts/fetch-geodata.sh
+
+      - name: Test Swift package
+        env:
+          CLANG_MODULE_CACHE_PATH: ${{ github.workspace }}/target/mobile/apple-clang-module-cache
+          HOME: ${{ github.workspace }}/target/mobile/apple-swiftpm-test-home
+        run: |
+          mkdir -p "$CLANG_MODULE_CACHE_PATH" "$HOME"
+          swift test --disable-sandbox --package-path platform/apple
+
+      - name: Check Apple adapter links
+        env:
+          XRAY_USE_PREBUILT_ARTIFACTS: "1"
+        run: bash scripts/check-apple-adapter-link.sh
+
+      - name: Build unsigned Apple sample apps
+        run: |
+          project="platform/apple/XrayClient/XrayClient.xcodeproj"
+          derived_data="$RUNNER_TEMP/xray-apple-sample"
+
+          xcodebuild \
+            -project "$project" \
+            -scheme XrayClient \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath "$derived_data" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
+
+          xcodebuild \
+            -project "$project" \
+            -scheme XrayClientTv \
+            -configuration Debug \
+            -sdk appletvsimulator \
+            -destination "generic/platform=tvOS Simulator" \
+            -derivedDataPath "$derived_data" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
+
+          xcodebuild \
+            -project "$project" \
+            -scheme XrayClientMac \
+            -configuration Debug \
+            -sdk macosx \
+            -destination "generic/platform=macOS" \
+            -derivedDataPath "$derived_data" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
+
