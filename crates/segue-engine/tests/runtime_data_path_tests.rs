@@ -71,6 +71,10 @@ use tokio::time::{sleep, timeout, Duration, Instant as TokioInstant};
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
+#[path = "../../../tests/support/xray_startup.rs"]
+#[macro_use]
+mod xray_startup;
+
 #[path = "runtime_data_path_tests/tun_admission.rs"]
 mod tun_admission;
 

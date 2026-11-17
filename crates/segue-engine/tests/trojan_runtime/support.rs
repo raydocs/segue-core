@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#[path = "../../../../tests/support/xray_startup.rs"]
+#[macro_use]
+mod xray_startup;
 use crate::hysteria_support as common;
 use common::server as tls;
 pub use common::{echo, socks, tcp_echo, udp_echo, Bootstrap, Protector};
@@ -16,11 +19,6 @@ pub const PASSWORD: &str = "synthetic-local-trojan-test-password";
 pub const DEADLINE: Duration = Duration::from_secs(20);
 /// Far longer than sing-box takes from flushing its 101 to the hijack.
 const HTTPUPGRADE_ROUND_TRIP: Duration = Duration::from_millis(10);
-/// Starts of a reference whose port another socket took, each on a fresh
-/// port. The harness picks a port by binding it and lets go for the
-/// reference to bind; a parallel test's socket can take it in between
-/// ("address already in use").
-const PORT_ATTEMPTS: usize = 5;
 /// Restarts on the same port, which a client knows, 100 ms apart: about two
 /// seconds for another socket to let go of it.
 const RESTART_ATTEMPTS: usize = 20;
@@ -85,15 +83,10 @@ impl ReferenceServer {
         vmess: Option<(&str, &str)>,
         vless: Option<(&str, bool)>,
     ) -> Self {
-        for _ in 1..PORT_ATTEMPTS {
-            if let Some(server) = Self::try_start_protocol(network, shadowsocks, vmess, vless).await
-            {
-                return server;
-            }
-        }
-        Self::try_start_protocol(network, shadowsocks, vmess, vless)
-            .await
-            .expect("the reference's port was taken on every attempt")
+        start_on_fresh_ports!(
+            "the reference",
+            Self::try_start_protocol(network, shadowsocks, vmess, vless)
+        )
     }
     /// A started reference, or `None` when another socket took its port.
     async fn try_start_protocol(
@@ -340,7 +333,7 @@ impl ReferenceServer {
             if self.child.try_wait().unwrap().is_some() {
                 let log =
                     std::fs::read_to_string(self.directory.join("server.log")).unwrap_or_default();
-                assert!(log.contains("address already in use"), "reference exited");
+                assert!(self::xray_startup::port_taken(&log), "reference exited:\n{log}");
                 return false;
             }
             // Xray's gRPC hub binds its listener in a goroutine after the core

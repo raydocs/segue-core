@@ -56,31 +56,29 @@ fn sudoku() -> Value {
 }
 
 /// Xray-core running `config`, once its UDP `port` is bound.
-async fn xray(config: Value, port: u16) -> XrayServer {
+///
+/// The port is picked by binding it and letting go, and a parallel test's
+/// socket can take it before Xray binds it; the server then exits with
+/// "address already in use" and the start is repeated on a fresh port, with
+/// `config` rendered again for it.
+async fn xray(config: impl Fn(u16) -> Value) -> XrayServer {
+    let checkout = resolve_xray_checkout();
+    start_on_fresh_ports!("xray", try_xray(&checkout, &config))
+}
+
+/// One start of [`xray`] on a fresh port: `None` when another socket took
+/// the port first.
+async fn try_xray(
+    checkout: &Path,
+    config: &impl Fn(u16) -> Value,
+) -> Option<XrayServer> {
     let temp_dir = create_temp_dir("xray-direct-udp-masks");
+    let binary = xray_vless_binary(checkout, &temp_dir);
     let config_path = temp_dir.path.join("config.json");
     let stdout_path = temp_dir.path.join("stdout.log");
     let stderr_path = temp_dir.path.join("stderr.log");
-    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-    let binary = env::var_os("XRAY_VLESS_FULL_BINARY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let binary = temp_dir
-                .path
-                .join(format!("xray{}", env::consts::EXE_SUFFIX));
-            let output = Command::new("go")
-                .args(["build", "-o"])
-                .arg(&binary)
-                .arg("./main")
-                .current_dir(resolve_xray_checkout())
-                .output()
-                .expect("start go build for Xray-core");
-            assert!(
-                output.status.success(),
-                "go build ./main failed: {output:?}"
-            );
-            binary
-        });
+    let port = allocate_loopback_udp_port();
+    fs::write(&config_path, serde_json::to_vec(&config(port)).unwrap()).unwrap();
     let mut child = Command::new(&binary)
         .arg("run")
         .arg("-config")
@@ -90,21 +88,23 @@ async fn xray(config: Value, port: u16) -> XrayServer {
         .spawn()
         .expect("start xray process");
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    wait_for_udp_listener(&mut child, addr, &stdout_path, &stderr_path).await;
-    XrayServer {
+    if !wait_for_udp_listener(&mut child, addr, &stdout_path, &stderr_path).await {
+        return None;
+    }
+    Some(XrayServer {
         child,
         _temp_dir: temp_dir,
         addr,
         stdout_path,
         stderr_path,
         tls_client_config: None,
-    }
+    })
 }
 
-/// Xray-core's `tunnel` inbound on UDP `port` under `masks`, forwarding each
-/// datagram to the loopback UDP echo on `echo_port`.
-async fn tunnel_server(port: u16, echo_port: u16, masks: &Value) -> XrayServer {
-    xray(
+/// Xray-core's `tunnel` inbound on a fresh UDP port under `masks`,
+/// forwarding each datagram to the loopback UDP echo on `echo_port`.
+async fn tunnel_server(echo_port: u16, masks: &Value) -> XrayServer {
+    xray(|port| {
         json!({
             "log": {"loglevel": "debug"},
             "inbounds": [{"protocol": "tunnel", "listen": "127.0.0.1", "port": port,
@@ -112,9 +112,8 @@ async fn tunnel_server(port: u16, echo_port: u16, masks: &Value) -> XrayServer {
                 "streamSettings": {"finalmask": {"udp": masks}}}],
             "outbounds": [{"protocol": "freedom",
                 "settings": {"finalRules": [{"action": "allow", "ip": ["127.0.0.0/8"]}]}}]
-        }),
-        port,
-    )
+        })
+    })
     .await
 }
 
@@ -209,13 +208,12 @@ async fn freedom_udp_flows_run_under_masks() {
         ),
     ] {
         eprintln!("freedom UDP {case}");
-        let port = allocate_loopback_udp_port();
-        let xray = tunnel_server(port, echo_port, &server).await;
+        let xray = tunnel_server(echo_port, &server).await;
         let core = core(freedom_client(&client)).await;
         let socks_addr = core.inbound_addr(Some("socks-in")).unwrap();
         let result = timeout(
             Duration::from_secs(30),
-            udp_echo_through(socks_addr, port, sizes),
+            udp_echo_through(socks_addr, xray.addr.port(), sizes),
         )
         .await;
         assert!(
@@ -228,13 +226,12 @@ async fn freedom_udp_flows_run_under_masks() {
     }
 
     eprintln!("freedom UDP salamander with another password");
-    let port = allocate_loopback_udp_port();
-    let xray = tunnel_server(port, echo_port, &json!([salamander(password)])).await;
+    let xray = tunnel_server(echo_port, &json!([salamander(password)])).await;
     let core = core(freedom_client(&json!([salamander("another-password")]))).await;
     let socks_addr = core.inbound_addr(Some("socks-in")).unwrap();
     let result = timeout(
         Duration::from_secs(8),
-        udp_echo_through(socks_addr, port, &[1, 512]),
+        udp_echo_through(socks_addr, xray.addr.port(), &[1, 512]),
     )
     .await;
     assert!(
@@ -253,11 +250,11 @@ fn wireguard_keys() -> (StaticSecret, StaticSecret) {
     )
 }
 
-/// Xray-core's WireGuard inbound on UDP `port` under `masks`, its freedom
-/// redirecting every flow to the loopback, keeping the port.
-async fn wireguard_server(port: u16, masks: &Value) -> XrayServer {
+/// Xray-core's WireGuard inbound on a fresh UDP port under `masks`, its
+/// freedom redirecting every flow to the loopback, keeping the port.
+async fn wireguard_server(masks: &Value) -> XrayServer {
     let (server, client) = wireguard_keys();
-    xray(
+    xray(|port| {
         json!({
             "log": {"loglevel": "debug"},
             "inbounds": [{"protocol": "wireguard", "listen": "127.0.0.1", "port": port,
@@ -268,9 +265,8 @@ async fn wireguard_server(port: u16, masks: &Value) -> XrayServer {
                 "streamSettings": {"finalmask": {"udp": masks}}}],
             "outbounds": [{"protocol": "freedom", "settings": {"redirect": "127.0.0.1:0",
                 "finalRules": [{"action": "allow", "ip": ["127.0.0.0/8"]}]}}]
-        }),
-        port,
-    )
+        })
+    })
     .await
 }
 
@@ -340,9 +336,8 @@ async fn wireguard_runs_under_masks() {
         ("sudoku", json!([sudoku()]), json!([sudoku()]), true),
     ] {
         eprintln!("WireGuard {case}");
-        let port = allocate_loopback_udp_port();
-        let xray = wireguard_server(port, &server).await;
-        let core = core(wireguard_client(port, &client)).await;
+        let xray = wireguard_server(&server).await;
+        let core = core(wireguard_client(xray.addr.port(), &client)).await;
         let socks_addr = core.inbound_addr(Some("socks-in")).unwrap();
         let result = timeout(Duration::from_secs(60), async {
             if tcp {
@@ -361,10 +356,9 @@ async fn wireguard_runs_under_masks() {
     }
 
     eprintln!("WireGuard salamander with another password");
-    let port = allocate_loopback_udp_port();
-    let xray = wireguard_server(port, &json!([salamander(password)])).await;
+    let xray = wireguard_server(&json!([salamander(password)])).await;
     let core = core(wireguard_client(
-        port,
+        xray.addr.port(),
         &json!([salamander("another-password")]),
     ))
     .await;

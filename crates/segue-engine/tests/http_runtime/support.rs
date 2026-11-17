@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#[path = "../../../../tests/support/xray_startup.rs"]
+#[macro_use]
+mod xray_startup;
 use base64::Engine as _;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{json, Value};
@@ -474,6 +477,18 @@ impl XrayServer {
     }
 
     async fn start_with_options(tls: Option<TlsIdentity>, outbound: Option<Value>) -> Self {
+        start_on_fresh_ports!(
+            "Xray",
+            Self::try_start_with_options(tls.as_ref(), outbound.as_ref())
+        )
+    }
+
+    /// One start on fresh ports: `None` when another socket took one of them
+    /// before Xray bound it.
+    async fn try_start_with_options(
+        tls: Option<&TlsIdentity>,
+        outbound: Option<&Value>,
+    ) -> Option<Self> {
         let binary = std::env::var_os("XRAY_CLIENT_PROTOCOL_BINARY")
             .expect("run scripts/check-http-interop.sh");
         let directory = std::env::temp_dir().join(format!(
@@ -505,12 +520,10 @@ impl XrayServer {
                 "protocol": "socks", "settings": {"auth": "noauth"}});
             config["outbounds"] = json!([outbound]);
         }
-        let trusted_connector = tls
-            .as_ref()
-            .map(|identity| identity.trusted_connector.clone());
+        let trusted_connector = tls.map(|identity| identity.trusted_connector.clone());
         let pin = tls.map(|identity| {
-            std::fs::write(directory.join("cert.pem"), identity.cert_pem).unwrap();
-            std::fs::write(directory.join("key.pem"), identity.key_pem).unwrap();
+            std::fs::write(directory.join("cert.pem"), &identity.cert_pem).unwrap();
+            std::fs::write(directory.join("key.pem"), &identity.key_pem).unwrap();
             for inbound in config["inbounds"].as_array_mut().unwrap() {
                 // Xray-core's HTTP inbound reads HTTP/1.1 only, and its TLS
                 // would pick h2 for any client that offers it, Xray-core's
@@ -520,7 +533,7 @@ impl XrayServer {
                     "certificates":[{"certificateFile":directory.join("cert.pem"),"keyFile":directory.join("key.pem")}]
                 }});
             }
-            identity.pin
+            identity.pin.clone()
         });
         std::fs::write(
             directory.join("config.json"),
@@ -545,23 +558,21 @@ impl XrayServer {
             pin,
             trusted_connector,
         };
-        server.wait_ready().await;
-        server
+        server.wait_ready().await.then_some(server)
     }
 
-    async fn wait_ready(&mut self) {
-        let deadline = tokio::time::Instant::now() + DEADLINE;
-        loop {
-            assert!(self.child.try_wait().unwrap().is_none(), "Xray exited");
-            if self.log().contains("core: Xray 26.11.9 started") {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "Xray startup timeout"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    /// `false` when Xray exited because another socket took one of its
+    /// ports; any other exit panics with its log.
+    async fn wait_ready(&mut self) -> bool {
+        let log_path = self.directory.join("server.log");
+        self::xray_startup::wait_ready(
+            &mut self.child,
+            || std::fs::read_to_string(&log_path).unwrap_or_default(),
+            |log| log.contains("core: Xray 26.11.9 started"),
+            "Xray",
+            DEADLINE,
+        )
+        .await
     }
 
     pub fn log(&self) -> String {
