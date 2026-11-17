@@ -85,11 +85,14 @@ const TUN_DNS_ANCHOR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 const TUN_CLIENT_IPV4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 
 /// The transport `streamSettings.network` names, before their settings block
-/// has been read. All of them dial TCP; the variant only says what gets
-/// layered on top.
+/// has been read. Most dial TCP; `Hysteria` and `Udp` dial UDP. The variant
+/// says what gets layered on top. `Udp` is TUIC's security-only carrier and
+/// becomes a raw transport classified as UDP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamNetwork {
     Raw,
+    /// `network: "udp"`, accepted only for a TUIC outbound.
+    Udp,
     Hysteria,
     WebSocket,
     HttpUpgrade,

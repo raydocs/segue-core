@@ -9,11 +9,13 @@ impl Parser<'_> {
         index: usize,
     ) -> Option<StreamSettings> {
         let stream = outbound.get("streamSettings");
-        let stream_network = self.parse_network(stream, index)?;
-        let tuic = outbound
+        // TUIC is the only outbound whose carrier is spelled `udp`. Every other
+        // protocol keeps the unsupported-network error for that name.
+        let allow_udp = outbound
             .get("protocol")
             .and_then(Value::as_str)
             .is_some_and(|protocol| protocol.eq_ignore_ascii_case("tuic"));
+        let stream_network = self.parse_network(stream, index, allow_udp)?;
         let mut security = self.parse_security(stream, index, outbound)?;
         if stream_network == StreamNetwork::Hysteria {
             if let StreamSecurity::Tls(tls) = &mut security {
@@ -378,9 +380,11 @@ impl Parser<'_> {
             salamander
         };
         Some(StreamSettings {
-            // Native Hysteria owns a UDP carrier; other transports retain
-            // their existing TCP classification (XHTTP selects H3 later).
-            network: if stream_network == StreamNetwork::Hysteria || tuic {
+            // Native Hysteria and TUIC's `network: "udp"` own a UDP carrier.
+            // Other transports retain their TCP classification (XHTTP selects
+            // H3 later). A TUIC outbound that names `tcp` stays TCP so
+            // `validate_tuic_stream` can reject it.
+            network: if matches!(stream_network, StreamNetwork::Hysteria | StreamNetwork::Udp) {
                 Network::Udp
             } else {
                 Network::Tcp
@@ -414,7 +418,8 @@ impl Parser<'_> {
             StreamNetwork::Hysteria => self
                 .parse_hysteria_transport(stream, index)
                 .map(StreamTransport::Hysteria),
-            StreamNetwork::Raw => Some(StreamTransport::Raw),
+            // TUIC carries QUIC itself; `udp` selects no layered transport.
+            StreamNetwork::Raw | StreamNetwork::Udp => Some(StreamTransport::Raw),
             StreamNetwork::WebSocket => self
                 .parse_websocket_settings(stream, index)
                 .map(StreamTransport::WebSocket),
@@ -468,6 +473,8 @@ impl Parser<'_> {
         let consumed: &[&str] = match network {
             StreamNetwork::Hysteria => &["hysteriaSettings"],
             StreamNetwork::Raw => &["tcpSettings", "rawSettings"],
+            // Security-only. A copied tcp/raw block is inert, same as on ws.
+            StreamNetwork::Udp => &[],
             StreamNetwork::WebSocket => &["wsSettings"],
             StreamNetwork::HttpUpgrade => &["httpupgradeSettings"],
             StreamNetwork::Grpc => &["grpcSettings"],
@@ -1488,6 +1495,7 @@ impl Parser<'_> {
         &mut self,
         stream: Option<&Value>,
         index: usize,
+        allow_udp: bool,
     ) -> Option<StreamNetwork> {
         let Some(stream_settings) = stream else {
             return Some(StreamNetwork::Raw);
@@ -1532,6 +1540,10 @@ impl Parser<'_> {
             "hysteria" => Some(StreamNetwork::Hysteria),
             // Xray renamed the `tcp` transport to `raw`; both names stay valid.
             "tcp" | "raw" => Some(StreamNetwork::Raw),
+            // Not an Xray transport. sing-box's TUIC outbound is a UDP QUIC
+            // carrier with no layered stream; `allow_udp` is set only then.
+            // Every other protocol still hits the unsupported-network arm.
+            "udp" if allow_udp => Some(StreamNetwork::Udp),
             "ws" | "websocket" => Some(StreamNetwork::WebSocket),
             "httpupgrade" => Some(StreamNetwork::HttpUpgrade),
             // No `gun` alias: v26.7.28's `TransportProtocol.Build` has only the
