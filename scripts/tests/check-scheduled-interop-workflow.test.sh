@@ -226,6 +226,10 @@ expected_job_headers="$(cat <<'EXPECTED'
   rust:
   tproxy-linux:
   go-oracles:
+  go-oracles-protocols:
+  go-oracles-carriers:
+  go-oracles-wireguard:
+  go-oracles-tunnels:
   rc-interop:
   scheduled-pinned-interop:
   xray-core-main-smoke:
