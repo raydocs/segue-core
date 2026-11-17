@@ -17,7 +17,7 @@ import = ["dep:serde_yaml_ng"]
 
 [dependencies]
 base64.workspace = true
-serde_yaml_ng = { version = "0.10", optional = true }
+serde_yaml_ng = { workspace = true, optional = true }
 libc.workspace = true
 num-bigint = { version = "0.5.1", default-features = false, features = ["std"] }
 prost.workspace = true
