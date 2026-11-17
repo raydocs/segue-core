@@ -159,7 +159,7 @@ All of it is behind `Socket::set_loss_recovery` and off by default. A socket
 that does not ask for it treats a loss as upstream does: none of the state
 below is set and none of the rules applies. The adapter's sockets ask for it,
 for WireGuard and for a CONNECT-IP tunnel alike. The sockets that terminate
-the TUN link in `xray-core-rs` do not.
+the TUN link in `segue-engine` do not.
 
 - `recover` is the end of what had been sent when a fast retransmit
   started. An ACK of new data short of it is a partial ACK:

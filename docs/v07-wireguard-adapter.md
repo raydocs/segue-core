@@ -206,7 +206,7 @@ The MASQUE outbound runs the same stack with the same settings and one more: its
 timer fires 200 ms past the round trip, as Linux's does. WireGuard can take that
 setting once it is measured on a real network; smoltcp does not undo a timeout
 that turns out spurious. Both are settings of this stack's own sockets. The
-sockets that terminate the TUN link in `xray-core-rs` ask for neither and treat a
+sockets that terminate the TUN link in `segue-engine` ask for neither and treat a
 loss as before.
 The handshake backlog is divided among configured peers, so an unreachable peer
 cannot starve a healthy peer's first UDP packet. Tests saturate one, two and seven
