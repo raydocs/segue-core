@@ -2788,6 +2788,7 @@ fn hex_value(byte: u8) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         fs,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
