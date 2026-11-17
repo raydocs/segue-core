@@ -87,7 +87,24 @@ async fn server(mode: TuicUdpRelayMode) -> MockEndpoint {
             return;
         };
         let connection = incoming.await.unwrap();
-        let mut authenticated = false;
+        // QUIC does not order streams against each other: the client's CONNECT
+        // bi stream can be accepted before its Authenticate uni stream is read.
+        // Like the reference servers, hold every other stream until the
+        // connection has authenticated (the client sends Authenticate first).
+        let mut authenticated = {
+            let mut stream = connection.accept_uni().await.unwrap();
+            let bytes = stream.read_to_end(MAX_STREAM_IN).await.unwrap();
+            let Ok(Command::Authenticate { uuid, token }) = wire::decode_datagram(&bytes) else {
+                panic!("the first uni stream is not Authenticate");
+            };
+            assert_eq!(uuid, *uuid::Uuid::parse_str(UUID).unwrap().as_bytes());
+            let mut exported = [0_u8; 32];
+            connection
+                .export_keying_material(&mut exported, &uuid, PASSWORD.as_bytes())
+                .unwrap();
+            assert_eq!(token, exported);
+            true
+        };
         let mut associated = false;
         loop {
             tokio::select! {
