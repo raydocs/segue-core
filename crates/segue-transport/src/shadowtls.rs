@@ -10,7 +10,8 @@
 //! not hidden behind this connector.
 
 use std::{
-    fmt, io,
+    fmt,
+    io::{self, Read},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -130,7 +131,21 @@ pub(crate) async fn connect_shadow_tls_stream(
         .map_err(TransportError::Tls)?;
     let (relay, mut session) = stream.into_inner();
     let mut plaintext = Vec::new();
-    session.reader().read_to_end(&mut plaintext).map_err(TransportError::Tls)?;
+    // `Read::read_to_end` treats rustls' post-handshake `WouldBlock` (buffer
+    // empty, session still open) as failure, and does not promise to keep
+    // bytes already copied. Drain until that signal instead.
+    {
+        let mut reader = session.reader();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => plaintext.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(TransportError::Tls(error)),
+            }
+        }
+    }
     if !plaintext.is_empty() {
         return Err(TransportError::ShadowTls(
             "unconsumed TLS dummy plaintext at the switch".to_owned(),
