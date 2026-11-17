@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#[path = "../../../../tests/support/xray_startup.rs"]
+#[macro_use]
+mod xray_startup;
 use serde_json::{json, Value};
 use std::{
     net::{IpAddr, Ipv4Addr},
@@ -39,6 +42,19 @@ impl XrayServer {
     }
 
     async fn start_with_options(listen: IpAddr, tls: bool, outbound: Option<Value>) -> Self {
+        start_on_fresh_ports!(
+            "Xray",
+            Self::try_start_with_options(listen, tls, outbound.clone())
+        )
+    }
+
+    /// One start on fresh ports: `None` when another socket took one of them
+    /// before Xray bound it.
+    async fn try_start_with_options(
+        listen: IpAddr,
+        tls: bool,
+        outbound: Option<Value>,
+    ) -> Option<Self> {
         let binary = std::env::var_os("XRAY_CLIENT_PROTOCOL_BINARY")
             .expect("run scripts/check-socks-interop.sh");
         let directory = std::env::temp_dir().join(format!(
@@ -102,23 +118,21 @@ impl XrayServer {
             noauth,
             connector,
         };
-        server.wait_ready().await;
-        server
+        server.wait_ready().await.then_some(server)
     }
 
-    async fn wait_ready(&mut self) {
-        let deadline = tokio::time::Instant::now() + DEADLINE;
-        loop {
-            assert!(self.child.try_wait().unwrap().is_none(), "Xray exited");
-            if self.log().contains("core: Xray 26.11.9 started") {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "Xray startup timeout"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    /// `false` when Xray exited because another socket took one of its
+    /// ports; any other exit panics with its log.
+    async fn wait_ready(&mut self) -> bool {
+        let log_path = self.directory.join("server.log");
+        self::xray_startup::wait_ready(
+            &mut self.child,
+            || std::fs::read_to_string(&log_path).unwrap_or_default(),
+            |log| log.contains("core: Xray 26.11.9 started"),
+            "Xray",
+            DEADLINE,
+        )
+        .await
     }
 
     pub fn log(&self) -> String {

@@ -131,7 +131,11 @@ async fn start_server_with(ml_kem: bool, stream: impl FnOnce(&Path) -> Value) ->
         .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
         .spawn()
         .expect("start xray process");
-    wait_for_xray_startup(&mut child, &stdout_path, &stderr_path).await;
+    // XDRIVE binds no socket, so no other test can take a port from it.
+    assert!(
+        wait_for_xray_startup(&mut child, &stdout_path, &stderr_path).await,
+        "the XDRIVE server exited on a port it does not bind"
+    );
     Session {
         server: XrayServer {
             child,
@@ -176,12 +180,21 @@ fn client_config_with(session: &Session, stream: Value) -> Value {
 }
 
 /// Xray-core's own client with `config`, one made for this client: its
-/// SOCKS inbound on a port of its own.
-async fn xray_client(mut config: Value) -> XrayServer {
+/// SOCKS inbound on a port of its own. That port is picked by binding it and
+/// letting go, so the start is repeated on a fresh one when another socket
+/// takes it before Xray binds it.
+async fn xray_client(config: Value) -> XrayServer {
     let checkout = resolve_xray_checkout();
+    start_on_fresh_ports!("Xray-core's client", try_xray_client(&checkout, &config))
+}
+
+/// One start of [`xray_client`] on a fresh port: `None` when another socket
+/// took the port first.
+async fn try_xray_client(checkout: &Path, config: &Value) -> Option<XrayServer> {
     let temp_dir = create_temp_dir("xray-rust-xdrive-xray-client");
-    let binary = xray_binary(&checkout, &temp_dir);
+    let binary = xray_binary(checkout, &temp_dir);
     let port = allocate_loopback_port();
+    let mut config = config.clone();
     config["inbounds"][0]["port"] = port.into();
     config["log"] = json!({"loglevel": "debug"});
     let config_path = temp_dir.path.join("client.json");
@@ -196,15 +209,17 @@ async fn xray_client(mut config: Value) -> XrayServer {
         .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
         .spawn()
         .expect("start Xray-core's client");
-    wait_for_xray_startup(&mut child, &stdout_path, &stderr_path).await;
-    XrayServer {
+    if !wait_for_xray_startup(&mut child, &stdout_path, &stderr_path).await {
+        return None;
+    }
+    Some(XrayServer {
         child,
         _temp_dir: temp_dir,
         addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         stdout_path,
         stderr_path,
         tls_client_config: None,
-    }
+    })
 }
 
 async fn check(

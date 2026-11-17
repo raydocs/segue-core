@@ -40,12 +40,30 @@ impl DnsResolver for Resolver {
 
 /// Xray-core's MASQUE server on `alpn`, with one user, an IPv4 and an IPv6
 /// pool, a freedom outbound redirected to the loopback and a DNS outbound.
+///
+/// The port is picked by binding it and letting go, and a parallel test's
+/// socket can take it before Xray binds it; the server then exits with
+/// "address already in use" and the start is repeated on a fresh port.
 pub(super) async fn start_server(
     checkout: &Path,
     alpn: &str,
-    customize: impl FnOnce(&mut Value),
+    customize: impl Fn(&mut Value),
 ) -> XrayServer {
+    start_on_fresh_ports!(
+        "the MASQUE server",
+        try_start_server(checkout, alpn, &customize)
+    )
+}
+
+/// One start of [`start_server`] on a fresh port: `None` when another socket
+/// took the port first.
+async fn try_start_server(
+    checkout: &Path,
+    alpn: &str,
+    customize: &impl Fn(&mut Value),
+) -> Option<XrayServer> {
     let temp_dir = create_temp_dir("xray-rust-masque-interop");
+    let binary = xray_vless_binary(checkout, &temp_dir);
     let config_path = temp_dir.path.join("server.json");
     let stdout_path = temp_dir.path.join("xray.stdout.log");
     let stderr_path = temp_dir.path.join("xray.stderr.log");
@@ -90,25 +108,6 @@ pub(super) async fn start_server(
     });
     customize(&mut config);
     fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-    let binary = env::var_os("XRAY_VLESS_FULL_BINARY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let binary = temp_dir
-                .path
-                .join(format!("xray{}", env::consts::EXE_SUFFIX));
-            let output = Command::new("go")
-                .args(["build", "-o"])
-                .arg(&binary)
-                .arg("./main")
-                .current_dir(checkout)
-                .output()
-                .expect("start go build for Xray-core");
-            assert!(
-                output.status.success(),
-                "go build ./main failed: {output:?}"
-            );
-            binary
-        });
     let mut child = Command::new(&binary)
         .arg("run")
         .arg("-config")
@@ -122,21 +121,24 @@ pub(super) async fn start_server(
     let xicmp = config["inbounds"][0]["streamSettings"]["finalmask"]["udp"]
         .as_array()
         .is_some_and(|masks| masks.iter().any(|mask| mask["type"] == "xicmp"));
-    if xicmp {
-        wait_for_xray_startup(&mut child, &stdout_path, &stderr_path).await;
+    let ready = if xicmp {
+        wait_for_xray_startup(&mut child, &stdout_path, &stderr_path).await
     } else if h3 {
-        wait_for_udp_listener(&mut child, addr, &stdout_path, &stderr_path).await;
+        wait_for_udp_listener(&mut child, addr, &stdout_path, &stderr_path).await
     } else {
-        wait_for_tcp_listener(&mut child, addr, &stdout_path, &stderr_path).await;
+        wait_for_tcp_listener(&mut child, addr, &stdout_path, &stderr_path).await
+    };
+    if !ready {
+        return None;
     }
-    XrayServer {
+    Some(XrayServer {
         child,
         _temp_dir: temp_dir,
         addr,
         stdout_path,
         stderr_path,
         tls_client_config: None,
-    }
+    })
 }
 
 /// Our client: a SOCKS inbound and the MASQUE outbound to `server`.
