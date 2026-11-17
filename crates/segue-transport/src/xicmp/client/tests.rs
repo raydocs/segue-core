@@ -125,7 +125,17 @@ fn elsewhere_a_socket_is_connected_to_its_address() {
         return;
     };
     assert!(connected);
-    assert_eq!(socket.peer_addr().unwrap().ip(), address);
+    // Linux reports a connected ping socket as not connected: its
+    // `getpeername` refuses a peer whose port is zero, and an ICMP socket's
+    // is. GitHub's runners refuse ping sockets, so `open` fails there and
+    // the test returns early; Instabox allows them.
+    match socket.peer_addr() {
+        Ok(peer) => assert_eq!(peer.ip(), address),
+        Err(error) if cfg!(target_os = "linux") => {
+            assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        }
+        Err(error) => panic!("{error}"),
+    }
 }
 
 /// An unconnected socket reads every echo reply the system gets. A reply
