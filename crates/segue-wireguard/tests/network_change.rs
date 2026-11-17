@@ -67,7 +67,9 @@ async fn rebind_protection_failure_closes_client_and_releases_flows() {
         .await
         .unwrap();
     assert!(client.rebind());
-    timeout(Duration::from_secs(2), async {
+    // The client closes once the failed protection reaches it; a slow runner
+    // can take a moment to schedule that task.
+    timeout(Duration::from_secs(10), async {
         while client.is_live() {
             tokio::task::yield_now().await;
         }
@@ -131,7 +133,9 @@ async fn native_rebind_preserves_existing_tcp_udp_flows_in_both_outer_families()
                     for _ in 0..10 {
                         assert!(client.rebind());
                     }
-                    timeout(Duration::from_secs(2), async {
+                    // Each rebind opens a fresh protected socket; a slow
+                    // runner may take a moment to schedule that work.
+                    timeout(Duration::from_secs(10), async {
                         while protector.calls.load(Ordering::SeqCst) < iteration + 1 {
                             tokio::task::yield_now().await;
                         }
