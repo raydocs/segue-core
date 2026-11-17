@@ -3,8 +3,9 @@ pub use vmess::VmessOutbound;
 mod first_payload;
 mod protocol_stream;
 use first_payload::{
-    flush_header_alone, FirstPayloadDeadline, HeldHeader, TROJAN_FIRST_PAYLOAD_WAIT,
-    VLESS_FIRST_PAYLOAD_WAIT,
+    flush_header_alone, FirstPayloadDeadline, HeldHeader, SHADOWSOCKS_2022_FIRST_PAYLOAD_WAIT,
+    SHADOWSOCKS_FIRST_PAYLOAD_WAIT, TROJAN_FIRST_PAYLOAD_WAIT, VLESS_FIRST_PAYLOAD_WAIT,
+    VMESS_FIRST_PAYLOAD_WAIT,
 };
 mod shadowsocks;
 pub use shadowsocks::Shadowsocks2022Outbound;
@@ -2499,7 +2500,17 @@ impl OutboundSelectionOverlay {
         self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn select(&self, group_tag: &str) -> Result<OutboundNodeId, CoreError> {
+    /// The balancer's pick, its `fallbackTag` when the strategy picks no
+    /// member, or `None` when it has no fallback either: Xray-core's
+    /// dispatcher then takes the default outbound. A `fallbackTag` naming no
+    /// outbound fails, as Xray-core closes a connection routed to a tag it
+    /// lacks.
+    ///
+    /// `leastPing` and `leastLoad` pick no member unless one is observed
+    /// healthy. `random` and `roundRobin` pick none only when every member is
+    /// unhealthy and the balancer has a `fallbackTag`, or when it has no
+    /// member at all: see [`Self::is_candidate`].
+    fn select(&self, group_tag: &str) -> Result<Option<OutboundNodeId>, CoreError> {
         let (group_index, group) = self.group_for_tag(group_tag)?;
         let state = &self.groups[group_index];
         if let Some(member_index) = state.override_member.load(Ordering::Acquire).checked_sub(1) {
@@ -2507,6 +2518,7 @@ impl OutboundSelectionOverlay {
                 .members()
                 .get(member_index)
                 .copied()
+                .map(Some)
                 .ok_or(CoreError::NoSupportedOutbound);
         }
         let selected = match group.strategy() {
@@ -2518,13 +2530,15 @@ impl OutboundSelectionOverlay {
             RoutingBalancerStrategy::LeastPing => self.select_least_ping(group),
             RoutingBalancerStrategy::LeastLoad(settings) => self.select_least_load(group, settings),
         };
-        selected
-            .or_else(|| {
-                group
-                    .fallback_tag()
-                    .and_then(|tag| self.graph.node_for_tag(tag))
-            })
-            .ok_or(CoreError::NoSupportedOutbound)
+        match (selected, group.fallback_tag()) {
+            (Some(node), _) => Ok(Some(node)),
+            (None, Some(tag)) => self
+                .graph
+                .node_for_tag(tag)
+                .map(Some)
+                .ok_or(CoreError::NoSupportedOutbound),
+            (None, None) => Ok(None),
+        }
     }
 
     fn group_for_tag(&self, group_tag: &str) -> Result<(usize, &OutboundSelectorGroup), CoreError> {
@@ -2551,11 +2565,20 @@ impl OutboundSelectionOverlay {
         })
     }
 
+    /// Whether `random` and `roundRobin` may pick `node` in `group`.
+    /// Xray-core's two strategies ask the observatory only when the balancer
+    /// has a `fallbackTag` (`RandomStrategy.InjectContext`), so a balancer
+    /// without one keeps every member, the unhealthy ones too, and never
+    /// leaves its members for the default outbound.
+    fn is_candidate(&self, group: &OutboundSelectorGroup, node: OutboundNodeId) -> bool {
+        group.fallback_tag().is_none() || self.is_eligible(node)
+    }
+
     fn select_random_eligible(&self, group: &OutboundSelectorGroup) -> Option<OutboundNodeId> {
         let eligible_count = group
             .members()
             .iter()
-            .filter(|node| self.is_eligible(**node))
+            .filter(|node| self.is_candidate(group, **node))
             .count();
         if eligible_count == 0 {
             return None;
@@ -2565,7 +2588,7 @@ impl OutboundSelectionOverlay {
             .members()
             .iter()
             .copied()
-            .filter(|node| self.is_eligible(*node))
+            .filter(|node| self.is_candidate(group, *node))
             .nth(selected)
     }
 
@@ -2577,7 +2600,7 @@ impl OutboundSelectionOverlay {
         let eligible_count = group
             .members()
             .iter()
-            .filter(|node| self.is_eligible(**node))
+            .filter(|node| self.is_candidate(group, **node))
             .count();
         if eligible_count == 0 {
             return None;
@@ -2588,7 +2611,7 @@ impl OutboundSelectionOverlay {
             .members()
             .iter()
             .copied()
-            .filter(|node| self.is_eligible(*node))
+            .filter(|node| self.is_candidate(group, *node))
             .nth(selected)
     }
 
@@ -3203,7 +3226,8 @@ impl OutboundRouter {
     }
 
     /// Selects the outbound of a TCP session routed by `target` that goes to
-    /// `dial_target`, which loopbacks route again.
+    /// `dial_target`. With `routeOnly` the two differ, and rules see the domain
+    /// of the first beside the IP of the second.
     pub(crate) async fn select_tcp_session_outbound_with_tag_and_resolver(
         &self,
         route: &RouteContext<'_>,
@@ -3405,7 +3429,8 @@ impl OutboundRouter {
     }
 
     /// Selects the outbound of a UDP session routed by `target` that goes to
-    /// `dial_target`, which loopbacks route again.
+    /// `dial_target`. With `routeOnly` the two differ, and rules see the domain
+    /// of the first beside the IP of the second.
     pub(crate) async fn select_udp_session_outbound_with_tag_and_resolver(
         &self,
         route: &RouteContext<'_>,
@@ -3510,9 +3535,10 @@ impl OutboundRouter {
     /// Follows loopback outbounds from `node`, as Xray-core's loopback
     /// dispatches its connection again. Routing then sees the loopback's
     /// `inboundTag` with the source, local address and user it had, but no
-    /// sniffed protocol or attributes, and checks the target given, the
-    /// address the connection goes to, without the DNS lookups of
-    /// `IPIfNonMatch` and `IPOnDemand`. Xray-core sets no limit to how many
+    /// sniffed protocol or attributes, and checks the target given without
+    /// the DNS lookups of `IPIfNonMatch` and `IPOnDemand`. That target is the
+    /// address the connection goes to, with the domain that `routeOnly`
+    /// sniffing found for it. Xray-core sets no limit to how many
     /// loopbacks follow one another, and recurses until it crashes on a loop;
     /// here more than [`MAX_LOOPBACK_HOPS`] fail the connection.
     #[expect(
@@ -3601,8 +3627,12 @@ impl OutboundRouter {
             .await
     }
 
-    /// Routes a session by `target`, then follows loopbacks by `dial_target`,
-    /// the address it goes to, which Xray-core's loopback routes again.
+    /// Routes a session by `target` and follows the loopbacks it meets.
+    /// `dial_target` is the address the session goes to. It differs from
+    /// `target` only when sniffing with `routeOnly` found a domain: `target`
+    /// is then that domain and `dial_target` the original destination, whose
+    /// IP the rules see beside the domain, at the first route and at every
+    /// loopback hop.
     async fn select_session_node_with_resolver(
         &self,
         route: &RouteContext<'_>,
@@ -3631,18 +3661,28 @@ impl OutboundRouter {
         dial_target: &Target,
         dns_resolver: &dyn DnsResolver,
     ) -> Result<OutboundNodeId, CoreError> {
-        let node =
-            match select_routed_target_with_resolver(&policy.routing, route, target, dns_resolver)
-                .await?
-            {
-                Some(target) => self.node_for_target(target)?,
-                None => self.select_default_configured_node()?,
-            };
+        // A `routeOnly` sniffed domain routes with the IP still dialed, as
+        // Xray-core keeps `ob.Target` beside `ob.RouteTarget`. A fake IP has
+        // already given way to its domain in `dial_target`, as there.
+        let node = match select_routed_target_with_resolver(
+            &policy.routing,
+            route,
+            target,
+            target_ip(dial_target),
+            dns_resolver,
+        )
+        .await?
+        {
+            Some(target) => self.node_for_target(target)?,
+            None => self.select_default_configured_node()?,
+        };
+        // A loopback's connection is the same Xray-core outbound session, so
+        // the `routeOnly` domain in `ob.RouteTarget` routes it again too.
         self.follow_loopbacks(
             policy,
             node,
             route,
-            target_domain(dial_target),
+            target_domain(target).or(target_domain(dial_target)),
             target_ip(dial_target),
             Some(target_network(dial_target)),
             Some(dial_target.port),
@@ -3674,7 +3714,10 @@ impl OutboundRouter {
     fn node_for_target(&self, target: &RoutingRuleTarget) -> Result<OutboundNodeId, CoreError> {
         match target {
             RoutingRuleTarget::Outbound(tag) => self.node_for_tag(tag),
-            RoutingRuleTarget::Balancer(tag) => self.selection().select(tag),
+            RoutingRuleTarget::Balancer(tag) => match self.selection().select(tag)? {
+                Some(node) => Ok(node),
+                None => self.select_default_configured_node(),
+            },
         }
     }
 }
@@ -4876,7 +4919,7 @@ async fn open_vless_tcp_stream_with_resolved_server_and_dialer(
 }
 
 /// The request on `stream`, its header held until the first payload, as
-/// Xray-core's VLESS outbound sends a TCP or reverse request.
+/// Xray-core's VLESS outbound sends every request.
 fn held_request_stream(
     outbound: &VlessTcpOutbound,
     flow: VisionFlow,
@@ -5265,8 +5308,9 @@ async fn open_reverse_carrier(
     vless.open_carrier(&server, &download, &proxy_dialer).await
 }
 
-/// Writes the request header for a UDP or Mux command. Unlike a TCP request,
-/// Vision queues no empty padding frame: an XUDP or Mux frame always follows.
+/// The request for a UDP or Mux command, its header held until the first
+/// XUDP or Mux frame as for a TCP request: Xray-core's `postRequest` sends
+/// every command's header with the first payload.
 async fn open_vless_command_stream(
     outbound: &VlessTcpOutbound,
     flow: VisionFlow,
@@ -5279,32 +5323,8 @@ async fn open_vless_command_stream(
     let stream = outbound
         .open_carrier(resolved_server, resolved_download, transport_dialer)
         .await?;
-    let mut stream = encryption::wrap(stream, outbound.encryption(), flow.uses_vision()).await?;
-    let request = VlessRequest {
-        user_id: outbound.user().id,
-        command,
-        target: target.clone(),
-        flow: flow.request_flow(),
-    };
-    let header = Zeroizing::new(encode_request_header(&request)?);
-
-    stream.write_all(&header).await?;
-
-    if flow.uses_vision() {
-        let stream = VlessResponseStream::new(VisionTransportStream::new(stream));
-        return Ok(Box::new(VisionOutboundStream::new(VisionStream::new(
-            stream,
-            *outbound.user().id.as_bytes(),
-            outbound.user().vision_seed,
-        ))));
-    }
-
-    // Without Vision there is no direct mode, so the transport never needs
-    // record-aligned reads.
-    stream.release_record_alignment();
-    Ok(Box::new(VlessOutboundStream::new(
-        VlessResponseStream::new(stream),
-    )))
+    let stream = encryption::wrap(stream, outbound.encryption(), flow.uses_vision()).await?;
+    held_request_stream(outbound, flow, stream, command, target)
 }
 
 fn should_use_xudp_for_udp_target(target: &Target) -> bool {
@@ -8288,6 +8308,112 @@ mod tests {
     }
 
     #[test]
+    fn empty_selector_group_without_fallback_takes_the_default_outbound() {
+        // Xray-core: the balancer's pick fails, PickRoute errs, and the
+        // dispatcher takes the default handler instead of closing.
+        let mut config = selector_group_config(RoutingBalancerStrategy::Random);
+        config.routing.balancers[0].selectors = vec!["absent".to_owned()];
+        config.routing.balancers[0].fallback_tag = None;
+        let router = OutboundRouter::new(Arc::new(config));
+
+        let selected = router
+            .select_tcp_outbound_for_session_with_tag(
+                &segue_config::RouteContext::default(),
+                &domain_tcp_target("example.test"),
+                true,
+            )
+            .expect("default outbound");
+
+        assert_eq!(selected.tag.as_deref(), Some("direct"));
+    }
+
+    #[test]
+    fn empty_selector_group_with_a_missing_fallback_tag_fails() {
+        let mut config = selector_group_config(RoutingBalancerStrategy::Random);
+        config.routing.balancers[0].selectors = vec!["absent".to_owned()];
+        config.routing.balancers[0].fallback_tag = Some("missing".to_owned());
+        let router = OutboundRouter::new(Arc::new(config));
+
+        assert!(matches!(
+            router.select_tcp_outbound_for_session(None, &domain_tcp_target("example.test")),
+            Err(CoreError::NoSupportedOutbound)
+        ));
+    }
+
+    /// The tag a balancer of `strategy` routes to once observation has marked
+    /// both its members unhealthy. `direct` is the default outbound and
+    /// `spare` the outbound a `fallback_tag` names; neither is a member.
+    fn tag_with_every_member_unhealthy(
+        strategy: RoutingBalancerStrategy,
+        fallback_tag: Option<&str>,
+    ) -> String {
+        let mut config = selector_group_config(strategy);
+        config.outbounds.push(direct_selection_freedom("spare"));
+        config.routing.balancers[0].fallback_tag = fallback_tag.map(str::to_owned);
+        let graph = Arc::new(OutboundGraph::new(Arc::new(config)));
+        let members = ["proxy-a", "proxy-b"].map(|tag| graph.node_for_tag(tag).unwrap());
+        let router = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(graph)));
+        for member in members {
+            router
+                .selection()
+                .record_health_failure(member, OutboundHealthFailure::Timeout, 1_000);
+        }
+        router
+            .select_tcp_outbound_for_session_with_tag(
+                &segue_config::RouteContext::default(),
+                &domain_tcp_target("example.test"),
+                true,
+            )
+            .expect("a route")
+            .tag
+            .expect("a tagged outbound")
+    }
+
+    fn every_strategy() -> [RoutingBalancerStrategy; 4] {
+        [
+            RoutingBalancerStrategy::Random,
+            RoutingBalancerStrategy::RoundRobin,
+            RoutingBalancerStrategy::LeastPing,
+            RoutingBalancerStrategy::LeastLoad(RoutingLeastLoadSettings::default()),
+        ]
+    }
+
+    #[test]
+    fn random_and_round_robin_without_fallback_keep_unhealthy_members() {
+        // Xray-core's two strategies take the observatory only when the
+        // balancer has a `fallbackTag`, so without one they never leave the
+        // members for the default outbound.
+        for strategy in [
+            RoutingBalancerStrategy::Random,
+            RoutingBalancerStrategy::RoundRobin,
+        ] {
+            let tag = tag_with_every_member_unhealthy(strategy.clone(), None);
+            assert!(tag.starts_with("proxy-"), "{strategy:?} took {tag}");
+        }
+    }
+
+    #[test]
+    fn least_ping_and_least_load_without_fallback_take_the_default_outbound() {
+        // Both always read the observatory, and with no healthy member their
+        // empty pick sends Xray-core's dispatcher to the default handler.
+        for strategy in [
+            RoutingBalancerStrategy::LeastPing,
+            RoutingBalancerStrategy::LeastLoad(RoutingLeastLoadSettings::default()),
+        ] {
+            let tag = tag_with_every_member_unhealthy(strategy.clone(), None);
+            assert_eq!(tag, "direct", "{strategy:?}");
+        }
+    }
+
+    #[test]
+    fn every_strategy_takes_its_fallback_when_all_members_are_unhealthy() {
+        for strategy in every_strategy() {
+            let tag = tag_with_every_member_unhealthy(strategy.clone(), Some("spare"));
+            assert_eq!(tag, "spare", "{strategy:?}");
+        }
+    }
+
+    #[test]
     fn dns_prefilter_preserves_balancer_routes_that_can_select_dns() {
         let mut config = direct_selection_config();
         config.outbounds = vec![
@@ -10515,7 +10641,7 @@ mod tests {
             .unwrap()
             .with_reality_engine(engine.clone());
 
-        let (_stream, framing) = open_vless_udp_stream_with_resolver_and_dialer(
+        let (mut stream, framing) = open_vless_udp_stream_with_resolver_and_dialer(
             &outbound,
             &target,
             &SystemDnsResolver,
@@ -10525,6 +10651,9 @@ mod tests {
         .expect("open VLESS UDP/443 stream with explicit udp443 Vision flow");
 
         assert_eq!(framing, VlessUdpFraming::Xudp);
+        // The header waits for the first XUDP frame and leaves in front of it.
+        stream.write_all(b"first frame").await.unwrap();
+        stream.flush().await.unwrap();
         let expected_header = encode_request_header(&VlessRequest {
             user_id: outbound.user().id,
             command: VlessCommand::Mux,
@@ -10533,11 +10662,21 @@ mod tests {
         })
         .unwrap();
         let mut received_header = vec![0; expected_header.len()];
-        protected_side
-            .read_exact(&mut received_header)
-            .await
-            .expect("read VLESS header from protected stream");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            protected_side.read_exact(&mut received_header),
+        )
+        .await
+        .expect("the header leaves with the first frame")
+        .expect("read VLESS header from protected stream");
         assert_eq!(received_header, expected_header);
+        let (_, content_len, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_vision_frame(&mut protected_side, true),
+        )
+        .await
+        .expect("the first frame follows the header");
+        assert_eq!(content_len, b"first frame".len());
         assert!(engine.seen().is_some());
     }
 
@@ -10611,15 +10750,28 @@ mod tests {
         .unwrap()
         .len();
         let mut header = vec![0; header_len];
-        protected_side.read_exact(&mut header).await.unwrap();
         for (index, payload) in [b"first".as_slice(), b"second", b"third"]
             .into_iter()
             .enumerate()
         {
             stream.write_all(payload).await.unwrap();
             stream.flush().await.unwrap();
-            let (_, content_len, padding_len) =
-                read_vision_frame(&mut protected_side, index == 0).await;
+            // The header leaves with the first frame.
+            if index == 0 {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    protected_side.read_exact(&mut header),
+                )
+                .await
+                .expect("the header leaves with the first frame")
+                .unwrap();
+            }
+            let (_, content_len, padding_len) = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_vision_frame(&mut protected_side, index == 0),
+            )
+            .await
+            .expect("the frame arrives");
             assert_eq!(content_len, payload.len());
             assert_eq!(padding_len, 0, "frame {index}");
         }
@@ -11804,6 +11956,78 @@ mod testpre_tests {
             443,
             RoutingNetwork::Tcp,
         )
+    }
+
+    /// A UDP or Mux request header waits for the first frame and leaves with
+    /// it, as Xray-core's `postRequest` sends the header of every command.
+    #[tokio::test]
+    async fn vless_command_header_waits_for_the_first_frame() {
+        let (port, mut connections) = server().await;
+        let outbound = vless(port, 0);
+        let flow = validate_outbound_flow(&outbound).unwrap();
+        let dialer = TransportDialer::system().unwrap();
+        let server_addr = [SocketAddr::from((Ipv4Addr::LOCALHOST, port))];
+        let wait = Duration::from_secs(5);
+        let target = target();
+        for command in [VlessCommand::Udp, VlessCommand::Mux] {
+            let open = open_vless_command_stream(
+                &outbound,
+                flow,
+                command,
+                &target,
+                &server_addr,
+                &[],
+                &dialer,
+            );
+            let mut stream = tokio::time::timeout(wait, open).await.unwrap().unwrap();
+            let mut connection = tokio::time::timeout(wait, connections.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut byte = [0; 1];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), connection.read(&mut byte))
+                    .await
+                    .is_err(),
+                "{command:?}: the header left before the first frame"
+            );
+            stream.write_all(b"first frame").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut header = [0; 17];
+            tokio::time::timeout(wait, connection.read_exact(&mut header))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(header[0], 0);
+            assert_eq!(&header[1..], uuid::Uuid::parse_str(ID).unwrap().as_bytes());
+
+            // Without a frame the header leaves alone once Xray-core's wait
+            // is over, driven by the relay's read. The wait starts when the
+            // stream is built, so it is measured from before the open.
+            let opened = tokio::time::Instant::now();
+            let open = open_vless_command_stream(
+                &outbound,
+                flow,
+                command,
+                &target,
+                &server_addr,
+                &[],
+                &dialer,
+            );
+            let mut stream = tokio::time::timeout(wait, open).await.unwrap().unwrap();
+            let mut connection = tokio::time::timeout(wait, connections.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::select! {
+                read = stream.read(&mut byte) => panic!("{command:?}: {read:?}"),
+                received = tokio::time::timeout(wait, connection.read_exact(&mut header)) => {
+                    received.expect("the header leaves alone").unwrap();
+                }
+            }
+            assert!(opened.elapsed() >= VLESS_FIRST_PAYLOAD_WAIT, "{command:?}");
+            assert_eq!(header[0], 0);
+        }
     }
 
     /// Nothing opens before the first request. Then each of the `testpre`
