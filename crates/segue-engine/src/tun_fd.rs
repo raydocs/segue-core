@@ -2248,10 +2248,18 @@ mod platform {
 
         #[test]
         fn a_jumbo_mtu_arena_still_holds_one_whole_read() {
-            let reader = PacketReader::new(TunFdPacketFormat::DarwinUtun, MAX_IP_PACKET_SIZE);
+            let mut reader = PacketReader::new(TunFdPacketFormat::DarwinUtun, MAX_IP_PACKET_SIZE);
             assert_eq!(reader.single_read, MAX_IP_PACKET_SIZE + 5);
+            // The single-packet arena is sized at `arena_len` and allocated
+            // lazily: a batching reader (Apple's default) holds no arena until
+            // a read needs one, so the size guarantee is `arena_len`, and
+            // `feed` allocates it the way `read_packet` does on first use.
             assert!(reader.arena_len >= reader.single_read);
-            assert!(reader.arena.capacity() >= reader.single_read);
+
+            let mut framed = vec![0, 0, 0, libc::AF_INET as u8];
+            framed.resize(MAX_IP_PACKET_SIZE + DARWIN_UTUN_HEADER_LEN, 0x45);
+            let packet = feed(&mut reader, &framed).expect("one whole jumbo read");
+            assert_eq!(packet.len(), MAX_IP_PACKET_SIZE);
         }
 
         fn test_packet_batch() -> Vec<Bytes> {

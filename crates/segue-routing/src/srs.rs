@@ -1773,7 +1773,8 @@ mod tests {
         payload.push(0);
         let set = read_rule_set(wrap(2, &payload).as_slice()).unwrap();
         assert!(set.rules.is_empty());
-        assert!(set.warnings[0].message.contains("match nothing"));
+        // The warning reads "…would match everything and matches nothing".
+        assert!(set.warnings[0].message.contains("matches nothing"));
     }
 
     #[test]

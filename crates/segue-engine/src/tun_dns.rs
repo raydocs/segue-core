@@ -917,13 +917,11 @@ pub(super) fn udp_action(
                 if let Some(plan) = exempt_plan {
                     return DnsUdpAction::Proxy(Arc::clone(plan));
                 }
-                return if is_anchor {
-                    dns_error_reply_packet(packet, DNS_RCODE_SERVFAIL)
-                        .map(DnsUdpAction::Reply)
-                        .unwrap_or(DnsUdpAction::Pass)
-                } else {
-                    DnsUdpAction::Pass
-                };
+                // No configured servers: an exempt name passes through, as the
+                // mode documents, whichever address the query was sent to. A
+                // SERVFAIL reply here would be a fake answer for a name the
+                // caller asked not to fake.
+                return DnsUdpAction::Pass;
             }
             let response = mapper
                 .lock()
