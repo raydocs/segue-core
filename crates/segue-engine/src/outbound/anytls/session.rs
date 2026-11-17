@@ -170,21 +170,6 @@ impl Pool {
         None
     }
 
-    fn push_idle(&self, session: &Arc<Session>) {
-        if self.0.closed.load(Ordering::Acquire) || session.closed() {
-            return;
-        }
-        let mut idle = lock(&self.0.idle);
-        if !idle.iter().any(|other| other.seq == session.seq) {
-            idle.push(session.clone());
-        }
-    }
-
-    fn forget(&self, seq: u64) {
-        lock(&self.0.idle).retain(|session| session.seq != seq);
-        lock(&self.0.sessions).retain(|session| session.seq != seq);
-    }
-
     fn start_session(&self, carrier: BoxedTransportStream) -> Result<Arc<Session>, CoreError> {
         if self.0.closed.load(Ordering::Acquire) {
             return Err(closed().into());
@@ -222,13 +207,44 @@ impl Pool {
     }
 
     pub(super) async fn join(&self) {
-        let sessions = std::mem::take(&mut *lock(&self.0.sessions));
+        // A `std` mutex guard is `!Send`. Drop it before any `.await`, including
+        // the `if let` scrutinee, whose temporary would otherwise live across
+        // the cleanup task's join and make `OutboundFactory::join_sessions`
+        // unsendable.
+        let sessions = {
+            let mut sessions = lock(&self.0.sessions);
+            std::mem::take(&mut *sessions)
+        };
         for session in sessions {
             session.join().await;
         }
-        if let Some(task) = lock(&self.0.cleanup).take() {
+        let task = {
+            let mut cleanup = lock(&self.0.cleanup);
+            cleanup.take()
+        };
+        if let Some(task) = task {
             let _ = task.await;
         }
+    }
+}
+
+impl PoolShared {
+    /// Return a session that has no live stream. Called with `Arc<PoolShared>`
+    /// from `Stream::drop`; `Pool` is only the outbound's handle.
+    fn push_idle(&self, session: &Arc<Session>) {
+        if self.closed.load(Ordering::Acquire) || session.closed() {
+            return;
+        }
+        let mut idle = lock(&self.idle);
+        if !idle.iter().any(|other| other.seq == session.seq) {
+            idle.push(session.clone());
+        }
+    }
+
+    /// Drop a closed session from the idle list and the shutdown list.
+    fn forget(&self, seq: u64) {
+        lock(&self.idle).retain(|session| session.seq != seq);
+        lock(&self.sessions).retain(|session| session.seq != seq);
     }
 }
 
@@ -282,7 +298,7 @@ async fn idle_cleanup(pool: Arc<PoolShared>) {
         // Snapshot under the lock, then decide outside it: `Stream::drop`
         // takes a session's `idle_since` lock before this one, so holding
         // both here would invert that order.
-        let idle = lock(&pool.idle).clone();
+        let mut idle = lock(&pool.idle).clone();
         // Newest first, as the reference's skiplist iterates.
         idle.sort_by(|a, b| b.seq.cmp(&a.seq));
         let mut kept = 0usize;
@@ -412,9 +428,13 @@ impl Session {
 
     async fn join(&self) {
         // The router closes before it joins; closing here too makes a join on
-        // its own terminate instead of waiting for the carrier.
+        // its own terminate instead of waiting for the carrier. The task-list
+        // guard is dropped before the awaits: it is a `std` mutex guard.
         self.close();
-        let tasks = std::mem::take(&mut *lock(&self.inner.tasks));
+        let tasks = {
+            let mut tasks = lock(&self.inner.tasks);
+            std::mem::take(&mut *tasks)
+        };
         for task in tasks {
             let _ = task.await;
         }
@@ -465,6 +485,7 @@ impl Session {
             rx,
             pending: Bytes::new(),
             fin_sent: false,
+            write_reserve: None,
         })
     }
 }
@@ -499,7 +520,7 @@ impl SessionInner {
         }
     }
 
-    fn arm_synack_watchdog(&self) {
+    fn arm_synack_watchdog(self: &Arc<Self>) {
         let generation = self.syn_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -625,7 +646,14 @@ async fn dispatch(
             if payload.is_empty() {
                 return true;
             }
-            let Some(tx) = lock(&inner.streams).get(&frame.stream_id).cloned() else {
+            // Clone the sender out from under the mutex. The guard is a `std`
+            // `MutexGuard` and must not be live across `send`'s await, or the
+            // reader task (and anything that joins it) is not `Send`.
+            let tx = {
+                let streams = lock(&inner.streams);
+                streams.get(&frame.stream_id).cloned()
+            };
+            let Some(tx) = tx else {
                 // A frame for a stream that already ended is discarded.
                 return true;
             };
@@ -665,7 +693,8 @@ async fn dispatch(
         Command::Waste | Command::Settings => true,
         Command::ServerSettings => {
             if let Ok(map) = wire::parse_settings(payload) {
-                if let Some(Ok(version)) = map.get("v").map(str::parse::<u8>) {
+                // `str::parse` does not coerce `&String` when passed as a function item.
+                if let Some(Ok(version)) = map.get("v").map(|value| value.parse::<u8>()) {
                     inner.peer_version.store(version, Ordering::Release);
                 }
             }
@@ -702,6 +731,32 @@ async fn dispatch(
     }
 }
 
+/// One in-flight `reserve_owned` on the session writer. Tokio 1.x `Sender` has
+/// no `poll_reserve`; `poll_write` drives this future so a full queue waits
+/// instead of dropping the waker.
+type ReservedSlot = Pin<
+    Box<
+        dyn Future<Output = Result<mpsc::OwnedPermit<WriteCommand>, mpsc::error::SendError<()>>>
+            + Send,
+    >,
+>;
+
+struct WriteSlot(ReservedSlot);
+
+impl std::fmt::Debug for WriteSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reserving")
+    }
+}
+
+/// Take one writer-queue slot. The permit is sent by `poll_write` only after
+/// this resolves, so the frame is encoded once a slot exists.
+async fn reserve_writer(
+    sender: mpsc::Sender<WriteCommand>,
+) -> Result<mpsc::OwnedPermit<WriteCommand>, mpsc::error::SendError<()>> {
+    sender.reserve_owned().await
+}
+
 /// One multiplexed stream. Dropping it sends `Fin` and returns the session to
 /// the idle pool once its last stream ends.
 #[derive(Debug)]
@@ -712,6 +767,8 @@ pub(super) struct Stream {
     rx: mpsc::Receiver<StreamEvent>,
     pending: Bytes,
     fin_sent: bool,
+    /// Set while `poll_write` is waiting for a queue slot.
+    write_reserve: Option<WriteSlot>,
 }
 
 impl Stream {
@@ -774,24 +831,52 @@ impl AsyncRead for Stream {
 
 impl AsyncWrite for Stream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         input: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.session.closed() {
+        let this = self.get_mut();
+        if this.session.closed() {
+            // Drop a waiter so a closed stream does not hold a queue slot.
+            this.write_reserve = None;
             return Poll::Ready(Err(closed()));
         }
         if input.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let frames = wire::push_frames(self.id, input);
-        match self.writer.poll_reserve(cx) {
-            Poll::Ready(Ok(permit)) => {
-                let written = input.len();
-                permit.send(WriteCommand::Data(frames));
-                Poll::Ready(Ok(written))
+        let id = this.id;
+        if this.write_reserve.is_none() {
+            match this.writer.try_reserve() {
+                Ok(permit) => {
+                    permit.send(WriteCommand::Data(wire::push_frames(id, input)));
+                    return Poll::Ready(Ok(input.len()));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Poll::Ready(Err(closed())),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let sender = this.writer.clone();
+                    let reserved: ReservedSlot = Box::pin(reserve_writer(sender));
+                    this.write_reserve = Some(WriteSlot(reserved));
+                }
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(closed())),
+        }
+        // Poll outside the borrow of `write_reserve` so the slot can be cleared.
+        let polled = {
+            let WriteSlot(slot) = this
+                .write_reserve
+                .as_mut()
+                .expect("a full writer queue stores its reservation");
+            slot.as_mut().poll(cx)
+        };
+        match polled {
+            Poll::Ready(Ok(permit)) => {
+                let _sender = permit.send(WriteCommand::Data(wire::push_frames(id, input)));
+                this.write_reserve = None;
+                Poll::Ready(Ok(input.len()))
+            }
+            Poll::Ready(Err(_)) => {
+                this.write_reserve = None;
+                Poll::Ready(Err(closed()))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
