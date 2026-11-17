@@ -57,7 +57,9 @@ type Sha1Hmac = Hmac<Sha1>;
 /// The connector's resolved settings. `password` authenticates the handshake
 /// and both directions of the post-switch stream; `tls` controls the genuine
 /// TLS certificate handshake, its SNI and its uTLS fingerprint.
-#[derive(Clone)]
+/// `Eq` exists so [`crate::ConnectorConfig`] can derive it. That comparison is
+/// structural (config identity), not a password check, so it is not constant-time.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ShadowTlsConfig {
     pub password: Zeroizing<String>,
     pub tls: TlsClientConfig,
