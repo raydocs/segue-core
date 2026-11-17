@@ -348,6 +348,7 @@ fn parse_xray_json_with_loader_and_limits(
         selector_budget: SelectorBudget::default(),
         parsing_xhttp_download: false,
         srs_cache: HashMap::new(),
+        mrs_cache: HashMap::new(),
     };
     let config = parser.parse_config();
 
@@ -377,6 +378,8 @@ struct Parser<'a> {
     /// Decoded `ext-srs:` files, keyed by the reference path, so one file is
     /// inflated once per parse.
     srs_cache: HashMap<String, Arc<segue_routing::srs::SrsRuleSet>>,
+    /// Decoded `ext-mrs:` files, keyed by the reference path.
+    mrs_cache: HashMap<String, Arc<segue_routing::mrs::MrsRuleSet>>,
 }
 
 impl Parser<'_> {
@@ -3154,6 +3157,7 @@ mod tests {
             selector_budget: SelectorBudget::default(),
             parsing_xhttp_download: false,
             srs_cache: HashMap::new(),
+            mrs_cache: HashMap::new(),
         };
         let spec = format!("test{}", "@AdS".repeat(MAX_CONFIG_GEODATA_ATTR_FILTERS + 1));
 
@@ -3176,6 +3180,7 @@ mod tests {
             selector_budget: SelectorBudget::default(),
             parsing_xhttp_download: false,
             srs_cache: HashMap::new(),
+            mrs_cache: HashMap::new(),
         };
         let attrs = (0..=MAX_CONFIG_GEODATA_ATTR_FILTERS)
             .map(|index| format!("attr{index}"))
@@ -3466,6 +3471,126 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("not both")));
+
+        fs::remove_dir_all(asset_dir).unwrap();
+    }
+
+    #[test]
+    fn ext_mrs_rules_match_domains_and_ips() {
+        let asset_dir = unique_temp_dir("ext-mrs");
+        fs::write(
+            asset_dir.join("domain.mrs"),
+            include_bytes!("../../segue-routing/fixtures/domain.mrs"),
+        )
+        .unwrap();
+        fs::write(
+            asset_dir.join("ipcidr.mrs"),
+            include_bytes!("../../segue-routing/fixtures/ipcidr.mrs"),
+        )
+        .unwrap();
+        let raw = r#"{
+          "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+          "routing": { "rules": [
+            { "domain": ["ext-mrs:domain.mrs", "keyword:google"], "outboundTag": "domain" },
+            { "ip": ["ext-mrs:ipcidr.mrs"], "port": "443", "outboundTag": "ip" }
+          ]}
+        }"#;
+
+        let parsed = super::parse_xray_json_with_geodata_dirs(raw, std::slice::from_ref(&asset_dir))
+            .expect("ext-mrs config");
+        let rules = &parsed.config.routing.rules;
+        let tagged = |tag: &str| {
+            rules
+                .iter()
+                .filter(|rule| rule.target.tag() == tag)
+                .collect::<Vec<_>>()
+        };
+
+        let domain = tagged("domain");
+        assert_eq!(domain.len(), 2);
+        assert!(domain
+            .iter()
+            .any(|rule| rule.matches(None, Some("example.com"), None)));
+        assert!(domain
+            .iter()
+            .any(|rule| rule.matches(None, Some("a.b.com.cn"), None)));
+        assert!(domain
+            .iter()
+            .all(|rule| !rule.matches(None, Some("com.cn"), None)));
+        assert!(domain
+            .iter()
+            .any(|rule| rule.matches(None, Some("www.google.com"), None)));
+        assert!(domain
+            .iter()
+            .any(|rule| rule.matches(None, Some("www.qq.com"), None)));
+        assert!(domain
+            .iter()
+            .any(|rule| rule.matches(None, Some("sagernet.org"), None)));
+        assert!(domain
+            .iter()
+            .all(|rule| !rule.matches(None, Some("www.example.com"), None)));
+
+        let ip_rules = tagged("ip");
+        assert_eq!(ip_rules.len(), 1);
+        let ten = "10.1.2.3".parse().unwrap();
+        let doc = "192.0.2.10".parse().unwrap();
+        let outside = "11.0.0.1".parse().unwrap();
+        let route = crate::RouteContext::inbound(None);
+        assert!(ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&ten),
+            Some(crate::Network::Tcp),
+            Some(443)
+        ));
+        assert!(ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&doc),
+            Some(crate::Network::Udp),
+            Some(443)
+        ));
+        assert!(!ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&ten),
+            Some(crate::Network::Tcp),
+            Some(80)
+        ));
+        assert!(!ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&outside),
+            Some(crate::Network::Tcp),
+            Some(443)
+        ));
+
+        let both = super::parse_xray_json_with_geodata_dirs(
+            r#"{
+              "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+              "routing": { "rules": [{
+                "domain": ["ext-mrs:domain.mrs"],
+                "ip": ["ext-srs:ipcidr.mrs"],
+                "outboundTag": "direct"
+              }] }
+            }"#,
+            std::slice::from_ref(&asset_dir),
+        )
+        .unwrap_err();
+        assert!(both
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("not both")));
+
+        let escaped = super::parse_xray_json_with_geodata_dirs(
+            r#"{
+              "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+              "routing": { "rules": [{ "domain": ["ext-mrs:../secret.mrs"], "outboundTag": "direct" }] }
+            }"#,
+            std::slice::from_ref(&asset_dir),
+        )
+        .unwrap_err();
+        assert!(escaped.diagnostics[0].message.contains("normal components"));
 
         fs::remove_dir_all(asset_dir).unwrap();
     }
