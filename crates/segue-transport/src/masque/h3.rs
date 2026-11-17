@@ -88,7 +88,7 @@ pub async fn dial_h3(
     };
     let carrier = connect.quic.hop_carrier();
     let protector = connect.socket_protector.clone();
-    let (endpoint, connection, _, wire_peer, _) = connect_quic_transport_with_datagrams(
+    let (endpoint, connection, _, wire_peer) = connect_quic_transport_with_datagrams(
         connect,
         Some(b"h3"),
         Some((

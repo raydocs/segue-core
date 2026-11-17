@@ -1643,22 +1643,29 @@ pub(crate) async fn connect_quic_transport_raw(
     let connecting = endpoint
         .connect_with(client_config, remote_addr, &config.server_name)
         .map_err(H3Error::ConnectStart)?;
-    let connection = if config.quic.enable_early_data {
+    // 0-RTT is rustls `enable_early_data` plus `Connecting::into_0rtt`. quinn
+    // 0.11 has no `ClientConfig::enable_early_data`. Callers that ignore the
+    // acceptance future still get a fully installed congestion controller.
+    let (connection, zero_rtt_accepted) = if config.quic.enable_early_data {
         match connecting.into_0rtt() {
-            Ok((connection, accepted)) => {
-                return Ok((endpoint, connection, diagnostics, wire_peer, Some(accepted)));
-            }
-            Err(connecting) => connecting.await.map_err(H3Error::Connect)?,
+            Ok((connection, accepted)) => (connection, Some(accepted)),
+            Err(connecting) => (connecting.await.map_err(H3Error::Connect)?, None),
         }
     } else {
-        connecting.await.map_err(H3Error::Connect)?
+        (connecting.await.map_err(H3Error::Connect)?, None)
     };
     if let Some(own_switch) = own_switch {
         if let Some(installed) = config.quic.installed_controller(None) {
             own_switch.install(installed);
         }
     }
-    Ok((endpoint, connection, diagnostics, wire_peer, None))
+    Ok((
+        endpoint,
+        connection,
+        diagnostics,
+        wire_peer,
+        zero_rtt_accepted,
+    ))
 }
 
 /// Connects the first successful protected UDP candidate.
@@ -1901,9 +1908,6 @@ fn build_quinn_config(
     client
         .version(QUIC_V1)
         .transport_config(Arc::new(transport));
-    if config.quic.enable_early_data {
-        client.enable_early_data();
-    }
     if config.quic.chrome_parrot {
         client.initial_dst_cid_provider(Arc::new(|| {
             quinn::ConnectionIdGenerator::generate_cid(
