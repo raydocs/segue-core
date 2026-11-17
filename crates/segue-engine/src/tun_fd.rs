@@ -198,6 +198,380 @@ mod platform {
         pending.clamp(1, UTUN_MAX_PENDING_PACKETS as usize) as libc::c_int
     }
 
+    /// IP payload that still fits a 4 KiB mbuf cluster once the 4-byte utun
+    /// prefix is included. `mbuf_allocpacket` takes a 16 KiB cluster — a pool
+    /// of a few hundred — for anything above `MBIGCLBYTES` (4096, prefix
+    /// included), and a `sendmsg_x` batch builds every packet before sending
+    /// any, so a batch of larger frames fails with `ENOBUFS`. Those stay on
+    /// the per-frame `writev`. sing-tun's `goDarwinBatchFrameLimit`.
+    #[cfg(any(target_vendor = "apple", test))]
+    const TUN_FD_SEND_FRAME_LIMIT: usize = 4096 - DARWIN_UTUN_HEADER_LEN;
+    /// `sendmsg_x` batch cap. sing-tun's `goDarwinTransmitBatch`.
+    #[cfg(any(target_vendor = "apple", test))]
+    const TUN_FD_SEND_BATCH_MAX: usize = 64;
+
+    /// `utun_pkt_input` in netif mode returns `ENOSPC` once the input chain
+    /// passes `net.utun.max_pending_input` (512) and does not free the mbuf,
+    /// and neither does `ctl_send`: every such refusal leaks one cluster until
+    /// reboot. The chain drains when the host syncs its receive ring, which a
+    /// successful input notifies, so the gate stays under the limit and, when
+    /// the counter stops moving, lets a few packets through as a probe rather
+    /// than waiting forever. sing-tun's `goDarwinGate*` constants.
+    #[cfg(any(target_vendor = "apple", test))]
+    const UTUN_INPUT_CHAIN_LIMIT: i64 = 512;
+    #[cfg(any(target_vendor = "apple", test))]
+    const UTUN_INPUT_CHAIN_HIGH_WATER: i64 = 384;
+    #[cfg(any(target_vendor = "apple", test))]
+    const UTUN_INPUT_CHAIN_PROBE: i64 = 8;
+    #[cfg(any(target_vendor = "apple", test))]
+    const UTUN_INPUT_CHAIN_PROBE_AFTER: i32 = 16;
+    /// How often the interface counter may be read. sing-tun's `goDarwinGateSample`.
+    /// Compiled into the pure-test build too, where nothing reads it.
+    #[cfg(any(target_vendor = "apple", test))]
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    const UTUN_GATE_SAMPLE: Duration = Duration::from_millis(1);
+
+    /// A fresh interface-counter reading, or the news that the 1 ms sample
+    /// window has not elapsed. `Fresh(None)` is a failed read: the estimate
+    /// stays where it was.
+    #[cfg(any(target_vendor = "apple", test))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum GateSample {
+        NotDue,
+        Fresh(Option<i64>),
+    }
+
+    /// Estimated utun input-chain depth. Pure: the counter and the clock are
+    /// inputs, so the decisions are tested on every OS. Without a counter
+    /// (`active == false`, sing-tun's `!netif`) the gate does not close —
+    /// there is nothing to estimate, and closing would stall the tunnel.
+    #[cfg(any(target_vendor = "apple", test))]
+    #[derive(Debug, Clone)]
+    struct UtunChainGate {
+        active: bool,
+        submitted: i64,
+        sampled_at: i64,
+        inflight_sample: i64,
+        consumed_base: i64,
+        last_consumed: i64,
+        probe_end: i64,
+        idle_polls: i32,
+    }
+
+    #[cfg(any(target_vendor = "apple", test))]
+    impl UtunChainGate {
+        fn inactive() -> Self {
+            Self {
+                active: false,
+                submitted: 0,
+                sampled_at: 0,
+                inflight_sample: 0,
+                consumed_base: 0,
+                last_consumed: 0,
+                probe_end: 0,
+                idle_polls: 0,
+            }
+        }
+
+        /// `consumed` is the interface's absolute input-packet counter at the
+        /// moment the gate is armed, and becomes the baseline the estimate is
+        /// measured from.
+        fn armed(consumed: i64) -> Self {
+            Self {
+                active: true,
+                consumed_base: consumed,
+                last_consumed: consumed,
+                ..Self::inactive()
+            }
+        }
+
+        fn estimate(&self) -> i64 {
+            self.inflight_sample + (self.submitted - self.sampled_at)
+        }
+
+        fn note_submitted(&mut self, count: usize) {
+            self.submitted += count as i64;
+        }
+
+        /// The chain was already past the limit when the kernel refused.
+        /// Frames the kernel freed behind the refused one never reach the
+        /// counter, so the baseline is moved until the estimate reads the
+        /// limit. sing-tun's `recordWriteError` for `ENOSPC`.
+        fn note_enospc(&mut self, consumed: Option<i64>) {
+            if !self.active {
+                return;
+            }
+            if let Some(consumed) = consumed {
+                self.last_consumed = consumed;
+                self.consumed_base =
+                    consumed - (self.submitted - (UTUN_INPUT_CHAIN_LIMIT + 1));
+            }
+            self.inflight_sample = UTUN_INPUT_CHAIN_LIMIT + 1;
+            self.sampled_at = self.submitted;
+            self.probe_end = 0;
+            self.idle_polls = 0;
+        }
+
+        fn apply_sample(&mut self, consumed: i64) -> bool {
+            let progressed = consumed != self.last_consumed;
+            if progressed {
+                self.probe_end = 0;
+            }
+            self.last_consumed = consumed;
+            let delta = consumed - self.consumed_base;
+            self.inflight_sample = (self.submitted - delta).max(0);
+            self.sampled_at = self.submitted;
+            progressed
+        }
+
+        /// How many of `pending` frames may be submitted right now.
+        fn admit(&mut self, pending: usize, sample: GateSample) -> usize {
+            if !self.active || pending == 0 {
+                return pending;
+            }
+            let pending_i = pending as i64;
+            if self.estimate() + pending_i > UTUN_INPUT_CHAIN_HIGH_WATER {
+                if let GateSample::Fresh(Some(consumed)) = sample {
+                    self.apply_sample(consumed);
+                }
+            }
+            room_from_estimate(
+                self.estimate(),
+                pending_i,
+                self.probe_end,
+                self.submitted,
+            )
+        }
+
+        /// One blocked poll. A sample that does not move the counter counts
+        /// toward the probe; a sample that does clears it. A sample that is
+        /// not due leaves the idle count alone and just rechecks the room.
+        fn poll_blocked(&mut self, pending: usize, sample: GateSample) -> usize {
+            if !self.active {
+                return pending;
+            }
+            if let GateSample::Fresh(reading) = sample {
+                let progressed = match reading {
+                    Some(consumed) => self.apply_sample(consumed),
+                    None => false,
+                };
+                if progressed {
+                    self.idle_polls = 0;
+                } else {
+                    self.idle_polls = self.idle_polls.saturating_add(1);
+                }
+                if self.idle_polls >= UTUN_INPUT_CHAIN_PROBE_AFTER {
+                    self.probe_end = self.submitted + UTUN_INPUT_CHAIN_PROBE;
+                    self.idle_polls = 0;
+                }
+            }
+            self.admit(pending, GateSample::NotDue)
+        }
+    }
+
+    /// sing-tun's `gateRoom` arithmetic, split out so the clamp is obvious:
+    /// never more than `pending`, never past one under the limit, and never
+    /// negative. The probe term is what lets a stuck counter move again.
+    #[cfg(any(target_vendor = "apple", test))]
+    fn room_from_estimate(estimate: i64, pending: i64, probe_end: i64, submitted: i64) -> usize {
+        let mut room = UTUN_INPUT_CHAIN_HIGH_WATER - estimate;
+        let probe = (probe_end - submitted).min(UTUN_INPUT_CHAIN_LIMIT - 1 - estimate);
+        room = room.max(probe);
+        room.min(pending).max(0) as usize
+    }
+
+    /// What the next frame of a utun write should do. A closed gate submits
+    /// nothing — not a `sendmsg_x`, and not a single `writev`. The single
+    /// write is the syscall that leaks a cluster once the chain is over the
+    /// limit, so "the gate says no" means wait, not fall through.
+    #[cfg(any(target_vendor = "apple", test))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PlannedSend {
+        Wait,
+        /// The frame does not fit a 4 KiB cluster. One `writev`, and only
+        /// because the gate allowed at least one packet.
+        Single,
+        /// This many leading frames, all of them small enough to batch.
+        Batch(usize),
+    }
+
+    #[cfg(any(target_vendor = "apple", test))]
+    fn plan_send(next_len: usize, batchable: usize, room: usize) -> PlannedSend {
+        if room == 0 {
+            return PlannedSend::Wait;
+        }
+        if next_len > TUN_FD_SEND_FRAME_LIMIT {
+            return PlannedSend::Single;
+        }
+        let count = batchable
+            .min(room)
+            .min(TUN_FD_SEND_BATCH_MAX);
+        if count == 0 {
+            // Small, but not a packet this code will put in a batch (no IP
+            // version). The caller reports it; it is not a write.
+            return PlannedSend::Wait;
+        }
+        PlannedSend::Batch(count)
+    }
+
+    /// How many leading packets of `packets` may share one `sendmsg_x`: each
+    /// must fit the cluster limit and carry an IP version, and there may be
+    /// at most `limit` of them.
+    #[cfg(any(target_vendor = "apple", test))]
+    fn batchable_count(packets: &[Bytes], limit: usize) -> usize {
+        let mut count = 0;
+        for packet in packets.iter().take(limit) {
+            if packet.len() > TUN_FD_SEND_FRAME_LIMIT || ip_family_byte(packet).is_err() {
+                break;
+            }
+            count += 1;
+        }
+        count
+    }
+
+    /// What one `sendmsg_x` result did to the messages handed to it. This is
+    /// the only place a syscall result becomes a cursor movement, so a
+    /// partial batch, `EAGAIN` and `ENOBUFS` cannot drop or resend a packet
+    /// by accident.
+    #[cfg(any(target_vendor = "apple", test))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SendAccount {
+        /// `done` messages were accepted. `done < submitted` is a partial
+        /// batch: the tail was not sent and must be submitted again.
+        Progress { done: usize },
+        /// Nothing was sent. Retry the same messages.
+        RetrySame,
+        /// Nothing was sent, and the batch was too big to build (`ENOBUFS` or
+        /// `EMSGSIZE` of more than one message). Retry a smaller prefix.
+        RetrySmaller,
+        /// The one message was refused (`EINVAL` / `EMSGSIZE`). Drop it.
+        DropOne,
+        /// The descriptor is gone. Do not retry, and do not pretend the
+        /// messages were delivered.
+        Fatal,
+        /// The kernel took every submitted message: the ones before the
+        /// failure were delivered, the failing one is the kernel's, and the
+        /// rest were dropped. Resending them would duplicate the delivered
+        /// prefix. `enospc` is the leaking refusal and realigns the gate.
+        Consumed { enospc: bool },
+    }
+
+    #[cfg(any(target_vendor = "apple", test))]
+    fn account_send(submitted: usize, result: Result<usize, i32>) -> SendAccount {
+        let errno = match result {
+            Ok(done) => {
+                let done = done.min(submitted);
+                return if done == 0 {
+                    SendAccount::RetrySame
+                } else {
+                    SendAccount::Progress { done }
+                };
+            }
+            Err(errno) => errno,
+        };
+        if errno == libc::EINTR
+            || errno == libc::EAGAIN
+            || errno == libc::EWOULDBLOCK
+            || (errno == libc::ENOBUFS && submitted <= 1)
+        {
+            return SendAccount::RetrySame;
+        }
+        if (errno == libc::ENOBUFS || errno == libc::EMSGSIZE) && submitted > 1 {
+            return SendAccount::RetrySmaller;
+        }
+        if (errno == libc::EMSGSIZE || errno == libc::EINVAL) && submitted <= 1 {
+            return SendAccount::DropOne;
+        }
+        if errno == libc::EBADF || errno == libc::ENXIO || errno == libc::ENOTCONN {
+            return SendAccount::Fatal;
+        }
+        SendAccount::Consumed {
+            enospc: errno == libc::ENOSPC,
+        }
+    }
+
+    /// `ifi_ipackets` inside a `NET_RT_IFLIST2` buffer. The offsets are the
+    /// LP64 `if_msghdr2` / packed-4 `if_data64` layout (asserted below): the
+    /// counter is a `u64` at byte 56 of an `RTM_IFINFO2` message.
+    #[cfg(any(target_vendor = "apple", test))]
+    const IF_MSGHDR2_TYPE: usize = 3;
+    #[cfg(any(target_vendor = "apple", test))]
+    const IF_MSGHDR2_INDEX: usize = 12;
+    #[cfg(any(target_vendor = "apple", test))]
+    const IF_MSGHDR2_IPACKETS: usize = 56;
+    #[cfg(any(target_vendor = "apple", test))]
+    const IF_MSGHDR2_SIZE: usize = 160;
+    #[cfg(any(target_vendor = "apple", test))]
+    const RTM_IFINFO2: u8 = 0x12;
+
+    #[cfg(any(target_vendor = "apple", test))]
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct IfMsgHdr2Head {
+        msglen: u16,
+        version: u8,
+        typ: u8,
+        addrs: i32,
+        flags: i32,
+        index: u16,
+        snd_len: i32,
+        snd_maxlen: i32,
+        snd_drops: i32,
+        timer: i32,
+    }
+
+    /// The prefix of `if_data64` through `ifi_ipackets`. The real struct is
+    /// `#pragma pack(4)`, so the `u64` counters are 4-byte aligned.
+    #[cfg(any(target_vendor = "apple", test))]
+    #[repr(C, packed(4))]
+    #[allow(dead_code)]
+    struct IfData64Head {
+        prefix: [u8; 8],
+        mtu: u32,
+        metric: u32,
+        baudrate: u64,
+        ipackets: u64,
+        rest_counters: [u64; 10],
+        recvtiming: u32,
+        xmittiming: u32,
+        lastchange_sec: i32,
+        lastchange_usec: i32,
+    }
+
+    #[cfg(any(target_vendor = "apple", test))]
+    const _: () = {
+        assert!(std::mem::size_of::<IfMsgHdr2Head>() == 32);
+        assert!(std::mem::offset_of!(IfMsgHdr2Head, index) == IF_MSGHDR2_INDEX);
+        assert!(std::mem::offset_of!(IfData64Head, ipackets) == 24);
+        assert!(std::mem::size_of::<IfData64Head>() == 128);
+        assert!(32 + 24 == IF_MSGHDR2_IPACKETS);
+        assert!(32 + 128 == IF_MSGHDR2_SIZE);
+    };
+
+    /// The input-packet counter for `index` in a `NET_RT_IFLIST2` buffer, or
+    /// `None` when that interface's `RTM_IFINFO2` message is not there.
+    #[cfg(any(target_vendor = "apple", test))]
+    fn utun_ipackets_from_rib(rib: &[u8], index: u16) -> Option<i64> {
+        let mut rest = rib;
+        while rest.len() >= 4 {
+            let msglen = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+            if msglen == 0 || msglen > rest.len() {
+                break;
+            }
+            if msglen >= IF_MSGHDR2_SIZE
+                && rest[IF_MSGHDR2_TYPE] == RTM_IFINFO2
+                && u16::from_le_bytes([rest[IF_MSGHDR2_INDEX], rest[IF_MSGHDR2_INDEX + 1]])
+                    == index
+            {
+                let mut octets = [0u8; 8];
+                octets.copy_from_slice(&rest[IF_MSGHDR2_IPACKETS..IF_MSGHDR2_IPACKETS + 8]);
+                return i64::try_from(u64::from_le_bytes(octets)).ok();
+            }
+            rest = &rest[msglen..];
+        }
+        None
+    }
+
     pub struct TunFdRuntime {
         shutdown: watch::Sender<bool>,
         read_task: JoinHandle<()>,
@@ -451,6 +825,10 @@ mod platform {
 
     struct AsyncFdPacketBatchWriter<'a> {
         fd: &'a AsyncFd<TunFd>,
+        /// Present on Apple even when batching is off, so the write loop has
+        /// one shape. `enabled` is what selects `sendmsg_x`.
+        #[cfg(target_vendor = "apple")]
+        utun: UtunSendState,
     }
 
     impl PacketBatchWriter for AsyncFdPacketBatchWriter<'_> {
@@ -459,6 +837,10 @@ mod platform {
             packet_format: TunFdPacketFormat,
             packets: &[Bytes],
         ) -> Result<(), PacketBatchWriteError> {
+            #[cfg(target_vendor = "apple")]
+            if self.utun.enabled {
+                return write_utun_send_batch(self.fd, packets, &mut self.utun).await;
+            }
             write_packet_batch(self.fd, packet_format, packets).await
         }
     }
@@ -579,7 +961,11 @@ mod platform {
         let mut next_packet = 0;
         let mut written_packets_in_batch = 0;
         let mut consecutive_errors: u32 = 0;
-        let mut writer = AsyncFdPacketBatchWriter { fd: fd.as_ref() };
+        let mut writer = AsyncFdPacketBatchWriter {
+            fd: fd.as_ref(),
+            #[cfg(target_vendor = "apple")]
+            utun: UtunSendState::new(fd.as_ref().as_raw_fd(), packet_format),
+        };
 
         loop {
             if next_packet < batch.len() {
@@ -1119,6 +1505,542 @@ mod platform {
         Ok(())
     }
 
+    /// Apple utun write batching. Frames that fit a 4 KiB cluster go out
+    /// together through `sendmsg_x`; a larger frame is one `writev`, the same
+    /// call the unbatched path makes. Both are limited by [`UtunChainGate`]:
+    /// when the estimated input chain is at the high water the write waits,
+    /// and a closed gate never falls through to a single write. `EAGAIN` and
+    /// `ENOBUFS` leave every unsent packet queued; a short `sendmsg_x` commits
+    /// only the count it returned.
+    #[cfg(target_vendor = "apple")]
+    async fn write_utun_send_batch<T: AsRawFd>(
+        fd: &AsyncFd<T>,
+        packets: &[Bytes],
+        state: &mut UtunSendState,
+    ) -> Result<(), PacketBatchWriteError> {
+        let mut index = 0;
+        while index < packets.len() {
+            // An unencodable packet is dropped by the caller. Checking it
+            // before the gate means a bad packet is not stuck behind a closed
+            // gate, and it is never handed to the kernel.
+            if let Err(error) = ip_family_byte(packets[index].as_ref()) {
+                return Err(PacketBatchWriteError::new(index, error));
+            }
+
+            let room = state.admit_or_wait(packets.len() - index).await;
+            let batchable = batchable_count(
+                &packets[index..],
+                room.min(TUN_FD_SEND_BATCH_MAX),
+            );
+            match plan_send(packets[index].len(), batchable, room) {
+                PlannedSend::Wait => {
+                    return Err(PacketBatchWriteError::new(
+                        index,
+                        io::Error::from_raw_os_error(libc::EAGAIN),
+                    ));
+                }
+                PlannedSend::Single => {
+                    let error = write_one_packet(
+                        fd,
+                        TunFdPacketFormat::DarwinUtun,
+                        packets[index].as_ref(),
+                    )
+                    .await;
+                    match error {
+                        Ok(()) => {
+                            state.chain.note_submitted(1);
+                            index += 1;
+                        }
+                        Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => {
+                            // The kernel took the packet and leaked its
+                            // cluster. Retrying would leak another.
+                            state.chain.note_submitted(1);
+                            state.realign_after_enospc();
+                            index += 1;
+                            return Err(PacketBatchWriteError::new(index, error));
+                        }
+                        Err(error) => {
+                            return Err(PacketBatchWriteError::new(index, error));
+                        }
+                    }
+                }
+                PlannedSend::Batch(count) => {
+                    // `written_packets` counts from the start of this run.
+                    // Shift it by the frames already committed, or a later
+                    // error would resend them.
+                    match sendmsg_x_accounted(
+                        fd,
+                        &packets[index..index + count],
+                        state,
+                    )
+                    .await
+                    {
+                        Ok(done) => index += done,
+                        Err(error) => {
+                            return Err(PacketBatchWriteError::new(
+                                index + error.written_packets,
+                                error.error,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One `write` / `writev` of a single packet, waiting out `EAGAIN` and
+    /// `EINTR`. A short write is an error, as it is on the unbatched path:
+    /// the kernel's datagram sockets do not deliver a prefix of one message.
+    #[cfg(target_vendor = "apple")]
+    async fn write_one_packet<T: AsRawFd>(
+        fd: &AsyncFd<T>,
+        packet_format: TunFdPacketFormat,
+        packet: &[u8],
+    ) -> io::Result<()> {
+        let encoded = EncodedPacket::new(packet_format, packet)?;
+        loop {
+            let mut guard = fd.writable().await?;
+            let result = guard.try_io(|inner| {
+                let written = encoded.write_to_fd(inner.get_ref().as_raw_fd());
+                if written < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if written as usize != encoded.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!(
+                            "short tun fd write: wrote {written} of {} bytes",
+                            encoded.len()
+                        ),
+                    ));
+                }
+                Ok(())
+            });
+            match result {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error))
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.kind() == io::ErrorKind::Interrupted =>
+                {
+                    continue;
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Submits `packets` (already known to be one batchable run) and returns
+    /// how many of them the kernel accepted. `ENOBUFS` and a multi-message
+    /// `EMSGSIZE` shrink the run and try again, because those failures are
+    /// raised before anything is sent. Anything the kernel consumed is not
+    /// part of the returned count's complement: the caller advances by the
+    /// returned count only, except a consumed run, which is reported as an
+    /// error whose `written_packets` already includes it.
+    #[cfg(target_vendor = "apple")]
+    async fn sendmsg_x_accounted<T: AsRawFd>(
+        fd: &AsyncFd<T>,
+        packets: &[Bytes],
+        state: &mut UtunSendState,
+    ) -> Result<usize, PacketBatchWriteError> {
+        let mut limit = packets.len();
+        loop {
+            let count = batchable_count(packets, limit).min(packets.len());
+            if count == 0 {
+                return Err(PacketBatchWriteError::new(
+                    0,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "tun packet is not IPv4 or IPv6",
+                    ),
+                ));
+            }
+            let result = state.syscall_sendmsg_x(fd, &packets[..count]).await;
+            let account = match &result {
+                Ok(done) => account_send(count, Ok(*done)),
+                Err(error) => match error.raw_os_error() {
+                    Some(errno) => account_send(count, Err(errno)),
+                    None => {
+                        return Err(PacketBatchWriteError::new(0, io::Error::new(
+                            error.kind(),
+                            error.to_string(),
+                        )));
+                    }
+                },
+            };
+            match account {
+                SendAccount::Progress { done } => {
+                    state.chain.note_submitted(done);
+                    return Ok(done);
+                }
+                SendAccount::RetrySame => {
+                    let error = result.err().unwrap_or_else(|| {
+                        io::Error::new(io::ErrorKind::WriteZero, "sendmsg_x accepted nothing")
+                    });
+                    return Err(PacketBatchWriteError::new(0, error));
+                }
+                SendAccount::RetrySmaller => {
+                    let next = (count + 1) / 2;
+                    if next == 0 || next >= count {
+                        let error = result.err().unwrap_or_else(|| {
+                            io::Error::from_raw_os_error(libc::ENOBUFS)
+                        });
+                        return Err(PacketBatchWriteError::new(0, error));
+                    }
+                    limit = next;
+                }
+                SendAccount::DropOne => {
+                    let error = result.err().unwrap_or_else(|| {
+                        io::Error::from_raw_os_error(libc::EINVAL)
+                    });
+                    return Err(PacketBatchWriteError::new(0, error));
+                }
+                SendAccount::Fatal => {
+                    let error = result.err().unwrap_or_else(|| {
+                        io::Error::from_raw_os_error(libc::EBADF)
+                    });
+                    return Err(PacketBatchWriteError::new(0, error));
+                }
+                SendAccount::Consumed { enospc } => {
+                    state.chain.note_submitted(count);
+                    if enospc {
+                        state.realign_after_enospc();
+                    }
+                    // `EINVAL` / `EMSGSIZE` would tell the caller to drop the
+                    // packet *after* this run. The run itself is already
+                    // consumed; the following packet was not part of it.
+                    let errno = result.as_ref().err().and_then(io::Error::raw_os_error);
+                    let error = match errno {
+                        Some(libc::EINVAL | libc::EMSGSIZE) | None => {
+                            io::Error::from_raw_os_error(if enospc {
+                                libc::ENOSPC
+                            } else {
+                                libc::EIO
+                            })
+                        }
+                        Some(_) => result.expect("errno was taken from this error"),
+                    };
+                    // `written_packets` is the whole run: the caller must not
+                    // submit it again. The error still backs off whatever
+                    // follows the run, unless the run finished the batch, in
+                    // which case there is nothing left to retry.
+                    return Err(PacketBatchWriteError::new(count, error));
+                }
+            }
+        }
+    }
+
+    /// The utun write gate plus the scratch `sendmsg_x` fills in. The scratch
+    /// is heap-stable, so the pointers written into it for one syscall stay
+    /// valid for that call even though the future around it is movable; they
+    /// are rewritten before every call and never read after it returns.
+    #[cfg(target_vendor = "apple")]
+    struct UtunSendState {
+        chain: UtunChainGate,
+        enabled: bool,
+        ifindex: u32,
+        rib: Vec<u8>,
+        last_sample: Option<std::time::Instant>,
+        headers: Vec<[u8; 4]>,
+        iovs: Vec<BatchIovec>,
+        msgs: Vec<apple::MsgHdrX>,
+    }
+
+    #[cfg(target_vendor = "apple")]
+    impl UtunSendState {
+        fn new(fd: RawFd, packet_format: TunFdPacketFormat) -> Self {
+            let enabled = packet_format == TunFdPacketFormat::DarwinUtun
+                && read_batching_enabled(packet_format);
+            let mut chain = UtunChainGate::inactive();
+            let mut ifindex = 0;
+            let mut rib = Vec::new();
+            if enabled && let Some(index) = utun_netif_index(fd) {
+                rib.resize(UTUN_GATE_RIB_SIZE, 0);
+                if let Ok(consumed) = read_utun_ipackets(index, &mut rib) {
+                    chain = UtunChainGate::armed(consumed);
+                    ifindex = index;
+                }
+            }
+            let slots = if enabled { TUN_FD_SEND_BATCH_MAX } else { 0 };
+            Self {
+                chain,
+                enabled,
+                ifindex,
+                rib,
+                // The arming sample just happened; the next one waits out the
+                // same 1 ms window sing-tun uses.
+                last_sample: enabled.then(std::time::Instant::now),
+                headers: vec![[0; DARWIN_UTUN_HEADER_LEN]; slots],
+                iovs: (0..slots * 2)
+                    .map(|_| {
+                        BatchIovec(libc::iovec {
+                            iov_base: std::ptr::null_mut(),
+                            iov_len: 0,
+                        })
+                    })
+                    .collect(),
+                msgs: (0..slots).map(|_| apple::MsgHdrX::zeroed()).collect(),
+            }
+        }
+
+        async fn admit_or_wait(&mut self, pending: usize) -> usize {
+            let room = self.admit(pending);
+            if room > 0 || !self.chain.active {
+                return room;
+            }
+            // Long enough for the probe to arm (16 samples, one per ms) and
+            // short enough that shutdown is not stuck behind it.
+            let deadline = std::time::Instant::now() + Duration::from_millis(20);
+            loop {
+                let room = self.poll_blocked(pending);
+                if room > 0 || std::time::Instant::now() >= deadline {
+                    return room;
+                }
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+        }
+
+        fn admit(&mut self, pending: usize) -> usize {
+            if !self.chain.active {
+                return pending;
+            }
+            let over = self.chain.estimate().saturating_add(pending as i64)
+                > UTUN_INPUT_CHAIN_HIGH_WATER;
+            let sample = if over && self.sample_due() {
+                self.read_sample()
+            } else {
+                GateSample::NotDue
+            };
+            self.chain.admit(pending, sample)
+        }
+
+        fn poll_blocked(&mut self, pending: usize) -> usize {
+            let sample = if self.sample_due() {
+                self.read_sample()
+            } else {
+                GateSample::NotDue
+            };
+            self.chain.poll_blocked(pending, sample)
+        }
+
+        fn sample_due(&self) -> bool {
+            self.last_sample
+                .map(|sampled| {
+                    std::time::Instant::now().saturating_duration_since(sampled)
+                        >= UTUN_GATE_SAMPLE
+                })
+                .unwrap_or(true)
+        }
+
+        fn read_sample(&mut self) -> GateSample {
+            self.last_sample = Some(std::time::Instant::now());
+            if self.ifindex == 0 {
+                return GateSample::Fresh(None);
+            }
+            GateSample::Fresh(read_utun_ipackets(self.ifindex, &mut self.rib).ok())
+        }
+
+        fn realign_after_enospc(&mut self) {
+            let consumed = if self.ifindex == 0 {
+                None
+            } else {
+                read_utun_ipackets(self.ifindex, &mut self.rib).ok()
+            };
+            self.chain.note_enospc(consumed);
+            self.last_sample = Some(std::time::Instant::now());
+        }
+
+        fn arm_messages(&mut self, packets: &[Bytes]) {
+            let UtunSendState {
+                headers,
+                iovs,
+                msgs,
+                ..
+            } = self;
+            for (index, packet) in packets.iter().enumerate() {
+                let family = ip_family_byte(packet).unwrap_or(0);
+                headers[index] = [0, 0, 0, family];
+                let packet = packet.as_ref();
+                iovs[index * 2] = BatchIovec(libc::iovec {
+                    iov_base: headers[index].as_mut_ptr().cast(),
+                    iov_len: DARWIN_UTUN_HEADER_LEN,
+                });
+                iovs[index * 2 + 1] = BatchIovec(libc::iovec {
+                    iov_base: packet.as_ptr().cast_mut().cast(),
+                    iov_len: packet.len(),
+                });
+                // The whole header is cleared, not just the fields set here:
+                // older kernels reject a slot whose unused fields are not empty.
+                msgs[index] = apple::MsgHdrX::zeroed();
+                msgs[index].msg_iov = &mut iovs[index * 2].0;
+                msgs[index].msg_iovlen = 2;
+            }
+        }
+
+        async fn syscall_sendmsg_x<T: AsRawFd>(
+            &mut self,
+            fd: &AsyncFd<T>,
+            packets: &[Bytes],
+        ) -> io::Result<usize> {
+            loop {
+                let mut guard = fd.writable().await?;
+                // Pointers are taken after the await, used only for this
+                // synchronous call, and never stored in the future as a local.
+                // The bytes they address live on the heap (the scratch vecs and
+                // the packet buffers), which does not move with the future.
+                self.arm_messages(packets);
+                let msgs = self.msgs.as_mut_ptr();
+                let count = packets.len() as libc::c_uint;
+                let result = guard.try_io(|inner| {
+                    // SAFETY: `msgs` is `count` initialised headers, each with
+                    // two iovecs pointing at this state's header bytes and the
+                    // caller's packet, and the descriptor is open for the call.
+                    let sent = unsafe {
+                        apple::sendmsg_x(
+                            inner.get_ref().as_raw_fd(),
+                            msgs,
+                            count,
+                            apple::MSG_DONTWAIT,
+                        )
+                    };
+                    if sent < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(sent as usize)
+                    }
+                });
+                match result {
+                    Ok(Ok(sent)) => return Ok(sent),
+                    Ok(Err(error))
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            || error.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        continue;
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+
+    /// `UTUN_OPT_ENABLE_NETIF` is 20 and `UTUN_OPT_IFNAME` is 2, both under
+    /// `SYSPROTO_CONTROL` (2). The gate arms only when the socket says it is
+    /// in netif mode and its input counter can be read; that is the mode in
+    /// which an over-full chain leaks. Any failure leaves the gate open.
+    #[cfg(target_vendor = "apple")]
+    fn utun_netif_index(fd: RawFd) -> Option<u32> {
+        const SYSPROTO_CONTROL: libc::c_int = 2;
+        const UTUN_OPT_IFNAME: libc::c_int = 2;
+        const UTUN_OPT_ENABLE_NETIF: libc::c_int = 20;
+        let mut enabled: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `enabled` and `length` are live and sized as declared, and
+        // `fd` is the caller's open descriptor.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                SYSPROTO_CONTROL,
+                UTUN_OPT_ENABLE_NETIF,
+                (&mut enabled as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        if rc != 0 || enabled == 0 {
+            return None;
+        }
+        let mut name = [0u8; UTUN_IFNAME_CAP];
+        length = name.len() as libc::socklen_t;
+        // SAFETY: `name` is a live buffer of `length` bytes.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                SYSPROTO_CONTROL,
+                UTUN_OPT_IFNAME,
+                name.as_mut_ptr().cast(),
+                &mut length,
+            )
+        };
+        if rc != 0 || !name.contains(&0) {
+            return None;
+        }
+        // SAFETY: `name` is NUL-terminated, as checked above.
+        let index = unsafe { libc::if_nametoindex(name.as_ptr().cast()) };
+        (index != 0).then_some(index)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    const UTUN_IFNAME_CAP: usize = 16;
+    #[cfg(target_vendor = "apple")]
+    const UTUN_GATE_RIB_SIZE: usize = 4096;
+    #[cfg(target_vendor = "apple")]
+    const UTUN_GATE_RIB_MAX: usize = 1 << 20;
+    /// `NET_RT_IFLIST2` from `net/route.h`. One interface is requested by
+    /// putting its index in the last name component, so the transfer stays
+    /// one message.
+    #[cfg(target_vendor = "apple")]
+    const NET_RT_IFLIST2: libc::c_int = 6;
+
+    #[cfg(target_vendor = "apple")]
+    fn read_utun_ipackets(index: u32, buf: &mut Vec<u8>) -> io::Result<i64> {
+        if buf.len() < UTUN_GATE_RIB_SIZE {
+            buf.resize(UTUN_GATE_RIB_SIZE, 0);
+        }
+        let mut mib: [libc::c_int; 6] = [
+            libc::CTL_NET,
+            libc::AF_ROUTE,
+            0,
+            libc::AF_UNSPEC,
+            NET_RT_IFLIST2,
+            index as libc::c_int,
+        ];
+        loop {
+            let mut length: libc::size_t = buf.len();
+            // SAFETY: `mib` is the six-element name, `buf` is `length` bytes,
+            // and a null new-value reads the sysctl without writing it.
+            let rc = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as libc::c_uint,
+                    buf.as_mut_ptr().cast(),
+                    &mut length,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOMEM) && buf.len() < UTUN_GATE_RIB_MAX {
+                    buf.resize(buf.len().saturating_mul(2).min(UTUN_GATE_RIB_MAX), 0);
+                    continue;
+                }
+                return Err(error);
+            }
+            let length = length.min(buf.len());
+            return utun_ipackets_from_rib(&buf[..length], index as u16).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "utun interface counter is not in the routing table",
+                )
+            });
+        }
+    }
+
+    /// The address family a packet's first nibble names, as the byte a utun
+    /// header carries. Anything else is not a packet the descriptor will
+    /// accept, and retrying it would wedge the queue behind it.
+    fn ip_family_byte(packet: &[u8]) -> io::Result<u8> {
+        match packet.first().copied().map(|byte| byte >> 4) {
+            Some(4) => Ok(libc::AF_INET as u8),
+            Some(6) => Ok(libc::AF_INET6 as u8),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tun packet is not IPv4 or IPv6",
+            )),
+        }
+    }
+
     enum EncodedPacket<'a> {
         RawIp(&'a [u8]),
         DarwinUtun { header: [u8; 4], payload: &'a [u8] },
@@ -1128,20 +2050,11 @@ mod platform {
         fn new(packet_format: TunFdPacketFormat, packet: &'a [u8]) -> io::Result<Self> {
             // Checked for both formats: a raw-IP device refuses anything else
             // with `EINVAL`, which says nothing about the descriptor.
-            let family = match packet.first().map(|byte| byte >> 4) {
-                Some(4) => libc::AF_INET,
-                Some(6) => libc::AF_INET6,
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "tun packet is not IPv4 or IPv6",
-                    ))
-                }
-            };
+            let family = ip_family_byte(packet)?;
             match packet_format {
                 TunFdPacketFormat::RawIp => Ok(Self::RawIp(packet)),
                 TunFdPacketFormat::DarwinUtun => Ok(Self::DarwinUtun {
-                    header: [0, 0, 0, family as u8],
+                    header: [0, 0, 0, family],
                     payload: packet,
                 }),
             }
@@ -2216,6 +3129,352 @@ mod platform {
             assert_eq!(out.len(), payloads.len());
             for (packet, payload) in out.iter().zip(payloads) {
                 assert_eq!(&packet[..], payload);
+            }
+        }
+
+        #[test]
+        fn an_oversized_frame_is_not_batched_and_a_closed_gate_writes_nothing() {
+            assert_eq!(TUN_FD_SEND_FRAME_LIMIT, 4092);
+            assert_eq!(TUN_FD_SEND_BATCH_MAX, 64);
+
+            let small = 100;
+            let big = TUN_FD_SEND_FRAME_LIMIT + 1;
+            // The gate refusing room is not a single write, whatever the frame
+            // size: that write is the syscall that leaks a cluster.
+            assert_eq!(plan_send(small, 4, 0), PlannedSend::Wait);
+            assert_eq!(plan_send(big, 0, 0), PlannedSend::Wait);
+            assert_eq!(plan_send(big, 0, 3), PlannedSend::Single);
+            assert_eq!(plan_send(small, 3, 10), PlannedSend::Batch(3));
+            assert_eq!(plan_send(small, 80, 100), PlannedSend::Batch(64));
+            assert_eq!(plan_send(small, 10, 4), PlannedSend::Batch(4));
+            // A small frame the batcher rejected (no IP version) is not sent.
+            assert_eq!(plan_send(small, 0, 5), PlannedSend::Wait);
+            assert_eq!(
+                plan_send(TUN_FD_SEND_FRAME_LIMIT, 1, 1),
+                PlannedSend::Batch(1),
+                "a frame that fills the 4 KiB cluster exactly is still batched"
+            );
+        }
+
+        #[test]
+        fn batchable_count_stops_at_an_oversized_or_unversioned_frame() {
+            let small = Bytes::from_static(&[0x45, 1]);
+            let v6 = Bytes::from_static(&[0x60, 1]);
+            let bad = Bytes::from_static(&[0x00, 1]);
+            let exact = Bytes::from(vec![0x45; TUN_FD_SEND_FRAME_LIMIT]);
+            let big = Bytes::from(vec![0x45; TUN_FD_SEND_FRAME_LIMIT + 1]);
+
+            assert_eq!(
+                batchable_count(&[small.clone(), v6.clone(), big.clone(), small.clone()], 10),
+                2
+            );
+            assert_eq!(batchable_count(&[exact], 10), 1);
+            assert_eq!(batchable_count(&[big, small.clone()], 10), 0);
+            assert_eq!(batchable_count(&[small.clone(), bad, v6], 10), 1);
+            assert_eq!(batchable_count(&vec![small; 80], 100), 80);
+            assert_eq!(batchable_count(&[], 10), 0);
+        }
+
+        #[test]
+        fn the_gate_stops_at_the_high_water_and_reopens_when_the_host_drains() {
+            let mut gate = UtunChainGate::inactive();
+            gate.note_submitted(10_000);
+            assert_eq!(gate.admit(7, GateSample::NotDue), 7);
+            assert_eq!(gate.poll_blocked(3, GateSample::Fresh(None)), 3);
+
+            let mut gate = UtunChainGate::armed(0);
+            gate.note_submitted(10);
+            // Under the high water a sample is not applied, so a counter that
+            // has already caught up does not lower the estimate yet.
+            assert_eq!(gate.admit(5, GateSample::Fresh(Some(10))), 5);
+            assert_eq!(gate.estimate(), 10);
+
+            gate.note_submitted(374);
+            assert_eq!(gate.estimate(), 384);
+            // Not due: the draining counter is ignored and the gate stays shut.
+            assert_eq!(gate.admit(8, GateSample::NotDue), 0);
+            assert_eq!(gate.estimate(), 384);
+            // Due: the host has taken everything submitted, so the chain is empty.
+            assert_eq!(gate.admit(8, GateSample::Fresh(Some(384))), 8);
+            assert_eq!(gate.estimate(), 0);
+        }
+
+        #[test]
+        fn idle_polls_arm_a_probe_that_stays_under_the_leaking_limit() {
+            let mut gate = UtunChainGate::armed(0);
+            gate.note_submitted(384);
+            for _ in 0..15 {
+                assert_eq!(gate.poll_blocked(10, GateSample::Fresh(Some(0))), 0);
+            }
+            // The 16th idle sample lets a probe through, and no more than the
+            // eight-packet probe.
+            assert_eq!(gate.poll_blocked(10, GateSample::Fresh(Some(0))), 8);
+
+            // Movement clears the probe and reopens from the new estimate.
+            assert_eq!(gate.poll_blocked(10, GateSample::Fresh(Some(20))), 10);
+            assert!(gate.estimate() < UTUN_INPUT_CHAIN_HIGH_WATER);
+
+            // One under the limit the probe is a single packet; at the limit
+            // it is nothing. 512 is where the kernel leaks.
+            let mut gate = UtunChainGate::armed(0);
+            gate.note_submitted(510);
+            for _ in 0..16 {
+                let _ = gate.poll_blocked(10, GateSample::Fresh(Some(0)));
+            }
+            assert_eq!(gate.admit(10, GateSample::NotDue), 1);
+
+            let mut gate = UtunChainGate::armed(0);
+            gate.note_submitted(511);
+            for _ in 0..16 {
+                assert_eq!(gate.poll_blocked(10, GateSample::Fresh(Some(0))), 0);
+            }
+            assert_eq!(gate.admit(10, GateSample::NotDue), 0);
+        }
+
+        #[test]
+        fn enospc_realigns_the_estimate_to_just_over_the_limit() {
+            let mut gate = UtunChainGate::armed(0);
+            gate.note_submitted(10);
+            gate.note_enospc(Some(4));
+            assert_eq!(gate.estimate(), UTUN_INPUT_CHAIN_LIMIT + 1);
+            assert_eq!(gate.admit(5, GateSample::NotDue), 0);
+
+            // A sample that has not caught up keeps the gate shut. One that
+            // has, reopens it. The figures follow the baseline `note_enospc`
+            // installs: inflight = 517 - consumed, and 383 is the first
+            // estimate with room.
+            assert_eq!(gate.admit(5, GateSample::Fresh(Some(133))), 0);
+            assert_eq!(gate.estimate(), 384);
+            assert_eq!(gate.admit(5, GateSample::Fresh(Some(134))), 1);
+            assert_eq!(gate.estimate(), 383);
+
+            // No counter at all still forces the estimate over the limit.
+            let mut gate = UtunChainGate::armed(0);
+            gate.note_submitted(3);
+            gate.note_enospc(None);
+            assert_eq!(gate.estimate(), UTUN_INPUT_CHAIN_LIMIT + 1);
+            assert_eq!(gate.admit(1, GateSample::NotDue), 0);
+
+            // An inactive gate has nothing to realign and does not close.
+            let mut gate = UtunChainGate::inactive();
+            gate.note_enospc(Some(0));
+            assert_eq!(gate.admit(4, GateSample::NotDue), 4);
+        }
+
+        #[test]
+        fn a_partial_send_commits_only_what_was_accepted_and_eagain_commits_nothing() {
+            assert_eq!(account_send(4, Ok(2)), SendAccount::Progress { done: 2 });
+            assert_eq!(account_send(4, Ok(4)), SendAccount::Progress { done: 4 });
+            // A count past the submission cannot commit a packet that was not
+            // handed over, and a zero count is not progress.
+            assert_eq!(account_send(2, Ok(9)), SendAccount::Progress { done: 2 });
+            assert_eq!(account_send(4, Ok(0)), SendAccount::RetrySame);
+
+            assert_eq!(account_send(3, Err(libc::EAGAIN)), SendAccount::RetrySame);
+            assert_eq!(
+                account_send(3, Err(libc::EWOULDBLOCK)),
+                SendAccount::RetrySame
+            );
+            assert_eq!(account_send(3, Err(libc::EINTR)), SendAccount::RetrySame);
+            // `ENOBUFS` sent nothing. More than one message is retried
+            // smaller; the last message is retried whole, not dropped.
+            assert_eq!(account_send(3, Err(libc::ENOBUFS)), SendAccount::RetrySmaller);
+            assert_eq!(account_send(1, Err(libc::ENOBUFS)), SendAccount::RetrySame);
+            assert_eq!(
+                account_send(2, Err(libc::EMSGSIZE)),
+                SendAccount::RetrySmaller
+            );
+            assert_eq!(account_send(1, Err(libc::EMSGSIZE)), SendAccount::DropOne);
+            assert_eq!(account_send(1, Err(libc::EINVAL)), SendAccount::DropOne);
+            // A multi-message `EINVAL` may have delivered a prefix. The whole
+            // submission is consumed so that prefix is not sent again.
+            assert_eq!(
+                account_send(3, Err(libc::EINVAL)),
+                SendAccount::Consumed { enospc: false }
+            );
+            assert_eq!(
+                account_send(4, Err(libc::ENOSPC)),
+                SendAccount::Consumed { enospc: true }
+            );
+            assert_eq!(
+                account_send(4, Err(libc::EIO)),
+                SendAccount::Consumed { enospc: false }
+            );
+            assert_eq!(account_send(4, Err(libc::EBADF)), SendAccount::Fatal);
+            assert_eq!(account_send(1, Err(libc::ENOTCONN)), SendAccount::Fatal);
+        }
+
+        /// Walks the same decisions `sendmsg_x_accounted` makes, over one
+        /// queue, and checks every packet is committed once. This is the
+        /// partial-batch / `EAGAIN` / `ENOBUFS` contract without a socket.
+        #[test]
+        fn replaying_a_short_batch_then_eagain_then_enobufs_neither_drops_nor_duplicates() {
+            let total = 5;
+            // Submission sizes the loop would have chosen, and what the
+            // kernel said back. A shrink halves the next submission.
+            let steps = [
+                (4, Ok(2)),
+                (3, Err(libc::EAGAIN)),
+                (3, Err(libc::ENOBUFS)),
+                (2, Ok(2)),
+                (1, Ok(1)),
+            ];
+            let mut cursor = 0;
+            let mut committed = Vec::new();
+            for (submitted, result) in steps {
+                assert!(submitted <= total - cursor);
+                match account_send(submitted, result) {
+                    SendAccount::Progress { done } => {
+                        committed.extend(cursor..cursor + done);
+                        cursor += done;
+                    }
+                    SendAccount::RetrySame | SendAccount::RetrySmaller => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert_eq!(cursor, total);
+            assert_eq!(committed, (0..total).collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn the_interface_counter_is_read_from_the_matching_ifinfo2_message() {
+            fn message(index: u16, ipackets: u64, msglen: usize) -> Vec<u8> {
+                let mut msg = vec![0u8; msglen];
+                msg[0..2].copy_from_slice(&(msglen as u16).to_le_bytes());
+                if msglen > IF_MSGHDR2_TYPE {
+                    msg[IF_MSGHDR2_TYPE] = RTM_IFINFO2;
+                }
+                if msglen >= IF_MSGHDR2_INDEX + 2 {
+                    msg[IF_MSGHDR2_INDEX..IF_MSGHDR2_INDEX + 2]
+                        .copy_from_slice(&index.to_le_bytes());
+                }
+                if msglen >= IF_MSGHDR2_IPACKETS + 8 {
+                    msg[IF_MSGHDR2_IPACKETS..IF_MSGHDR2_IPACKETS + 8]
+                        .copy_from_slice(&ipackets.to_le_bytes());
+                }
+                msg
+            }
+
+            // A short message is skipped rather than read past its end, and
+            // the counter comes from the matching message only.
+            let mut rib = message(2, 11, 20);
+            rib.extend(message(7, 99, IF_MSGHDR2_SIZE));
+            rib.extend(message(8, 5, IF_MSGHDR2_SIZE));
+            assert_eq!(utun_ipackets_from_rib(&rib, 7), Some(99));
+            assert_eq!(utun_ipackets_from_rib(&rib, 8), Some(5));
+            assert_eq!(utun_ipackets_from_rib(&rib, 2), None);
+            // A zero length ends the walk, so a later message is invisible.
+            let mut stalled = message(3, 4, IF_MSGHDR2_SIZE);
+            stalled.extend_from_slice(&[0, 0]);
+            stalled.extend(message(1, 9, IF_MSGHDR2_SIZE));
+            assert_eq!(utun_ipackets_from_rib(&stalled, 1), None);
+            assert_eq!(utun_ipackets_from_rib(&stalled, 3), Some(4));
+        }
+
+        /// `sendmsg_x` on a `socketpair(AF_UNIX, SOCK_DGRAM)` is the same
+        /// datagram shape as a utun fd, so the write syscall can be exercised
+        /// without a tunnel. More packets than one batch, plus one frame
+        /// bigger than the path MTU but still inside the 4 KiB cluster (a
+        /// unix datagram will not carry the oversized-frame case; that one
+        /// is the planner test above), must all arrive in order with the
+        /// utun family header and nothing duplicated.
+        #[cfg(target_vendor = "apple")]
+        #[tokio::test]
+        async fn a_batched_write_of_a_dgram_socketpair_delivers_every_datagram() {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: `fds` is a two-element array the call fills in.
+            let rc =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+            assert_eq!(rc, 0, "socketpair: {}", io::Error::last_os_error());
+            // SAFETY: `socketpair` returned two descriptors this test owns.
+            let sender = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+            // SAFETY: as above for the second descriptor.
+            let receiver = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+            set_nonblocking(sender.as_raw_fd()).unwrap();
+            set_nonblocking(receiver.as_raw_fd()).unwrap();
+            let buffer: libc::c_int = 1 << 20;
+            let buffer_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            for fd in [sender.as_raw_fd(), receiver.as_raw_fd()] {
+                // SAFETY: `buffer` is a live `c_int` of the length passed.
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        (&buffer as *const libc::c_int).cast(),
+                        buffer_len,
+                    );
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        (&buffer as *const libc::c_int).cast(),
+                        buffer_len,
+                    );
+                }
+            }
+
+            // RawIp so utun socket options are not attempted on a unix
+            // socket. The writer's format is what selects batching.
+            let writer_fd = TunFd::new(
+                TunFdConfig::new(
+                    sender.as_raw_fd(),
+                    TunFdPacketFormat::RawIp,
+                    TunFdClosePolicy::Borrowed,
+                ),
+                1500,
+            )
+            .unwrap();
+            // SAFETY: the duplicate lives until `writer_fd` drops, which the
+            // registration below keeps as its owner.
+            let afd = unsafe { AsyncFd::register(writer_fd) }.unwrap();
+            let mut state = UtunSendState::new(afd.as_raw_fd(), TunFdPacketFormat::DarwinUtun);
+            if !state.enabled {
+                // `SEGUE_TUN_BATCH` is off; the pure tests still cover the gate.
+                return;
+            }
+
+            let mut packets = Vec::new();
+            // One past the batch cap, so the run takes two `sendmsg_x` calls.
+            for byte in 0..TUN_FD_SEND_BATCH_MAX as u8 + 6 {
+                packets.push(Bytes::from(vec![0x45, byte, byte ^ 0x5a]));
+            }
+            // Still inside the cluster limit, so it is batched, and inside the
+            // unix datagram limit, so the socket can actually carry it.
+            let mut medium = vec![0x45; 1500];
+            medium[1] = 0xcd;
+            packets.push(Bytes::from(medium));
+
+            write_utun_send_batch(&afd, &packets, &mut state)
+                .await
+                .unwrap();
+
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 2048];
+            loop {
+                // SAFETY: `buf` is a live buffer and the descriptor is open.
+                let read = unsafe {
+                    libc::read(receiver.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                };
+                if read < 0 {
+                    let error = io::Error::last_os_error();
+                    assert_eq!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock,
+                        "unexpected read error: {error}"
+                    );
+                    break;
+                }
+                assert!(read > 0);
+                got.push(buf[..read as usize].to_vec());
+            }
+            assert_eq!(got.len(), packets.len());
+            let header = [0, 0, 0, libc::AF_INET as u8];
+            for (frame, packet) in got.iter().zip(&packets) {
+                assert_eq!(&frame[..header.len()], &header);
+                assert_eq!(&frame[header.len()..], packet.as_ref());
             }
         }
     }
