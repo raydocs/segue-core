@@ -84,6 +84,7 @@ pub enum Transport {
     Tcp,
 }
 
+#[derive(Clone, Debug)]
 pub struct DnsSettings {
     pub domestic: Vec<SocketAddr>,
     pub query_timeout: Duration,

@@ -13,6 +13,7 @@ pub mod dns;
 pub mod fakeip;
 pub mod killswitch;
 pub mod policy;
+pub mod process;
 pub mod quic;
 pub mod rules;
 pub mod session;

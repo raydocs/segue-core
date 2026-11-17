@@ -323,8 +323,18 @@ impl KernelConfig {
         Self::parse_in(text, Path::new("."))
     }
 
-    /// Parse; relative `chnroute_file` paths resolve against `base`.
+    /// Parse; relative paths resolve against `base` (the config file's
+    /// directory).
     pub fn parse_in(text: &str, base: &Path) -> Result<Self, String> {
+        Self::parse_with(text, base, None)
+    }
+
+    /// Parse. Relative runtime paths (`control.token_file`,
+    /// `dns.fake_ip_state`, `policy.installed`) resolve against `state_dir`
+    /// when it is set, and against `base` otherwise. The delivered bundle,
+    /// tickets and `chnroute_file` always stay next to the config.
+    pub fn parse_with(text: &str, base: &Path, state_dir: Option<&Path>) -> Result<Self, String> {
+        let state = state_dir.unwrap_or(base);
         let raw: RawConfig = serde_json::from_str(text).map_err(|e| format!("config: {e}"))?;
         if !raw.listen.ip().is_loopback() {
             // The SOCKS entry point has no authentication; exposing it beyond
@@ -477,13 +487,14 @@ impl KernelConfig {
                             .into(),
                     );
                 }
-                let (c, cidrs) = dns_config(d, &known, base)?;
+                let (c, cidrs) = dns_config(d, &known, base, state)?;
                 (Some(c), cidrs)
             }
             None => (None, Vec::new()),
         };
         let udp = raw.udp.map(|u| udp_config(u, &known, &home)).transpose()?;
-        let resolve = |p: PathBuf| if p.is_absolute() { p } else { base.join(p) };
+        let in_config = |p: PathBuf| if p.is_absolute() { p } else { base.join(p) };
+        let in_state = |p: PathBuf| if p.is_absolute() { p } else { state.join(p) };
         let (policy, policy_log) = match raw.policy {
             Some(p) => {
                 if raw.rules.is_some() || raw.default.is_some() {
@@ -504,8 +515,8 @@ impl KernelConfig {
                     known.keys().cloned().collect(),
                     home.clone(),
                 )?;
-                let store = PolicyStore::signed(verifier, p.installed.map(resolve));
-                let log = store.load_startup(p.bundle.map(resolve).as_deref());
+                let store = PolicyStore::signed(verifier, p.installed.map(in_state));
+                let log = store.load_startup(p.bundle.map(in_config).as_deref());
                 (Arc::new(store), log)
             }
             None => {
@@ -543,7 +554,7 @@ impl KernelConfig {
                 }
                 Some(ControlConfig {
                     listen: c.listen,
-                    token_file: resolve(c.token_file),
+                    token_file: in_state(c.token_file),
                 })
             }
         };
@@ -608,7 +619,8 @@ fn udp_config(
 fn dns_config(
     d: RawDns,
     outbounds: &BTreeMap<String, Value>,
-    base: &Path,
+    config_base: &Path,
+    state_base: &Path,
 ) -> Result<(DnsConfig, Vec<Cidr>), String> {
     if !d.listen.ip().is_loopback() {
         // An open resolver on the LAN would answer anyone and hand out
@@ -645,7 +657,7 @@ fn dns_config(
         let path = if file.is_absolute() {
             file.clone()
         } else {
-            base.join(file)
+            config_base.join(file)
         };
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("dns.chnroute_file {}: {e}", path.display()))?;
@@ -692,9 +704,13 @@ fn dns_config(
         fake_ip_ttl: Duration::from_secs(d.fake_ip_ttl_secs),
         fake_ip_grace: Duration::from_secs(d.fake_ip_grace_secs),
         fake_ip_max_entries: d.fake_ip_max_entries,
-        fake_ip_state: d
-            .fake_ip_state
-            .map(|f| if f.is_absolute() { f } else { base.join(f) }),
+        fake_ip_state: d.fake_ip_state.map(|f| {
+            if f.is_absolute() {
+                f
+            } else {
+                state_base.join(f)
+            }
+        }),
         foreign: d.foreign,
     };
     Ok((cfg, cidrs))
@@ -1015,5 +1031,35 @@ mod tests {
         .err()
         .unwrap();
         assert!(err.contains("loopback"), "{err}");
+    }
+
+    #[test]
+    fn state_dir_keeps_runtime_files_off_the_config_directory() {
+        let dir = std::env::temp_dir().join(format!("segue-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        let text = r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+            "control":{"listen":"127.0.0.1:0","token_file":"control.json"},
+            "dns":{"listen":"127.0.0.1:5353","domestic":["1.1.1.1:53"],"fake_ip_state":"fakeip.state"}}"#;
+        let state = dir.join("state");
+        let c = KernelConfig::parse_with(text, &dir, Some(&state)).unwrap();
+        assert_eq!(
+            c.control.as_ref().unwrap().token_file,
+            state.join("control.json")
+        );
+        assert_eq!(
+            c.dns.as_ref().unwrap().fake_ip_state.as_ref().unwrap(),
+            &state.join("fakeip.state")
+        );
+        let abs = r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+            "control":{"listen":"127.0.0.1:0","token_file":"/tmp/keep.json"}}"#;
+        let c = KernelConfig::parse_with(abs, &dir, Some(&state)).unwrap();
+        assert_eq!(
+            c.control.unwrap().token_file,
+            PathBuf::from("/tmp/keep.json")
+        );
+        let c = KernelConfig::parse_in(text, &dir).unwrap();
+        assert_eq!(c.control.unwrap().token_file, dir.join("control.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -412,3 +412,18 @@ stage, not the recommendation in §1.
 7. **Installer API?** Default: Tono's `osascript` script, with
    `SMAppService.statusForLegacyPlist` only to explain "Allow in the
    Background". Not `SMAppService.daemon`.
+
+## Appendix. `segue-kernel` exit codes
+
+The helper treats these as the process contract (`crates/segue-kernel/src/process.rs`).
+A clean shutdown (`SIGTERM`, `SIGINT`, or the listeners closing) flushes the
+fake-IP journal and deletes the control token before the process ends. A tun
+setup failure removes any route it already added.
+
+| Code | When |
+| --- | --- |
+| 0 | Clean shutdown, or `--help` |
+| 1 | A listener failed after the process was up |
+| 2 | The arguments are not a known command |
+| 3 | The kernel JSON, `--state-dir` or `--log` path was rejected |
+| 4 | macOS utun, address, MTU or route install failed |
