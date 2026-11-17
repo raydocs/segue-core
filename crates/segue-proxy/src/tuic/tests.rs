@@ -237,9 +237,7 @@ fn reassembly_bounds_payload_size_count_and_total_memory() {
         Err(WireError::ReassemblyLimit)
     );
     let mut reassembly = Reassembler::new(Duration::from_secs(30), 100).unwrap();
-    reassembly
-        .feed(&packet(1, 2, 0, &[1; 80]), start)
-        .unwrap();
+    reassembly.feed(&packet(1, 2, 0, &[1; 80]), start).unwrap();
     assert_eq!(
         reassembly.feed(&packet(1, 2, 1, &[2; 21]), start),
         Err(WireError::ReassemblyLimit)
