@@ -9,9 +9,17 @@ fn server() -> Value {
     json!({"address":"example.test","port":443,"password":"synthetic-anytls-test-secret"})
 }
 
-fn settings_of(config: &Value) -> &AnyTlsOutboundSettings {
+fn settings_of(config: &Value) -> AnyTlsOutboundSettings {
+    // Own the settings. A reference would borrow `parsed`, which dies with this
+    // function, and the callers pass a temporary profile.
     let parsed = parse_xray_json(&config.to_string()).unwrap();
-    let OutboundSettings::AnyTls(settings) = &parsed.config.outbounds[0].settings else {
+    let outbound = parsed
+        .config
+        .outbounds
+        .into_iter()
+        .next()
+        .expect("outbound");
+    let OutboundSettings::AnyTls(settings) = outbound.settings else {
         panic!("AnyTLS")
     };
     settings
