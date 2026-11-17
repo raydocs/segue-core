@@ -583,12 +583,8 @@ mod tests {
         let (suffixes, cidrs) = builtin_ai_list();
         // Inbound ranges from platform.claude.com/docs/en/api/ip-addresses
         // (2026-11-17). Not the larger outbound blocks, and not a CDN.
-        let published = [
-            "160.79.104.0/23",
-            "153.61.224.0/22",
-            "2607:6bc0::/48",
-        ]
-        .map(|s| Cidr::parse(s).unwrap());
+        let published = ["160.79.104.0/23", "153.61.224.0/22", "2607:6bc0::/48"]
+            .map(|s| Cidr::parse(s).unwrap());
         assert_eq!(cidrs.as_slice(), published.as_slice());
         let rules = RuleSet::new(Vec::new(), Action::Direct).with_ai(
             suffixes,
