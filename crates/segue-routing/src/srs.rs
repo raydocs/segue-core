@@ -346,7 +346,7 @@ impl<R: Read> Reader<R> {
             return Err(SrsError::Invalid("logical rule nested too deep".to_owned()));
         }
         match self.read_u8()? {
-            0 => Ok(RawRule::Default(self.read_default()?)),
+            0 => Ok(RawRule::Default(Box::new(self.read_default()?))),
             1 => self.read_logical(depth),
             other => Err(SrsError::Invalid(format!("unknown rule type {other}"))),
         }
@@ -611,7 +611,7 @@ enum LogicalMode {
 }
 
 enum RawRule {
-    Default(RawDefault),
+    Default(Box<RawDefault>),
     Logical {
         mode: LogicalMode,
         rules: Vec<RawRule>,
@@ -1152,7 +1152,7 @@ fn lower(
     out: &mut Vec<FlatRule>,
 ) {
     match rule {
-        RawRule::Default(rule) => lower_default(rule, index, limits, warnings, out),
+        RawRule::Default(rule) => lower_default(*rule, index, limits, warnings, out),
         RawRule::Logical { mode, rules, invert } => {
             if invert {
                 warnings.push(SrsWarning {

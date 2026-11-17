@@ -1749,7 +1749,8 @@ mod platform {
             let mut chain = UtunChainGate::inactive();
             let mut ifindex = 0;
             let mut rib = Vec::new();
-            if enabled && let Some(index) = utun_netif_index(fd) {
+            let index = if enabled { utun_netif_index(fd) } else { None };
+            if let Some(index) = index {
                 rib.resize(UTUN_GATE_RIB_SIZE, 0);
                 if let Ok(consumed) = read_utun_ipackets(index, &mut rib) {
                     chain = UtunChainGate::armed(consumed);
