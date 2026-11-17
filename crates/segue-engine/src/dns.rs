@@ -469,6 +469,7 @@ impl RoutedDnsQueryTransport {
                 .await?
             }
             outbound @ (TcpOutbound::Trojan(_)
+            | TcpOutbound::AnyTls(_)
             | TcpOutbound::Socks(_)
             | TcpOutbound::Http(_)
             | TcpOutbound::Vmess(_)

@@ -3027,7 +3027,10 @@ async fn open_tcp_bridge_stream(
                 )
                 .await?);
             }
+            // Each of these encodes the upstream as a Socksaddr or an Xray
+            // VLESS target, neither of which carries an IPv6 scope.
             TcpOutbound::Trojan(_)
+            | TcpOutbound::AnyTls(_)
             | TcpOutbound::Socks(_)
             | TcpOutbound::Http(_)
             | TcpOutbound::Vmess(_)
@@ -3059,6 +3062,7 @@ async fn open_tcp_bridge_stream(
                     outbound.primary(),
                     TcpOutbound::Vless(_)
                         | TcpOutbound::Trojan(_)
+                        | TcpOutbound::AnyTls(_)
                         | TcpOutbound::Socks(_)
                         | TcpOutbound::Http(_)
                         | TcpOutbound::Vmess(_)
@@ -3079,6 +3083,7 @@ async fn open_tcp_bridge_stream(
     let destination_resolver = match outbound.primary() {
         TcpOutbound::Freedom(_) => context.dns_resolver.as_ref(),
         TcpOutbound::Trojan(_)
+        | TcpOutbound::AnyTls(_)
         | TcpOutbound::Socks(_)
         | TcpOutbound::Http(_)
         | TcpOutbound::Vmess(_)
@@ -3565,6 +3570,9 @@ async fn bridge_tcp_flow_inner(
             ),
             TcpOutbound::Freedom(_) => context.inbound_policy.handshake,
             TcpOutbound::Trojan(outbound) => {
+                effective_policy_for_level(&context.config, Some(outbound.level())).handshake
+            }
+            TcpOutbound::AnyTls(outbound) => {
                 effective_policy_for_level(&context.config, Some(outbound.level())).handshake
             }
             TcpOutbound::Socks(outbound) => {

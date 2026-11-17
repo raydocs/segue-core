@@ -941,6 +941,14 @@ pub(crate) fn tcp_relay_policy(
                 outbound_policy.relay_buffer_size(),
             )
         }
+        TcpOutbound::AnyTls(outbound) => {
+            let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
         TcpOutbound::Trojan(outbound) => {
             let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
             (

@@ -1,3 +1,4 @@
+mod anytls;
 mod blackhole;
 mod dns;
 mod filter;
@@ -1111,6 +1112,8 @@ impl Parser<'_> {
             Some("socks") => OutboundProtocol::Socks,
             Some("http") => OutboundProtocol::Http,
             Some("masque") => OutboundProtocol::Masque,
+            // Not an Xray-core protocol; the name is sing-box's and mihomo's.
+            Some("anytls") => OutboundProtocol::AnyTls,
             Some(protocol) => {
                 self.error(
                     protocol_path,
@@ -1164,6 +1167,9 @@ impl Parser<'_> {
             }
             OutboundProtocol::Masque => {
                 OutboundSettings::Masque(self.parse_masque_settings(outbound, index)?)
+            }
+            OutboundProtocol::AnyTls => {
+                OutboundSettings::AnyTls(self.parse_anytls_settings(outbound, index)?)
             }
         };
         let target_strategy = self.domain_strategy_at(
@@ -1246,6 +1252,7 @@ impl Parser<'_> {
         self.validate_hysteria_pair(&settings, &stream, proxy_settings.is_some(), index);
         self.validate_masque_pair(&settings, &stream, proxy_settings.is_some(), index);
         self.validate_trojan_stream(&settings, &stream, index);
+        self.validate_anytls_stream(&settings, &stream, index);
 
         // Xray v26.7.28 applies this policy only to its simplified top-level
         // VLESS settings. Its legacy `vnext` path bypasses that validation.
@@ -1276,7 +1283,9 @@ impl Parser<'_> {
             | OutboundSettings::Socks(_)
             | OutboundSettings::Http(_)
             // MASQUE requires TLS.
-            | OutboundSettings::Masque(_) => false,
+            | OutboundSettings::Masque(_)
+            // AnyTLS requires TLS; `validate_anytls_stream` refuses plaintext.
+            | OutboundSettings::AnyTls(_) => false,
         };
         if rejects_plaintext_server {
             self.error(

@@ -18,6 +18,7 @@ pub(crate) enum Session {
         session: super::masque::MasqueUdpSession,
         requested: Target,
     },
+    AnyTls(anytls::UdpSession),
 }
 pub(crate) struct Datagram {
     pub(crate) source: Target,
@@ -68,6 +69,9 @@ pub(crate) async fn open(
             session: outbound.open_udp(target, bootstrap, dialer).await?,
             requested: target.clone(),
         }),
+        UdpOutbound::AnyTls(outbound) => Ok(Session::AnyTls(
+            outbound.open_udp(target, bootstrap, dialer).await?,
+        )),
         _ => Err(CoreError::UnsupportedOutboundNetwork),
     }
 }
@@ -87,6 +91,7 @@ pub(crate) async fn open_within_handshake(
     let level = match outbound {
         UdpOutbound::Vless(outbound) => outbound.user().level,
         UdpOutbound::Trojan(outbound) => outbound.level(),
+        UdpOutbound::AnyTls(outbound) => outbound.level(),
         UdpOutbound::Socks(outbound) => outbound.level(),
         UdpOutbound::Vmess(outbound) => outbound.level(),
         UdpOutbound::Shadowsocks2022(outbound) => outbound.level(),
@@ -128,6 +133,7 @@ impl Session {
         match self {
             Self::VlessMux(_) => segue_proxy::mux::MAX_PAYLOAD,
             Self::Trojan(_) => segue_proxy::trojan::MAX_UDP_PAYLOAD_LENGTH,
+            Self::AnyTls(_) => segue_proxy::anytls::MAX_UDP_PAYLOAD_LENGTH,
             Self::Vmess(session) => session.max_payload(),
             Self::Wireguard { session, .. } => session.max_payload(),
             Self::Masque { session, .. } => session.max_payload(),
@@ -144,7 +150,7 @@ impl Session {
     /// datagrams. The others ride a stream.
     pub(crate) fn loses_datagrams(&self) -> bool {
         match self {
-            Self::VlessMux(_) | Self::Trojan(_) | Self::Vmess(_) => false,
+            Self::VlessMux(_) | Self::Trojan(_) | Self::Vmess(_) | Self::AnyTls(_) => false,
             Self::Shadowsocks2022(session) => session.loses_datagrams(),
             Self::Socks(_) | Self::Hysteria(_) | Self::Wireguard { .. } | Self::Masque { .. } => {
                 true
@@ -155,6 +161,7 @@ impl Session {
         match self {
             Self::VlessMux(session) => session.send(target, payload).await,
             Self::Trojan(session) => session.send(target, payload).await,
+            Self::AnyTls(session) => session.send(target, payload).await,
             Self::Socks(session) => session.send(target, payload).await,
             Self::Vmess(session) => session.send(target, payload).await,
             Self::Shadowsocks2022(session) => session.send(target, payload).await,
@@ -178,6 +185,7 @@ impl Session {
         match self {
             Self::VlessMux(session) => session.recv().await,
             Self::Trojan(session) => session.recv().await,
+            Self::AnyTls(session) => session.recv().await,
             Self::Socks(session) => session.recv().await,
             Self::Vmess(session) => session.recv().await,
             Self::Shadowsocks2022(session) => session.recv().await,

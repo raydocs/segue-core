@@ -352,6 +352,8 @@ pub enum CoreError {
     #[error(transparent)]
     Trojan(#[from] segue_proxy::trojan::WireError),
     #[error(transparent)]
+    AnyTls(#[from] segue_proxy::anytls::WireError),
+    #[error(transparent)]
     Socks(#[from] segue_proxy::outbound::SocksClientError),
     #[error(transparent)]
     Http(#[from] segue_proxy::outbound::HttpClientError),
@@ -857,6 +859,7 @@ impl Core {
                         | segue_config::OutboundSettings::Shadowsocks2022(_)
                         | segue_config::OutboundSettings::Socks(_)
                         | segue_config::OutboundSettings::Http(_)
+                        | segue_config::OutboundSettings::AnyTls(_)
                 )
                 && !outbound::masque::over_http2(outbound)
             {

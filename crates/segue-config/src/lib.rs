@@ -49,6 +49,7 @@ pub use model::{
     XmcMask, XmcProfile,
 };
 pub use model::{MasqueOutboundSettings, MasqueSettings, MasqueWarpSettings, MASQUE_DEFAULT_XMUX};
+pub use model::{AnyTlsOutboundSettings, MAX_ANYTLS_IDLE_SESSIONS};
 pub use parser::{
     parse_xray_json, parse_xray_json_with_exclusive_geodata_dirs, parse_xray_json_with_geodata_dir,
     parse_xray_json_with_geodata_dirs, ConfigParseError, ParsedConfig, MAX_CONFIG_DOMAIN_MATCHERS,

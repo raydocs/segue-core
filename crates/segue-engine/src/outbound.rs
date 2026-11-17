@@ -16,6 +16,8 @@ pub(crate) use blackhole::{
 mod encryption;
 mod trojan;
 pub use trojan::TrojanOutbound;
+mod anytls;
+pub use anytls::AnyTlsOutbound;
 mod socks;
 pub use socks::SocksOutbound;
 mod http;
@@ -413,6 +415,7 @@ pub enum TcpOutbound {
     Hysteria(HysteriaOutbound),
     Wireguard(WireguardOutbound),
     Masque(MasqueOutbound),
+    AnyTls(AnyTlsOutbound),
     Chained {
         outbound: Box<TcpOutbound>,
         proxy: Box<TcpOutbound>,
@@ -436,6 +439,7 @@ pub enum UdpOutbound {
     Hysteria(HysteriaOutbound),
     Wireguard(WireguardOutbound),
     Masque(MasqueOutbound),
+    AnyTls(AnyTlsOutbound),
 }
 
 impl UdpOutbound {
@@ -455,6 +459,8 @@ impl UdpOutbound {
             Self::Trojan(trojan) if !trojan.udp_uses_mux(target) => {
                 (trojan.carrier(), Network::Tcp)
             }
+            // AnyTLS carries UDP over a stream to the server.
+            Self::AnyTls(anytls) => (anytls.carrier(), Network::Tcp),
             Self::Vmess(vmess) if !vmess.udp_uses_mux(target) => (vmess.carrier(), Network::Tcp),
             // Shadowsocks sends its datagrams to the server over UDP.
             Self::Shadowsocks2022(shadowsocks) if !shadowsocks.udp_uses_mux(target) => {
@@ -1183,6 +1189,7 @@ impl TcpOutbound {
             Self::Shadowsocks2022(shadowsocks) => Some(shadowsocks.carrier()),
             Self::Socks(socks) => Some(socks.carrier()),
             Self::Http(http) => Some(http.carrier()),
+            Self::AnyTls(anytls) => Some(anytls.carrier()),
             _ => None,
         }
     }
@@ -1268,7 +1275,8 @@ impl TcpOutbound {
             | Self::Shadowsocks2022(_)
             | Self::Hysteria(_)
             | Self::Wireguard(_)
-            | Self::Masque(_) => None,
+            | Self::Masque(_)
+            | Self::AnyTls(_) => None,
             Self::Chained { .. } => unreachable!("primary outbound is never a chain wrapper"),
         }
     }
@@ -1335,6 +1343,15 @@ impl ResolvedTcpConnector for OutboundProxyTcpConnector {
                 "Hysteria chaining is unsupported".into(),
             )),
             TcpOutbound::Trojan(outbound) => outbound
+                .open_resolved(
+                    original_target,
+                    &self.server_candidates,
+                    &[],
+                    &self.transport_dialer,
+                )
+                .await
+                .map_err(|error| TransportError::ChainedOutbound(error.to_string())),
+            TcpOutbound::AnyTls(outbound) => outbound
                 .open_resolved(
                     original_target,
                     &self.server_candidates,
@@ -1428,6 +1445,11 @@ fn prepare_outbound_proxy_dialer<'a>(
                 .resolve_server(dns_resolver, &transport_dialer)
                 .await?
                 .into_boxed_slice(),
+            TcpOutbound::AnyTls(outbound) if requires_local_resolution => outbound
+                .carrier()
+                .resolve_server(dns_resolver, &transport_dialer)
+                .await?
+                .into_boxed_slice(),
             TcpOutbound::Socks(outbound) if requires_local_resolution => outbound
                 .carrier()
                 .resolve_server(dns_resolver, &transport_dialer)
@@ -1449,6 +1471,7 @@ fn prepare_outbound_proxy_dialer<'a>(
                 .await?
                 .into_boxed_slice(),
             TcpOutbound::Trojan(_) => Box::default(),
+            TcpOutbound::AnyTls(_) => Box::default(),
             TcpOutbound::Socks(_) => Box::default(),
             TcpOutbound::Http(_) => Box::default(),
             TcpOutbound::Vmess(_) => Box::default(),
@@ -1494,6 +1517,7 @@ fn proxy_chain_requires_local_resolution(proxy: &TcpOutbound) -> bool {
     match proxy.primary() {
         TcpOutbound::Vless(_)
         | TcpOutbound::Trojan(_)
+        | TcpOutbound::AnyTls(_)
         | TcpOutbound::Socks(_)
         | TcpOutbound::Http(_)
         | TcpOutbound::Vmess(_)
@@ -1520,6 +1544,7 @@ fn proxy_chain_requires_local_resolution(proxy: &TcpOutbound) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CachedOutboundError {
     Trojan(segue_proxy::trojan::WireError),
+    AnyTls(segue_proxy::anytls::WireError),
     NoSupportedOutbound,
     UnsupportedOutboundNetwork,
     UnsupportedOutboundSecurity,
@@ -1538,6 +1563,7 @@ impl CachedOutboundError {
     fn from_core_error(error: CoreError) -> Self {
         match error {
             CoreError::Trojan(error) => Self::Trojan(error),
+            CoreError::AnyTls(error) => Self::AnyTls(error),
             CoreError::NoSupportedOutbound => Self::NoSupportedOutbound,
             CoreError::UnsupportedOutboundNetwork => Self::UnsupportedOutboundNetwork,
             CoreError::UnsupportedOutboundSecurity => Self::UnsupportedOutboundSecurity,
@@ -1563,6 +1589,7 @@ impl CachedOutboundError {
     fn into_core_error(self) -> CoreError {
         match self {
             Self::Trojan(error) => CoreError::Trojan(error),
+            Self::AnyTls(error) => CoreError::AnyTls(error),
             Self::NoSupportedOutbound => CoreError::NoSupportedOutbound,
             Self::UnsupportedOutboundNetwork => CoreError::UnsupportedOutboundNetwork,
             Self::UnsupportedOutboundSecurity => CoreError::UnsupportedOutboundSecurity,
@@ -1592,6 +1619,7 @@ struct CachedOutboundEntry {
     dns: OnceLock<Result<DnsOutbound, CachedOutboundError>>,
     vless: OnceLock<Result<VlessTcpOutbound, CachedOutboundError>>,
     trojan: OnceLock<Result<TrojanOutbound, CachedOutboundError>>,
+    anytls: OnceLock<Result<AnyTlsOutbound, CachedOutboundError>>,
     vmess: OnceLock<Result<VmessOutbound, CachedOutboundError>>,
     shadowsocks: OnceLock<Result<Shadowsocks2022Outbound, CachedOutboundError>>,
     hysteria: OnceLock<Result<HysteriaOutbound, CachedOutboundError>>,
@@ -1614,6 +1642,7 @@ pub enum OutboundNodeKind {
     Hysteria,
     Wireguard,
     Masque,
+    AnyTls,
     Freedom,
     Vless,
     Trojan,
@@ -1836,6 +1865,7 @@ impl OutboundGraph {
                     OutboundSettings::Hysteria(_) => OutboundNodeKind::Hysteria,
                     OutboundSettings::Wireguard(_) => OutboundNodeKind::Wireguard,
                     OutboundSettings::Masque(_) => OutboundNodeKind::Masque,
+                    OutboundSettings::AnyTls(_) => OutboundNodeKind::AnyTls,
                     OutboundSettings::Dns(_) => OutboundNodeKind::Dns,
                     OutboundSettings::Blackhole(_) => OutboundNodeKind::Blackhole,
                     OutboundSettings::Loopback(_) => OutboundNodeKind::Loopback,
@@ -3820,6 +3850,33 @@ impl OutboundFactory {
         result
     }
 
+    fn cached_anytls_outbound(
+        &self,
+        node: OutboundNodeId,
+    ) -> Result<AnyTlsOutbound, CachedOutboundError> {
+        if self.sessions_closed.load(Ordering::Acquire) {
+            return Err(CachedOutboundError::NoSupportedOutbound);
+        }
+        let configured = self
+            .graph
+            .configured_outbound(node)
+            .ok_or(CachedOutboundError::NoSupportedOutbound)?;
+        let result = self
+            .entry(node)?
+            .anytls
+            .get_or_init(|| {
+                AnyTlsOutbound::new(configured).map_err(CachedOutboundError::from_core_error)
+            })
+            .clone();
+        if self.sessions_closed.load(Ordering::Acquire) {
+            if let Ok(outbound) = &result {
+                outbound.close();
+            }
+            return Err(CachedOutboundError::NoSupportedOutbound);
+        }
+        result
+    }
+
     fn cached_vmess_outbound(
         &self,
         node: OutboundNodeId,
@@ -3969,6 +4026,9 @@ impl OutboundFactory {
             if let Some(Ok(outbound)) = entry.trojan.get() {
                 outbound.close();
             }
+            if let Some(Ok(outbound)) = entry.anytls.get() {
+                outbound.close();
+            }
             if let Some(Ok(outbound)) = entry.shadowsocks.get() {
                 outbound.close();
             }
@@ -3993,6 +4053,9 @@ impl OutboundFactory {
                 outbound.join().await;
             }
             if let Some(Ok(outbound)) = entry.trojan.get() {
+                outbound.join().await;
+            }
+            if let Some(Ok(outbound)) = entry.anytls.get() {
                 outbound.join().await;
             }
             if let Some(Ok(outbound)) = entry.shadowsocks.get() {
@@ -4070,6 +4133,9 @@ impl OutboundFactory {
             }
             OutboundSettings::Trojan(_) => {
                 self.cached_trojan_outbound(node).map(TcpOutbound::Trojan)
+            }
+            OutboundSettings::AnyTls(_) => {
+                self.cached_anytls_outbound(node).map(TcpOutbound::AnyTls)
             }
             OutboundSettings::Vmess(_) => self.cached_vmess_outbound(node).map(TcpOutbound::Vmess),
             OutboundSettings::Shadowsocks2022(_) => self
@@ -4162,6 +4228,9 @@ impl OutboundFactory {
             OutboundSettings::Trojan(_) => {
                 self.cached_trojan_outbound(node).map(UdpOutbound::Trojan)
             }
+            OutboundSettings::AnyTls(_) => {
+                self.cached_anytls_outbound(node).map(UdpOutbound::AnyTls)
+            }
             OutboundSettings::Vmess(_) => self.cached_vmess_outbound(node).map(UdpOutbound::Vmess),
             OutboundSettings::Shadowsocks2022(_) => self
                 .cached_shadowsocks_outbound(node)
@@ -4235,6 +4304,7 @@ impl OutboundFactory {
             | OutboundSettings::Shadowsocks2022(_)
             | OutboundSettings::Wireguard(_)
             | OutboundSettings::Masque(_)
+            | OutboundSettings::AnyTls(_)
             | OutboundSettings::Socks(_)
             | OutboundSettings::Http(_) => Err(CachedOutboundError::NoSupportedOutbound),
         }
@@ -4276,6 +4346,7 @@ fn build_tcp_outbound(outbound: &OutboundConfig) -> Result<TcpOutbound, CoreErro
         }
         OutboundSettings::Masque(_) => MasqueOutbound::new(outbound).map(TcpOutbound::Masque),
         OutboundSettings::Trojan(_) => TrojanOutbound::new(outbound).map(TcpOutbound::Trojan),
+        OutboundSettings::AnyTls(_) => AnyTlsOutbound::new(outbound).map(TcpOutbound::AnyTls),
         OutboundSettings::Vmess(_) => VmessOutbound::new(outbound).map(TcpOutbound::Vmess),
         OutboundSettings::Shadowsocks2022(_) => {
             Shadowsocks2022Outbound::new(outbound).map(TcpOutbound::Shadowsocks2022)
@@ -4308,6 +4379,7 @@ fn build_udp_outbound(outbound: &OutboundConfig) -> Result<UdpOutbound, CoreErro
         }
         OutboundSettings::Masque(_) => MasqueOutbound::new(outbound).map(UdpOutbound::Masque),
         OutboundSettings::Trojan(_) => TrojanOutbound::new(outbound).map(UdpOutbound::Trojan),
+        OutboundSettings::AnyTls(_) => AnyTlsOutbound::new(outbound).map(UdpOutbound::AnyTls),
         OutboundSettings::Vmess(_) => VmessOutbound::new(outbound).map(UdpOutbound::Vmess),
         OutboundSettings::Shadowsocks2022(_) => {
             Shadowsocks2022Outbound::new(outbound).map(UdpOutbound::Shadowsocks2022)
@@ -4755,6 +4827,13 @@ async fn open_plain_tcp_stream_with_resolvers_and_dialer(
 ) -> Result<BoxedTransportStream, CoreError> {
     match outbound {
         TcpOutbound::Trojan(outbound) => {
+            if requires_local_resolution {
+                Box::pin(outbound.open(target, bootstrap_resolver, transport_dialer)).await
+            } else {
+                Box::pin(outbound.open_resolved(target, &[], &[], transport_dialer)).await
+            }
+        }
+        TcpOutbound::AnyTls(outbound) => {
             if requires_local_resolution {
                 Box::pin(outbound.open(target, bootstrap_resolver, transport_dialer)).await
             } else {
