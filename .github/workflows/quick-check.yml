@@ -43,6 +43,9 @@ jobs:
       - name: Format
         run: |
           mkdir -p out
+          # Bees cannot run cargo: add lock entries for new dependencies
+          # (workspace members only, nothing else is upgraded).
+          cargo update --workspace || true
           cargo fmt --all || true
           git diff > out/fmt.patch
           git diff --stat
@@ -55,8 +58,18 @@ jobs:
       - name: Lint and build every target
         run: |
           set -o pipefail
-          cargo clippy --keep-going --workspace --all-targets --all-features --locked --message-format=short \
+          cargo clippy --keep-going --workspace --all-targets --all-features --message-format=short \
             -- -D warnings -W clippy::perf -W clippy::suspicious 2>&1 | tee out/clippy.txt
+
+      - name: Regenerate checked-in generated files (patch includes fmt and lock)
+        if: always()
+        run: |
+          cargo run -q -p segue-config --example config_contract > docs/config-contract.json || true
+          git diff --stat
+          git diff > out/gen.patch
+          echo '=====GEN-PATCH-BEGIN====='
+          base64 -w0 out/gen.patch; echo
+          echo '=====GEN-PATCH-END====='
 
       - name: Upload results
         if: always()
