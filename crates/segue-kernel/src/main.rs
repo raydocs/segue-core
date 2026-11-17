@@ -15,6 +15,7 @@ use segue_kernel::dial::EngineDialer;
 use segue_kernel::dns::{serve_tcp, serve_udp, SmartDns};
 use segue_kernel::fakeip::FakeIpPool;
 use segue_kernel::policy;
+use segue_kernel::killswitch::FlowPosture;
 use segue_kernel::session::KernelDialer;
 use segue_kernel::socks::{serve, Kernel};
 use segue_kernel::udp::Udp;
@@ -149,6 +150,7 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             tokio::spawn(serve_tcp(tcp, dns));
             fake_ip = Some(pool);
         }
+        let flows: Arc<dyn FlowPosture> = dialer.clone();
         let kernel = Arc::new(Kernel {
             policy: config.policy,
             dialer,
@@ -156,6 +158,7 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             sniff: config.sniff,
             udp: config.udp.map(|u| Arc::new(Udp::new(u))),
             hidden: Default::default(),
+            flows: Some(flows),
         });
         serve(listener, kernel).await?;
         Ok(())

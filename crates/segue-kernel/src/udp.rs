@@ -307,7 +307,23 @@ pub(crate) fn route(
         }
         _ => (policy.rules.decide(addr).clone(), addr.clone()),
     };
-    finish(s, action, target, port)
+    let routed = finish(s, action, target, port)?;
+    let decided = match &routed.0 {
+        Some(tag) => Action::Proxy(tag.clone()),
+        None => Action::Direct,
+    };
+    // UDP is not held across a reconnect. A datagram has no handshake the
+    // application is blocked on, and queueing until the tunnel returns would
+    // pin memory for a flow the app has usually already abandoned.
+    // `Verdict::Wait` is a drop, the same as a refused route
+    // (`killswitch::admission`).
+    if matches!(
+        kernel.preview(&decided, true),
+        crate::killswitch::Admission::Refuse
+    ) {
+        return None;
+    }
+    Some(routed)
 }
 
 fn finish(

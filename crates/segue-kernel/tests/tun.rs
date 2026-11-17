@@ -1643,6 +1643,7 @@ fn kernel_env_with(policy: Policy, sniff: bool, udp: bool, dns: bool, dialer: Fa
             }))
         }),
         hidden: Default::default(),
+        flows: None,
     });
     let smart = dns.then(|| {
         Arc::new(SmartDns::new(
