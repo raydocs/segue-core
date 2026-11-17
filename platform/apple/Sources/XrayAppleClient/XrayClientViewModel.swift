@@ -170,6 +170,8 @@ public final class XrayClientViewModel: ObservableObject {
             importedProfile.dnsTestMode = profile.dnsTestMode
             importedProfile.dnsTestTransport = profile.dnsTestTransport
             importedProfile.dnsTestUpstream = profile.dnsTestUpstream
+            importedProfile.includeAllNetworks = profile.includeAllNetworks
+            importedProfile.excludeLocalNetworks = profile.excludeLocalNetworks
             XrayAppleLog.info(
                 "ClientViewModel",
                 "Imported VLESS profile name=\(importedProfile.name) provider=\(importedProfile.providerBundleIdentifier) server=\(importedProfile.serverAddress) configBytes=\(importedProfile.configJSON.utf8.count)"

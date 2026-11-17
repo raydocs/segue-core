@@ -377,6 +377,8 @@ final class XrayClientProfileTests: XCTestCase {
         XCTAssertTrue(profile.dnsTestUpstream.isEmpty)
         XCTAssertEqual(profile.regionalRoutingMode, .off)
         XCTAssertTrue(profile.regionalRoutingRegions.isEmpty)
+        XCTAssertFalse(profile.includeAllNetworks)
+        XCTAssertTrue(profile.excludeLocalNetworks)
     }
 
     func testProfileEncodesRuntimeFlagsAndRegionalRoutingWithoutLegacyQuicOption() throws {
@@ -408,6 +410,8 @@ final class XrayClientProfileTests: XCTestCase {
         XCTAssertEqual(root["dnsTestUpstream"] as? String, "192.0.2.53:5353")
         XCTAssertEqual(root["regionalRoutingMode"] as? String, "bypass-selected")
         XCTAssertEqual(root["regionalRoutingRegions"] as? [String], ["russia", "iran"])
+        XCTAssertEqual(root["includeAllNetworks"] as? Bool, false)
+        XCTAssertEqual(root["excludeLocalNetworks"] as? Bool, true)
     }
 
     func testEffectiveConfigLeavesBaseJSONByteForByteInConfigurationMode() throws {
