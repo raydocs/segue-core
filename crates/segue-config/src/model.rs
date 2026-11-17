@@ -98,8 +98,27 @@ pub enum RoutingBalancerStrategy {
     #[default]
     Random,
     RoundRobin,
-    LeastPing,
+    LeastPing(RoutingLeastPingSettings),
     LeastLoad(RoutingLeastLoadSettings),
+}
+
+/// Segue's hysteresis for Xray's `leastPing`, in sing-box's urltest style.
+///
+/// Xray has no `leastPing` settings. This separately named model field defaults
+/// to 50 ms, while leastLoad's fractional failure `tolerance` is unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoutingLeastPingSettings {
+    pub ping_tolerance: Option<Duration>,
+}
+
+impl RoutingLeastPingSettings {
+    /// sing-box urltest `tolerance` (`constant.DefaultURLTestTolerance`).
+    pub const DEFAULT_PING_TOLERANCE: Duration = Duration::from_millis(50);
+
+    pub fn effective_ping_tolerance(self) -> Duration {
+        self.ping_tolerance
+            .unwrap_or(Self::DEFAULT_PING_TOLERANCE)
+    }
 }
 
 /// Bounded subset of Xray's `leastLoad` strategy settings.
@@ -113,8 +132,20 @@ pub struct RoutingLeastLoadSettings {
     pub expected: u8,
     pub max_rtt: Option<Duration>,
     pub tolerance_millionths: u32,
+    /// Segue's optional incumbent hysteresis, in sing-box urltest milliseconds.
+    /// `None` uses [`RoutingLeastPingSettings::DEFAULT_PING_TOLERANCE`]. It does
+    /// not replace Xray's fractional `tolerance`, and the spread across `expected`
+    /// candidates stays random.
+    pub ping_tolerance: Option<Duration>,
     pub baselines: Vec<Duration>,
     pub costs: Vec<RoutingLeastLoadCost>,
+}
+
+impl RoutingLeastLoadSettings {
+    pub fn effective_ping_tolerance(&self) -> Duration {
+        self.ping_tolerance
+            .unwrap_or(RoutingLeastPingSettings::DEFAULT_PING_TOLERANCE)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

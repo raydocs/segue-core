@@ -2036,7 +2036,83 @@ fn parses_least_ping_routing_balancer_strategy() {
 
     assert_eq!(
         parsed.config.routing.balancers[0].strategy,
-        segue_config::RoutingBalancerStrategy::LeastPing
+        segue_config::RoutingBalancerStrategy::LeastPing(Default::default())
+    );
+    let segue_config::RoutingBalancerStrategy::LeastPing(settings) =
+        &parsed.config.routing.balancers[0].strategy
+    else {
+        panic!("expected leastPing strategy");
+    };
+    assert_eq!(
+        settings.effective_ping_tolerance(),
+        Duration::from_millis(50)
+    );
+}
+
+#[test]
+fn parses_least_ping_and_least_load_ping_tolerance() {
+    let least_ping = raw_with_routing(
+        r#""balancers": [{
+          "tag": "automatic",
+          "selector": ["proxy"],
+          "strategy": { "type": "leastPing", "settings": { "pingTolerance": "80ms" } }
+        }]"#,
+    );
+    let parsed = parse_xray_json(&least_ping).expect("leastPing tolerance should parse");
+    assert_eq!(
+        parsed.config.routing.balancers[0].strategy,
+        segue_config::RoutingBalancerStrategy::LeastPing(
+            segue_config::RoutingLeastPingSettings {
+                ping_tolerance: Some(Duration::from_millis(80)),
+            }
+        )
+    );
+
+    let least_load = raw_with_routing(
+        r#""balancers": [{
+          "tag": "automatic",
+          "selector": ["proxy"],
+          "strategy": {
+            "type": "leastLoad",
+            "settings": { "tolerance": 0.25, "pingTolerance": "80ms" }
+          }
+        }]"#,
+    );
+    let parsed = parse_xray_json(&least_load).expect("leastLoad tolerance should parse");
+    let segue_config::RoutingBalancerStrategy::LeastLoad(settings) =
+        &parsed.config.routing.balancers[0].strategy
+    else {
+        panic!("expected leastLoad strategy");
+    };
+    assert_eq!(settings.tolerance_millionths, 250_000);
+    assert_eq!(settings.ping_tolerance, Some(Duration::from_millis(80)));
+    assert_eq!(
+        settings.effective_ping_tolerance(),
+        Duration::from_millis(80)
+    );
+
+    let unknown = raw_with_routing(
+        r#""balancers": [{
+          "tag": "automatic",
+          "selector": ["proxy"],
+          "strategy": { "type": "leastPing", "settings": { "expected": 2 } }
+        }]"#,
+    );
+    assert_parse_error_path(
+        &unknown,
+        "$.routing.balancers[0].strategy.settings.expected",
+    );
+
+    let zero = raw_with_routing(
+        r#""balancers": [{
+          "tag": "automatic",
+          "selector": ["proxy"],
+          "strategy": { "type": "leastPing", "settings": { "pingTolerance": "0s" } }
+        }]"#,
+    );
+    assert_parse_error_path(
+        &zero,
+        "$.routing.balancers[0].strategy.settings.pingTolerance",
     );
 }
 
