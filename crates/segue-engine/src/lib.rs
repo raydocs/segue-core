@@ -104,6 +104,14 @@ pub struct TunRuntimeOptions {
     /// pooled relay buffers as it approaches the limit. `None` (the default)
     /// starts no watchdog.
     pub memory_limit: Option<u64>,
+    /// Stop observatory probes after this much time without a connection that
+    /// uses a health-aware balancer. `None` uses 30 minutes. Probing resumes on
+    /// the next such connection and retains the observations already gathered.
+    pub observatory_idle_timeout: Option<Duration>,
+    /// Retain eager observatory probing from startup on every profile. The
+    /// default is lazy on mobile and low-memory profiles, eager on desktop and
+    /// throughput profiles. Xray's observatory JSON fields are unchanged.
+    pub eager_observatory: bool,
 }
 
 /// MTU of the TUN link, validated to [`TunMtu::MIN`]..=[`TunMtu::MAX`].
@@ -283,6 +291,22 @@ impl TunRuntimeProfile {
 }
 
 impl TunRuntimeOptions {
+    pub(crate) fn observatory_is_lazy(self) -> bool {
+        !self.eager_observatory
+            && match self.profile {
+                TunRuntimeProfile::Default => matches!(
+                    DEFAULT_DNS_RUNTIME_PROFILE,
+                    TunRuntimeProfile::Mobile
+                        | TunRuntimeProfile::MobilePlus
+                        | TunRuntimeProfile::LowMemory
+                ),
+                TunRuntimeProfile::Mobile
+                | TunRuntimeProfile::MobilePlus
+                | TunRuntimeProfile::LowMemory => true,
+                TunRuntimeProfile::Desktop | TunRuntimeProfile::Throughput => false,
+            }
+    }
+
     pub fn with_profile(profile: TunRuntimeProfile) -> Self {
         Self {
             profile,
@@ -1590,6 +1614,19 @@ impl Core {
                 .graph()
                 .leaf_nodes_matching_prefixes(&observatory.subject_selectors);
             if !nodes.is_empty() {
+                // Sing-box rejects an idle timeout shorter than the probe
+                // interval. Clamp instead of failing the core start: this is a
+                // runtime option, not an Xray JSON field.
+                let idle_timeout = if self.tun_runtime_options.observatory_is_lazy() {
+                    Some(
+                        self.tun_runtime_options
+                            .observatory_idle_timeout
+                            .unwrap_or(health::DEFAULT_OBSERVATORY_IDLE_TIMEOUT)
+                            .max(observatory.probe_interval),
+                    )
+                } else {
+                    None
+                };
                 let runtime = health::ObservatoryRuntime::new(
                     observatory,
                     nodes,
@@ -1598,6 +1635,7 @@ impl Core {
                     Arc::clone(&runtime_dns_resolvers.destination),
                     Arc::clone(&runtime_dns_resolvers.bootstrap),
                     Arc::clone(&self.transport_dialer),
+                    idle_timeout,
                 );
                 let task =
                     tokio::spawn(health::run_observatory(runtime, self.shutdown.subscribe()));
@@ -1973,6 +2011,29 @@ mod tests {
         DnsRules, DnsRuntimeLimits, TransportDnsQueryStrategy, TunRuntimeOptions,
         TunRuntimeProfile,
     };
+
+    #[test]
+    fn observatory_probing_is_lazy_on_phone_profiles_unless_forced_eager() {
+        for profile in [
+            TunRuntimeProfile::Mobile,
+            TunRuntimeProfile::MobilePlus,
+            TunRuntimeProfile::LowMemory,
+        ] {
+            assert!(
+                TunRuntimeOptions::with_profile(profile).observatory_is_lazy(),
+                "{profile:?}"
+            );
+            let mut forced = TunRuntimeOptions::with_profile(profile);
+            forced.eager_observatory = true;
+            assert!(!forced.observatory_is_lazy(), "{profile:?}");
+        }
+        for profile in [TunRuntimeProfile::Desktop, TunRuntimeProfile::Throughput] {
+            assert!(
+                !TunRuntimeOptions::with_profile(profile).observatory_is_lazy(),
+                "{profile:?}"
+            );
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_waits_for_runtime_shutdown_cleanup() {

@@ -69,7 +69,8 @@ use segue_config::{
     CoreConfig, DnsOutboundSettings, DomainStrategy, FreedomFinalRule, FreedomOutboundSettings,
     FreedomRedirect, Network, OutboundConfig, OutboundSettings, ProxyProtocolVersion,
     QuicParamsSettings, RouteContext, RoutingBalancerStrategy, RoutingConfig,
-    RoutingDomainStrategy, RoutingLeastLoadSettings, RoutingRule, RoutingRuleTarget,
+    RoutingDomainStrategy, RoutingLeastLoadSettings, RoutingLeastPingSettings, RoutingRule,
+    RoutingRuleTarget,
     StreamSecurity, StreamSettings, StreamTransport, TargetAddr, VlessUser, XhttpSettings,
 };
 use segue_proxy::vless::{
@@ -92,6 +93,7 @@ use segue_transport::{
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use zeroize::Zeroizing;
 
+use crate::health::ObservatoryActivity;
 use crate::policy::effective_policy_for_level;
 use crate::{CompiledDnsOutboundPolicy, CoreError};
 pub(crate) use proxy_protocol::InboundSource;
@@ -2202,6 +2204,8 @@ fn least_load_cost_millionths(settings: &RoutingLeastLoadSettings, tag: &str) ->
 struct OutboundSelectorGroupState {
     override_member: AtomicUsize,
     round_robin_cursor: AtomicU64,
+    /// Member index + 1 of the hysteresis incumbent. Zero means there is none.
+    health_incumbent: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -2339,6 +2343,7 @@ pub struct OutboundSelectionOverlay {
     health: Box<[OutboundHealthAtomicState]>,
     revision: AtomicU64,
     update_lock: Mutex<()>,
+    observatory_activity: OnceLock<Arc<ObservatoryActivity>>,
 }
 
 impl OutboundSelectionOverlay {
@@ -2347,6 +2352,7 @@ impl OutboundSelectionOverlay {
             .map(|_| OutboundSelectorGroupState {
                 override_member: AtomicUsize::new(0),
                 round_robin_cursor: AtomicU64::new(0),
+                health_incumbent: AtomicUsize::new(0),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -2360,6 +2366,17 @@ impl OutboundSelectionOverlay {
             health,
             revision: AtomicU64::new(0),
             update_lock: Mutex::new(()),
+            observatory_activity: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn configure_observatory_activity(&self, activity: Arc<ObservatoryActivity>) {
+        let _ = self.observatory_activity.set(activity);
+    }
+
+    fn note_observatory_use(&self) {
+        if let Some(activity) = self.observatory_activity.get() {
+            activity.touch();
         }
     }
 
@@ -2545,6 +2562,9 @@ impl OutboundSelectionOverlay {
     /// member at all: see [`Self::is_candidate`].
     fn select(&self, group_tag: &str) -> Result<Option<OutboundNodeId>, CoreError> {
         let (group_index, group) = self.group_for_tag(group_tag)?;
+        if strategy_needs_observatory(group.strategy()) {
+            self.note_observatory_use();
+        }
         let state = &self.groups[group_index];
         if let Some(member_index) = state.override_member.load(Ordering::Acquire).checked_sub(1) {
             return group
@@ -2560,8 +2580,12 @@ impl OutboundSelectionOverlay {
                 let cursor = state.round_robin_cursor.fetch_add(1, Ordering::Relaxed);
                 self.select_round_robin_eligible(group, cursor)
             }
-            RoutingBalancerStrategy::LeastPing => self.select_least_ping(group),
-            RoutingBalancerStrategy::LeastLoad(settings) => self.select_least_load(group, settings),
+            RoutingBalancerStrategy::LeastPing(settings) => {
+                self.select_least_ping(group_index, group, settings)
+            }
+            RoutingBalancerStrategy::LeastLoad(settings) => {
+                self.select_least_load(group_index, group, settings)
+            }
         };
         match (selected, group.fallback_tag()) {
             (Some(node), _) => Ok(Some(node)),
@@ -2648,23 +2672,58 @@ impl OutboundSelectionOverlay {
             .nth(selected)
     }
 
-    fn select_least_ping(&self, group: &OutboundSelectorGroup) -> Option<OutboundNodeId> {
-        group
-            .members()
-            .iter()
-            .copied()
-            .filter_map(|node| {
-                let health = self.health_state(node)?;
-                (OutboundHealthState::from_u8(health.state.load(Ordering::Acquire))
-                    == OutboundHealthState::Healthy)
-                    .then(|| (health.delay_ms.load(Ordering::Acquire), node))
-            })
-            .min_by_key(|(delay_ms, _)| *delay_ms)
-            .map(|(_, node)| node)
+    /// Keep the incumbent unless another healthy member is faster by more than
+    /// `pingTolerance` (default 50 ms). With no incumbent, the lowest delay
+    /// wins and equal delays keep the tag-sorted member order.
+    fn select_least_ping(
+        &self,
+        group_index: usize,
+        group: &OutboundSelectorGroup,
+        settings: &RoutingLeastPingSettings,
+    ) -> Option<OutboundNodeId> {
+        let tolerance_ms = duration_millis(settings.effective_ping_tolerance());
+        let incumbent = self.health_incumbent_node(group_index, group);
+        let mut best: Option<(u64, usize, OutboundNodeId)> = None;
+        let mut incumbent_delay = None;
+        for (member_index, node) in group.members().iter().copied().enumerate() {
+            let Some(health) = self.health_state(node) else {
+                continue;
+            };
+            if OutboundHealthState::from_u8(health.state.load(Ordering::Acquire))
+                != OutboundHealthState::Healthy
+            {
+                continue;
+            }
+            let delay_ms = health.delay_ms.load(Ordering::Acquire);
+            if incumbent == Some(node) {
+                incumbent_delay = Some(delay_ms);
+            }
+            let replace = match best {
+                Some((best_delay, _, _)) => delay_ms < best_delay,
+                None => true,
+            };
+            if replace {
+                best = Some((delay_ms, member_index, node));
+            }
+        }
+        let Some((best_delay, best_member, best_node)) = best else {
+            self.clear_health_incumbent(group_index);
+            return None;
+        };
+        if incumbent_delay
+            .is_some_and(|delay| delay <= best_delay.saturating_add(tolerance_ms))
+        {
+            return incumbent;
+        }
+        self.groups[group_index]
+            .health_incumbent
+            .store(best_member + 1, Ordering::Release);
+        Some(best_node)
     }
 
     fn select_least_load(
         &self,
+        group_index: usize,
         group: &OutboundSelectorGroup,
         settings: &RoutingLeastLoadSettings,
     ) -> Option<OutboundNodeId> {
@@ -2729,6 +2788,8 @@ impl OutboundSelectionOverlay {
                 .then_with(|| left.4.cmp(right.4))
         });
         if candidates.is_empty() {
+            drop(candidates);
+            self.clear_health_incumbent(group_index);
             return None;
         }
 
@@ -2756,11 +2817,105 @@ impl OutboundSelectionOverlay {
             }
         };
         if selected_count == 0 {
+            drop(candidates);
+            self.clear_health_incumbent(group_index);
             return None;
+        }
+        if selected_count == 1 {
+            let best_average = candidates[0].1;
+            let best_node = candidates[0].5;
+            let ranked = candidates
+                .iter()
+                .map(|candidate| (candidate.1, candidate.5))
+                .collect::<Vec<_>>();
+            drop(candidates);
+            return Some(self.pick_single_least_load(
+                group_index,
+                group,
+                settings,
+                best_average,
+                best_node,
+                &ranked,
+            ));
         }
         let selected = rand::thread_rng().gen_range(0..selected_count);
         Some(candidates[selected].5)
     }
+
+    /// Xray's ranking is unchanged. When it yields one outbound, keep the
+    /// incumbent unless the new best average is faster by more than
+    /// `pingTolerance`. Spreading across `expected` > 1 stays random.
+    fn pick_single_least_load(
+        &self,
+        group_index: usize,
+        group: &OutboundSelectorGroup,
+        settings: &RoutingLeastLoadSettings,
+        best_average: u64,
+        best_node: OutboundNodeId,
+        ranked: &[(u64, OutboundNodeId)],
+    ) -> OutboundNodeId {
+        let tolerance_ms = duration_millis(settings.effective_ping_tolerance());
+        let incumbent_average = self
+            .health_incumbent_node(group_index, group)
+            .and_then(|incumbent| {
+                ranked
+                    .iter()
+                    .find(|(_, node)| *node == incumbent)
+                    .map(|(average, _)| (incumbent, *average))
+            });
+        if let Some((incumbent, average)) = incumbent_average {
+            let beaten =
+                best_node != incumbent && average > best_average.saturating_add(tolerance_ms);
+            if !beaten {
+                return incumbent;
+            }
+        }
+        self.remember_health_incumbent(group_index, group, best_node);
+        best_node
+    }
+
+    fn health_incumbent_node(
+        &self,
+        group_index: usize,
+        group: &OutboundSelectorGroup,
+    ) -> Option<OutboundNodeId> {
+        let member_index = self.groups[group_index]
+            .health_incumbent
+            .load(Ordering::Acquire)
+            .checked_sub(1)?;
+        group.members().get(member_index).copied()
+    }
+
+    fn remember_health_incumbent(
+        &self,
+        group_index: usize,
+        group: &OutboundSelectorGroup,
+        node: OutboundNodeId,
+    ) {
+        let Some(member_index) = group.members().iter().position(|member| *member == node) else {
+            return;
+        };
+        self.groups[group_index]
+            .health_incumbent
+            .store(member_index + 1, Ordering::Release);
+    }
+
+    fn clear_health_incumbent(&self, group_index: usize) {
+        self.groups[group_index]
+            .health_incumbent
+            .store(0, Ordering::Release);
+    }
+}
+
+fn strategy_needs_observatory(strategy: &RoutingBalancerStrategy) -> bool {
+    matches!(
+        strategy,
+        RoutingBalancerStrategy::LeastPing(_) | RoutingBalancerStrategy::LeastLoad(_)
+    )
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Owns the lazily compiled handlers and transport resources for one graph.
@@ -8036,9 +8191,9 @@ mod tests {
     }
 
     #[test]
-    fn least_ping_selects_lowest_healthy_delay_with_stable_tag_tiebreak() {
+    fn least_ping_tiebreak_is_tag_order_when_there_is_no_incumbent() {
         let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
-            RoutingBalancerStrategy::LeastPing,
+            RoutingBalancerStrategy::LeastPing(Default::default()),
         ))));
         let proxy_a = graph.node_for_tag("proxy-a").unwrap();
         let proxy_b = graph.node_for_tag("proxy-b").unwrap();
@@ -8047,7 +8202,7 @@ mod tests {
 
         router
             .selection()
-            .record_health_success(proxy_a, Duration::from_millis(40), 1_000);
+            .record_health_success(proxy_a, Duration::from_millis(10), 1_000);
         router
             .selection()
             .record_health_success(proxy_b, Duration::from_millis(10), 1_000);
@@ -8058,19 +8213,179 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert_eq!(selected.tag.as_deref(), Some("proxy-b"));
+        // Members are tag-sorted, so the first minimum is proxy-a when nothing
+        // is incumbent yet.
+        assert_eq!(selected.tag.as_deref(), Some("proxy-a"));
+    }
+
+    fn least_ping_keeps_the_incumbent_within_tolerance() {
+        let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
+            RoutingBalancerStrategy::LeastPing(Default::default()),
+        ))));
+        let proxy_a = graph.node_for_tag("proxy-a").unwrap();
+        let proxy_b = graph.node_for_tag("proxy-b").unwrap();
+        let router = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(graph)));
+        let target = domain_tcp_target("example.test");
+        let select = || {
+            router
+                .select_tcp_outbound_for_session_with_tag(
+                    &segue_config::RouteContext::default(),
+                    &target,
+                    true,
+                )
+                .unwrap()
+                .tag
+        };
 
         router
             .selection()
-            .record_health_success(proxy_a, Duration::from_millis(10), 2_000);
-        let selected = router
+            .record_health_success(proxy_a, Duration::from_millis(100), 1_000);
+        router
+            .selection()
+            .record_health_success(proxy_b, Duration::from_millis(140), 1_000);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+
+        // 40 ms better is inside the default 50 ms tolerance: do not flap.
+        router
+            .selection()
+            .record_health_success(proxy_b, Duration::from_millis(60), 2_000);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+
+        // Strictly more than 50 ms switches, and the new pick becomes incumbent.
+        router
+            .selection()
+            .record_health_success(proxy_b, Duration::from_millis(40), 3_000);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+
+        router
+            .selection()
+            .record_health_success(proxy_a, Duration::from_millis(10), 4_000);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+
+        router
+            .selection()
+            .record_health_failure(proxy_b, OutboundHealthFailure::Timeout, 5_000);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+    }
+
+    fn least_ping_zero_tolerance_switches_on_any_strict_improvement() {
+        let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
+            RoutingBalancerStrategy::LeastPing(RoutingLeastPingSettings {
+                ping_tolerance: Some(Duration::ZERO),
+            }),
+        ))));
+        let proxy_a = graph.node_for_tag("proxy-a").unwrap();
+        let proxy_b = graph.node_for_tag("proxy-b").unwrap();
+        let router = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(graph)));
+        let target = domain_tcp_target("example.test");
+        let select = || {
+            router
+                .select_tcp_outbound_for_session_with_tag(
+                    &segue_config::RouteContext::default(),
+                    &target,
+                    true,
+                )
+                .unwrap()
+                .tag
+        };
+
+        router
+            .selection()
+            .record_health_success(proxy_a, Duration::from_millis(50), 1_000);
+        router
+            .selection()
+            .record_health_success(proxy_b, Duration::from_millis(80), 1_000);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+
+        router
+            .selection()
+            .record_health_success(proxy_b, Duration::from_millis(49), 2_000);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+
+        router
+            .selection()
+            .record_health_success(proxy_a, Duration::from_millis(49), 3_000);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+    }
+
+    fn least_load_keeps_the_single_pick_within_ping_tolerance() {
+        let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
+            RoutingBalancerStrategy::LeastLoad(RoutingLeastLoadSettings::default()),
+        ))));
+        let proxy_a = graph.node_for_tag("proxy-a").unwrap();
+        let proxy_b = graph.node_for_tag("proxy-b").unwrap();
+        let router = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(graph)));
+        let target = domain_tcp_target("example.test");
+        let select = || {
+            router
+                .select_tcp_outbound_for_session_with_tag(
+                    &segue_config::RouteContext::default(),
+                    &target,
+                    true,
+                )
+                .unwrap()
+                .tag
+        };
+        let fill = |node, delay_ms: u64| {
+            for sample in 0..16 {
+                router.selection().record_health_success(
+                    node,
+                    Duration::from_millis(delay_ms),
+                    sample as u64,
+                );
+            }
+        };
+
+        fill(proxy_a, 100);
+        fill(proxy_b, 140);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+
+        fill(proxy_b, 60);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+
+        fill(proxy_b, 40);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+
+        fill(proxy_a, 10);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+    }
+
+    fn health_aware_selection_touches_the_observatory_and_other_strategies_do_not() {
+        let activity = ObservatoryActivity::new();
+        let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
+            RoutingBalancerStrategy::LeastPing(Default::default()),
+        ))));
+        let router = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(graph)));
+        router
+            .selection()
+            .configure_observatory_activity(Arc::clone(&activity));
+        let target = domain_tcp_target("example.test");
+        let _ = router
             .select_tcp_outbound_for_session_with_tag(
                 &segue_config::RouteContext::default(),
                 &target,
                 true,
             )
             .unwrap();
-        assert_eq!(selected.tag.as_deref(), Some("proxy-a"));
+        assert_eq!(activity.generation(), 1);
+
+        let random = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(Arc::new(
+            OutboundGraph::new(Arc::new(selector_group_config(
+                RoutingBalancerStrategy::Random,
+            ))),
+        ))));
+        random
+            .selection()
+            .configure_observatory_activity(Arc::clone(&activity));
+        let _ = random
+            .select_tcp_outbound_for_session_with_tag(
+                &segue_config::RouteContext::default(),
+                &target,
+                true,
+            )
+            .unwrap();
+        assert_eq!(activity.generation(), 1);
     }
 
     #[test]
@@ -8467,7 +8782,7 @@ mod tests {
         [
             RoutingBalancerStrategy::Random,
             RoutingBalancerStrategy::RoundRobin,
-            RoutingBalancerStrategy::LeastPing,
+            RoutingBalancerStrategy::LeastPing(Default::default()),
             RoutingBalancerStrategy::LeastLoad(RoutingLeastLoadSettings::default()),
         ]
     }
@@ -8491,7 +8806,7 @@ mod tests {
         // Both always read the observatory, and with no healthy member their
         // empty pick sends Xray-core's dispatcher to the default handler.
         for strategy in [
-            RoutingBalancerStrategy::LeastPing,
+            RoutingBalancerStrategy::LeastPing(Default::default()),
             RoutingBalancerStrategy::LeastLoad(RoutingLeastLoadSettings::default()),
         ] {
             let tag = tag_with_every_member_unhealthy(strategy.clone(), None);

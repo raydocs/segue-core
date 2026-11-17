@@ -6,14 +6,15 @@ use crate::surface;
 use crate::{
     DomainMatcher, DomainNameMode, Network, RoutingAttributes, RoutingBalancer,
     RoutingBalancerStrategy, RoutingConfig, RoutingDomainStrategy, RoutingLeastLoadCost,
-    RoutingLeastLoadSettings, RoutingOrigin, RoutingPortRange, RoutingRule, RoutingRuleTarget,
-    RoutingUsers,
+    RoutingLeastLoadSettings, RoutingLeastPingSettings, RoutingOrigin, RoutingPortRange,
+    RoutingRule, RoutingRuleTarget, RoutingUsers,
 };
 use segue_routing::srs::{self, FlatRule, SrsPortRange};
 use segue_routing::{Cidr, DomainMatcherSet, IpMatcherSet, RegexMatcher};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 const MAX_ROUTING_BALANCERS: usize = 256;
 const MAX_ROUTING_BALANCER_SELECTORS: usize = 4_096;
@@ -212,13 +213,18 @@ impl Parser<'_> {
                 .parse_least_load_settings(strategy.get("settings"), &strategy_path)
                 .map(RoutingBalancerStrategy::LeastLoad);
         }
+        if kind.eq_ignore_ascii_case("leastping") {
+            return self
+                .parse_least_ping_settings(strategy.get("settings"), &strategy_path)
+                .map(RoutingBalancerStrategy::LeastPing);
+        }
         if let Some(settings) = strategy.get("settings") {
             match settings {
                 Value::Null => {}
                 Value::Object(settings) if settings.is_empty() => {}
                 _ => self.error(
                     format!("{strategy_path}.settings"),
-                    "routing balancer strategy settings are only supported for leastLoad",
+                    "routing balancer strategy settings are only supported for leastPing and leastLoad",
                 ),
             }
         }
@@ -226,14 +232,66 @@ impl Parser<'_> {
             Some(RoutingBalancerStrategy::Random)
         } else if kind.eq_ignore_ascii_case("roundrobin") {
             Some(RoutingBalancerStrategy::RoundRobin)
-        } else if kind.eq_ignore_ascii_case("leastping") {
-            Some(RoutingBalancerStrategy::LeastPing)
         } else {
             self.error(
                 format!("{strategy_path}.type"),
                 format!("unsupported routing balancer strategy `{kind}`"),
             );
             None
+        }
+    }
+
+    fn parse_least_ping_settings(
+        &mut self,
+        raw_settings: Option<&Value>,
+        strategy_path: &str,
+    ) -> Option<RoutingLeastPingSettings> {
+        let settings_path = format!("{strategy_path}.settings");
+        match raw_settings {
+            None | Some(Value::Null) => return Some(RoutingLeastPingSettings::default()),
+            Some(Value::Object(settings)) if settings.is_empty() => {
+                return Some(RoutingLeastPingSettings::default());
+            }
+            Some(settings_value @ Value::Object(_)) => {
+                self.reject_unknown_fields(settings_value, &settings_path, &surface::LEAST_PING);
+            }
+            Some(_) => {
+                self.error(
+                    &settings_path,
+                    "leastPing settings must be an object or null",
+                );
+                return None;
+            }
+        };
+        let settings = raw_settings
+            .and_then(Value::as_object)
+            .expect("leastPing settings were validated as an object");
+        Some(RoutingLeastPingSettings {
+            ping_tolerance: self
+                .parse_ping_tolerance(settings.get("pingTolerance"), &settings_path)?,
+        })
+    }
+
+    fn parse_ping_tolerance(
+        &mut self,
+        raw: Option<&Value>,
+        settings_path: &str,
+    ) -> Option<Option<Duration>> {
+        let path = format!("{settings_path}.pingTolerance");
+        match raw {
+            None | Some(Value::Null) => Some(None),
+            Some(Value::String(value)) if value.is_empty() => Some(None),
+            Some(Value::String(value)) => match parse_xray_duration(value) {
+                Some(duration) if !duration.is_zero() => Some(Some(duration)),
+                _ => {
+                    self.error(path, "pingTolerance must be a positive duration");
+                    None
+                }
+            },
+            Some(_) => {
+                self.error(path, "pingTolerance must be a duration string or null");
+                None
+            }
         }
     }
 
@@ -320,6 +378,8 @@ impl Parser<'_> {
         let costs = self.parse_least_load_costs(settings.get("costs"), &settings_path)?;
 
         Some(RoutingLeastLoadSettings {
+            ping_tolerance: self
+                .parse_ping_tolerance(settings.get("pingTolerance"), &settings_path)?,
             expected,
             max_rtt,
             tolerance_millionths,
