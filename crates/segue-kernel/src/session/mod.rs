@@ -10,7 +10,11 @@
 //! outbound and a relay. The exit choice is `Auto` (first exit in config
 //! order whose carrier is up or not recently failed) or one named exit; a
 //! session stays on the exit it was opened on (its state lives in that
-//! relay), so a change applies to new sessions.
+//! relay), so a change applies to new sessions. An AI-class session
+//! (`exit_class` [`EXIT_AI`]) does not follow that failover: under Auto it
+//! pins one exit and may move only to another exit in the same
+//! [`Exit::group`]. A named choice is the pin. If that exit (and its group)
+//! is down the dial is refused, not sent to a different egress.
 //!
 //! The app gets success only after the relay answered OPENED, which it does
 //! only once the site connect worked: a refused session (exit_denied,
@@ -102,6 +106,22 @@ pub struct Exit {
     pub relay: SocketAddr,
     /// Node id sent as `anchor_node_id`.
     pub node_id: u64,
+    /// Exits that share an egress identity. Empty means this exit is its
+    /// own group ([`Exit::group`]): an AI flow pinned here never moves to
+    /// another exit.
+    pub egress_group: String,
+}
+
+impl Exit {
+    /// The egress identity AI flows may move inside. Absent in config
+    /// (empty here) means the exit's own name.
+    pub fn group(&self) -> &str {
+        if self.egress_group.is_empty() {
+            &self.name
+        } else {
+            &self.egress_group
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -209,8 +229,13 @@ struct State {
     choice: Option<usize>,
     /// Bumped whenever the user changes `choice` (r11 R5): a fresh
     /// session pinned to the exit of an earlier attempt keeps the pin
-    /// only while this is unchanged.
+    /// only while this is unchanged. The AI pin is updated in the same
+    /// assignment: a named exit becomes the pin, Auto clears it so the
+    /// next AI flow pins whatever Auto selects then.
     choice_gen: u64,
+    /// Exit index the AI class is stuck to under Auto. `None` until the
+    /// first AI flow, and after the user switches back to Auto.
+    ai_pin: Option<usize>,
     health: Vec<Health>,
 }
 
@@ -233,6 +258,44 @@ impl State {
         (0..self.health.len())
             .min_by_key(|&i| self.health[i].last_fail)
             .unwrap_or(0)
+    }
+
+    /// Exit for an AI-class session.
+    ///
+    /// A named choice is that exit, even when it is down (the caller then
+    /// refuses; this does not shop for another). Under Auto the first call
+    /// pins [`Self::pick`]'s exit and later calls stay there. A down pin may
+    /// move only to an exit whose [`Exit::group`] is the same and that is
+    /// up. If none is, the pin is returned unchanged so the strict verdict
+    /// refuses on it instead of opening on a different egress.
+    fn pick_ai(&mut self, groups: &[String]) -> usize {
+        if let Some(i) = self.choice {
+            self.ai_pin = Some(i);
+            return i;
+        }
+        if let Some(i) = self.ai_pin {
+            if self.ai_up(i) {
+                return i;
+            }
+            let group = groups.get(i).map(String::as_str).unwrap_or("");
+            let moved = (0..self.health.len()).find(|&j| {
+                j != i && groups.get(j).map(String::as_str) == Some(group) && self.ai_up(j)
+            });
+            if let Some(j) = moved {
+                self.ai_pin = Some(j);
+                return j;
+            }
+            return i;
+        }
+        let i = self.pick();
+        self.ai_pin = Some(i);
+        i
+    }
+
+    /// Connected, and not waiting on a session answer that never came.
+    fn ai_up(&self, i: usize) -> bool {
+        let h = &self.health[i];
+        h.ks.posture() == Posture::Connected && !h.unproven
     }
 
     fn posture(&self) -> Posture {
@@ -338,6 +401,7 @@ impl KernelDialer {
                 revoked: None,
                 choice: None,
                 choice_gen: 0,
+                ai_pin: None,
                 health,
             })),
             off: watch::channel(false).0,
@@ -502,7 +566,22 @@ impl KernelDialer {
         if st.choice != choice {
             st.choice = choice;
             st.choice_gen += 1;
+            // The user changed exit. Named: AI follows that exit now.
+            // Auto: drop the pin; the next AI flow pins the exit Auto
+            // is on at that moment, and sticks to its egress group.
+            st.ai_pin = choice;
         }
+        Ok(())
+    }
+
+    /// Lab / tests: put `name` in `group` (AI may move to other exits in it).
+    pub(crate) fn set_egress_group(&mut self, name: &str, group: &str) -> Result<(), DialError> {
+        let exit = self
+            .exits
+            .iter_mut()
+            .find(|e| e.name == name)
+            .ok_or_else(|| DialError(format!("unknown exit {name:?}")))?;
+        exit.egress_group = group.to_string();
         Ok(())
     }
 
@@ -661,8 +740,9 @@ impl KernelDialer {
         pin: Option<(usize, u64)>,
         exit: &mut Option<(usize, u64)>,
     ) -> Result<crate::dial::Stream, (DialError, Option<u8>)> {
+        let groups: Vec<String> = self.exits.iter().map(|e| e.group().to_string()).collect();
         let i = {
-            let st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap();
             if st.user_off {
                 return Err((DialError("refused: disconnected".into()), None));
             }
@@ -672,13 +752,24 @@ impl KernelDialer {
                     Some(c),
                 ));
             }
-            if self.exits.is_empty() {
+            if groups.is_empty() {
                 return Err((DialError("refused: no exits configured".into()), None));
             }
             // A pin from an UNKNOWN_SESSION answer (see `open`) is void
             // once the user picked another exit.
             let pinned = pin.filter(|&(_, g)| g == st.choice_gen).map(|(i, _)| i);
-            let i = pinned.unwrap_or_else(|| st.pick());
+            let i = if r.exit_class == EXIT_AI {
+                if let Some(i) = pinned {
+                    // The fresh OPEN stays on the exit that answered.
+                    // Re-picking would move an AI flow to another egress.
+                    st.ai_pin = Some(i);
+                    i
+                } else {
+                    st.pick_ai(&groups)
+                }
+            } else {
+                pinned.unwrap_or_else(|| st.pick())
+            };
             *exit = Some((i, st.choice_gen));
             let h = &st.health[i];
             // Posture decides. Protection comes from the route's exit class,

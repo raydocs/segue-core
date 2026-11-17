@@ -370,6 +370,7 @@ mod tests {
                 carrier: format!("c-{n}"),
                 relay: "127.0.0.1:7443".parse().unwrap(),
                 node_id: i as u64 + 1,
+                egress_group: String::new(),
             })
             .collect();
         let routes = [(

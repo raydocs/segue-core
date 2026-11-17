@@ -2643,6 +2643,7 @@ async fn tun_session_flow_moves_both_ways_with_the_elastic_pool_spent() {
             carrier: "relay".into(),
             relay: "127.0.0.1:7443".parse().unwrap(),
             node_id: 1,
+            egress_group: String::new(),
         }],
         [(
             "p1".to_string(),
@@ -2893,6 +2894,7 @@ async fn slow_carriers_and_a_healthy_tun_flow_share_the_pool() {
             carrier: "relay".into(),
             relay: "127.0.0.1:7443".parse().unwrap(),
             node_id: 1,
+            egress_group: String::new(),
         }],
         [(
             "p1".to_string(),
@@ -3126,6 +3128,7 @@ async fn tun_and_session_flows_over_a_loopback_tcp_carrier_with_pool_and_rss() {
                 carrier: "relay".into(),
                 relay: relay_addr,
                 node_id: 1,
+                egress_group: String::new(),
             }],
             [(
                 "p1".to_string(),
@@ -3499,6 +3502,7 @@ async fn slow_tcp_carriers_full_pool_and_a_healthy_tun_flow_over_loopback() {
             carrier: "relay".into(),
             relay: relay_addr,
             node_id: 1,
+            egress_group: String::new(),
         }],
         [(
             "p1".to_string(),
