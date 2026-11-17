@@ -8296,7 +8296,13 @@ mod tests {
         let endpoint = IpEndpoint::new(IpAddress::Ipv4(Ipv4Addr::new(203, 0, 113, 7)), 443);
         let mut sockets = SocketSet::new(Vec::new());
         let mut listeners = HashMap::new();
-        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
+        add_tcp_listener(
+            &mut sockets,
+            &mut listeners,
+            endpoint,
+            1500,
+            TCP_BUFFER_SIZE,
+        );
         let socket = sockets.get::<tcp::Socket>(listeners.get(&endpoint).unwrap().handle);
         // The tunnels' stacks turn these on for a lossy path; the host's
         // own link keeps what it had.
@@ -8321,7 +8327,13 @@ mod tests {
         iface.set_any_ip(true);
         let mut sockets = SocketSet::new(Vec::new());
         let mut listeners = HashMap::new();
-        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
+        add_tcp_listener(
+            &mut sockets,
+            &mut listeners,
+            endpoint,
+            1500,
+            TCP_BUFFER_SIZE,
+        );
         let handle = listeners.get(&endpoint).unwrap().handle;
         let packet = |seq: u32, ack: u32, flags: u8, data: &[u8]| {
             Bytes::from(build_ipv4_tcp_packet(
@@ -8411,7 +8423,13 @@ mod tests {
         iface.set_any_ip(true);
         let mut sockets = SocketSet::new(Vec::new());
         let mut listeners = HashMap::new();
-        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
+        add_tcp_listener(
+            &mut sockets,
+            &mut listeners,
+            endpoint,
+            1500,
+            TCP_BUFFER_SIZE,
+        );
         let handle = listeners.get(&endpoint).unwrap().handle;
 
         device.push_inbound(Bytes::from(build_ipv4_tcp_packet(
@@ -8934,7 +8952,13 @@ mod tests {
         iface.set_any_ip(true);
         let mut sockets = SocketSet::new(Vec::new());
         let mut listeners = HashMap::new();
-        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
+        add_tcp_listener(
+            &mut sockets,
+            &mut listeners,
+            endpoint,
+            1500,
+            TCP_BUFFER_SIZE,
+        );
         let handle = listeners.get(&endpoint).unwrap().handle;
 
         device.push_inbound(Bytes::from(build_ipv4_tcp_packet(
@@ -9048,7 +9072,13 @@ mod tests {
         iface.set_any_ip(true);
         let mut sockets = SocketSet::new(Vec::new());
         let mut listeners = HashMap::new();
-        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
+        add_tcp_listener(
+            &mut sockets,
+            &mut listeners,
+            endpoint,
+            1500,
+            TCP_BUFFER_SIZE,
+        );
         let handle = listeners.get(&endpoint).unwrap().handle;
 
         device.push_inbound(Bytes::from(build_ipv4_tcp_packet(
@@ -9162,7 +9192,13 @@ mod tests {
             iface.set_any_ip(true);
             let mut sockets = SocketSet::new(Vec::new());
             let mut listeners = HashMap::new();
-            add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500, TCP_BUFFER_SIZE);
+            add_tcp_listener(
+                &mut sockets,
+                &mut listeners,
+                endpoint,
+                1500,
+                TCP_BUFFER_SIZE,
+            );
             let handle = listeners.get(&endpoint).unwrap().handle;
 
             let (to_remote, _from_stack) = mpsc::channel(1);
@@ -10003,8 +10039,7 @@ mod tests {
         for mtu in crate::TunMtu::MIN..=crate::TunMtu::MAX {
             let mtu = mtu as usize;
             assert!(
-                tcp_rx_buffer_size(mtu, TCP_MAX_RECEIVE_BUFFER_SIZE)
-                    >= TCP_MAX_RECEIVE_BUFFER_SIZE
+                tcp_rx_buffer_size(mtu, TCP_MAX_RECEIVE_BUFFER_SIZE) >= TCP_MAX_RECEIVE_BUFFER_SIZE
             );
         }
     }
@@ -10064,10 +10099,17 @@ mod tests {
             (TunRuntimeProfile::Mobile, TCP_BUFFER_SIZE, 0),
             (TunRuntimeProfile::LowMemory, TCP_BUFFER_SIZE, 0),
             (TunRuntimeProfile::Desktop, TCP_MAX_RECEIVE_BUFFER_SIZE, 3),
-            (TunRuntimeProfile::Throughput, TCP_MAX_RECEIVE_BUFFER_SIZE, 3),
+            (
+                TunRuntimeProfile::Throughput,
+                TCP_MAX_RECEIVE_BUFFER_SIZE,
+                3,
+            ),
         ] {
             let policy = tun_runtime_policy_for_options(TunRuntimeOptions::with_profile(profile));
-            assert_eq!(policy.flows.tcp_receive_buffer_size, expected_ring, "{profile:?}");
+            assert_eq!(
+                policy.flows.tcp_receive_buffer_size, expected_ring,
+                "{profile:?}"
+            );
 
             let server_ip = Ipv4Addr::new(203, 0, 113, 7);
             let endpoint = IpEndpoint::new(IpAddress::Ipv4(server_ip), 443);

@@ -882,10 +882,7 @@ mod platform {
 
         /// Reads one packet, returning `None` for a read that carries no
         /// payload once the format header is stripped.
-        async fn read_packet<T: AsRawFd>(
-            &mut self,
-            fd: &AsyncFd<T>,
-        ) -> io::Result<Option<Bytes>> {
+        async fn read_packet<T: AsRawFd>(&mut self, fd: &AsyncFd<T>) -> io::Result<Option<Bytes>> {
             loop {
                 // A packet is split off whole, so the arena is always empty
                 // here and its capacity is what is left of the allocation.
@@ -959,7 +956,10 @@ mod platform {
         ) -> io::Result<usize> {
             let single_read = self.single_read;
             let header_len = self.header_len;
-            let batch = self.batch.as_mut().expect("batching reader has batch state");
+            let batch = self
+                .batch
+                .as_mut()
+                .expect("batching reader has batch state");
             loop {
                 let requested = batch.size.min(batch.max).max(1);
                 // One arena per batch, as on the single-packet path: carving
@@ -1054,13 +1054,7 @@ mod platform {
                 // `single_read` bytes, so that prefix of the spare capacity is
                 // initialised.
                 unsafe { batch.arena.advance_mut(received * single_read) };
-                carve_batch(
-                    &mut batch.arena,
-                    &batch.slots,
-                    single_read,
-                    header_len,
-                    out,
-                );
+                carve_batch(&mut batch.arena, &batch.slots, single_read, header_len, out);
                 batch.size = next_batch_size(requested, received, batch.max);
                 return Ok(received);
             }

@@ -10,7 +10,7 @@
 //! Only the read direction is declared. `sendmsg_x` is deliberately absent:
 //! write batching is a separate change.
 
-use libc::{c_int, c_uint, c_void, iovec, size_t, ssize_t, socklen_t};
+use libc::{c_int, c_uint, c_void, iovec, size_t, socklen_t, ssize_t};
 
 /// `MSG_DONTWAIT` from `bsd/sys/socket.h` (0x80 on Darwin). Declared here
 /// rather than taken from `libc` so the value the syscall sees is the one this
@@ -72,10 +72,5 @@ extern "C" {
     /// many slots it filled. It walks every submitted slot whether or not a
     /// packet is pending for it, so `cnt` must be the batch size, not the
     /// number of packets believed to be queued.
-    pub(super) fn recvmsg_x(
-        fd: c_int,
-        msgp: *mut MsgHdrX,
-        cnt: c_uint,
-        flags: c_int,
-    ) -> ssize_t;
+    pub(super) fn recvmsg_x(fd: c_int, msgp: *mut MsgHdrX, cnt: c_uint, flags: c_int) -> ssize_t;
 }

@@ -505,7 +505,12 @@ mod tests {
 
         // The first pass is below the trigger and sheds nothing; the second
         // closes the oldest connection only, because the pass is capped.
-        state.tick(options, 10 * MIB, registry.as_ref(), &RuntimeLogger::disabled());
+        state.tick(
+            options,
+            10 * MIB,
+            registry.as_ref(),
+            &RuntimeLogger::disabled(),
+        );
         state.tick(
             options,
             options.trigger_bytes(),
@@ -540,30 +545,84 @@ mod tests {
         let lookahead = Duration::from_secs(1);
         let elapsed = Duration::from_secs(1);
         // 1 MiB in 1 s with 2 MiB of headroom reaches the limit in 2 s.
-        assert!(!growth_projects_limit(48 * MIB, 47 * MIB, elapsed, LIMIT, lookahead));
+        assert!(!growth_projects_limit(
+            48 * MIB,
+            47 * MIB,
+            elapsed,
+            LIMIT,
+            lookahead
+        ));
         // 4 MiB in 1 s with 2 MiB of headroom reaches it in 0.5 s.
-        assert!(growth_projects_limit(48 * MIB, 44 * MIB, elapsed, LIMIT, lookahead));
+        assert!(growth_projects_limit(
+            48 * MIB,
+            44 * MIB,
+            elapsed,
+            LIMIT,
+            lookahead
+        ));
     }
 
     #[test]
     fn growth_projection_ignores_flat_shrinking_and_over_limit_samples() {
         let lookahead = Duration::from_secs(1);
         let elapsed = Duration::from_secs(1);
-        assert!(!growth_projects_limit(40 * MIB, 40 * MIB, elapsed, LIMIT, lookahead));
-        assert!(!growth_projects_limit(40 * MIB, 45 * MIB, elapsed, LIMIT, lookahead));
-        assert!(!growth_projects_limit(51 * MIB, 40 * MIB, elapsed, LIMIT, lookahead));
-        assert!(!growth_projects_limit(40 * MIB, 30 * MIB, Duration::ZERO, LIMIT, lookahead));
-        assert!(!growth_projects_limit(40 * MIB, 30 * MIB, elapsed, LIMIT, Duration::ZERO));
+        assert!(!growth_projects_limit(
+            40 * MIB,
+            40 * MIB,
+            elapsed,
+            LIMIT,
+            lookahead
+        ));
+        assert!(!growth_projects_limit(
+            40 * MIB,
+            45 * MIB,
+            elapsed,
+            LIMIT,
+            lookahead
+        ));
+        assert!(!growth_projects_limit(
+            51 * MIB,
+            40 * MIB,
+            elapsed,
+            LIMIT,
+            lookahead
+        ));
+        assert!(!growth_projects_limit(
+            40 * MIB,
+            30 * MIB,
+            Duration::ZERO,
+            LIMIT,
+            lookahead
+        ));
+        assert!(!growth_projects_limit(
+            40 * MIB,
+            30 * MIB,
+            elapsed,
+            LIMIT,
+            Duration::ZERO
+        ));
     }
 
     #[test]
     fn growth_projection_is_exact_at_the_lookahead_boundary() {
         let lookahead = Duration::from_secs(1);
         // 1 MiB of headroom at 1 MiB/s is exactly the 1 s lookahead: not yet.
-        assert!(!growth_projects_limit(49 * MIB, 48 * MIB, lookahead, LIMIT, lookahead));
+        assert!(!growth_projects_limit(
+            49 * MIB,
+            48 * MIB,
+            lookahead,
+            LIMIT,
+            lookahead
+        ));
         // A nanosecond faster is.
         let faster = lookahead - Duration::from_nanos(1);
-        assert!(growth_projects_limit(49 * MIB, 48 * MIB, faster, LIMIT, lookahead));
+        assert!(growth_projects_limit(
+            49 * MIB,
+            48 * MIB,
+            faster,
+            LIMIT,
+            lookahead
+        ));
     }
 
     #[test]
@@ -603,12 +662,7 @@ mod tests {
         );
         assert!(without.is_none());
 
-        let zero = spawn_memory_watchdog(
-            registry,
-            Some(0),
-            RuntimeLogger::disabled(),
-            shutdown_rx,
-        );
+        let zero = spawn_memory_watchdog(registry, Some(0), RuntimeLogger::disabled(), shutdown_rx);
         assert!(zero.is_none());
     }
 }
