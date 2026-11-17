@@ -10,5 +10,6 @@
   the mux/Shadowsocks/Trojan/VMess reference alone) to
   `tests/support/xray_startup.rs`, used by the local Xray interop suite (main
   server/client, MASQUE, reverse portal, direct UDP masks, XDRIVE), the SOCKS
-  and HTTP runtimes, live REALITY, and the MASQUE TUN runtime. Upstream commits
-  `f33a50b0`, `b68f0254`.
+  and HTTP runtimes, live REALITY, the MASQUE TUN runtime, and the
+  mux/Shadowsocks/Trojan/VMess reference that upstream's fix covered. Upstream
+  commits `f33a50b0`, `b68f0254`.
