@@ -442,7 +442,10 @@ impl DnsResolver for FixedDns {
         _domain: &str,
         _port: u16,
     ) -> Result<segue_transport::DnsLookup, TransportError> {
-        Ok(segue_transport::DnsLookup::new(self.0.iter().copied(), None))
+        Ok(segue_transport::DnsLookup::new(
+            self.0.iter().copied(),
+            None,
+        ))
     }
 }
 

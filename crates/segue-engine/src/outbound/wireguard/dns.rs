@@ -117,10 +117,10 @@ pub(crate) fn resolver(flows: TunnelFlows, servers: &[IpAddr]) -> Arc<dyn DnsRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use segue_transport::DnsQueryStrategy;
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use segue_transport::DnsQueryStrategy;
 
     fn udp_v4(src: (Ipv4Address, u16), dst: (Ipv4Address, u16), payload: &[u8]) -> bytes::Bytes {
         let udp = UdpRepr {
