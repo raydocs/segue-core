@@ -45,7 +45,7 @@ fn address_encodings_cover_domains_ips_and_the_fragment_sentinel() {
     ] {
         let (decoded, consumed) = decode(&encode(&Command::Connect(address.clone())).unwrap()).unwrap();
         assert_eq!(decoded, Command::Connect(address));
-        assert_eq!(consumed, encode(&Command::Connect(decoded)).unwrap().len());
+        assert_eq!(consumed, encode(&decoded).unwrap().len());
     }
     assert_eq!(decode(&[5, 1, 0xff, 0]).unwrap_err(), WireError::Address);
     let target = Target::new(TargetAddr::Ip("2001:db8::1".parse().unwrap()), 443, Network::Udp);

@@ -268,11 +268,15 @@ impl Reader<'_> {
             return Ok(None);
         }
         let host = match kind {
-            0 => WireAddress::Domain(
-                std::str::from_utf8(&self.take(self.byte()?.into())?)
-                    .map_err(|_| WireError::Address)?
-                    .to_owned(),
-            ),
+            0 => {
+                let length = usize::from(self.byte()?);
+                let name = self.take(length)?;
+                WireAddress::Domain(
+                    std::str::from_utf8(&name)
+                        .map_err(|_| WireError::Address)?
+                        .to_owned(),
+                )
+            }
             1 => WireAddress::V4(Ipv4Addr::from(self.array::<4>()?)),
             2 => WireAddress::V6(Ipv6Addr::from(self.array::<16>()?)),
             _ => return Err(WireError::Address),
