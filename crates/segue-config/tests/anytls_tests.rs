@@ -13,12 +13,7 @@ fn settings_of(config: &Value) -> AnyTlsOutboundSettings {
     // Own the settings. A reference would borrow `parsed`, which dies with this
     // function, and the callers pass a temporary profile.
     let parsed = parse_xray_json(&config.to_string()).unwrap();
-    let outbound = parsed
-        .config
-        .outbounds
-        .into_iter()
-        .next()
-        .expect("outbound");
+    let outbound = parsed.config.outbounds.into_iter().next().expect("outbound");
     let OutboundSettings::AnyTls(settings) = outbound.settings else {
         panic!("AnyTLS")
     };
