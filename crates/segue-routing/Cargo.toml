@@ -11,5 +11,6 @@ description = "Routing matchers and policy evaluation for xray-rust"
 [dependencies]
 aho-corasick.workspace = true
 bytes.workspace = true
+flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
 regex.workspace = true
 thiserror.workspace = true

@@ -6,6 +6,7 @@ pub mod domain_matcher;
 pub mod domain_matcher_set;
 pub mod ip_filter;
 pub mod ip_range_set;
+pub mod srs;
 
 pub use domain_host_index::{DnsHostTarget, DomainHostIndex};
 pub use domain_matcher::{DomainMatcher, DomainNameMode, DomainRegexError, RegexMatcher};
