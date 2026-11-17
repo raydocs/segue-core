@@ -32,12 +32,12 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
     for (index, proxy) in array(root.get("proxies")).iter().enumerate() {
         let path = format!("proxies[{index}]");
         let Some(map) = proxy.as_object() else {
-            ctx.warn(&path, "proxy entry is not a mapping and was dropped");
+            ctx.warn(path.as_str(), "proxy entry is not a mapping and was dropped");
             continue;
         };
         let name = string(map, "name").unwrap_or_default().to_owned();
         if name.is_empty() {
-            ctx.warn(&path, "proxy without a name was dropped");
+            ctx.warn(path.as_str(), "proxy without a name was dropped");
             continue;
         }
         if tags.contains(&name) {
@@ -72,12 +72,12 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
     for (index, group) in array(root.get("proxy-groups")).iter().enumerate() {
         let path = format!("proxy-groups[{index}]");
         let Some(map) = group.as_object() else {
-            ctx.warn(&path, "proxy group is not a mapping and was dropped");
+            ctx.warn(path.as_str(), "proxy group is not a mapping and was dropped");
             continue;
         };
         let name = string(map, "name").unwrap_or_default().to_owned();
         if name.is_empty() {
-            ctx.warn(&path, "proxy group without a name was dropped");
+            ctx.warn(path.as_str(), "proxy group without a name was dropped");
             continue;
         }
         if group_tags.contains(&name) {
@@ -198,7 +198,7 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
     for (index, raw) in array(root.get("rules")).iter().enumerate() {
         let path = format!("rules[{index}]");
         let Some(text) = raw.as_str() else {
-            ctx.warn(&path, "rule is not a string and was dropped");
+            ctx.warn(path.as_str(), "rule is not a string and was dropped");
             continue;
         };
         match convert_rule(
@@ -884,6 +884,7 @@ fn hysteria2_outbound(
     let mut tls = tls_object(
         sni.as_deref(),
         &["h3".to_owned()],
+        // Hysteria uses stock QUIC TLS; the parser refuses a fingerprint.
         None,
         boolean(map, "skip-cert-verify"),
         ctx,

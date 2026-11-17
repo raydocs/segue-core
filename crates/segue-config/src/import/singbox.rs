@@ -27,7 +27,7 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
     for (index, entry) in array(root.get("outbounds")).iter().enumerate() {
         let path = format!("outbounds[{index}]");
         let Some(map) = entry.as_object() else {
-            ctx.warn(&path, "outbound is not an object and was dropped");
+            ctx.warn(path.as_str(), "outbound is not an object and was dropped");
             continue;
         };
         // Selector and urltest outbounds become balancers below.
@@ -39,7 +39,7 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
         }
         let tag = string(map, "tag").unwrap_or_default().to_owned();
         if tag.is_empty() {
-            ctx.warn(&path, "outbound without a tag was dropped");
+            ctx.warn(path.as_str(), "outbound without a tag was dropped");
             continue;
         }
         if tags.contains(&tag) {
@@ -202,7 +202,7 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
         for (index, entry) in array(route.get("rules")).iter().enumerate() {
             let path = format!("route.rules[{index}]");
             let Some(map) = entry.as_object() else {
-                ctx.warn(&path, "rule is not an object and was dropped");
+                ctx.warn(path.as_str(), "rule is not an object and was dropped");
                 continue;
             };
             match convert_rule(map, &path, &tags, &group_tags, &rule_sets, ctx) {
@@ -532,7 +532,7 @@ fn convert_dns(dns: Option<&Value>, ctx: &mut Ctx) -> Option<Value> {
     for (index, entry) in array(dns.get("servers")).iter().enumerate() {
         let path = format!("dns.servers[{index}]");
         let Some(map) = entry.as_object() else {
-            ctx.warn(&path, "DNS server is not an object and was dropped");
+            ctx.warn(path.as_str(), "DNS server is not an object and was dropped");
             continue;
         };
         let kind = string(map, "type").unwrap_or_default();
@@ -930,9 +930,13 @@ fn hysteria2_outbound(
         ctx.warn(format!("{path}.password"), "missing password");
         return None;
     };
-    let mut tls = security_of(map, path, ctx).unwrap_or_else(|| json!({"kind": "tls"}));
+    let mut tls = security_of(map, path, ctx).unwrap_or_else(|| json!({}));
     tls["kind"] = json!("tls");
     tls["alpn"] = json!(["h3"]);
+    // Hysteria uses stock QUIC TLS; the parser refuses a shaping fingerprint.
+    if let Some(tls) = tls.as_object_mut() {
+        tls.remove("fingerprint");
+    }
 
     let mut udp_masks: Vec<Value> = Vec::new();
     if let Some(obfs) = object(map, "obfs") {
