@@ -113,6 +113,8 @@ pub(super) fn http_config(
                 ech_config_list: tls.ech_config_list.clone(),
             }
         }
+        // ShadowTLS cannot carry the service's independent URL destinations.
+        StreamSecurity::ShadowTls(_) => return Err(CoreError::UnsupportedOutboundSecurity),
         // The parser refuses REALITY under XDRIVE, as Xray-core does.
         StreamSecurity::None | StreamSecurity::Reality(_) => TlsClientConfig {
             server_name: String::new(),

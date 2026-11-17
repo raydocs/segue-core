@@ -50,6 +50,7 @@ pub mod reality_runtime;
 mod reality_rustls;
 mod reality_spider;
 mod route_probe;
+mod shadowtls;
 mod socket_options;
 pub mod stream;
 mod system_records;
@@ -79,6 +80,7 @@ pub use reality_runtime::{
 pub use reality_rustls::extract_server_hello_for_fuzzing;
 pub use reality_rustls::RustlsRealityTlsSessionProvider;
 pub use route_probe::{RouteFamilies, RouteProbe, SystemRouteProbe};
+pub use shadowtls::ShadowTlsConfig;
 pub use socket_options::{
     CustomSocketOption, SocketOptions, SocketOptionsProtector, SocketOptionsReport,
     DEFAULT_TCP_KEEPALIVE_SECS,
@@ -92,6 +94,7 @@ pub enum ConnectorConfig {
     Tcp,
     Tls(TlsClientConfig),
     Reality(RealityClientConfig),
+    ShadowTls(ShadowTlsConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +227,8 @@ pub enum TransportError {
     Http2Connect(#[from] stream::Http2ConnectError),
     #[error("reality handshake failed: {0}")]
     Reality(#[from] reality::RealityError),
+    #[error("ShadowTLS transport error: {0}")]
+    ShadowTls(String),
     #[error("REALITY live TLS completion is not implemented")]
     RealityTlsCompletionUnsupported,
 }
@@ -586,8 +591,8 @@ impl TransportConnector for TcpConnector {
             ConnectorConfig::Tls(_) => {
                 return Err(TransportError::UnsupportedConnectorConfig("tls"));
             }
-            ConnectorConfig::Reality(_) => {
-                return Err(TransportError::UnsupportedConnectorConfig("reality"));
+            ConnectorConfig::Reality(_) | ConnectorConfig::ShadowTls(_) => {
+                return Err(TransportError::UnsupportedConnectorConfig("security"));
             }
         }
 

@@ -103,7 +103,7 @@ impl UtlsClientHelloCustomizer {
 /// - XHTTP/2 calls the ordinary `HandshakeContext`, so a shaped profile keeps
 ///   its own ALPN rather than being rewritten to gRPC's `h2`-only offer.
 ///
-fn alpn_override_for(alpn: &[String], policy: TlsAlpnPolicy) -> Option<Vec<Vec<u8>>> {
+pub(crate) fn alpn_override_for(alpn: &[String], policy: TlsAlpnPolicy) -> Option<Vec<Vec<u8>>> {
     match policy {
         TlsAlpnPolicy::Raw => match alpn {
             [only] if only == ALPN_HTTP11 => Some(vec![ALPN_HTTP11.as_bytes().to_vec()]),

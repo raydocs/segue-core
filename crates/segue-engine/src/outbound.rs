@@ -4680,7 +4680,18 @@ fn dns_tcp_connector(stream: &StreamSettings) -> Result<DnsTcpConnector, CoreErr
                 mldsa65_verify: reality.mldsa65_verify.clone(),
             },
         ))),
+        StreamSecurity::ShadowTls(_) if shadow_tls_name_is_explicit(stream) => {
+            Ok(DnsTcpConnector::Static(carrier::build_connector(
+                &stream.security,
+                &TargetAddr::Domain("unused.invalid".to_owned()),
+            )))
+        }
+        StreamSecurity::ShadowTls(_) => Err(CoreError::UnsupportedOutboundSecurity),
     }
+}
+
+fn shadow_tls_name_is_explicit(stream: &StreamSettings) -> bool {
+    matches!(&stream.security, StreamSecurity::ShadowTls(shadow) if shadow.tls.server_name.as_deref().is_some_and(|name| !name.is_empty()))
 }
 
 fn dns_happy_eyeballs_mode(stream: &StreamSettings) -> DnsHappyEyeballsMode {
@@ -4722,7 +4733,7 @@ fn validate_stream_flow(flow: Option<&str>, security: &StreamSecurity) -> Result
         flow,
         matches!(
             security,
-            StreamSecurity::Tls(_) | StreamSecurity::Reality(_)
+            StreamSecurity::Tls(_) | StreamSecurity::Reality(_) | StreamSecurity::ShadowTls(_)
         ),
     )
     .map(|_| ())
@@ -4759,7 +4770,7 @@ fn validate_connector_flow(
         flow,
         matches!(
             transport,
-            ConnectorConfig::Tls(_) | ConnectorConfig::Reality(_)
+            ConnectorConfig::Tls(_) | ConnectorConfig::Reality(_) | ConnectorConfig::ShadowTls(_)
         ),
     )
 }
