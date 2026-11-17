@@ -3452,7 +3452,10 @@ mod tests {
             std::slice::from_ref(&asset_dir),
         )
         .unwrap_err();
-        assert!(both.diagnostics.iter().any(|diagnostic| diagnostic.message.contains("not both")));
+        assert!(both
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("not both")));
 
         fs::remove_dir_all(asset_dir).unwrap();
     }

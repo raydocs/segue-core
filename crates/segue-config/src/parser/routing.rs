@@ -581,10 +581,7 @@ impl Parser<'_> {
         let domain_spec = self.routing_rule_domains(rule, &rule_path)?;
         let ip_spec = self.routing_ip_spec(rule, &rule_path)?;
         if !domain_spec.srs.is_empty() && !ip_spec.srs.is_empty() {
-            self.error(
-                &rule_path,
-                "ext-srs may be set on domain or ip, not both",
-            );
+            self.error(&rule_path, "ext-srs may be set on domain or ip, not both");
             return None;
         }
         let local_os = self.parse_routing_local_os(rule, &rule_path)?;
@@ -779,7 +776,8 @@ impl Parser<'_> {
     /// both must parse. `ext-srs:<path>` names a local sing-box rule-set
     /// instead of a domain pattern.
     fn routing_rule_domains(&mut self, rule: &Value, rule_path: &str) -> Option<DomainSpec> {
-        let domain = self.routing_domain_spec(rule.get("domain"), &format!("{rule_path}.domain"))?;
+        let domain =
+            self.routing_domain_spec(rule.get("domain"), &format!("{rule_path}.domain"))?;
         let domains =
             self.routing_domain_spec(rule.get("domains"), &format!("{rule_path}.domains"))?;
         Some(
@@ -955,18 +953,19 @@ impl Parser<'_> {
                 return Some(None);
             }
         };
-        let source_ports =
-            match intersect_port_lists(template.origin.source_ports.as_deref(), &flat.source_ports)
-            {
-                Ok(ranges) => ranges,
-                Err(()) => {
-                    self.warning(
+        let source_ports = match intersect_port_lists(
+            template.origin.source_ports.as_deref(),
+            &flat.source_ports,
+        ) {
+            Ok(ranges) => ranges,
+            Err(()) => {
+                self.warning(
                         path,
                         "ext-srs source port does not overlap the routing rule and that rule matches nothing",
                     );
-                    return Some(None);
-                }
-            };
+                return Some(None);
+            }
+        };
         let networks = match intersect_networks(template.networks.as_deref(), &flat.networks) {
             Ok(networks) => networks,
             Err(()) => {
@@ -1031,11 +1030,7 @@ impl Parser<'_> {
         Some(Some(builder.build()))
     }
 
-    fn load_srs(
-        &mut self,
-        file: &str,
-        path: &str,
-    ) -> Option<Arc<segue_routing::srs::SrsRuleSet>> {
+    fn load_srs(&mut self, file: &str, path: &str) -> Option<Arc<segue_routing::srs::SrsRuleSet>> {
         if let Some(cached) = self.srs_cache.get(file) {
             return Some(Arc::clone(cached));
         }
@@ -1051,10 +1046,7 @@ impl Parser<'_> {
             Err(error) => {
                 self.error(
                     path,
-                    format!(
-                        "failed to read rule-set `{}`: {error}",
-                        full_path.display()
-                    ),
+                    format!("failed to read rule-set `{}`: {error}", full_path.display()),
                 );
                 return None;
             }
@@ -1080,8 +1072,7 @@ impl Parser<'_> {
             self.warning(path, format!("rule-set `{file}`: {warning}"));
         }
         let decoded = Arc::new(decoded);
-        self.srs_cache
-            .insert(file.to_owned(), Arc::clone(&decoded));
+        self.srs_cache.insert(file.to_owned(), Arc::clone(&decoded));
         Some(decoded)
     }
 

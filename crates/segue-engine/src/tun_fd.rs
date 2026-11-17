@@ -303,8 +303,7 @@ mod platform {
             }
             if let Some(consumed) = consumed {
                 self.last_consumed = consumed;
-                self.consumed_base =
-                    consumed - (self.submitted - (UTUN_INPUT_CHAIN_LIMIT + 1));
+                self.consumed_base = consumed - (self.submitted - (UTUN_INPUT_CHAIN_LIMIT + 1));
             }
             self.inflight_sample = UTUN_INPUT_CHAIN_LIMIT + 1;
             self.sampled_at = self.submitted;
@@ -335,12 +334,7 @@ mod platform {
                     self.apply_sample(consumed);
                 }
             }
-            room_from_estimate(
-                self.estimate(),
-                pending_i,
-                self.probe_end,
-                self.submitted,
-            )
+            room_from_estimate(self.estimate(), pending_i, self.probe_end, self.submitted)
         }
 
         /// One blocked poll. A sample that does not move the counter counts
@@ -403,9 +397,7 @@ mod platform {
         if next_len > TUN_FD_SEND_FRAME_LIMIT {
             return PlannedSend::Single;
         }
-        let count = batchable
-            .min(room)
-            .min(TUN_FD_SEND_BATCH_MAX);
+        let count = batchable.min(room).min(TUN_FD_SEND_BATCH_MAX);
         if count == 0 {
             // Small, but not a packet this code will put in a batch (no IP
             // version). The caller reports it; it is not a write.
@@ -560,8 +552,7 @@ mod platform {
             }
             if msglen >= IF_MSGHDR2_SIZE
                 && rest[IF_MSGHDR2_TYPE] == RTM_IFINFO2
-                && u16::from_le_bytes([rest[IF_MSGHDR2_INDEX], rest[IF_MSGHDR2_INDEX + 1]])
-                    == index
+                && u16::from_le_bytes([rest[IF_MSGHDR2_INDEX], rest[IF_MSGHDR2_INDEX + 1]]) == index
             {
                 let mut octets = [0u8; 8];
                 octets.copy_from_slice(&rest[IF_MSGHDR2_IPACKETS..IF_MSGHDR2_IPACKETS + 8]);
@@ -1522,10 +1513,7 @@ mod platform {
             }
 
             let room = state.admit_or_wait(packets.len() - index).await;
-            let batchable = batchable_count(
-                &packets[index..],
-                room.min(TUN_FD_SEND_BATCH_MAX),
-            );
+            let batchable = batchable_count(&packets[index..], room.min(TUN_FD_SEND_BATCH_MAX));
             match plan_send(packets[index].len(), batchable, room) {
                 PlannedSend::Wait => {
                     return Err(PacketBatchWriteError::new(
@@ -1562,13 +1550,7 @@ mod platform {
                     // `written_packets` counts from the start of this run.
                     // Shift it by the frames already committed, or a later
                     // error would resend them.
-                    match sendmsg_x_accounted(
-                        fd,
-                        &packets[index..index + count],
-                        state,
-                    )
-                    .await
-                    {
+                    match sendmsg_x_accounted(fd, &packets[index..index + count], state).await {
                         Ok(done) => index += done,
                         Err(error) => {
                             return Err(PacketBatchWriteError::new(
@@ -1644,10 +1626,7 @@ mod platform {
             if count == 0 {
                 return Err(PacketBatchWriteError::new(
                     0,
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "tun packet is not IPv4 or IPv6",
-                    ),
+                    io::Error::new(io::ErrorKind::InvalidData, "tun packet is not IPv4 or IPv6"),
                 ));
             }
             let result = state.syscall_sendmsg_x(fd, &packets[..count]).await;
@@ -1656,10 +1635,10 @@ mod platform {
                 Err(error) => match error.raw_os_error() {
                     Some(errno) => account_send(count, Err(errno)),
                     None => {
-                        return Err(PacketBatchWriteError::new(0, io::Error::new(
-                            error.kind(),
-                            error.to_string(),
-                        )));
+                        return Err(PacketBatchWriteError::new(
+                            0,
+                            io::Error::new(error.kind(), error.to_string()),
+                        ));
                     }
                 },
             };
@@ -1677,23 +1656,23 @@ mod platform {
                 SendAccount::RetrySmaller => {
                     let next = (count + 1) / 2;
                     if next == 0 || next >= count {
-                        let error = result.err().unwrap_or_else(|| {
-                            io::Error::from_raw_os_error(libc::ENOBUFS)
-                        });
+                        let error = result
+                            .err()
+                            .unwrap_or_else(|| io::Error::from_raw_os_error(libc::ENOBUFS));
                         return Err(PacketBatchWriteError::new(0, error));
                     }
                     limit = next;
                 }
                 SendAccount::DropOne => {
-                    let error = result.err().unwrap_or_else(|| {
-                        io::Error::from_raw_os_error(libc::EINVAL)
-                    });
+                    let error = result
+                        .err()
+                        .unwrap_or_else(|| io::Error::from_raw_os_error(libc::EINVAL));
                     return Err(PacketBatchWriteError::new(0, error));
                 }
                 SendAccount::Fatal => {
-                    let error = result.err().unwrap_or_else(|| {
-                        io::Error::from_raw_os_error(libc::EBADF)
-                    });
+                    let error = result
+                        .err()
+                        .unwrap_or_else(|| io::Error::from_raw_os_error(libc::EBADF));
                     return Err(PacketBatchWriteError::new(0, error));
                 }
                 SendAccount::Consumed { enospc } => {
@@ -1800,8 +1779,8 @@ mod platform {
             if !self.chain.active {
                 return pending;
             }
-            let over = self.chain.estimate().saturating_add(pending as i64)
-                > UTUN_INPUT_CHAIN_HIGH_WATER;
+            let over =
+                self.chain.estimate().saturating_add(pending as i64) > UTUN_INPUT_CHAIN_HIGH_WATER;
             let sample = if over && self.sample_due() {
                 self.read_sample()
             } else {
@@ -1822,8 +1801,7 @@ mod platform {
         fn sample_due(&self) -> bool {
             self.last_sample
                 .map(|sampled| {
-                    std::time::Instant::now().saturating_duration_since(sampled)
-                        >= UTUN_GATE_SAMPLE
+                    std::time::Instant::now().saturating_duration_since(sampled) >= UTUN_GATE_SAMPLE
                 })
                 .unwrap_or(true)
         }
@@ -3273,7 +3251,10 @@ mod platform {
             assert_eq!(account_send(3, Err(libc::EINTR)), SendAccount::RetrySame);
             // `ENOBUFS` sent nothing. More than one message is retried
             // smaller; the last message is retried whole, not dropped.
-            assert_eq!(account_send(3, Err(libc::ENOBUFS)), SendAccount::RetrySmaller);
+            assert_eq!(
+                account_send(3, Err(libc::ENOBUFS)),
+                SendAccount::RetrySmaller
+            );
             assert_eq!(account_send(1, Err(libc::ENOBUFS)), SendAccount::RetrySame);
             assert_eq!(
                 account_send(2, Err(libc::EMSGSIZE)),
@@ -3450,9 +3431,8 @@ mod platform {
             let mut buf = vec![0u8; 2048];
             loop {
                 // SAFETY: `buf` is a live buffer and the descriptor is open.
-                let read = unsafe {
-                    libc::read(receiver.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-                };
+                let read =
+                    unsafe { libc::read(receiver.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
                 if read < 0 {
                     let error = io::Error::last_os_error();
                     assert_eq!(

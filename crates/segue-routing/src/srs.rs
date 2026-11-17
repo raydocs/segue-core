@@ -232,7 +232,9 @@ struct Reader<R> {
 
 impl<R: Read> Reader<R> {
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), SrsError> {
-        self.inner.read_exact(buf).map_err(map_bounded_io(self.inner.limit))
+        self.inner
+            .read_exact(buf)
+            .map_err(map_bounded_io(self.inner.limit))
     }
 
     fn read_u8(&mut self) -> Result<u8, SrsError> {
@@ -366,7 +368,11 @@ impl<R: Read> Reader<R> {
             rules.push(self.read_rule(depth + 1)?);
         }
         let invert = self.read_bool()?;
-        Ok(RawRule::Logical { mode, rules, invert })
+        Ok(RawRule::Logical {
+            mode,
+            rules,
+            invert,
+        })
     }
 
     fn read_default(&mut self) -> Result<RawDefault, SrsError> {
@@ -451,9 +457,7 @@ impl<R: Read> Reader<R> {
                     return Ok(rule);
                 }
                 other => {
-                    return Err(SrsError::Invalid(format!(
-                        "unknown rule item type {other}"
-                    )));
+                    return Err(SrsError::Invalid(format!("unknown rule item type {other}")));
                 }
             }
         }
@@ -493,7 +497,9 @@ impl<R: Read> Reader<R> {
     fn read_ip_set(&mut self) -> Result<Vec<Cidr>, SrsError> {
         let version = self.read_u8()?;
         if version != 1 {
-            return Err(SrsError::Invalid(format!("unknown IP set version {version}")));
+            return Err(SrsError::Invalid(format!(
+                "unknown IP set version {version}"
+            )));
         }
         let count = self.read_u64()?;
         let count = usize::try_from(count)
@@ -691,9 +697,9 @@ impl Succinct {
                 }
                 continue;
             }
-            let label_index = bitmap_index.checked_sub(node_id).ok_or_else(|| {
-                SrsError::Invalid("succinct label index underflows".to_owned())
-            })?;
+            let label_index = bitmap_index
+                .checked_sub(node_id)
+                .ok_or_else(|| SrsError::Invalid("succinct label index underflows".to_owned()))?;
             let label = *self.labels.get(label_index).ok_or_else(|| {
                 SrsError::Invalid("succinct label index is out of range".to_owned())
             })?;
@@ -723,9 +729,10 @@ impl Succinct {
 }
 
 fn bit(words: &[u64], index: usize) -> Result<u64, SrsError> {
-    let word = words.get(index >> 6).copied().ok_or_else(|| {
-        SrsError::Invalid("succinct set bit is out of range".to_owned())
-    })?;
+    let word = words
+        .get(index >> 6)
+        .copied()
+        .ok_or_else(|| SrsError::Invalid("succinct set bit is out of range".to_owned()))?;
     Ok((word >> (index & 63)) & 1)
 }
 
@@ -784,19 +791,21 @@ fn count_ones_before(words: &[u64], ranks: &[i32], index: usize) -> Result<i32, 
     let bit_index = (index & 63) as u32;
     if word_index == words.len() {
         if bit_index != 0 {
-            return Err(SrsError::Invalid("succinct rank is out of range".to_owned()));
+            return Err(SrsError::Invalid(
+                "succinct rank is out of range".to_owned(),
+            ));
         }
         return ranks
             .last()
             .copied()
             .ok_or_else(|| SrsError::Invalid("succinct rank is out of range".to_owned()));
     }
-    let base = *ranks.get(word_index).ok_or_else(|| {
-        SrsError::Invalid("succinct rank is out of range".to_owned())
-    })?;
-    let word = *words.get(word_index).ok_or_else(|| {
-        SrsError::Invalid("succinct bitmap is out of range".to_owned())
-    })?;
+    let base = *ranks
+        .get(word_index)
+        .ok_or_else(|| SrsError::Invalid("succinct rank is out of range".to_owned()))?;
+    let word = *words
+        .get(word_index)
+        .ok_or_else(|| SrsError::Invalid("succinct bitmap is out of range".to_owned()))?;
     let low = if bit_index == 0 {
         0
     } else {
@@ -809,7 +818,9 @@ fn count_ones_before(words: &[u64], ranks: &[i32], index: usize) -> Result<i32, 
 fn count_zeros(words: &[u64], ranks: &[i32], index: usize) -> Result<usize, SrsError> {
     let ones = count_ones_before(words, ranks, index)? as usize;
     if index < ones {
-        return Err(SrsError::Invalid("succinct zero count underflows".to_owned()));
+        return Err(SrsError::Invalid(
+            "succinct zero count underflows".to_owned(),
+        ));
     }
     Ok(index - ones)
 }
@@ -844,22 +855,22 @@ fn select_ith_one(
         return Err(SrsError::Invalid("select of a negative bit".to_owned()));
     }
     let bucket = (ith as usize) >> 5;
-    let mut word_index = (*selects.get(bucket).ok_or_else(|| {
-        SrsError::Invalid("succinct select index is out of range".to_owned())
-    })? as usize)
+    let mut word_index = (*selects
+        .get(bucket)
+        .ok_or_else(|| SrsError::Invalid("succinct select index is out of range".to_owned()))?
+        as usize)
         >> 6;
     loop {
-        let next = ranks.get(word_index + 1).copied().ok_or_else(|| {
-            SrsError::Invalid("succinct select rank is out of range".to_owned())
-        })?;
+        let next = ranks
+            .get(word_index + 1)
+            .copied()
+            .ok_or_else(|| SrsError::Invalid("succinct select rank is out of range".to_owned()))?;
         if next > ith {
             break;
         }
         word_index += 1;
         if word_index >= words.len() {
-            return Err(SrsError::Invalid(
-                "select walked off the bitmap".to_owned(),
-            ));
+            return Err(SrsError::Invalid("select walked off the bitmap".to_owned()));
         }
     }
     let mut window = words[word_index];
@@ -965,8 +976,8 @@ fn suffix_matcher(suffix: &str) -> Result<DomainMatcher, SrsError> {
             return Err(SrsError::Invalid("empty domain suffix".to_owned()));
         }
         let pattern = format!("{}$", regex_escape(&suffix.to_ascii_lowercase()));
-        let matcher = RegexMatcher::new(pattern)
-            .map_err(|error| SrsError::Invalid(error.to_string()))?;
+        let matcher =
+            RegexMatcher::new(pattern).map_err(|error| SrsError::Invalid(error.to_string()))?;
         return Ok(DomainMatcher::Regex(matcher));
     }
     Ok(DomainMatcher::Suffix(suffix.to_owned()))
@@ -1008,7 +1019,11 @@ fn cidrs_for_range(start: &[u8], end: &[u8]) -> Result<Vec<Cidr>, SrsError> {
                     32,
                 );
             }
-            ints_to_cidrs(u128::from_be_bytes(start_bytes), u128::from_be_bytes(end_bytes), 128)
+            ints_to_cidrs(
+                u128::from_be_bytes(start_bytes),
+                u128::from_be_bytes(end_bytes),
+                128,
+            )
         }
         other => Err(SrsError::Invalid(format!("IP address length {other}"))),
     }
@@ -1051,8 +1066,8 @@ fn ints_to_cidrs(mut start: u128, end: u128, bits: u32) -> Result<Vec<Cidr>, Srs
         let prefix_len = u8::try_from(bits - size)
             .map_err(|_| SrsError::Invalid("IP prefix length overflows".to_owned()))?;
         let address = int_to_ip(start, bits)?;
-        let cidr = Cidr::new(address, prefix_len)
-            .map_err(|error| SrsError::Invalid(error.to_string()))?;
+        let cidr =
+            Cidr::new(address, prefix_len).map_err(|error| SrsError::Invalid(error.to_string()))?;
         cidrs.push(cidr);
         if size >= 128 {
             break;
@@ -1105,9 +1120,8 @@ fn ports_from(exact: &[u16], ranges: &[String]) -> Result<Vec<SrsPortRange>, Str
         });
     }
     for text in ranges {
-        let (start, end) = parse_port_range(text).map_err(|_| {
-            format!("port range `{text}` is invalid and the rule matches nothing")
-        })?;
+        let (start, end) = parse_port_range(text)
+            .map_err(|_| format!("port range `{text}` is invalid and the rule matches nothing"))?;
         if start <= end {
             ports.push(SrsPortRange { start, end });
         }
@@ -1153,7 +1167,11 @@ fn lower(
 ) {
     match rule {
         RawRule::Default(rule) => lower_default(*rule, index, limits, warnings, out),
-        RawRule::Logical { mode, rules, invert } => {
+        RawRule::Logical {
+            mode,
+            rules,
+            invert,
+        } => {
             if invert {
                 warnings.push(SrsWarning {
                     rule_index: index,
@@ -1336,7 +1354,10 @@ fn push_rule(
             "rule-set expands past {} rules; later rules match nothing",
             limits.max_rules
         );
-        if warnings.last().is_none_or(|warning| warning.message != message) {
+        if warnings
+            .last()
+            .is_none_or(|warning| warning.message != message)
+        {
             warnings.push(SrsWarning {
                 rule_index: index,
                 message,
@@ -1402,7 +1423,10 @@ fn lower_and(
                         let message = format!(
                             "logical and of two {field} lists is not supported and that combination matches nothing"
                         );
-                        if warnings.last().is_none_or(|warning| warning.message != message) {
+                        if warnings
+                            .last()
+                            .is_none_or(|warning| warning.message != message)
+                        {
                             warnings.push(SrsWarning {
                                 rule_index: index,
                                 message,
@@ -1514,9 +1538,9 @@ mod tests {
     use flate2::{write::ZlibEncoder, Compression};
 
     use super::{
-        ints_to_cidrs, Cidr, FlatRule, ITEM_DOMAIN, ITEM_FINAL, ITEM_IP_CIDR, ITEM_NETWORK,
-        ITEM_PORT, ITEM_PORT_RANGE, Network, read_rule_set, read_rule_set_with_limits, SrsError,
-        SrsLimits, SrsPortRange, SrsRuleSet,
+        ints_to_cidrs, read_rule_set, read_rule_set_with_limits, Cidr, FlatRule, Network, SrsError,
+        SrsLimits, SrsPortRange, SrsRuleSet, ITEM_DOMAIN, ITEM_FINAL, ITEM_IP_CIDR, ITEM_NETWORK,
+        ITEM_PORT, ITEM_PORT_RANGE,
     };
 
     fn uvarint(mut value: u64) -> Vec<u8> {
@@ -1579,8 +1603,12 @@ mod tests {
 
     fn load_fixture(name: &str) -> SrsRuleSet {
         match name {
-            "domain-v1.srs" => read_rule_set(include_bytes!("../fixtures/domain-v1.srs").as_slice()),
-            "domain-v2.srs" => read_rule_set(include_bytes!("../fixtures/domain-v2.srs").as_slice()),
+            "domain-v1.srs" => {
+                read_rule_set(include_bytes!("../fixtures/domain-v1.srs").as_slice())
+            }
+            "domain-v2.srs" => {
+                read_rule_set(include_bytes!("../fixtures/domain-v2.srs").as_slice())
+            }
             "ip-v2.srs" => read_rule_set(include_bytes!("../fixtures/ip-v2.srs").as_slice()),
             "mixed-v2.srs" => read_rule_set(include_bytes!("../fixtures/mixed-v2.srs").as_slice()),
             "logical-or-v2.srs" => {
@@ -1595,7 +1623,9 @@ mod tests {
             "unsupported-v5.srs" => {
                 read_rule_set(include_bytes!("../fixtures/unsupported-v5.srs").as_slice())
             }
-            "invert-v2.srs" => read_rule_set(include_bytes!("../fixtures/invert-v2.srs").as_slice()),
+            "invert-v2.srs" => {
+                read_rule_set(include_bytes!("../fixtures/invert-v2.srs").as_slice())
+            }
             "process-v2.srs" => {
                 read_rule_set(include_bytes!("../fixtures/process-v2.srs").as_slice())
             }
@@ -1664,8 +1694,14 @@ mod tests {
         let set = read_rule_set(wrap(3, &one_rule(&items)).as_slice()).unwrap();
         let rule = &set.rules[0];
         assert_eq!(rule.networks.as_deref(), Some(&[Network::Tcp][..]));
-        assert!(rule.ports.iter().any(|range| range.start == 53 && range.end == 53));
-        assert!(rule.ports.iter().any(|range| range.start == 80 && range.end == u16::MAX));
+        assert!(rule
+            .ports
+            .iter()
+            .any(|range| range.start == 53 && range.end == 53));
+        assert!(rule
+            .ports
+            .iter()
+            .any(|range| range.start == 80 && range.end == u16::MAX));
     }
 
     #[test]
@@ -1702,7 +1738,13 @@ mod tests {
         let set = read_rule_set(wrap(2, &payload).as_slice()).unwrap();
         assert!(set.warnings.is_empty(), "{:?}", set.warnings);
         assert_eq!(set.rules.len(), 1);
-        assert_eq!(set.rules[0].ports, vec![SrsPortRange { start: 443, end: 443 }]);
+        assert_eq!(
+            set.rules[0].ports,
+            vec![SrsPortRange {
+                start: 443,
+                end: 443
+            }]
+        );
         assert_eq!(set.rules[0].networks.as_deref(), Some(&[Network::Tcp][..]));
     }
 
@@ -1719,7 +1761,10 @@ mod tests {
 
     #[test]
     fn bad_magic_version_and_truncated_stream_fail() {
-        assert!(matches!(read_rule_set(&b"NOPE"[..]).unwrap_err(), SrsError::BadMagic));
+        assert!(matches!(
+            read_rule_set(&b"NOPE"[..]).unwrap_err(),
+            SrsError::BadMagic
+        ));
         assert!(matches!(
             read_rule_set(&b"SRS\x00"[..]).unwrap_err(),
             SrsError::UnsupportedVersion(0)
@@ -1742,7 +1787,7 @@ mod tests {
         };
         // A non-zero rule count forces the reader past the decompressed cap.
         let mut payload = vec![1u8];
-        payload.extend(std::iter::repeat(0u8).take(64));
+        payload.extend(std::iter::repeat_n(0u8, 64));
         let error = read_rule_set_with_limits(wrap(2, &payload).as_slice(), limits).unwrap_err();
         assert!(matches!(error, SrsError::TooLarge(8)), "{error}");
     }
@@ -1788,8 +1833,14 @@ mod tests {
         let ip_rule = &ips.rules[0];
         assert!(covers_v4(&ip_rule.ip_cidrs, [10, 1, 2, 3]));
         assert!(!covers_v4(&ip_rule.ip_cidrs, [11, 0, 0, 1]));
-        assert!(covers_v6(&ip_rule.ip_cidrs, [0x2001, 0x0db8, 0, 0, 0, 0, 0, 1]));
-        assert!(!covers_v6(&ip_rule.ip_cidrs, [0x2001, 0x0db9, 0, 0, 0, 0, 0, 1]));
+        assert!(covers_v6(
+            &ip_rule.ip_cidrs,
+            [0x2001, 0x0db8, 0, 0, 0, 0, 0, 1]
+        ));
+        assert!(!covers_v6(
+            &ip_rule.ip_cidrs,
+            [0x2001, 0x0db9, 0, 0, 0, 0, 0, 1]
+        ));
         assert!(covers_v4(&ip_rule.source_ip_cidrs, [192, 0, 2, 1]));
         assert!(!covers_v4(&ip_rule.source_ip_cidrs, [192, 0, 2, 2]));
 
@@ -1797,22 +1848,36 @@ mod tests {
         assert_eq!(mixed.rules.len(), 2);
         assert!(mixed.rules.iter().all(|rule| {
             rule.networks.as_deref() == Some(&[Network::Tcp][..])
-                && rule.ports == vec![SrsPortRange { start: 80, end: 443 }]
+                && rule.ports
+                    == vec![SrsPortRange {
+                        start: 80,
+                        end: 443,
+                    }]
                 && rule.source_ports == vec![SrsPortRange { start: 53, end: 53 }]
         }));
         assert!(mixed
             .rules
             .iter()
             .any(|rule| matches_domain(rule, "example.com") && rule.ip_cidrs.is_empty()));
-        assert!(mixed.rules.iter().any(|rule| {
-            rule.domains.is_empty() && covers_v4(&rule.ip_cidrs, [192, 0, 2, 10])
-        }));
+        assert!(mixed
+            .rules
+            .iter()
+            .any(|rule| { rule.domains.is_empty() && covers_v4(&rule.ip_cidrs, [192, 0, 2, 10]) }));
 
         let logical = load_fixture("logical-or-v2.srs");
         assert_eq!(logical.rules.len(), 2);
-        assert!(logical.rules.iter().any(|rule| matches_domain(rule, "www.a.test")));
-        assert!(logical.rules.iter().any(|rule| matches_domain(rule, "b.test")));
-        assert!(!logical.rules.iter().any(|rule| matches_domain(rule, "c.test")));
+        assert!(logical
+            .rules
+            .iter()
+            .any(|rule| matches_domain(rule, "www.a.test")));
+        assert!(logical
+            .rules
+            .iter()
+            .any(|rule| matches_domain(rule, "b.test")));
+        assert!(!logical
+            .rules
+            .iter()
+            .any(|rule| matches_domain(rule, "c.test")));
 
         let skipped = load_fixture("unsupported-v3.srs");
         assert_eq!(skipped.rules.len(), 1);
@@ -1855,7 +1920,10 @@ mod tests {
 
         let process = load_fixture("process-v2.srs");
         assert!(matches_domain(&process.rules[0], "keep.example"));
-        assert!(!process.rules.iter().any(|rule| matches_domain(rule, "drop.example")));
+        assert!(!process
+            .rules
+            .iter()
+            .any(|rule| matches_domain(rule, "drop.example")));
         assert!(process.warnings[0].message.contains("process_name"));
     }
 }
