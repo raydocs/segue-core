@@ -404,11 +404,52 @@ jobs:
             --exec "set -e; modprobe xt_TPROXY; modprobe nft_tproxy; cd '$PWD'; XRAY_TPROXY_ISOLATED_NETWORK=1 XRAY_TPROXY_TEST_BINARY='$test_binary' bash scripts/check-tproxy-linux.sh; echo TPROXY_VM_OK" 2>&1 | tee "$log"
           grep -Fxq TPROXY_VM_OK "$log"
 
+  # Required-check name. Oracle steps run on the four shards below (balanced
+  # from run 43811109067, where this job took 31.9 minutes). This job fails
+  # unless every shard succeeded. always() keeps a shard failure red instead
+  # of skipped; cancelled() == false still skips the gate when the run is
+  # cancelled, and the event clause still skips a stable tag push.
   go-oracles:
+    needs:
+      - go-oracles-protocols
+      - go-oracles-carriers
+      - go-oracles-wireguard
+      - go-oracles-tunnels
+    if: always() && cancelled() == false && (github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.'))
+    runs-on: instabox-medium
+    timeout-minutes: 10
+    steps:
+      - name: Require every Go oracle shard
+        env:
+          PROTOCOLS: ${{ needs.go-oracles-protocols.result }}
+          CARRIERS: ${{ needs.go-oracles-carriers.result }}
+          WIREGUARD: ${{ needs.go-oracles-wireguard.result }}
+          TUNNELS: ${{ needs.go-oracles-tunnels.result }}
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local name="$1"
+            local result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "go-oracles-$name did not succeed: ${result:-missing}" >&2
+              fail=1
+            else
+              echo "go-oracles-$name succeeded"
+            fi
+          }
+          check protocols "$PROTOCOLS"
+          check carriers "$CARRIERS"
+          check wireguard "$WIREGUARD"
+          check tunnels "$TUNNELS"
+          exit "$fail"
+
+  # ~7.3 min of steps on run 43811109067: fixtures through v0.8 chains.
+  go-oracles-protocols:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
     runs-on: instabox-medium
-    # The pinned-interop steps run about 31 minutes (29 on main dbf1360f, 23-27
-    # on the v26.11.9 stack before it); leave room for a slow runner.
+    # Slowest shard was about 10 minutes on run 43811109067; keep the single
+    # job's budget so a cold toolchain or a slow runner is not a new failure.
     timeout-minutes: 45
     # Every step builds its test binaries into one target directory, once per
     # run. Incremental caches and full debug info only cost disk here, and the
@@ -422,50 +463,14 @@ jobs:
         with:
           persist-credentials: false
 
-      # Instabox runs the workspace on a 20 GiB /data disk, which a full
-      # workspace test build fills. The root disk has the room, so build there.
-      - name: Keep build outputs on the root disk
-        run: |
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
-          mkdir -p target
-          sudo mount --bind /opt/segue-target target
-          df -h / target
-
-      # The pinned Xray-core v26.11.9 source requires Go 1.27.
-      # Use one exact toolchain for all oracle and interoperability checks.
-      #
-      # Every locally committed module's `go.sum` is listed: the cache key uses these
-      # paths alone, so a module missing from the list has its dependencies
-      # re-downloaded on every run.
-      - name: Install pinned Go toolchain
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.27.4"
-          cache-dependency-path: |
-            go.sum
-            tools/reality-oracle/masquerade/go.sum
-            tools/reality-oracle/grpc/go.sum
-            tools/wireguard-reference/go.sum
+      - name: Prepare pinned Go, Rust and Xray-core
+        uses: ./.github/actions/go-oracle-setup
 
       - name: Verify Go-oracle fixtures
         run: bash scripts/verify-oracle-fixtures.sh
 
-      - name: Check out pinned routing and encryption oracle
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: XTLS/Xray-core
-          ref: 676eaf66f8f05d4d558ee7a74b4736623d3feeb9
-          path: Xray-core
-          persist-credentials: false
-
       - name: Verify routing domain strategies against pinned Xray-core
         run: bash scripts/check-routing-oracle.sh
-
-      - name: Install pinned Rust toolchain for encryption interop
-        run: rustup toolchain install 1.96.0 --profile minimal
-
-      - name: Select pinned Rust toolchain
-        run: rustup default 1.96.0
 
       - name: Verify VLESS encryption primitives and live pinned interop
         run: bash scripts/check-vless-encryption-oracle.sh
@@ -487,32 +492,66 @@ jobs:
 
       - name: Check VMess AEAD pinned Xray interoperability
         run: bash scripts/check-vmess-interop.sh
+
       - name: Check SOCKS5 TCP/TLS, IPv6, chains, probes, UDP and TUN against pinned Xray-core
         run: bash scripts/check-socks-interop.sh
+
       - name: Check HTTP outbound against the pinned Xray HTTP server
         run: bash scripts/check-http-interop.sh
+
       - name: Check shared Mux and XUDP interoperability
         run: bash scripts/check-mux-interop.sh
+
       - name: Check v0.8 clients against pinned independent sing-box
         run: bash scripts/check-v08-independent-interop.sh
+
       - name: Check v0.8 REALITY, split-XHTTP and cross-protocol chains
         run: bash scripts/check-v08-carrier-interop.sh
+
+      # Keep this step last: it shows how much room the steps above leave.
+      - name: Report disk use
+        if: always()
+        run: |
+          df -h /
+          du -sh target ~/.cache/go-build ~/go/pkg/mod 2>/dev/null || true
+
+  # ~8.3 min of steps on run 43811109067: live Hysteria, mKCP, header-custom,
+  # sudoku, xmc, and the native Hysteria server.
+  go-oracles-carriers:
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: instabox-medium
+    # Slowest shard was about 10 minutes on run 43811109067; keep the single
+    # job's budget so a cold toolchain or a slow runner is not a new failure.
+    timeout-minutes: 45
+    # Every step builds its test binaries into one target directory, once per
+    # run. Incremental caches and full debug info only cost disk here, and the
+    # runner ran out of it after the xdns step; line tables keep panic locations.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare pinned Go, Rust and Xray-core
+        uses: ./.github/actions/go-oracle-setup
+
       - name: Verify live Hysteria TCP and UDP against pinned Xray-core
         run: bash scripts/check-hysteria-interop.sh
+
       - name: Verify mKCP masks and live mKCP carriers against pinned Xray-core
         run: bash scripts/check-kcp-interop.sh
+
       - name: Verify header-custom TCP and UDP against pinned Xray-core
         run: bash scripts/check-header-custom-interop.sh
+
       - name: Verify the sudoku mask against pinned Xray-core
         run: bash scripts/check-sudoku-interop.sh
+
       - name: Verify the xmc mask against pinned Xray-core
         run: bash scripts/check-xmc-interop.sh
-      - name: Verify the xdns mask against pinned Xray-core
-        run: bash scripts/check-xdns-interop.sh
-      - name: Verify the realm mask against pinned Xray-core
-        run: bash scripts/check-realm-interop.sh
-      - name: Verify the xicmp mask against pinned Xray-core
-        run: bash scripts/check-xicmp-interop.sh
 
       - name: Check out independent native Hysteria reference
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -526,6 +565,36 @@ jobs:
         run: |
           python3 scripts/tests/verify-hysteria-reference.test.py
           bash scripts/check-native-hysteria-interop.sh
+
+      # Keep this step last: it shows how much room the steps above leave.
+      - name: Report disk use
+        if: always()
+        run: |
+          df -h /
+          du -sh target ~/.cache/go-build ~/go/pkg/mod 2>/dev/null || true
+
+  # ~6.9 min of steps on run 43811109067: WireGuard against Xray, the native
+  # roaming/replay/recovery suite, the direct fixture, and BBR.
+  go-oracles-wireguard:
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: instabox-medium
+    # Slowest shard was about 10 minutes on run 43811109067; keep the single
+    # job's budget so a cold toolchain or a slow runner is not a new failure.
+    timeout-minutes: 45
+    # Every step builds its test binaries into one target directory, once per
+    # run. Incremental caches and full debug info only cost disk here, and the
+    # runner ran out of it after the xdns step; line tables keep panic locations.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare pinned Go, Rust and Xray-core
+        uses: ./.github/actions/go-oracle-setup
 
       - name: Verify bounded WireGuard engine and TCP UDP core runtime against pinned Xray-core
         run: bash scripts/check-wireguard-runtime.sh
@@ -541,11 +610,51 @@ jobs:
       - name: Verify the BBR profiles against pinned Xray-core's sender and servers
         run: bash scripts/check-bbr-interop.sh
 
+      # Keep this step last: it shows how much room the steps above leave.
+      - name: Report disk use
+        if: always()
+        run: |
+          df -h /
+          du -sh target ~/.cache/go-build ~/go/pkg/mod 2>/dev/null || true
+
+  # ~8.0 min of steps on run 43811109067: xdns, realm, xicmp, MASQUE, reverse,
+  # XDRIVE, and the pinned-Xray verdict, fingerprint and ChromeParrot checks.
+  go-oracles-tunnels:
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: instabox-medium
+    # Slowest shard was about 10 minutes on run 43811109067; keep the single
+    # job's budget so a cold toolchain or a slow runner is not a new failure.
+    timeout-minutes: 45
+    # Every step builds its test binaries into one target directory, once per
+    # run. Incremental caches and full debug info only cost disk here, and the
+    # runner ran out of it after the xdns step; line tables keep panic locations.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare pinned Go, Rust and Xray-core
+        uses: ./.github/actions/go-oracle-setup
+
+      - name: Verify the xdns mask against pinned Xray-core
+        run: bash scripts/check-xdns-interop.sh
+
+      - name: Verify the realm mask against pinned Xray-core
+        run: bash scripts/check-realm-interop.sh
+
+      - name: Verify the xicmp mask against pinned Xray-core
+        run: bash scripts/check-xicmp-interop.sh
+
       - name: Verify the MASQUE client against pinned Xray-core
         run: bash scripts/check-masque-interop.sh
 
       - name: Verify the VLESS reverse proxy bridge against pinned Xray-core
         run: bash scripts/check-reverse-interop.sh
+
       - name: Verify the XDRIVE client against pinned Xray-core
         run: bash scripts/check-xdrive-interop.sh
 

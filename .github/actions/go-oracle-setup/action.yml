@@ -1,0 +1,50 @@
+name: Prepare a Go oracle shard
+description: >-
+  Bind the build directory to the root disk, install the pinned Go and Rust
+  toolchains, and check out pinned Xray-core. The caller checks out this
+  repository first; a local action is not on disk until then.
+
+runs:
+  using: composite
+  steps:
+    # Instabox runs the workspace on a 20 GiB /data disk, which a full
+    # workspace test build fills. The root disk has the room, so build there.
+    - name: Keep build outputs on the root disk
+      shell: bash
+      run: |
+        sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
+        mkdir -p target
+        sudo mount --bind /opt/segue-target target
+        df -h / target
+
+    # The pinned Xray-core v26.11.9 source requires Go 1.27.
+    # Use one exact toolchain for all oracle and interoperability checks.
+    #
+    # Every locally committed module's `go.sum` is listed: the cache key uses these
+    # paths alone, so a module missing from the list has its dependencies
+    # re-downloaded on every run.
+    - name: Install pinned Go toolchain
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: "1.27.4"
+        cache-dependency-path: |
+          go.sum
+          tools/reality-oracle/masquerade/go.sum
+          tools/reality-oracle/grpc/go.sum
+          tools/wireguard-reference/go.sum
+
+    - name: Check out pinned routing and encryption oracle
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: XTLS/Xray-core
+        ref: 676eaf66f8f05d4d558ee7a74b4736623d3feeb9
+        path: Xray-core
+        persist-credentials: false
+
+    - name: Install pinned Rust toolchain for encryption interop
+      shell: bash
+      run: rustup toolchain install 1.96.0 --profile minimal
+
+    - name: Select pinned Rust toolchain
+      shell: bash
+      run: rustup default 1.96.0

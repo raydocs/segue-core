@@ -16,6 +16,10 @@ import sys
 
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "raydocs/segue-core")
 WORKFLOW = ".github/workflows/ci.yml"
+# `go-oracles` is the required aggregate of go-oracles-protocols,
+# go-oracles-carriers, go-oracles-wireguard and go-oracles-tunnels. Those
+# shards are additional jobs: a failure is rejected below, and the aggregate
+# itself fails unless every shard succeeded.
 REQUIRED = {
     "release-metadata", "secrets", "rust", "tproxy-linux", "go-oracles", "rc-interop",
     "scheduled-pinned-interop", "host-hardening", "fuzz-smoke",

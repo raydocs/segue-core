@@ -268,10 +268,83 @@ done
 # A stable tag skips exactly the gates its candidate run proved, and only
 # after its own history scan and evidence pass does it bind to that run.
 stable_tag_skip="    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')"
-for job in rust tproxy-linux go-oracles android supply-chain; do
+for job in rust tproxy-linux android supply-chain \
+  go-oracles-protocols go-oracles-carriers go-oracles-wireguard go-oracles-tunnels; do
   grep -Fxq "$stable_tag_skip" <<<"$(job_body "$job")" || \
     die "$job does not run for every event except a stable tag push"
 done
+# go-oracles stays the required check. It uses the same stable-tag predicate,
+# but always() so a failed shard turns the check red instead of skipping it.
+go_oracles="$(job_body go-oracles)"
+grep -Fxq "    if: always() && cancelled() == false && (github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.'))" <<<"$go_oracles" || \
+  die "go-oracles does not stay skipped on a stable tag and red when a shard fails"
+for shard in go-oracles-protocols go-oracles-carriers go-oracles-wireguard go-oracles-tunnels; do
+  grep -Fxq "      - $shard" <<<"$go_oracles" || die "go-oracles does not wait for $shard"
+  shard_body="$(job_body "$shard")"
+  grep -Fxq '        uses: ./.github/actions/go-oracle-setup' <<<"$shard_body" || \
+    die "$shard does not prepare the pinned Go, Rust and Xray-core toolchain"
+  grep -Fxq '      CARGO_INCREMENTAL: "0"' <<<"$shard_body" || \
+    die "$shard dropped the incremental-compile disk guard"
+  grep -Fxq '      CARGO_PROFILE_DEV_DEBUG: line-tables-only' <<<"$shard_body" || \
+    die "$shard dropped the line-tables disk guard"
+  grep -Fxq '      - name: Report disk use' <<<"$shard_body" || \
+    die "$shard no longer reports disk use after its steps"
+done
+grep -Fxq '            if [[ "$result" != "success" ]]; then' <<<"$go_oracles" || \
+  die "go-oracles does not fail when a shard is not successful"
+# Every oracle command from the single go-oracles job still runs once.
+for command in \
+  "bash scripts/verify-oracle-fixtures.sh" \
+  "bash scripts/check-routing-oracle.sh" \
+  "bash scripts/check-vless-encryption-oracle.sh" \
+  "bash scripts/check-xhttp-download-oracle.sh" \
+  "bash scripts/check-v07-protocol-oracle.sh" \
+  "bash scripts/check-v08-protocol-oracle.sh" \
+  "bash scripts/check-trojan-interop.sh" \
+  "bash scripts/check-shadowsocks2022-interop.sh" \
+  "bash scripts/check-vmess-interop.sh" \
+  "bash scripts/check-socks-interop.sh" \
+  "bash scripts/check-http-interop.sh" \
+  "bash scripts/check-mux-interop.sh" \
+  "bash scripts/check-v08-independent-interop.sh" \
+  "bash scripts/check-v08-carrier-interop.sh" \
+  "bash scripts/check-hysteria-interop.sh" \
+  "bash scripts/check-kcp-interop.sh" \
+  "bash scripts/check-header-custom-interop.sh" \
+  "bash scripts/check-sudoku-interop.sh" \
+  "bash scripts/check-xmc-interop.sh" \
+  "bash scripts/check-xdns-interop.sh" \
+  "bash scripts/check-realm-interop.sh" \
+  "bash scripts/check-xicmp-interop.sh" \
+  "bash scripts/check-native-hysteria-interop.sh" \
+  "bash scripts/check-wireguard-runtime.sh" \
+  "bash scripts/check-native-wireguard-interop.sh" \
+  "bash scripts/check-wireguard-direct-fixture.sh" \
+  "bash scripts/check-bbr-interop.sh" \
+  "bash scripts/check-masque-interop.sh" \
+  "bash scripts/check-reverse-interop.sh" \
+  "bash scripts/check-xdrive-interop.sh" \
+  "bash scripts/check-xray-verdicts.sh" \
+  "bash scripts/check-xray-default-fingerprint.sh" \
+  "bash scripts/check-chrome-parrot-interop.sh" \
+  "python3 scripts/tests/verify-hysteria-reference.test.py" \
+  "python3 scripts/tests/verify-wireguard-reference.test.py"
+do
+  count="$(grep -Fc "$command" "$WORKFLOW" || true)"
+  [[ "$count" == "1" ]] || die "oracle command must run once, found $count: $command"
+done
+oracle_setup="$WORKSPACE_ROOT/.github/actions/go-oracle-setup/action.yml"
+[[ -f "$oracle_setup" ]] || die "go oracle shards have no shared setup action"
+grep -Fxq '        ref: 676eaf66f8f05d4d558ee7a74b4736623d3feeb9' "$oracle_setup" || \
+  die "go oracle setup does not pin the audited Xray-core commit"
+grep -Fxq '        go-version: "1.27.4"' "$oracle_setup" || \
+  die "go oracle setup does not pin the Go toolchain"
+grep -Fq 'rustup toolchain install 1.96.0 --profile minimal' "$oracle_setup" || \
+  die "go oracle setup does not install the pinned Rust toolchain"
+grep -Fq 'rustup default 1.96.0' "$oracle_setup" || \
+  die "go oracle setup does not select the pinned Rust toolchain"
+grep -Fq 'sudo mount --bind /opt/segue-target target' "$oracle_setup" || \
+  die "go oracle setup does not keep build outputs on the root disk"
 # The owner turned the macOS job off while no macOS runner is available
 # (2026-11-13). It keeps the stable-tag condition or is off outright; while
 # it is off, publish-prerelease, which needs it, cannot run either.
