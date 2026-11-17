@@ -134,12 +134,12 @@ pub(super) fn convert(bytes: &[u8], ctx: &mut Ctx) -> Result<Value, ImportError>
             );
             continue;
         }
-        if let Some(use) = map.get("use") {
+        if let Some(providers) = map.get("use") {
             ctx.warn(
                 format!("{path}.use"),
                 format!(
                     "proxy providers {} are not imported; only listed `proxies` members are used",
-                    string_list(Some(use)).join(", ")
+                    string_list(Some(providers)).join(", ")
                 ),
             );
         }
