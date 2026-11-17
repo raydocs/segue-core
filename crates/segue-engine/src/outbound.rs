@@ -1536,6 +1536,7 @@ fn proxy_chain_requires_local_resolution(proxy: &TcpOutbound) -> bool {
         | TcpOutbound::Vmess(_)
         | TcpOutbound::Shadowsocks2022(_)
         | TcpOutbound::Hysteria(_)
+        | TcpOutbound::Tuic(_)
         | TcpOutbound::Wireguard(_)
         | TcpOutbound::Masque(_) => false,
         TcpOutbound::Freedom(freedom) => match proxy {
