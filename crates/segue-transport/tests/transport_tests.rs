@@ -1118,9 +1118,13 @@ mod transport_tests {
 
         let result = connector.connect(&target).await;
 
+        // TcpConnector carries plaintext only: every security connector config
+        // is refused up front — REALITY and ShadowTLS share one arm with the
+        // "security" tag — so a REALITY target never dials or downgrades to a
+        // plaintext stream.
         assert!(matches!(
             result,
-            Err(TransportError::UnsupportedConnectorConfig("reality"))
+            Err(TransportError::UnsupportedConnectorConfig("security"))
         ));
     }
 
