@@ -139,25 +139,31 @@ use_build_std_for_target() {
   esac
 }
 
-build_target() {
-  local target="$1"
-  if use_build_std_for_target "$target"; then
+# One cargo invocation per toolchain for the given targets: cargo then
+# compiles the targets in parallel and builds the shared host
+# build scripts and proc macros once, instead of one target at a time.
+build_targets() {
+  local target
+  local stable=()
+  local build_std=()
+  for target in "$@"; do
+    if use_build_std_for_target "$target"; then
+      build_std+=(--target "$target")
+    else
+      stable+=(--target "$target")
+    fi
+  done
+  if [[ "${#stable[@]}" -gt 0 ]]; then
+    "$CARGO_BIN" build --locked --package segue-ffi "${stable[@]}" $(cargo_profile_args)
+  fi
+  if [[ "${#build_std[@]}" -gt 0 ]]; then
     "$CARGO_BIN" "+$TVOS_RUST_TOOLCHAIN" build \
       --locked \
       -Z build-std=std,panic_unwind \
       --package segue-ffi \
-      --target "$target" \
+      "${build_std[@]}" \
       $(cargo_profile_args)
-  else
-    "$CARGO_BIN" build --locked --package segue-ffi --target "$target" $(cargo_profile_args)
   fi
-}
-
-build_targets() {
-  local target
-  for target in "$@"; do
-    build_target "$target"
-  done
 }
 
 combine_staticlibs() {
@@ -192,10 +198,10 @@ main() {
   validate_output_paths
   validate_headers
 
-  build_targets "${IOS_DEVICE_TARGETS[@]}"
-  build_targets "${IOS_SIMULATOR_TARGETS[@]}"
-  build_targets "${TVOS_DEVICE_TARGETS[@]}"
-  build_targets "${TVOS_SIMULATOR_TARGETS[@]}"
+  # One platform at a time, its targets in parallel: each segue-engine
+  # compile peaks near 1.7 GB, so all seven at once would swap a 16 GB Mac.
+  build_targets "${IOS_DEVICE_TARGETS[@]}" "${IOS_SIMULATOR_TARGETS[@]}"
+  build_targets "${TVOS_DEVICE_TARGETS[@]}" "${TVOS_SIMULATOR_TARGETS[@]}"
   build_targets "${MACOS_TARGETS[@]}"
 
   local ios_device_lib="$OUT_DIR/ios-device/$LIB_NAME"
