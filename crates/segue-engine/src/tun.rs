@@ -6648,6 +6648,7 @@ mod tests {
             ipv4_pool: segue_config::IpCidr::new(IpAddr::V4(network), prefix).unwrap(),
             pool_size,
             ttl,
+            exempt_domains: segue_config::default_fake_ip_exempt_domains(),
         };
         FakeIpMapper::from_config_with_start(
             &config,

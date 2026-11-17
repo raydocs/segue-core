@@ -21,8 +21,8 @@ use hkdf::Hkdf;
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use segue_config::{
-    compile_dns_domain_matchers, compile_domain_matchers, parse_xray_json, CoreConfig, DnsConfig,
-    DnsFakeIpConfig, DnsHostTarget, DnsNameServerConfig, DnsOutboundRule, DnsOutboundRuleAction,
+    compile_dns_domain_matchers, compile_domain_matchers, default_fake_ip_exempt_domains,
+    parse_xray_json, CoreConfig, DnsConfig, DnsFakeIpConfig, DnsHostTarget, DnsNameServerConfig, DnsOutboundRule, DnsOutboundRuleAction,
     DnsOutboundSettings, DnsQTypeRange, DnsQueryStrategy, DnsServerConfig, DnsServerEndpoint,
     DomainHostIndex, DomainMatcher, DomainMatcherSet, InboundConfig, InboundProtocol,
     InboundSniffingConfig, IpCidr, IpMatcherSet, Network, OutboundConfig, OutboundSettings,
@@ -676,6 +676,7 @@ fn runtime_tun_config_with_fake_ip_route_only_http_sniffing(unused_proxy_port: u
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config.dns.hosts = DomainHostIndex::from_iter([(
         DomainMatcher::Full("routed.example".to_owned()),
@@ -703,6 +704,7 @@ fn runtime_tun_config_with_fake_ip_quic_sniffing_routed_to_dns_outbound() -> Cor
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config
 }
@@ -719,6 +721,7 @@ fn runtime_tun_config_with_fake_ip_domain_routed_freedom_outbound(
             ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
             pool_size: 32_768,
             ttl: 60,
+            exempt_domains: default_fake_ip_exempt_domains(),
         }),
         ..Default::default()
     };
@@ -734,6 +737,7 @@ fn runtime_tun_config_with_mobile_fake_dns_freedom(dns_server: SocketAddr) -> Co
             ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
             pool_size: 32_768,
             ttl: 60,
+            exempt_domains: default_fake_ip_exempt_domains(),
         }),
         ..Default::default()
     };
@@ -788,6 +792,7 @@ fn runtime_tun_config_with_fake_ip_ip_if_non_match_routed_freedom_outbound(
             ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
             pool_size: 32_768,
             ttl: 60,
+            exempt_domains: default_fake_ip_exempt_domains(),
         }),
         ..Default::default()
     };
@@ -6066,6 +6071,7 @@ async fn run_tun_fake_dns_static_only_vless_remote_resolution_scenario() {
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     let mut core = Core::with_tun_runtime_options(
         config,
@@ -6926,6 +6932,7 @@ async fn run_core_wide_fake_dns_socks_to_http_scenario() {
         ipv4_pool: fake_ip_pool,
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config.dns.hosts.insert(
         DomainMatcher::Full(domain.to_owned()),
@@ -7043,6 +7050,7 @@ async fn run_tun_dns_outbound_fake_ip_domain_scenario(strategy: RoutingDomainStr
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config.routing.domain_strategy = strategy;
     let mut core = Core::with_dns_resolver(
@@ -7123,6 +7131,7 @@ async fn run_tun_dns_outbound_tcp_fake_ip_domain_scenario(strategy: RoutingDomai
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config.routing.domain_strategy = strategy;
     let mut core = Core::with_dns_resolver(
@@ -9647,6 +9656,7 @@ async fn run_tun_fake_dns_tcp_scenario(dns_destination: Ipv4Addr) {
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     let mut core = Core::new(config).unwrap();
     core.start().await.unwrap();
@@ -10195,6 +10205,7 @@ async fn run_socks_mapped_fake_ip_http_sniffing_precedence_scenario() {
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     let resolver = StaticDnsResolver {
         domain: mapped_domain,
@@ -10246,6 +10257,7 @@ async fn run_socks_in_pool_unmapped_route_only_http_sniffing_scenario() {
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config.dns.hosts = DomainHostIndex::from_iter([(
         DomainMatcher::Full("routed.example".to_owned()),

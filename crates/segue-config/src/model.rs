@@ -335,6 +335,45 @@ pub struct DnsFakeIpConfig {
     pub ipv4_pool: IpCidr,
     pub pool_size: u32,
     pub ttl: u32,
+    /// Names that keep real answers instead of a fake IP, as Xray domain
+    /// rules. Absent or `null` selects [`default_fake_ip_exempt_domains`]; an
+    /// empty list exempts nothing, which is the behaviour without this field.
+    pub exempt_domains: DomainMatcherSet,
+}
+
+/// Names that keep real answers under `dns.fakeIp` unless the configuration
+/// replaces the list: captive-portal probes, NTP and local-network names.
+///
+/// A fake IP breaks these: a captive-portal check must see the network's own
+/// answer, NTP must reach a real time source, and a `.lan` or `.local` name
+/// must resolve on the local network rather than be proxied. Xray-core has no
+/// such filter; this is a Segue extension, and `"exemptDomains": []` turns it
+/// off.
+pub const DEFAULT_FAKE_IP_EXEMPT_DOMAINS: &[&str] = &[
+    "full:captive.apple.com",
+    "full:connectivitycheck.gstatic.com",
+    "full:www.msftconnecttest.com",
+    "domain:ntp.org",
+    "full:time.apple.com",
+    "domain:lan",
+    "domain:local",
+];
+
+/// The compiled form of [`DEFAULT_FAKE_IP_EXEMPT_DOMAINS`].
+pub fn default_fake_ip_exempt_domains() -> DomainMatcherSet {
+    let matchers: Vec<DomainMatcher> = DEFAULT_FAKE_IP_EXEMPT_DOMAINS
+        .iter()
+        .map(|rule| match rule.strip_prefix("full:") {
+            Some(name) => DomainMatcher::Full(name.to_owned()),
+            None => DomainMatcher::Suffix(
+                rule.strip_prefix("domain:")
+                    .expect("a default exemption is a full: or domain: rule")
+                    .to_owned(),
+            ),
+        })
+        .collect();
+    DomainMatcherSet::compile(&matchers, DomainNameMode::Dns)
+        .expect("the built-in fake-IP exemptions are valid domain rules")
 }
 
 /// A routing rule. Each condition is `None` when the rule sets none and

@@ -122,6 +122,7 @@ async fn use_system_gives_no_fake_ip_without_an_ipv4_route() {
                 .unwrap(),
             pool_size: 1024,
             ttl: 60,
+            exempt_domains: default_fake_ip_exempt_domains(),
         });
         let routes = ScriptedRoutes::new(false, true);
         let core = core_with_routes(config, routes.clone()).await;

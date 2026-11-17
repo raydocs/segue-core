@@ -12,9 +12,9 @@ pub use segue_vless_encryption::Encryption as VlessEncryption;
 pub use diagnostic::{Diagnostic, DiagnosticSeverity};
 pub use model::{
     compile_dns_domain_matchers, compile_domain_matchers, deciding_final_rule, go_lowercase,
-    mux_tcp_concurrency, AddressFamilies, AddressPortRecords, AddressPortStrategy,
-    ConfigModelError, ContentAttributes, CoreConfig, CustomSocketOption, DnsConfig,
-    DnsFakeIpConfig, DnsHostTarget, DnsIpFilter, DnsNameServerConfig, DnsOutboundRule,
+    mux_tcp_concurrency, default_fake_ip_exempt_domains, AddressFamilies, AddressPortRecords,
+    AddressPortStrategy, ConfigModelError, ContentAttributes, CoreConfig, CustomSocketOption,
+    DnsConfig, DnsFakeIpConfig, DnsHostTarget, DnsIpFilter, DnsNameServerConfig, DnsOutboundRule,
     DnsOutboundRuleAction, DnsOutboundSettings, DnsQTypeRange, DnsQueryStrategy, DnsServerConfig,
     DnsServerEndpoint, DnsServerTransport, DomainHostIndex, DomainMatcher, DomainMatcherSet,
     DomainNameMode, DomainStrategy, FragmentPackets, FragmentRange, FreedomBlockDelay,
