@@ -562,9 +562,13 @@ pub struct XrayUdpQuicBlockedEvent {
 
 pub struct XrayCoreHandle {
     core: Option<Core>,
+    // Stage 1 keeps the kernel beside the engine; the stage-2 `xray_kernel_*`
+    // entry points read these (docs/design/ffi-kernel-embedding.md).
     #[cfg(feature = "proprietary-kernel")]
+    #[allow(dead_code)]
     kernel: Option<Arc<segue_kernel::tun::TunStack>>,
     #[cfg(feature = "proprietary-kernel")]
+    #[allow(dead_code)]
     kernel_config: Option<segue_kernel::config::KernelConfig>,
     runtime: Runtime,
     pending_outbound_packets: Mutex<VecDeque<Bytes>>,
@@ -4664,7 +4668,7 @@ mod tests {
         #[cfg(not(feature = "proprietary-kernel"))]
         {
             assert_eq!(XRAY_FFI_ABI_MINOR, 17);
-            assert_eq!(XRAY_FFI_CAPABILITIES, super::XRAY_FFI_ENGINE_CAPABILITIES);
+            assert_eq!(super::XRAY_FFI_CAPABILITIES, super::XRAY_FFI_ENGINE_CAPABILITIES);
         }
         #[cfg(feature = "proprietary-kernel")]
         {
@@ -4677,16 +4681,16 @@ mod tests {
                 | super::XRAY_FFI_CAPABILITY_KERNEL_TUN_FD;
             assert_eq!(expected, (0x1f_u64 << 32) | (1_u64 << 31));
             assert_eq!(
-                XRAY_FFI_CAPABILITIES ^ super::XRAY_FFI_ENGINE_CAPABILITIES,
+                super::XRAY_FFI_CAPABILITIES ^ super::XRAY_FFI_ENGINE_CAPABILITIES,
                 expected
             );
             let constants = [
-                XRAY_FFI_CAPABILITY_KERNEL,
-                XRAY_FFI_CAPABILITY_KERNEL_KILLSWITCH,
-                XRAY_FFI_CAPABILITY_KERNEL_POLICY,
-                XRAY_FFI_CAPABILITY_KERNEL_DNS,
-                XRAY_FFI_CAPABILITY_KERNEL_STATS,
-                XRAY_FFI_CAPABILITY_KERNEL_TUN_FD,
+                super::XRAY_FFI_CAPABILITY_KERNEL,
+                super::XRAY_FFI_CAPABILITY_KERNEL_KILLSWITCH,
+                super::XRAY_FFI_CAPABILITY_KERNEL_POLICY,
+                super::XRAY_FFI_CAPABILITY_KERNEL_DNS,
+                super::XRAY_FFI_CAPABILITY_KERNEL_STATS,
+                super::XRAY_FFI_CAPABILITY_KERNEL_TUN_FD,
             ];
             assert_eq!(expected, constants.into_iter().sum());
         }
