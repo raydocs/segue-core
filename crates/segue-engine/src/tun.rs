@@ -3049,6 +3049,7 @@ async fn open_tcp_bridge_stream(
                 .into());
             }
             TcpOutbound::Trojan(_)
+            | TcpOutbound::AnyTls(_)
             | TcpOutbound::Socks(_)
             | TcpOutbound::Http(_)
             | TcpOutbound::Vmess(_)
