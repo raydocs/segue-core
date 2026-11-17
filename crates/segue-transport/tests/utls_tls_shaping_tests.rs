@@ -1206,6 +1206,162 @@ mod utls_tls_shaping_tests {
         }
     }
 
+    /// Xray 26.11.9's REALITY server (github.com/xtls/reality, `tls.go`) accepts a
+    /// hello only when all of these hold, and it forwards the connection — or
+    /// closes it — when any one fails. The full cipher-suite list changed the
+    /// hello's size and contents; these draws are what a live handshake actually
+    /// sends, GREASE and the Chrome shuffle included.
+    ///
+    /// * one handshake record, so the server's first read is the whole hello
+    /// * the legacy session id is 32 bytes at handshake offset 39, where both
+    ///   sides seal it (`hello.Raw[39:]`)
+    /// * an X25519MLKEM768 share of exactly 1216 bytes appears before any
+    ///   X25519 share (the server stops at the first X25519)
+    /// * no duplicate extension type, which Go's unmarshal rejects
+    /// * the extension block is consumed exactly, so a length bug cannot hide
+    #[test]
+    fn reality_server_can_parse_every_random_hybrid_hello() {
+        const DRAWS: usize = 16;
+        // `XRAY_REALITY_HYBRID_FINGERPRINTS`, the names v26.11.9 will authenticate.
+        let fingerprints = [
+            "chrome",
+            "firefox",
+            "safari",
+            "hellofirefox_148",
+            "hellochrome_131",
+            "hellochrome_133",
+            "hellochrome_155",
+            "hellosafari_26_3",
+        ];
+        for fingerprint in fingerprints {
+            for draw in 0..DRAWS {
+                let hello = plain_tls_client_hello_bytes(&config(fingerprint, &[]))
+                    .unwrap_or_else(|error| panic!("{fingerprint} draw {draw}: {error}"));
+                assert_reality_hello(&hello, fingerprint, draw);
+            }
+        }
+        // gRPC replaces the profile ALPN with h2. The key-share rule does not move.
+        for draw in 0..DRAWS {
+            let hello = plain_tls_client_hello_bytes(&config("chrome", &["h2"]))
+                .unwrap_or_else(|error| panic!("chrome h2 draw {draw}: {error}"));
+            assert_reality_hello(&hello, "chrome/h2", draw);
+        }
+    }
+
+    fn assert_reality_hello(hello: &[u8], fingerprint: &str, draw: usize) {
+        const MLKEM_SHARE_LEN: usize = 1184 + 32;
+        let what = format!("{fingerprint} draw {draw}");
+        assert!(hello.len() > 5, "{what}: empty flight");
+        assert_eq!(hello[0], 0x16, "{what}: not a handshake record");
+        assert!(
+            hello[1..3] == [0x03, 0x01] || hello[1..3] == [0x03, 0x03],
+            "{what}: record version {:02x}{:02x}",
+            hello[1],
+            hello[2]
+        );
+        let record_len = usize::from(u16::from_be_bytes([hello[3], hello[4]]));
+        assert_eq!(
+            hello.len(),
+            5 + record_len,
+            "{what}: the flight is more than one record"
+        );
+        assert!(record_len <= 16_384, "{what}: record is {record_len} bytes");
+        assert_eq!(hello[5], 0x01, "{what}: not a ClientHello");
+        let handshake_len = (usize::from(hello[6]) << 16)
+            | (usize::from(hello[7]) << 8)
+            | usize::from(hello[8]);
+        assert_eq!(
+            handshake_len + 4,
+            record_len,
+            "{what}: handshake message does not fill the record"
+        );
+        // Handshake offset 39 is `raw[39:]` on both sides. The length byte sits
+        // one before it.
+        assert!(
+            hello.len() > 5 + 38,
+            "{what}: hello is shorter than a session id"
+        );
+        assert_eq!(hello[5 + 38], 32, "{what}: session id is not 32 bytes");
+
+        let mut cursor = 5 + 4 + 2 + 32;
+        cursor += 1 + usize::from(hello[cursor]);
+        let cipher_len = usize::from(u16::from_be_bytes([hello[cursor], hello[cursor + 1]]));
+        assert_eq!(cipher_len % 2, 0, "{what}: cipher suite list is odd");
+        assert!(cipher_len >= 2, "{what}: no cipher suites");
+        cursor += 2 + cipher_len;
+        cursor += 1 + usize::from(hello[cursor]);
+        let extensions_len = usize::from(u16::from_be_bytes([hello[cursor], hello[cursor + 1]]));
+        cursor += 2;
+        let extensions_end = cursor + extensions_len;
+        assert_eq!(
+            extensions_end,
+            hello.len(),
+            "{what}: extensions do not fill the hello"
+        );
+
+        let mut seen = HashSet::new();
+        let mut shares: Vec<(u16, usize)> = Vec::new();
+        while cursor + 4 <= extensions_end {
+            let extension_type = u16::from_be_bytes([hello[cursor], hello[cursor + 1]]);
+            let payload_len =
+                usize::from(u16::from_be_bytes([hello[cursor + 2], hello[cursor + 3]]));
+            cursor += 4;
+            assert!(
+                cursor + payload_len <= extensions_end,
+                "{what}: extension {extension_type:#06x} overruns the block"
+            );
+            assert!(
+                seen.insert(extension_type),
+                "{what}: duplicate extension {extension_type:#06x}"
+            );
+            if extension_type == EXT_KEY_SHARE {
+                shares = key_share_entries(&hello[cursor..cursor + payload_len], &what);
+            }
+            cursor += payload_len;
+        }
+        assert_eq!(cursor, extensions_end, "{what}: trailing extension bytes");
+
+        let mlkem = shares
+            .iter()
+            .position(|(group, len)| *group == 0x11ec && *len == MLKEM_SHARE_LEN);
+        assert!(
+            mlkem.is_some(),
+            "{what}: no X25519MLKEM768 share of {MLKEM_SHARE_LEN} bytes in {shares:?}"
+        );
+        if let Some(x25519) = shares.iter().position(|(group, _)| *group == 0x001d) {
+            assert!(
+                x25519 > mlkem.unwrap(),
+                "{what}: X25519 at {x25519} is not after X25519MLKEM768 ({shares:?})"
+            );
+            assert_eq!(shares[x25519].1, 32, "{what}: X25519 share length");
+        }
+    }
+
+    fn key_share_entries(payload: &[u8], what: &str) -> Vec<(u16, usize)> {
+        assert!(payload.len() >= 2, "{what}: key share extension is short");
+        let list_len = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+        assert_eq!(
+            payload.len(),
+            2 + list_len,
+            "{what}: key share list length"
+        );
+        let mut cursor = 2;
+        let end = 2 + list_len;
+        let mut shares = Vec::new();
+        while cursor < end {
+            assert!(cursor + 4 <= end, "{what}: truncated key share");
+            let group = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]);
+            let key_len =
+                usize::from(u16::from_be_bytes([payload[cursor + 2], payload[cursor + 3]]));
+            cursor += 4;
+            assert!(cursor + key_len <= end, "{what}: key share {group:#06x} overruns");
+            assert!(key_len > 0, "{what}: empty key share {group:#06x}");
+            shares.push((group, key_len));
+            cursor += key_len;
+        }
+        shares
+    }
+
     /// uTLS's GREASE slots, each drawn per hello: the cipher, the group that
     /// supported_groups and the GREASE key share both carry, supported_versions,
     /// signature_algorithms (Chrome 155) and the two extensions, which never
