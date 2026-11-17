@@ -9,6 +9,7 @@ use crate::{
     RoutingLeastLoadSettings, RoutingLeastPingSettings, RoutingOrigin, RoutingPortRange,
     RoutingRule, RoutingRuleTarget, RoutingUsers,
 };
+use segue_routing::mrs;
 use segue_routing::srs::{self, FlatRule, SrsPortRange};
 use segue_routing::{Cidr, DomainMatcherSet, IpMatcherSet, RegexMatcher};
 use serde_json::Value;
@@ -641,7 +642,10 @@ impl Parser<'_> {
         let domain_spec = self.routing_rule_domains(rule, &rule_path)?;
         let ip_spec = self.routing_ip_spec(rule, &rule_path)?;
         if !domain_spec.srs.is_empty() && !ip_spec.srs.is_empty() {
-            self.error(&rule_path, "ext-srs may be set on domain or ip, not both");
+            self.error(
+                &rule_path,
+                "ext-srs or ext-mrs may be set on domain or ip, not both",
+            );
             return None;
         }
         let local_os = self.parse_routing_local_os(rule, &rule_path)?;
@@ -833,8 +837,8 @@ impl Parser<'_> {
 
     /// `domain` and `domains`, each a `StringList` of domain rules. As in
     /// Xray-core, `domains` replaces `domain` when both are given, though
-    /// both must parse. `ext-srs:<path>` names a local sing-box rule-set
-    /// instead of a domain pattern.
+    /// both must parse. `ext-srs:<path>` names a local sing-box rule-set and
+    /// `ext-mrs:<path>` a local mihomo rule-set, instead of a domain pattern.
     fn routing_rule_domains(&mut self, rule: &Value, rule_path: &str) -> Option<DomainSpec> {
         let domain =
             self.routing_domain_spec(rule.get("domain"), &format!("{rule_path}.domain"))?;
@@ -859,12 +863,12 @@ impl Parser<'_> {
         let mut spec = DomainSpec::empty();
         let mut plain = Vec::new();
         for entry in entries {
-            if let Some(file) = ext_srs_path(entry.text) {
+            if let Some((file, format)) = ext_rule_set_path(entry.text) {
                 if file.is_empty() {
-                    self.error(&entry.path, "ext-srs path cannot be empty");
+                    self.error(&entry.path, format!("{} path cannot be empty", format.label()));
                     return None;
                 }
-                push_srs_ref(&mut spec.srs, file, entry.path);
+                push_srs_ref(&mut spec.srs, file, entry.path, format);
                 continue;
             }
             plain.push(entry);
@@ -908,12 +912,12 @@ impl Parser<'_> {
         let mut spec = IpSpec::empty();
         let mut plain = Vec::new();
         for entry in entries {
-            if let Some(file) = ext_srs_path(entry.text) {
+            if let Some((file, format)) = ext_rule_set_path(entry.text) {
                 if file.is_empty() {
-                    self.error(&entry.path, "ext-srs path cannot be empty");
+                    self.error(&entry.path, format!("{} path cannot be empty", format.label()));
                     return None;
                 }
-                push_srs_ref(&mut spec.srs, file, entry.path);
+                push_srs_ref(&mut spec.srs, file, entry.path, format);
                 continue;
             }
             plain.push((Some(entry.text), entry.path));
@@ -924,9 +928,10 @@ impl Parser<'_> {
         Some(spec)
     }
 
-    /// Expands `ext-srs:` into one Segue rule per headless rule. Plain entries
-    /// in the same list are a separate OR branch. The routing rule's other
-    /// conditions, including the opposite list, are AND'd with each branch.
+    /// Expands `ext-srs:` into one Segue rule per headless rule, and `ext-mrs:`
+    /// into one rule for the set. Plain entries in the same list are a separate
+    /// OR branch. The routing rule's other conditions, including the opposite
+    /// list, are AND'd with each branch.
     fn expand_srs_rule(
         &mut self,
         template: RoutingRule,
@@ -934,11 +939,6 @@ impl Parser<'_> {
         refs: &[SrsRef],
         rule_path: &str,
     ) -> Option<Vec<RoutingRule>> {
-        let mut flat = Vec::new();
-        for srs_ref in refs {
-            let set = self.load_srs(&srs_ref.file, &srs_ref.path)?;
-            flat.extend(set.rules.iter().cloned());
-        }
         let mut expanded = Vec::new();
         let plain_sibling = match side {
             SrsSide::Domain => template.domain_matchers.is_some(),
@@ -947,15 +947,28 @@ impl Parser<'_> {
         if plain_sibling {
             expanded.push(template.clone());
         }
-        for rule in &flat {
-            if let Some(rule) = self.and_srs_rule(&template, side, rule, rule_path)? {
-                expanded.push(rule);
+        for srs_ref in refs {
+            let loaded = match srs_ref.format {
+                RuleSetFormat::Srs => self.load_srs(&srs_ref.file, &srs_ref.path)?.rules.clone(),
+                RuleSetFormat::Mrs => self.load_mrs(&srs_ref.file, &srs_ref.path)?.rules.clone(),
+            };
+            let label = srs_ref.format.label();
+            for rule in &loaded {
+                if let Some(rule) = self.and_srs_rule(&template, side, rule, rule_path, label)? {
+                    expanded.push(rule);
+                }
             }
         }
         if expanded.is_empty() {
+            let label = refs
+                .first()
+                .map(|rule_ref| rule_ref.format.label())
+                .unwrap_or("ext-srs");
             self.warning(
                 rule_path,
-                "ext-srs produced no rules Segue can match; the routing rule matches nothing",
+                format!(
+                    "{label} produced no rules Segue can match; the routing rule matches nothing"
+                ),
             );
         }
         Some(expanded)
@@ -967,13 +980,16 @@ impl Parser<'_> {
         side: SrsSide,
         flat: &FlatRule,
         path: &str,
+        label: &str,
     ) -> Option<Option<RoutingRule>> {
         let domain_matchers = match side {
             SrsSide::Domain => self.compile_srs_domains(&flat.domains, path)?,
             SrsSide::Ip if template.domain_matchers.is_some() && !flat.domains.is_empty() => {
                 self.warning(
                     path,
-                    "ext-srs domain list cannot be combined with domain and that rule matches nothing",
+                    format!(
+                        "{label} domain list cannot be combined with domain and that rule matches nothing"
+                    ),
                 );
                 return Some(None);
             }
@@ -985,7 +1001,9 @@ impl Parser<'_> {
             SrsSide::Domain if template.ip_matchers.is_some() && !flat.ip_cidrs.is_empty() => {
                 self.warning(
                     path,
-                    "ext-srs ip_cidr cannot be combined with ip and that rule matches nothing",
+                    format!(
+                        "{label} ip_cidr cannot be combined with ip and that rule matches nothing"
+                    ),
                 );
                 return Some(None);
             }
@@ -997,7 +1015,9 @@ impl Parser<'_> {
         } else if template.origin.source_ips.is_some() {
             self.warning(
                 path,
-                "ext-srs source_ip_cidr cannot be combined with sourceIP and that rule matches nothing",
+                format!(
+                    "{label} source_ip_cidr cannot be combined with sourceIP and that rule matches nothing"
+                ),
             );
             return Some(None);
         } else {
@@ -1008,7 +1028,9 @@ impl Parser<'_> {
             Err(()) => {
                 self.warning(
                     path,
-                    "ext-srs port does not overlap the routing rule and that rule matches nothing",
+                    format!(
+                        "{label} port does not overlap the routing rule and that rule matches nothing"
+                    ),
                 );
                 return Some(None);
             }
@@ -1021,7 +1043,9 @@ impl Parser<'_> {
             Err(()) => {
                 self.warning(
                         path,
-                        "ext-srs source port does not overlap the routing rule and that rule matches nothing",
+                        format!(
+                            "{label} source port does not overlap the routing rule and that rule matches nothing"
+                        ),
                     );
                 return Some(None);
             }
@@ -1031,7 +1055,9 @@ impl Parser<'_> {
             Err(()) => {
                 self.warning(
                     path,
-                    "ext-srs network does not overlap the routing rule and that rule matches nothing",
+                    format!(
+                        "{label} network does not overlap the routing rule and that rule matches nothing"
+                    ),
                 );
                 return Some(None);
             }
@@ -1052,7 +1078,10 @@ impl Parser<'_> {
             target: template.target.clone(),
         };
         if !rule.has_condition() {
-            self.warning(path, "ext-srs rule has no condition and matches nothing");
+            self.warning(
+                path,
+                format!("{label} rule has no condition and matches nothing"),
+            );
             return Some(None);
         }
         Some(Some(rule))
@@ -1136,6 +1165,56 @@ impl Parser<'_> {
         Some(decoded)
     }
 
+    fn load_mrs(
+        &mut self,
+        file: &str,
+        path: &str,
+    ) -> Option<Arc<segue_routing::mrs::MrsRuleSet>> {
+        if let Some(cached) = self.mrs_cache.get(file) {
+            return Some(Arc::clone(cached));
+        }
+        let (mut opened, full_path) = match self.geodata_loader.open_readable(file) {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.error(path, error.to_string());
+                return None;
+            }
+        };
+        let len = match opened.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                self.error(
+                    path,
+                    format!("failed to read rule-set `{}`: {error}", full_path.display()),
+                );
+                return None;
+            }
+        };
+        if len > mrs::MAX_MRS_FILE_BYTES {
+            self.error(
+                path,
+                format!(
+                    "rule-set is {len} bytes; maximum supported size is {} bytes",
+                    mrs::MAX_MRS_FILE_BYTES
+                ),
+            );
+            return None;
+        }
+        let decoded = match mrs::read_rule_set(&mut opened) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.error(path, format!("rule-set `{file}`: {error}"));
+                return None;
+            }
+        };
+        for warning in &decoded.warnings {
+            self.warning(path, format!("rule-set `{file}`: {warning}"));
+        }
+        let decoded = Arc::new(decoded);
+        self.mrs_cache.insert(file.to_owned(), Arc::clone(&decoded));
+        Some(decoded)
+    }
+
     /// Xray's `localOS` is a Go `StringList`: an array of strings, or one
     /// string split at commas without trimming. Names are not validated; one
     /// that is no `runtime.GOOS` value simply never matches.
@@ -1175,9 +1254,25 @@ enum SrsSide {
     Ip,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleSetFormat {
+    Srs,
+    Mrs,
+}
+
+impl RuleSetFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Srs => "ext-srs",
+            Self::Mrs => "ext-mrs",
+        }
+    }
+}
+
 struct SrsRef {
     file: String,
     path: String,
+    format: RuleSetFormat,
 }
 
 struct DomainSpec {
@@ -1208,17 +1303,27 @@ impl IpSpec {
     }
 }
 
-fn ext_srs_path(text: &str) -> Option<&str> {
-    text.strip_prefix("ext-srs:")
+fn ext_rule_set_path(text: &str) -> Option<(&str, RuleSetFormat)> {
+    if let Some(file) = text.strip_prefix("ext-mrs:") {
+        return Some((file, RuleSetFormat::Mrs));
+    }
+    if let Some(file) = text.strip_prefix("ext-srs:") {
+        return Some((file, RuleSetFormat::Srs));
+    }
+    None
 }
 
-fn push_srs_ref(refs: &mut Vec<SrsRef>, file: &str, path: String) {
-    if refs.iter().any(|known| known.file == file) {
+fn push_srs_ref(refs: &mut Vec<SrsRef>, file: &str, path: String, format: RuleSetFormat) {
+    if refs
+        .iter()
+        .any(|known| known.file == file && known.format == format)
+    {
         return;
     }
     refs.push(SrsRef {
         file: file.to_owned(),
         path,
+        format,
     });
 }
 

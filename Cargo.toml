@@ -69,6 +69,9 @@ prost = "0.14"
 rand = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 regex = "1"
+# Pure-Rust zstd decoder. The `zstd` crate links libzstd, which iOS and Android
+# cross builds would have to compile as C; rule-set reads only need a decoder.
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 # Named only for congestion-controller callback types; quinn selects the features.
 quinn-proto = { version = "=0.11.19", default-features = false }
