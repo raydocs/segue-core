@@ -1202,6 +1202,8 @@ pub enum OutboundProtocol {
     /// AnyTLS, which Xray-core does not have; the spelling follows sing-box's
     /// `"type": "anytls"`.
     AnyTls,
+    /// TUIC v5, which Xray-core does not have.
+    Tuic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1220,6 +1222,7 @@ pub enum OutboundSettings {
     Http(HttpOutboundSettings),
     Masque(MasqueOutboundSettings),
     AnyTls(AnyTlsOutboundSettings),
+    Tuic(TuicSettings),
 }
 
 impl OutboundSettings {
@@ -1239,7 +1242,52 @@ impl OutboundSettings {
             Self::Http(_) => OutboundProtocol::Http,
             Self::Masque(_) => OutboundProtocol::Masque,
             Self::AnyTls(_) => OutboundProtocol::AnyTls,
+            Self::Tuic(_) => OutboundProtocol::Tuic,
         }
+    }
+}
+
+/// A TUIC v5 QUIC client, using sing-box's outbound field names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TuicCongestionControl {
+    Cubic,
+    #[default]
+    NewReno,
+    Bbr,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TuicUdpRelayMode {
+    #[default]
+    Native,
+    Quic,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TuicSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    pub uuid: uuid::Uuid,
+    pub password: zeroize::Zeroizing<String>,
+    pub congestion_control: TuicCongestionControl,
+    pub udp_relay_mode: TuicUdpRelayMode,
+    pub zero_rtt_handshake: bool,
+    pub heartbeat: std::time::Duration,
+}
+
+impl fmt::Debug for TuicSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TuicSettings")
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("uuid", &"<redacted>")
+            .field("password", &"<redacted>")
+            .field("congestion_control", &self.congestion_control)
+            .field("udp_relay_mode", &self.udp_relay_mode)
+            .field("zero_rtt_handshake", &self.zero_rtt_handshake)
+            .field("heartbeat", &self.heartbeat)
+            .finish()
     }
 }
 

@@ -294,6 +294,10 @@ objects! {
     TROJAN: ("$.outbounds[].settings (trojan)",
         ["address", "port", "password", "level", "email", "flow", "servers"],
         "One flattened server or exactly one servers entry; mixing forms is rejected. Password 1..4096 UTF-8 bytes. Empty/absent flow only. Verified TLS/REALITY required except private/test plaintext endpoints."),
+    TUIC: ("$.outbounds[].settings (tuic)",
+        ["server", "port", "uuid", "password", "congestion_control", "udp_relay_mode", "zero_rtt_handshake", "heartbeat"],
+        "TUIC protocol version 5 over TLS 1.3 QUIC, with sing-box's field names. server and nonzero port are required; uuid is an RFC 4122 UUID and password a bounded UTF-8 string. congestion_control is cubic, new_reno (default) or bbr. udp_relay_mode is native datagrams (default) or quic unidirectional streams. heartbeat is a positive Go duration or nanoseconds, default 10s. zero_rtt_handshake enables early QUIC data where a resumed session permits it. Requires TLS 1.3 over raw UDP, default ALPN h3, no chaining or Mux; allowInsecure follows sing-box explicitly and disables certificate verification. A TUIC UDP association is full-cone: its own reassembly, 65,535-byte payload cap, ten-second fragment expiry, and a Dissociate command on close."),
+
     ANYTLS: ("$.outbounds[].settings (anytls)",
         ["address", "port", "password", "level", "idle_session_check_interval", "idle_session_timeout", "min_idle_session", "client_metadata"],
         "Not an Xray-core protocol: the field names follow sing-box's AnyTLS outbound. One TLS server; a plaintext stream is refused. password is the SHA-256 credential's source and is redacted. Both idle timings are Go durations or nanoseconds, and a zero or absent value takes the reference's thirty-second floor at runtime. min_idle_session is 0..=8, the pool's session bound. client_metadata replaces the version string the settings frame reports and must not contain newlines or `=`."),

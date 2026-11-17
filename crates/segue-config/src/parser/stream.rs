@@ -10,7 +10,7 @@ impl Parser<'_> {
     ) -> Option<StreamSettings> {
         let stream = outbound.get("streamSettings");
         let stream_network = self.parse_network(stream, index)?;
-        let mut security = self.parse_security(stream, index)?;
+        let mut security = self.parse_security(stream, index, outbound)?;
         if stream_network == StreamNetwork::Hysteria {
             if let StreamSecurity::Tls(tls) = &mut security {
                 let explicit = stream
@@ -1558,8 +1558,8 @@ impl Parser<'_> {
         &mut self,
         stream: Option<&Value>,
         index: usize,
-    ) -> Option<StreamSecurity> {
-        let security_path = format!("$.outbounds[{index}].streamSettings.security");
+        outbound: &Value,
+    ) -> Option<StreamSecurity> {        let security_path = format!("$.outbounds[{index}].streamSettings.security");
         // As with `network`, only an absent key defaults. A silent fallback
         // here is worse than a wrong transport: `"security": 5` would strip a
         // REALITY or TLS outbound down to plaintext.
@@ -1579,9 +1579,11 @@ impl Parser<'_> {
             "tls" => {
                 let tls_settings = stream.and_then(|stream| stream.get("tlsSettings"));
                 let path = format!("$.outbounds[{index}].streamSettings.tlsSettings");
-                Some(StreamSecurity::Tls(
-                    self.parse_tls_object(tls_settings, &path),
-                ))
+                Some(StreamSecurity::Tls(self.parse_tls_object_for_protocol(
+                    tls_settings,
+                    &path,
+                    outbound,
+                )))
             }
             "reality" => self
                 .parse_reality_settings(stream, index)
@@ -1605,6 +1607,19 @@ impl Parser<'_> {
         }
     }
 
+    fn parse_tls_object_for_protocol(
+        &mut self,
+        tls_settings: Option<&Value>,
+        path: &str,
+        outbound: &Value,
+    ) -> TlsSettings {
+        let tuic = outbound
+            .get("protocol")
+            .and_then(Value::as_str)
+            .is_some_and(|protocol| protocol.eq_ignore_ascii_case("tuic"));
+        self.parse_tls_object_inner(tls_settings, path, tuic)
+    }
+
     /// A TLS settings object at `path`, as Xray-core's `TLSConfig` reads it:
     /// `streamSettings.tlsSettings`, or a mask's `tlsConfig`.
     pub(super) fn parse_tls_object(
@@ -1612,9 +1627,21 @@ impl Parser<'_> {
         tls_settings: Option<&Value>,
         path: &str,
     ) -> TlsSettings {
+        self.parse_tls_object_inner(tls_settings, path, false)
+    }
+
+    fn parse_tls_object_inner(
+        &mut self,
+        tls_settings: Option<&Value>,
+        path: &str,
+        tuic: bool,
+    ) -> TlsSettings {
         self.validate_tls_settings(tls_settings, path);
         let allow_insecure_path = format!("{path}.allowInsecure");
         let allow_insecure = match tls_settings.and_then(|settings| settings.get("allowInsecure")) {
+            // TUIC keeps sing-box's explicit skip-verification option. The
+            // other canonical Xray outbounds reject allowInsecure as above.
+            Some(Value::Bool(true)) if tuic => true,
             None | Some(Value::Null) | Some(Value::Bool(false)) => false,
             Some(Value::Bool(true)) => {
                 self.error(
