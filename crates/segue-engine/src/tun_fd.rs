@@ -1,5 +1,8 @@
 use libc::c_int;
 
+#[cfg(all(unix, target_vendor = "apple"))]
+mod apple;
+
 const MAX_IP_PACKET_SIZE: usize = 65_535;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +71,8 @@ mod platform {
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
 
+    #[cfg(target_vendor = "apple")]
+    use super::apple;
     use super::{TunFdConfig, MAX_IP_PACKET_SIZE};
     use crate::TunFdPacketFormat;
 
@@ -78,6 +83,120 @@ mod platform {
     /// per-packet path used to allocate, which bounds what one long-lived
     /// packet can pin. A larger MTU raises it to hold one whole read.
     const TUN_FD_READ_ARENA_MIN: usize = 64 * 1024;
+
+    /// The smallest and largest number of packets one `recvmsg_x` call asks
+    /// the kernel for. The size starts at the minimum and doubles when a batch
+    /// comes back full, halves when it comes back under half full — sing-tun's
+    /// `goReadBatch` adaptation (`stack_go_io_darwin.go`, profiles in
+    /// `stack_go_profile_*.go`). The iOS profile caps a batch lower than the
+    /// macOS one because the Network Extension budget does not allow
+    /// macOS-sized bursts.
+    #[cfg(any(target_vendor = "apple", test))]
+    const TUN_FD_READ_BATCH_MIN: usize = 4;
+    #[cfg(all(
+        any(target_vendor = "apple", test),
+        any(target_os = "ios", target_os = "tvos", target_os = "watchos")
+    ))]
+    const TUN_FD_READ_BATCH_MAX: usize = 32;
+    #[cfg(all(
+        any(target_vendor = "apple", test),
+        not(any(target_os = "ios", target_os = "tvos", target_os = "watchos"))
+    ))]
+    const TUN_FD_READ_BATCH_MAX: usize = 64;
+
+    /// `SEGUE_TUN_BATCH=0` (or `false`, `off`, empty) turns Apple read
+    /// batching off and leaves the single-packet `read(2)` path exactly as it
+    /// is. It is read once per process, like Xray's `XRAY_*` flags.
+    #[cfg(target_vendor = "apple")]
+    const TUN_FD_BATCH_FLAG: &str = "SEGUE_TUN_BATCH";
+
+    /// Whether a read of a Darwin utun descriptor may be batched. Off on every
+    /// platform without `recvmsg_x`, for a raw-IP descriptor, and when the
+    /// environment flag disables it.
+    fn read_batching_enabled(packet_format: TunFdPacketFormat) -> bool {
+        if packet_format != TunFdPacketFormat::DarwinUtun {
+            return false;
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                let value = std::env::var_os(TUN_FD_BATCH_FLAG);
+                parse_batch_flag(value.as_deref())
+            })
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            false
+        }
+    }
+
+    /// The upper bound on one batch's arena. A batch of `batch_max` slots of
+    /// `single_read` bytes each never exceeds it (see [`batch_max_for`]), so
+    /// the memory one batch pins is stated: **at most 272 KiB**, reached when
+    /// the slot count and the slot size trade off against each other. A
+    /// 1500-byte MTU allocates only 64 × 1505 ≈ 94 KiB (32 slots, ≈47 KiB, on
+    /// iOS). The arena stays pinned only until the stack has consumed the
+    /// batch's packets, exactly as the single-packet arena does. The constant
+    /// is above `TUN_FD_READ_BATCH_MIN × (MAX_IP_PACKET_SIZE + 5)`, so even a
+    /// jumbo MTU keeps the starting batch size.
+    #[cfg(any(target_vendor = "apple", test))]
+    const TUN_FD_READ_BATCH_ARENA_MAX: usize = 272 * 1024;
+
+    /// How many slots one batch may use, given the per-slot size: the
+    /// platform cap, but never more than the arena budget allows, and never
+    /// fewer than the starting size.
+    #[cfg(any(target_vendor = "apple", test))]
+    fn batch_max_for(single_read: usize) -> usize {
+        (TUN_FD_READ_BATCH_ARENA_MAX / single_read.max(1))
+            .clamp(TUN_FD_READ_BATCH_MIN, TUN_FD_READ_BATCH_MAX)
+    }
+
+    /// The next adaptive batch size, in the shape sing-tun uses: grow on a
+    /// full batch, shrink below half a batch, hold in between. `max` is the
+    /// caller's cap, itself bounded by what the arena can hold.
+    #[cfg(any(target_vendor = "apple", test))]
+    fn next_batch_size(requested: usize, received: usize, max: usize) -> usize {
+        if received >= requested {
+            requested
+                .saturating_mul(2)
+                .min(max)
+                .max(TUN_FD_READ_BATCH_MIN)
+        } else if received * 2 < requested {
+            (requested / 2).max(TUN_FD_READ_BATCH_MIN).min(max)
+        } else {
+            requested.min(max)
+        }
+    }
+
+    /// Whether an environment value turns read batching off: unset, `1`,
+    /// `true`, `on` and anything else leave it on; empty, `0`, `false` and
+    /// `off` turn it off.
+    #[cfg(any(target_vendor = "apple", test))]
+    fn parse_batch_flag(value: Option<&std::ffi::OsStr>) -> bool {
+        match value {
+            None => true,
+            Some(value) => {
+                !(value.is_empty() || value == "0" || value == "false" || value == "off")
+            }
+        }
+    }
+
+    /// How many pending packets a utun socket is allowed to accept before the
+    /// interface pauses: sing-tun's `receiveBuffer/8*7/(mtu+4)`, clamped to
+    /// 64 (`tun_darwin.go`). It is derived from `SO_RCVBUF` because the
+    /// control socket's backlog is counted in bytes against that buffer,
+    /// whereas this option makes the interface pause instead of dropping.
+    #[cfg(any(target_vendor = "apple", test))]
+    fn derive_utun_pending_packets(receive_buffer: usize, mtu: usize) -> libc::c_int {
+        const UTUN_MAX_PENDING_PACKETS: libc::c_int = 64;
+        let per_packet = mtu.saturating_add(DARWIN_UTUN_HEADER_LEN);
+        if per_packet == 0 {
+            return 1;
+        }
+        let pending = receive_buffer / 8 * 7 / per_packet;
+        pending.clamp(1, UTUN_MAX_PENDING_PACKETS as usize) as libc::c_int
+    }
 
     pub struct TunFdRuntime {
         shutdown: watch::Sender<bool>,
@@ -92,7 +211,7 @@ mod platform {
                 return Err(err);
             }
             let packet_format = config.packet_format;
-            let inner = TunFd::new(config)?;
+            let inner = TunFd::new(config, tun.mtu())?;
             // SAFETY: TunFd owns a private duplicate. Its AsRawFd always returns
             // that descriptor, which stays open until AsyncFd drops the owner.
             let fd = Arc::new(unsafe { AsyncFd::register(inner) }?);
@@ -127,7 +246,7 @@ mod platform {
     }
 
     impl TunFd {
-        fn new(config: TunFdConfig) -> io::Result<Self> {
+        fn new(config: TunFdConfig, mtu: usize) -> io::Result<Self> {
             // A raw descriptor supplied by a host cannot guarantee AsyncFd's
             // lifetime. Duplicate it atomically with CLOEXEC so the registration
             // has its own owner even when the original is borrowed.
@@ -139,8 +258,102 @@ mod platform {
             }
             // SAFETY: fcntl returned a new open descriptor that we alone own.
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            if config.packet_format == TunFdPacketFormat::DarwinUtun {
+                set_utun_max_pending_packets(fd.as_raw_fd(), config.fd, mtu);
+            }
             Ok(Self { fd, config })
         }
+    }
+
+    /// Best-effort `UTUN_OPT_MAX_PENDING_PACKETS` on a utun control socket, so
+    /// the interface pauses when the receive buffer fills instead of letting
+    /// the socket drop outbound packets with `ENOBUFS`. A failure says nothing
+    /// about the descriptor's ability to carry packets — every macOS version
+    /// before the option existed answers `ENOPROTOOPT` — so it is logged at
+    /// debug and ignored. The value is derived from the *host* descriptor
+    /// because that is the one the kernel knows; the duplicate shares the
+    /// socket, so the option applies to both.
+    #[cfg(target_vendor = "apple")]
+    fn set_utun_max_pending_packets(dup_fd: RawFd, host_fd: RawFd, mtu: usize) {
+        // `SOL_SYSTEM` (2) is the level these sysctl-style socket options live
+        // under; `UTUN_OPT_MAX_PENDING_PACKETS` is 16 (`if_utun.h`).
+        const SOL_SYSTEM: libc::c_int = 2;
+        const UTUN_OPT_MAX_PENDING_PACKETS: libc::c_int = 16;
+        let Some(receive_buffer) = utun_receive_buffer(host_fd) else {
+            return;
+        };
+        let value = derive_utun_pending_packets(receive_buffer, mtu);
+        // SAFETY: `host_fd` is a live descriptor owned by the caller, and
+        // `value` is a `c_int` of the length passed.
+        let rc = unsafe {
+            libc::setsockopt(
+                host_fd,
+                SOL_SYSTEM,
+                UTUN_OPT_MAX_PENDING_PACKETS,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            // No `RuntimeLogger` reaches this far — the fd is built before the
+            // engine has one — so the debug channel available here is a debug
+            // build's stderr. A release build drops the message and the tunnel
+            // carries on; the option is an optimisation, not a requirement.
+            debug_log_utun_option_failure(dup_fd, io::Error::last_os_error());
+        }
+    }
+
+    /// Reports a failed best-effort utun option at debug level. Silent in a
+    /// release build, where there is no logger to write to yet.
+    #[cfg(target_vendor = "apple")]
+    fn debug_log_utun_option_failure(fd: RawFd, error: io::Error) {
+        #[cfg(debug_assertions)]
+        eprintln!("segue: utun option on fd {fd} not set (continuing): {error}");
+        #[cfg(not(debug_assertions))]
+        let _ = (fd, error);
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    fn set_utun_max_pending_packets(_dup_fd: RawFd, _host_fd: RawFd, _mtu: usize) {}
+
+    /// The socket's receive buffer in bytes, raised towards sing-tun's 8 MiB
+    /// target first: `SO_RCVBUF` is clamped to `kern.ipc.maxsockbuf`, so the
+    /// halving walk stops at the first size the kernel accepts (1 MiB floor).
+    /// The value read back afterwards is what the option is derived from.
+    #[cfg(target_vendor = "apple")]
+    fn utun_receive_buffer(fd: RawFd) -> Option<usize> {
+        const TARGET: libc::c_int = 8 << 20;
+        const FLOOR: libc::c_int = 1 << 20;
+        let mut size = TARGET;
+        while size >= FLOOR {
+            // SAFETY: `size` is a live `c_int` of the length passed.
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc == 0 {
+                break;
+            }
+            size /= 2;
+        }
+        let mut current: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `current` and `length` are live and sized as declared.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&mut current as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        (rc == 0 && current > 0).then_some(current as usize)
     }
 
     impl AsRawFd for TunFd {
@@ -303,6 +516,10 @@ mod platform {
     ) {
         let mut reader = PacketReader::new(packet_format, tun.mtu());
         let mut consecutive_errors: u32 = 0;
+        // Reused across reads so the packet list itself never allocates. It
+        // holds at most one batch's packets, which the reader has already
+        // carved out of its arena.
+        let mut packets: Vec<Bytes> = Vec::new();
 
         loop {
             tokio::select! {
@@ -311,18 +528,27 @@ mod platform {
                         break;
                     }
                 }
-                packet = reader.read_packet(&fd) => {
-                    match packet {
-                        Ok(Some(packet)) => {
+                read = reader.read_into(&fd, &mut packets) => {
+                    match read {
+                        Ok(_) => {
                             consecutive_errors = 0;
-                            match tun.push_inbound(packet).await {
-                                Ok(())
-                                | Err(TunError::QueueFull | TunError::PacketTooLarge { .. }) => {}
-                                Err(TunError::QueueClosed) => break,
+                            let mut closed = false;
+                            for packet in packets.drain(..) {
+                                match tun.push_inbound(packet).await {
+                                    Ok(())
+                                    | Err(
+                                        TunError::QueueFull
+                                        | TunError::PacketTooLarge { .. },
+                                    ) => {}
+                                    Err(TunError::QueueClosed) => {
+                                        closed = true;
+                                        break;
+                                    }
+                                }
                             }
-                        }
-                        Ok(None) => {
-                            consecutive_errors = 0;
+                            if closed {
+                                break;
+                            }
                         }
                         Err(err) => {
                             let disposition = io_disposition(&err);
@@ -473,6 +699,54 @@ mod platform {
         }
     }
 
+    /// One slot of a batched read, as the kernel reported it: how many bytes
+    /// it wrote and whether it says the datagram was truncated.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg(any(target_vendor = "apple", test))]
+    struct BatchSlot {
+        len: usize,
+        truncated: bool,
+    }
+
+    /// Carves the packets of one batch out of `arena`, in slot order.
+    ///
+    /// Every slot occupies a fixed `stride` of the arena, whether or not it
+    /// carried a packet, because that is how the buffers were laid out for the
+    /// syscall. A slot is dropped when the kernel flagged it truncated or when
+    /// it holds no payload past the format header; the rest are split off the
+    /// shared allocation without a copy, exactly as the single-packet path
+    /// does. This is the pure half of batching: it never touches a descriptor,
+    /// so it runs and is tested on every platform.
+    #[cfg(any(target_vendor = "apple", test))]
+    fn carve_batch(
+        arena: &mut BytesMut,
+        slots: &[BatchSlot],
+        stride: usize,
+        header_len: usize,
+        out: &mut Vec<Bytes>,
+    ) {
+        if slots.is_empty() || stride == 0 {
+            return;
+        }
+        let total = slots.len().saturating_mul(stride);
+        if arena.len() < total {
+            return;
+        }
+        let mut region = arena.split_to(total);
+        for slot in slots {
+            let mut packet = region.split_to(stride);
+            // A datagram longer than the slot is truncated to it; the extra
+            // byte the slot reserves past the MTU is what keeps an oversized
+            // packet observable, so it is still rejected downstream.
+            packet.truncate(slot.len.min(stride));
+            if slot.truncated || packet.len() <= header_len {
+                continue;
+            }
+            packet.advance(header_len);
+            out.push(packet.freeze());
+        }
+    }
+
     /// Carves inbound packets out of a shared arena so a packet reaches the
     /// queue without a per-packet allocation and without a copy: the read
     /// lands directly in the arena's spare capacity and the packet is split
@@ -487,6 +761,49 @@ mod platform {
         single_read: usize,
         arena_len: usize,
         header_len: usize,
+        /// Apple only, and only when batching is on: the state one
+        /// `recvmsg_x` batch needs. `None` means the single-packet path.
+        #[cfg(target_vendor = "apple")]
+        batch: Option<BatchState>,
+    }
+
+    /// One `iovec` slot, wrapped so the reader stays `Send`.
+    ///
+    /// `libc::iovec` holds a raw pointer and is therefore neither `Send` nor
+    /// `Sync` by default, but these pointers only ever address the reader's
+    /// own arena, which travels with it.
+    #[cfg(target_vendor = "apple")]
+    struct BatchIovec(libc::iovec);
+
+    // SAFETY: see the type's comment — the pointer targets the owning
+    // reader's arena and iovec array, which move together and are never
+    // shared.
+    #[cfg(target_vendor = "apple")]
+    unsafe impl Send for BatchIovec {}
+
+    /// A fresh batch arena of `len` bytes: allocated, zero-filled and then
+    /// emptied, so its whole capacity is initialised behind a zero length.
+    /// That keeps `advance_mut` sound over a slot the kernel only partly
+    /// wrote, while `spare_capacity_mut` still spans the whole buffer.
+    #[cfg(target_vendor = "apple")]
+    fn batch_arena(len: usize) -> BytesMut {
+        let mut arena = BytesMut::zeroed(len);
+        arena.clear();
+        arena
+    }
+
+    /// The reusable state of a batched read. Its memory is bounded: the arena
+    /// holds at most `max * single_read` bytes, which [`batch_max_for`] keeps
+    /// at or below [`TUN_FD_READ_BATCH_ARENA_MAX`] (272 KiB) for any MTU, and
+    /// the header and iovec vectors are allocated once at `max` entries.
+    #[cfg(target_vendor = "apple")]
+    struct BatchState {
+        max: usize,
+        size: usize,
+        arena: BytesMut,
+        headers: Vec<apple::MsgHdrX>,
+        iovs: Vec<BatchIovec>,
+        slots: Vec<BatchSlot>,
     }
 
     impl PacketReader {
@@ -500,17 +817,75 @@ mod platform {
                 .saturating_add(header_len)
                 .saturating_add(1);
             let arena_len = single_read.max(TUN_FD_READ_ARENA_MIN);
+            let batching = read_batching_enabled(packet_format);
+            // The single-packet arena is only allocated when it can be used:
+            // a batching reader would otherwise hold 64 KiB it never reads
+            // into, on top of the batch arena.
+            let arena = if batching {
+                BytesMut::new()
+            } else {
+                BytesMut::with_capacity(arena_len)
+            };
+            #[cfg(target_vendor = "apple")]
+            let batch = batching.then(|| {
+                let max = batch_max_for(single_read);
+                BatchState {
+                    max,
+                    size: TUN_FD_READ_BATCH_MIN.min(max),
+                    // Allocated per batch in `read_batch`; empty here.
+                    arena: BytesMut::new(),
+                    headers: (0..max).map(|_| apple::MsgHdrX::zeroed()).collect(),
+                    iovs: (0..max)
+                        .map(|_| {
+                            BatchIovec(libc::iovec {
+                                iov_base: std::ptr::null_mut(),
+                                iov_len: 0,
+                            })
+                        })
+                        .collect(),
+                    slots: Vec::with_capacity(max),
+                }
+            });
             Self {
-                arena: BytesMut::with_capacity(arena_len),
+                arena,
                 single_read,
                 arena_len,
                 header_len,
+                #[cfg(target_vendor = "apple")]
+                batch,
+            }
+        }
+
+        /// Reads whatever the descriptor has ready, appending the packets to
+        /// `out` and returning how many were added. `Ok(0)` means a read that
+        /// carried no payload, not an error; a descriptor at EOF is an error,
+        /// as it is on the single-packet path.
+        async fn read_into<T: AsRawFd>(
+            &mut self,
+            fd: &AsyncFd<T>,
+            out: &mut Vec<Bytes>,
+        ) -> io::Result<usize> {
+            #[cfg(target_vendor = "apple")]
+            {
+                if self.batch.is_some() {
+                    return self.read_batch(fd, out).await;
+                }
+            }
+            match self.read_packet(fd).await? {
+                Some(packet) => {
+                    out.push(packet);
+                    Ok(1)
+                }
+                None => Ok(0),
             }
         }
 
         /// Reads one packet, returning `None` for a read that carries no
         /// payload once the format header is stripped.
-        async fn read_packet(&mut self, fd: &AsyncFd<TunFd>) -> io::Result<Option<Bytes>> {
+        async fn read_packet<T: AsRawFd>(
+            &mut self,
+            fd: &AsyncFd<T>,
+        ) -> io::Result<Option<Bytes>> {
             loop {
                 // A packet is split off whole, so the arena is always empty
                 // here and its capacity is what is left of the allocation.
@@ -569,6 +944,126 @@ mod platform {
             }
             packet.advance(self.header_len);
             Some(packet.freeze())
+        }
+
+        /// Reads up to the current adaptive batch size in one `recvmsg_x`
+        /// call. The batch size grows when a batch comes back full and shrinks
+        /// when it comes back under half full, so a busy tunnel amortises the
+        /// syscall and an idle one does not ask for packets that are not
+        /// there.
+        #[cfg(target_vendor = "apple")]
+        async fn read_batch<T: AsRawFd>(
+            &mut self,
+            fd: &AsyncFd<T>,
+            out: &mut Vec<Bytes>,
+        ) -> io::Result<usize> {
+            let single_read = self.single_read;
+            let header_len = self.header_len;
+            let batch = self.batch.as_mut().expect("batching reader has batch state");
+            loop {
+                let requested = batch.size.min(batch.max).max(1);
+                // One arena per batch, as on the single-packet path: carving
+                // splits the batch's bytes off the arena, so the packets keep
+                // the allocation alive and it cannot be reused while they
+                // live. A batch is 94 KiB at a 1500-byte MTU — one allocation
+                // for up to 64 packets, where the single-packet path allocates
+                // 64 KiB for about 40.
+                batch.arena = batch_arena(requested * single_read);
+
+                // Lay the slots out back to back in the arena's spare
+                // capacity. The raw pointer stays inside this block: holding
+                // one across the await below would make the future `!Send`
+                // and the read loop could not be spawned.
+                {
+                    // Disjoint field borrows, so the iovec and its header can
+                    // be written together.
+                    let BatchState {
+                        arena,
+                        headers,
+                        iovs,
+                        ..
+                    } = batch;
+                    let base = arena.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+                    for index in 0..requested {
+                        // SAFETY: the arena reserved `requested * single_read`
+                        // bytes above, so slot `index` lies inside it.
+                        let slot = unsafe { base.add(index * single_read) };
+                        iovs[index] = BatchIovec(libc::iovec {
+                            iov_base: slot.cast(),
+                            iov_len: single_read,
+                        });
+                        // The whole header is cleared, not just the fields set
+                        // here: older kernels reject a slot whose unused
+                        // fields are not empty.
+                        headers[index] = apple::MsgHdrX::zeroed();
+                        headers[index].msg_iov = &mut iovs[index].0;
+                        headers[index].msg_iovlen = 1;
+                    }
+                }
+
+                let mut guard = fd.readable().await?;
+                let headers = &mut batch.headers[..requested];
+                let result = guard.try_io(|inner| {
+                    // SAFETY: `headers` is a live array of `requested`
+                    // initialised slots, each pointing at its own slot of the
+                    // arena, and the descriptor is open for the call.
+                    let received = unsafe {
+                        apple::recvmsg_x(
+                            inner.get_ref().as_raw_fd(),
+                            headers.as_mut_ptr(),
+                            requested as libc::c_uint,
+                            apple::MSG_DONTWAIT,
+                        )
+                    };
+                    if received < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(received as usize)
+                    }
+                });
+
+                let received = match result {
+                    Ok(Ok(received)) => received,
+                    Ok(Err(err))
+                        if err.kind() == io::ErrorKind::WouldBlock
+                            || err.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        continue
+                    }
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => continue,
+                };
+                // A datagram socket with a closed peer answers `ECONNRESET`
+                // and a zero-length datagram still counts as one slot, so a
+                // fill count of zero should not occur; if it ever does, treat
+                // it as a read with no payload and go back to waiting on
+                // readiness rather than declaring the tunnel dead.
+                if received == 0 {
+                    return Ok(0);
+                }
+                let received = received.min(requested);
+
+                batch.slots.clear();
+                for header in &batch.headers[..received] {
+                    batch.slots.push(BatchSlot {
+                        len: header.msg_datalen,
+                        truncated: header.msg_flags & apple::MSG_TRUNC != 0,
+                    });
+                }
+                // SAFETY: the kernel reported `received` slots written, each
+                // `single_read` bytes, so that prefix of the spare capacity is
+                // initialised.
+                unsafe { batch.arena.advance_mut(received * single_read) };
+                carve_batch(
+                    &mut batch.arena,
+                    &batch.slots,
+                    single_read,
+                    header_len,
+                    out,
+                );
+                batch.size = next_batch_size(requested, received, batch.max);
+                return Ok(received);
+            }
         }
     }
 
@@ -939,11 +1434,14 @@ mod platform {
         fn tun_registration_owns_a_cloexec_duplicate() {
             let (host, mut peer) = UnixStream::pair().unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-            let inner = TunFd::new(TunFdConfig::new(
-                host.as_raw_fd(),
-                TunFdPacketFormat::RawIp,
-                TunFdClosePolicy::Borrowed,
-            ))
+            let inner = TunFd::new(
+                TunFdConfig::new(
+                    host.as_raw_fd(),
+                    TunFdPacketFormat::RawIp,
+                    TunFdClosePolicy::Borrowed,
+                ),
+                1500,
+            )
             .unwrap();
             assert_ne!(inner.as_raw_fd(), host.as_raw_fd());
             assert_ne!(
@@ -1466,6 +1964,259 @@ mod platform {
                 .unwrap();
 
             assert_eq!(batch.as_ptr(), allocation);
+        }
+
+        // ---- Batched read: the pure parts, tested on every OS ----
+
+        #[test]
+        fn batch_size_grows_on_a_full_batch_and_stops_at_the_cap() {
+            assert_eq!(next_batch_size(4, 4, 64), 8);
+            assert_eq!(next_batch_size(8, 8, 64), 16);
+            assert_eq!(next_batch_size(32, 32, 64), 64);
+            assert_eq!(next_batch_size(64, 64, 64), 64, "capped");
+        }
+
+        #[test]
+        fn batch_size_halves_below_half_full_and_never_under_the_start() {
+            assert_eq!(next_batch_size(64, 31, 64), 32);
+            assert_eq!(next_batch_size(8, 3, 64), 4);
+            assert_eq!(next_batch_size(4, 1, 64), TUN_FD_READ_BATCH_MIN);
+            // Between half and full the size holds.
+            assert_eq!(next_batch_size(16, 8, 64), 16);
+            assert_eq!(next_batch_size(16, 15, 64), 16);
+        }
+
+        #[test]
+        fn a_batch_never_exceeds_the_arena_budget() {
+            // A 1500-byte MTU gets the platform batch cap.
+            assert_eq!(batch_max_for(1505), TUN_FD_READ_BATCH_MAX.min(64));
+            // A jumbo MTU cannot fit the cap, so the slot count drops instead.
+            let single = MAX_IP_PACKET_SIZE + DARWIN_UTUN_HEADER_LEN + 1;
+            let max = batch_max_for(single);
+            assert!(max <= TUN_FD_READ_BATCH_ARENA_MAX / single);
+            assert!(max * single <= TUN_FD_READ_BATCH_ARENA_MAX);
+            assert!(max >= TUN_FD_READ_BATCH_MIN);
+            // A slot so large that even the starting batch busts the budget
+            // still gets the starting size, so batching is never disabled by
+            // a pathological slot size.
+            assert_eq!(batch_max_for(usize::MAX / 2), TUN_FD_READ_BATCH_MIN);
+        }
+
+        #[test]
+        fn the_batch_flag_is_off_only_for_its_off_values() {
+            use std::ffi::OsStr;
+            assert!(parse_batch_flag(None));
+            assert!(parse_batch_flag(Some(OsStr::new("1"))));
+            assert!(parse_batch_flag(Some(OsStr::new("true"))));
+            assert!(parse_batch_flag(Some(OsStr::new("on"))));
+            assert!(!parse_batch_flag(Some(OsStr::new("0"))));
+            assert!(!parse_batch_flag(Some(OsStr::new("false"))));
+            assert!(!parse_batch_flag(Some(OsStr::new("off"))));
+            assert!(!parse_batch_flag(Some(OsStr::new(""))));
+        }
+
+        #[test]
+        fn utun_pending_packets_follow_the_receive_buffer() {
+            // A 64 KiB buffer with a 1500-byte MTU: 64k/8*7/1504 = 38.
+            assert_eq!(derive_utun_pending_packets(64 * 1024, 1500), 38);
+            // A 512 KiB buffer derives 305, clamped to the 64 ceiling.
+            assert_eq!(derive_utun_pending_packets(512 * 1024, 1500), 64);
+            // An 8 MiB buffer is clamped too.
+            assert_eq!(derive_utun_pending_packets(8 << 20, 1500), 64);
+            // A buffer smaller than one packet still asks for one.
+            assert_eq!(derive_utun_pending_packets(0, 1500), 1);
+            assert_eq!(derive_utun_pending_packets(1000, 1500), 1);
+        }
+
+        /// Lays `packets` out in `stride`-sized slots, the way a batch read
+        /// would, and returns the arena plus the slot descriptors.
+        fn staged_batch_arena(
+            packets: &[(usize, bool)],
+            stride: usize,
+        ) -> (BytesMut, Vec<BatchSlot>) {
+            let mut arena = BytesMut::with_capacity(packets.len() * stride + 1);
+            let mut slots = Vec::new();
+            for (len, truncated) in packets {
+                let start = arena.len();
+                arena.resize(start + stride, 0);
+                for (index, byte) in arena[start..start + *len].iter_mut().enumerate() {
+                    *byte = index as u8;
+                }
+                slots.push(BatchSlot {
+                    len: *len,
+                    truncated: *truncated,
+                });
+            }
+            (arena, slots)
+        }
+
+        #[test]
+        fn carving_a_batch_yields_one_untouched_packet_per_slot() {
+            let stride = 64;
+            let packets = [(10, false), (20, false), (30, false)];
+            let (mut arena, slots) = staged_batch_arena(&packets, stride);
+            let mut out = Vec::new();
+            carve_batch(&mut arena, &slots, stride, 0, &mut out);
+
+            assert_eq!(out.len(), 3);
+            assert_eq!(out[0].len(), 10);
+            assert_eq!(out[1].len(), 20);
+            assert_eq!(out[2].len(), 30);
+            assert_eq!(&out[1][..4], &[0, 1, 2, 3]);
+            assert!(arena.is_empty(), "the whole batch was carved out");
+        }
+
+        #[test]
+        fn carving_strips_the_utun_header_without_copying_the_payload() {
+            let stride = 32;
+            let mut framed = vec![0, 0, 0, libc::AF_INET as u8];
+            framed.extend_from_slice(&[0x45, 0x11, 0x22, 0x33]);
+            let mut arena = BytesMut::with_capacity(stride);
+            arena.extend_from_slice(&framed);
+            arena.resize(stride, 0);
+            let slots = [BatchSlot {
+                len: framed.len(),
+                truncated: false,
+            }];
+
+            let mut out = Vec::new();
+            carve_batch(&mut arena, &slots, stride, DARWIN_UTUN_HEADER_LEN, &mut out);
+
+            assert_eq!(&out[0][..], &[0x45, 0x11, 0x22, 0x33]);
+        }
+
+        #[test]
+        fn a_truncated_slot_is_dropped_even_when_it_looks_like_a_packet() {
+            let stride = 32;
+            let (mut arena, slots) = staged_batch_arena(&[(32, true), (32, false)], stride);
+            let mut out = Vec::new();
+            carve_batch(&mut arena, &slots, stride, 0, &mut out);
+            assert_eq!(out.len(), 1, "only the untruncated slot survives");
+        }
+
+        #[test]
+        fn a_slot_with_no_payload_past_the_header_is_dropped() {
+            let stride = 16;
+            // Empty, and header-only: neither carries a packet.
+            let packets = [(0, false), (4, false), (8, false)];
+            let (mut arena, slots) = staged_batch_arena(&packets, stride);
+            let mut out = Vec::new();
+            carve_batch(&mut arena, &slots, stride, DARWIN_UTUN_HEADER_LEN, &mut out);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].len(), 4);
+        }
+
+        #[test]
+        fn a_short_batch_carves_only_the_slots_the_kernel_filled() {
+            // `recvmsg_x` returns the count it filled; the reader slices the
+            // slot list to it, so carving sees a prefix and leaves the rest.
+            let stride = 32;
+            let (mut arena, slots) = staged_batch_arena(&[(10, false), (10, false)], stride);
+            let mut out = Vec::new();
+            carve_batch(&mut arena, &slots[..1], stride, 0, &mut out);
+            assert_eq!(out.len(), 1);
+            // One slot's stride was consumed; the unfilled slot stays.
+            assert_eq!(arena.len(), stride);
+        }
+
+        #[test]
+        fn an_oversized_datagram_is_carved_at_the_slot_size() {
+            // `msg_datalen` can exceed the slot when the kernel did not flag
+            // truncation; the packet is cut to the slot so the extra byte is
+            // still what makes it rejectable downstream.
+            let stride = 8;
+            let mut arena = BytesMut::with_capacity(stride);
+            arena.resize(stride, 0x45);
+            let slots = [BatchSlot {
+                len: 40,
+                truncated: false,
+            }];
+            let mut out = Vec::new();
+            carve_batch(&mut arena, &slots, stride, 0, &mut out);
+            assert_eq!(out[0].len(), stride);
+        }
+
+        #[test]
+        fn carving_an_empty_batch_does_nothing() {
+            let mut arena = BytesMut::with_capacity(8);
+            arena.resize(8, 0);
+            let mut out = Vec::new();
+            carve_batch(&mut arena, &[], 8, 0, &mut out);
+            assert!(out.is_empty());
+            assert_eq!(arena.len(), 8);
+        }
+
+        #[test]
+        fn a_raw_ip_reader_never_batches() {
+            let reader = PacketReader::new(TunFdPacketFormat::RawIp, 1500);
+            #[cfg(target_vendor = "apple")]
+            assert!(reader.batch.is_none());
+            assert_eq!(reader.header_len, 0);
+        }
+
+        /// `recvmsg_x` works on a `socketpair(AF_UNIX, SOCK_DGRAM)`, which is
+        /// the same datagram shape as a utun fd, so the syscall half of the
+        /// batch can be exercised without a tunnel or privileges.
+        #[cfg(target_vendor = "apple")]
+        #[tokio::test]
+        async fn a_batched_read_of_a_dgram_socketpair_returns_every_datagram() {
+            use std::os::fd::FromRawFd;
+
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: `fds` is a two-element array the call fills in.
+            let rc =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+            assert_eq!(rc, 0, "socketpair: {}", io::Error::last_os_error());
+            // SAFETY: `socketpair` returned two descriptors this test owns.
+            let sender = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+            // SAFETY: as above for the second descriptor.
+            let receiver = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+            set_nonblocking(receiver.as_raw_fd()).unwrap();
+
+            // Each datagram is framed with the 4-byte utun header, which the
+            // batch must strip exactly as the single-packet path does.
+            let payloads: [&[u8]; 3] = [&[1, 2, 3, 4], &[5, 6, 7], &[8, 9]];
+            for payload in payloads {
+                let mut framed = vec![0, 0, 0, libc::AF_INET as u8];
+                framed.extend_from_slice(payload);
+                // SAFETY: the descriptor is open and `framed` is a live slice.
+                let written = unsafe {
+                    libc::write(sender.as_raw_fd(), framed.as_ptr().cast(), framed.len())
+                };
+                assert_eq!(written, framed.len() as isize);
+            }
+
+            // RawIp here so the utun-only socket options are not attempted on
+            // a plain dgram socket; the reader's format is what selects
+            // batching, and it is set to utun below.
+            let reader_fd = TunFd::new(
+                TunFdConfig::new(
+                    receiver.as_raw_fd(),
+                    TunFdPacketFormat::RawIp,
+                    TunFdClosePolicy::Borrowed,
+                ),
+                1500,
+            )
+            .unwrap();
+            // SAFETY: the duplicate lives until `reader_fd` drops, which the
+            // registration below keeps as its owner.
+            let afd = unsafe { AsyncFd::register(reader_fd) }.unwrap();
+
+            let mut reader = PacketReader::new(TunFdPacketFormat::DarwinUtun, 1500);
+            if reader.batch.is_none() {
+                // `SEGUE_TUN_BATCH` is off in this environment; the syscall
+                // path is not reachable, and the pure tests still cover the
+                // carving.
+                return;
+            }
+
+            let mut out = Vec::new();
+            let count = reader.read_into(&afd, &mut out).await.unwrap();
+            assert_eq!(count, payloads.len());
+            assert_eq!(out.len(), payloads.len());
+            for (packet, payload) in out.iter().zip(payloads) {
+                assert_eq!(&packet[..], payload);
+            }
         }
     }
 }
