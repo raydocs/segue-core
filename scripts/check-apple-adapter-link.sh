@@ -62,7 +62,12 @@ verify_macos_universal_library() {
     echo "macOS static library not found in $XCFRAMEWORK_PATH" >&2
     exit 1
   fi
-  lipo "$binary" -verify_arch arm64 x86_64
+  # One architecture per call: Xcode 27's lipo takes a single arch after
+  # -verify_arch and reads a second one as another input file.
+  local arch
+  for arch in arm64 x86_64; do
+    lipo "$binary" -verify_arch "$arch"
+  done
 }
 
 main() {
