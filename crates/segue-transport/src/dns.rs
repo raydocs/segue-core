@@ -6069,7 +6069,7 @@ mod tests {
             dns_cache_capacity(MemoryClass::Standard),
             DNS_CACHE_MAX_ENTRIES_STANDARD
         );
-        assert!(DNS_CACHE_MAX_ENTRIES_CONSTRAINED < DNS_CACHE_MAX_ENTRIES_STANDARD);
+        const { assert!(DNS_CACHE_MAX_ENTRIES_CONSTRAINED < DNS_CACHE_MAX_ENTRIES_STANDARD) };
     }
 
     #[tokio::test]

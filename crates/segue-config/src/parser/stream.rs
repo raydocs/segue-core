@@ -1707,9 +1707,7 @@ impl Parser<'_> {
         use base64::Engine as _;
 
         let path = format!("{path}.echConfigList");
-        let Some(value) = settings.and_then(|settings| settings.get("echConfigList")) else {
-            return None;
-        };
+        let value = settings.and_then(|settings| settings.get("echConfigList"))?;
         let encoded = match value {
             // encoding/json unmarshals JSON null into the Go string zero value.
             Value::Null => return None,
