@@ -573,7 +573,9 @@ mod tests {
                 let (action, protection, label): (&Action, Protection, &str) = match kind {
                     ClassKind::AiDomain => {
                         assert_eq!(
-                            policy.rules.decide(&TargetAddr::Domain("api.claude.ai".into())),
+                            policy
+                                .rules
+                                .decide(&TargetAddr::Domain("api.claude.ai".into())),
                             &ai
                         );
                         (&ai, Protection::Strict, "ai domain")

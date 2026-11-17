@@ -46,7 +46,6 @@ pub use model::{
 };
 pub use model::{xdrive_default_xmux, XdriveS3Settings, XdriveService, XdriveSettings};
 pub use model::{AnyTlsOutboundSettings, MAX_ANYTLS_IDLE_SESSIONS};
-pub use model::{TuicCongestionControl, TuicSettings, TuicUdpRelayMode};
 pub use model::{
     BlackholeOutboundSettings, BlackholeResponse, HttpInboundSettings, HttpOutboundSettings,
     NoiseSegment, RealmIpMode, RealmMask, RealmPortMapping, RealmScheme, RealmStunServer,
@@ -55,6 +54,7 @@ pub use model::{
     XmcMask, XmcProfile,
 };
 pub use model::{MasqueOutboundSettings, MasqueSettings, MasqueWarpSettings, MASQUE_DEFAULT_XMUX};
+pub use model::{TuicCongestionControl, TuicSettings, TuicUdpRelayMode};
 pub use parser::{
     parse_xray_json, parse_xray_json_with_exclusive_geodata_dirs, parse_xray_json_with_geodata_dir,
     parse_xray_json_with_geodata_dirs, ConfigParseError, ParsedConfig, MAX_CONFIG_DOMAIN_MATCHERS,

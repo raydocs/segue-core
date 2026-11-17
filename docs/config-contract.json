@@ -51,49 +51,7 @@
   ],
   "coreVersion": "0.9.0",
   "documentation": "docs/config-tooling.md",
-  "examples": {"tuic":   {
-    "inbounds": [
-      {
-        "tag": "tun-in",
-        "protocol": "tun",
-        "settings": {}
-      }
-    ],
-    "outbounds": [
-      {
-        "tag": "proxy",
-        "protocol": "tuic",
-        "settings": {
-          "server": "tuic.example",
-          "port": 443,
-          "uuid": "00010203-0405-0607-0809-0a0b0c0d0e0f",
-          "password": "synthetic-tuic-example-password",
-          "congestion_control": "bbr",
-          "udp_relay_mode": "native",
-          "zero_rtt_handshake": true,
-          "heartbeat": "10s"
-        },
-        "streamSettings": {
-          "network": "udp",
-          "security": "tls",
-          "tlsSettings": {
-            "serverName": "tuic.example",
-            "alpn": [
-              "h3"
-            ]
-          }
-        }
-      }
-    ],
-    "dns": {
-      "queryStrategy": "UseIPv4"
-    },
-    "routing": {
-      "domainStrategy": "AsIs",
-      "rules": []
-    }
-  },
-
+  "examples": {
     "anytls": {
       "dns": {
         "fakeIp": {
@@ -329,6 +287,48 @@
             "security": "tls",
             "tlsSettings": {
               "serverName": "trojan.example"
+            }
+          },
+          "tag": "proxy"
+        }
+      ],
+      "routing": {
+        "domainStrategy": "AsIs",
+        "rules": []
+      }
+    },
+    "tuic": {
+      "dns": {
+        "queryStrategy": "UseIPv4"
+      },
+      "inbounds": [
+        {
+          "protocol": "tun",
+          "settings": {},
+          "tag": "tun-in"
+        }
+      ],
+      "outbounds": [
+        {
+          "protocol": "tuic",
+          "settings": {
+            "congestion_control": "bbr",
+            "heartbeat": "10s",
+            "password": "synthetic-tuic-example-password",
+            "port": 443,
+            "server": "tuic.example",
+            "udp_relay_mode": "native",
+            "uuid": "00010203-0405-0607-0809-0a0b0c0d0e0f",
+            "zero_rtt_handshake": true
+          },
+          "streamSettings": {
+            "network": "udp",
+            "security": "tls",
+            "tlsSettings": {
+              "alpn": [
+                "h3"
+              ],
+              "serverName": "tuic.example"
             }
           },
           "tag": "proxy"
@@ -1194,16 +1194,25 @@
       "notes": "socks (alias mixed: SOCKS 5, SOCKS 4/4a CONNECT and HTTP CONNECT on one port), http and tun. Only loopback listeners unless allowUnauthenticatedLan is explicitly true. TUN settings have a separate compatibility surface."
     },
     {
+      "context": "$.routing.balancers[].strategy.settings (leastPing)",
+      "fields": [
+        "pingTolerance"
+      ],
+      "id": "LEAST_PING",
+      "notes": "Xray has no leastPing settings. Segue's optional pingTolerance is a hysteresis duration; omitted means 50ms, matching sing-box urltest tolerance. The incumbent stays until another healthy outbound is faster by more than that."
+    },
+    {
       "context": "$.routing.balancers[].strategy.settings (leastLoad)",
       "fields": [
         "expected",
         "maxRTT",
         "tolerance",
         "baselines",
-        "costs"
+        "costs",
+        "pingTolerance"
       ],
       "id": "LEAST_LOAD",
-      "notes": "Value types, bounds and activation rules are enforced by the executable parser."
+      "notes": "Xray's tolerance stays the failure fraction; expected and baselines are unchanged. Segue's optional pingTolerance is incumbent hysteresis in milliseconds, default 50ms, and applies only when the ranking picks a single outbound. Value types, bounds and activation rules are enforced by the executable parser."
     },
     {
       "context": "$.routing.balancers[].strategy.settings.costs[]",
@@ -1514,6 +1523,7 @@
         "security",
         "tlsSettings",
         "realitySettings",
+        "shadowtlsSettings",
         "tcpSettings",
         "rawSettings",
         "wsSettings",
@@ -1529,7 +1539,21 @@
         "sockopt"
       ],
       "id": "STREAM",
-      "notes": "method takes priority over network. raw/tcp, ws/websocket, httpupgrade, grpc, xhttp/splithttp, kcp/mkcp, hysteria, masque, xdrive; security none/tls/reality. address and port are XDRIVE's: where its storage connections go instead of the URL's host, the port only when nonzero; other transports refuse them. Carrier/security combinations and inactive block handling require the validator."
+      "notes": "method takes priority over network. raw/tcp, ws/websocket, httpupgrade, grpc, xhttp/splithttp, kcp/mkcp, hysteria, masque, xdrive; security none/tls/reality/shadowtls. address and port are XDRIVE's: where its storage connections go instead of the URL's host, the port only when nonzero; other transports refuse them. Carrier/security combinations and inactive block handling require the validator."
+    },
+    {
+      "context": "streamSettings.shadowtlsSettings",
+      "fields": [
+        "password",
+        "version",
+        "serverName",
+        "fingerprint",
+        "alpn",
+        "pinnedPeerCertSha256",
+        "verifyPeerCertByName"
+      ],
+      "id": "SHADOWTLS",
+      "notes": "Segue-only ShadowTLS v3 over raw/tcp; version absent or 3, nonempty password and serverName. Default fingerprint is Chrome. Other fields are the genuine TLS relay's options; certificate trust stays enabled; fromMitm and unsafe fingerprints are unsupported."
     },
     {
       "context": "streamSettings.tlsSettings",

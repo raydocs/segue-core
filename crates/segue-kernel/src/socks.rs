@@ -414,8 +414,8 @@ pub(crate) fn sniffed_route(
             // not steer an AI CIDR onto another proxy (stricter would take
             // the domain when both sides are Proxy). An explicit Reject on
             // either side still blocks.
-            let ai = rules.is_ai(&TargetAddr::Ip(ip))
-                || rules.is_ai(&TargetAddr::Domain(d.clone()));
+            let ai =
+                rules.is_ai(&TargetAddr::Ip(ip)) || rules.is_ai(&TargetAddr::Domain(d.clone()));
             let blocked = matches!(by_ip, Some((_, Action::Reject)))
                 || matches!(by_domain, Some((_, Action::Reject)));
             let a = if ai && !blocked {

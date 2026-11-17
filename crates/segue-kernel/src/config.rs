@@ -372,9 +372,8 @@ impl KernelConfig {
                 Some(g)
                     if !g.is_empty()
                         && g.len() <= 64
-                        && g.bytes().all(|b| {
-                            b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
-                        }) =>
+                        && g.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
                 {
                     g.clone()
                 }
@@ -898,16 +897,10 @@ mod tests {
         assert!(c.udp.unwrap().refuse.contains("ai"));
         assert_eq!(c.exits[0].name, "la");
         assert_eq!(c.exits[0].group(), "la", "absent egress_group is its own");
-        let grouped = ok.replace(
-            r#""node_id":1}]"#,
-            r#""node_id":1,"egress_group":"iad"}]"#,
-        );
+        let grouped = ok.replace(r#""node_id":1}]"#, r#""node_id":1,"egress_group":"iad"}]"#);
         let c = KernelConfig::parse_in(&grouped, &dir).unwrap();
         assert_eq!(c.exits[0].group(), "iad");
-        let bad_group = ok.replace(
-            r#""node_id":1}]"#,
-            r#""node_id":1,"egress_group":""}]"#,
-        );
+        let bad_group = ok.replace(r#""node_id":1}]"#, r#""node_id":1,"egress_group":""}]"#);
         assert!(KernelConfig::parse_in(&bad_group, &dir).is_err());
         let bad = ok.replace(
             r#""exit_class":"ai"}"#,

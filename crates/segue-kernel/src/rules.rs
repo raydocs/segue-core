@@ -131,8 +131,7 @@ impl RuleSet {
                 &self.ai.as_ref().expect("is_ai implies a tier").action,
             ))
         } else {
-            self.user_index(target)
-                .map(|i| (i, &self.rules[i].action))
+            self.user_index(target).map(|i| (i, &self.rules[i].action))
         }
     }
 
@@ -224,8 +223,8 @@ pub fn parse_ai_list(text: &str) -> Result<(Vec<String>, Vec<Cidr>), String> {
                 }
             }
             "cidr" => {
-                let cidr = Cidr::parse(value)
-                    .map_err(|e| format!("ai list line {}: {e}", n + 1))?;
+                let cidr =
+                    Cidr::parse(value).map_err(|e| format!("ai list line {}: {e}", n + 1))?;
                 cidrs.push(cidr);
             }
             other => return Err(format!("ai list line {}: unknown kind {other:?}", n + 1)),
@@ -608,7 +607,12 @@ mod tests {
                 "{name}"
             );
         }
-        for name in ["notopenai.com", "example.com", "statsigapi.net", "sentry.io"] {
+        for name in [
+            "notopenai.com",
+            "example.com",
+            "statsigapi.net",
+            "sentry.io",
+        ] {
             assert_eq!(rules.decide(&d(name)), &Action::Direct, "{name}");
         }
     }

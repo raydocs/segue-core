@@ -810,10 +810,11 @@ mod tests {
             direct.rules.decide(&dom("api.claude.ai")),
             &Action::Proxy("ai".into())
         );
-        let blocked = open(
-            r#"[{"domain_suffix":"openai.com","action":{"type":"reject"}}]"#,
+        let blocked = open(r#"[{"domain_suffix":"openai.com","action":{"type":"reject"}}]"#);
+        assert_eq!(
+            blocked.rules.decide(&dom("api.openai.com")),
+            &Action::Reject
         );
-        assert_eq!(blocked.rules.decide(&dom("api.openai.com")), &Action::Reject);
         assert_eq!(
             blocked.rules.decide(&dom("claude.ai")),
             &Action::Proxy("ai".into())

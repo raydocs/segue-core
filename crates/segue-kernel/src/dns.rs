@@ -1328,7 +1328,8 @@ mod tests {
         let (_, rc, ips) = answers_for_test(&aaaa).unwrap();
         assert_eq!((rc, ips.len()), (RCODE_OK, 0), "real AAAA leaked: {ips:?}");
         assert_eq!(
-            dns.upstream_queries.load(std::sync::atomic::Ordering::Relaxed),
+            dns.upstream_queries
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "AI name was sent to a direct upstream"
         );

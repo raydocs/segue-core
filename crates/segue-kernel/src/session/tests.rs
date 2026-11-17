@@ -546,16 +546,26 @@ async fn ai_auto_does_not_leave_its_egress_group() {
     let l = lab();
     l.d.probe().await.unwrap();
     roundtrip(l.d.dial(Some("ai"), &site(), 443).await.unwrap()).await;
-    assert_eq!(l.ny_carriers.load(Ordering::SeqCst), 0, "first pin was not la");
+    assert_eq!(
+        l.ny_carriers.load(Ordering::SeqCst),
+        0,
+        "first pin was not la"
+    );
     l.la_up.store(false, Ordering::SeqCst);
     // Probe moves Auto's overseas pick to ny. The AI pin stays on la.
     let _ = l.d.probe().await;
-    assert!(l.ny_carriers.load(Ordering::SeqCst) >= 1, "ny was not probed");
+    assert!(
+        l.ny_carriers.load(Ordering::SeqCst) >= 1,
+        "ny was not probed"
+    );
     let ny_before = l.ny_carriers.load(Ordering::SeqCst);
     let t = Instant::now();
     let e = l.d.dial(Some("ai"), &site(), 443).await.unwrap_err();
     assert!(e.0.contains("strict"), "{e}");
-    assert!(t.elapsed() < Duration::from_millis(200), "not refused at once");
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "not refused at once"
+    );
     assert_eq!(
         l.ny_carriers.load(Ordering::SeqCst),
         ny_before,
