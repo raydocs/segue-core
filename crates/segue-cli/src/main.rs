@@ -10,7 +10,8 @@ fn main() {
 }
 
 async fn run() {
-    if let Err(error) = segue_cli::run_cli_with_shutdown(std::env::args(), shutdown_signal()).await {
+    if let Err(error) = segue_cli::run_cli_with_shutdown(std::env::args(), shutdown_signal()).await
+    {
         let code = match &error {
             segue_cli::CliError::ConfigCheckFailed { code } => i32::from(*code),
             segue_cli::CliError::InvalidArguments(_) | segue_cli::CliError::Output { .. } => 2,

@@ -9856,7 +9856,7 @@ mod tests {
         tcp[2..4].copy_from_slice(&destination_port.to_be_bytes());
         tcp[4..8].copy_from_slice(&sequence.to_be_bytes());
         tcp[8..12].copy_from_slice(&acknowledgement.to_be_bytes());
-        tcp[12] = (header_len / 4) as u8 << 4;
+        tcp[12] = ((header_len / 4) as u8) << 4;
         tcp[13] = flags;
         tcp[14..16].copy_from_slice(&u16::MAX.to_be_bytes());
         tcp[20..20 + options.len()].copy_from_slice(options);
