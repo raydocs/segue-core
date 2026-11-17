@@ -632,6 +632,14 @@ mod tests {
         }
     }
 
+    /// `tokio::time::advance` yields only once, which is not enough for the
+    /// spawned schedule to wake from its `sleep_until` and reach the next probe
+    /// or its pause decision. Let the task run before the test asserts on it.
+    async fn advance_and_drain(duration: Duration) {
+        tokio::time::advance(duration).await;
+        drain().await;
+    }
+
     fn stamps_of(stamps: &Arc<Mutex<Vec<tokio::time::Instant>>>) -> Vec<tokio::time::Instant> {
         stamps.lock().expect("probe stamps").clone()
     }
@@ -728,7 +736,7 @@ mod tests {
         });
 
         drain().await;
-        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        advance_and_drain(Duration::from_secs(60 * 60)).await;
         assert!(
             stamps_of(&stamps).is_empty(),
             "lazy mode does not probe before the first health-aware connection"
@@ -738,16 +746,16 @@ mod tests {
         drain().await;
         assert_eq!(stamps_of(&stamps).len(), 1);
 
-        tokio::time::advance(Duration::from_secs(10)).await;
+        advance_and_drain(Duration::from_secs(10)).await;
         assert_eq!(stamps_of(&stamps).len(), 2);
-        tokio::time::advance(Duration::from_secs(10)).await;
+        advance_and_drain(Duration::from_secs(10)).await;
         assert_eq!(stamps_of(&stamps).len(), 3);
         // Idle deadline is 30s from the touch at t=0, so the gap after the
         // probe at t=20 pauses instead of probing at t=30.
-        tokio::time::advance(Duration::from_secs(10)).await;
+        advance_and_drain(Duration::from_secs(10)).await;
         assert_eq!(stamps_of(&stamps).len(), 3);
         let kept_across_pause = kept.load(Ordering::SeqCst);
-        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        advance_and_drain(Duration::from_secs(60 * 60)).await;
         assert_eq!(stamps_of(&stamps).len(), 3);
         assert_eq!(
             kept.load(Ordering::SeqCst),
@@ -794,15 +802,15 @@ mod tests {
 
         activity.touch();
         drain().await;
-        tokio::time::advance(Duration::from_secs(10)).await;
+        advance_and_drain(Duration::from_secs(10)).await;
         assert_eq!(stamps_of(&stamps).len(), 2);
         // A connection at t=10 moves the idle deadline from 30s to 40s.
         activity.touch();
         drain().await;
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::time::advance(Duration::from_secs(10)).await;
+        advance_and_drain(Duration::from_secs(10)).await;
+        advance_and_drain(Duration::from_secs(10)).await;
         assert_eq!(stamps_of(&stamps).len(), 4);
-        tokio::time::advance(Duration::from_secs(10)).await;
+        advance_and_drain(Duration::from_secs(10)).await;
         assert_eq!(
             stamps_of(&stamps).len(),
             4,
@@ -843,14 +851,14 @@ mod tests {
         assert_eq!(stamps_of(&stamps).len(), 1);
         // Each step probes then sleeps 10s. Idle is 25s, so probes start at
         // 0s, 10s and 20s, and the step that returns at 30s pauses.
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::time::advance(Duration::from_secs(10)).await;
+        advance_and_drain(Duration::from_secs(10)).await;
+        advance_and_drain(Duration::from_secs(10)).await;
+        advance_and_drain(Duration::from_secs(10)).await;
         let recorded = stamps_of(&stamps);
         assert_eq!(recorded.len(), 3, "got {recorded:?}");
         assert_eq!(recorded[1] - recorded[0], Duration::from_secs(10));
         assert_eq!(recorded[2] - recorded[1], Duration::from_secs(10));
-        tokio::time::advance(Duration::from_secs(60)).await;
+        advance_and_drain(Duration::from_secs(60)).await;
         assert_eq!(stamps_of(&stamps).len(), 3);
 
         activity.touch();
