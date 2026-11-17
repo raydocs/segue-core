@@ -1,6 +1,9 @@
 # Embedding the Segue kernel/session layer in the mobile FFI
 
-Status: design, not implemented. Owner: FFI/platform.
+Status: stage 0 (Q3 explicitly deferred) and stage 1 implemented
+(2026-11-17); stages 2–7 remain design. Kernel symbol declarations are guarded
+by `XRAY_FFI_WITH_PROPRIETARY_KERNEL`; stage 1 exports no new C functions.
+Owner: FFI/platform.
 Related: [`docs/ffi.md`](../ffi.md), [`docs/architecture.md`](../architecture.md),
 [`docs/design/`](./), `crates/segue-ffi/include/segue_ffi.h`.
 
@@ -629,13 +632,24 @@ release evidence.
 
 ## 8. Open questions
 
-1. **Where does the kernel's outbound graph come from?** Option A (proposed):
-   `EngineDialer` builds it from the kernel JSON's `outbounds`, exactly as the
-   prototype does, sharing only the `TransportDialer`. Option B: build it from
-   the engine `Core`'s `OutboundFactory` so engine-mode snapshots/observatory see
-   the same graph. B removes the duplicate parse but couples kernel mode to a
-   started `Core`, reintroducing the `NoSupportedInbound` problem. Decide before
-   stage 2.
+**Stage 0/1 status (2026-11-17).** `EngineDialer` accepts an
+`Arc<TransportDialer>`; outbounds and direct flows use it, with carrier/direct
+recording-protector tests. No later-stage symbols are implemented. Stage 1's
+ABI minor is 17 when off and 18 when on; guarded header declarations, C harness
+and exact symbol-list tests cover both configurations. Q1 is settled on option
+A. Q3 is deferred because both low-level constructors (`UdpSocket::bind` and
+`TcpStream::connect`) currently bypass `TransportDialer`; resolving it needs
+one shared `SocketProtector` through `SmartDns` or a protected raw-UDP/TCP
+transport adapter, with coherent `SocketOptions` and network-change semantics.
+No `xray_kernel_load_config_json` exists in stage 1, so no host can select the
+incomplete skeleton. The deferred resolution must occur before embedded DNS
+config is accepted, not deferred as a silent runtime fallback.
+
+1. **Where does the kernel's outbound graph come from?** Settled at stage 0:
+   option A. `EngineDialer` builds it from the kernel JSON's `outbounds`, exactly as the
+   prototype does, sharing only the `TransportDialer`. Option B (from an engine
+   `Core`) was rejected because it reintroduces `Core::start` inbound/lifecycle
+   coupling and cannot avoid the engine allocation in kernel mode.
 2. **Second runtime or the handle's runtime?** The prototype uses a
    single-threaded runtime ("the target is a phone VPN extension"), while
    `xray_core_new` builds a multi-thread runtime with 2–6 workers. Running
@@ -648,8 +662,11 @@ release evidence.
    C ABI has no way to do it. Options: pass the `SocketProtector` into
    `SmartDns`; route domestic DNS through the protected `TransportDialer`; or
    exclude the DNS upstream addresses from the TUN routes in the host (host
-   responsibility, fragile). This is a real leak/loop risk on Android and must be
-   settled in stage 0.
+   responsibility, fragile). **Deferred in stage 0** as the brief permits:
+   carriers/direct flows share the supplied `TransportDialer`, but upstream DNS
+   still uses raw sockets without it. Protecting only those raw sockets loses
+   the transport's `SocketOptions`; sharing it needs a raw-UDP connector as well
+   as TCP. Resolve this before an embedded `dns` section can be accepted.
 4. **Should `xray_kernel_load_config_json` accept the prototype's `listen`
    (SOCKS) section at all?** In an embedded product the SOCKS front end is not
    used; leaving `listen` in the kernel JSON means the FFI would open a loopback

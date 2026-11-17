@@ -11,6 +11,11 @@ description = "Stable C ABI for embedding xray-rust in Apple and Android clients
 [lib]
 crate-type = ["rlib", "staticlib", "cdylib"]
 
+[features]
+default = []
+# ABI 1.18. Deliberately not enabled in platform/build scripts yet.
+proprietary-kernel = ["dep:segue-kernel", "dep:segue-session", "dep:segue-policy"]
+
 [dependencies]
 bytes.workspace = true
 libc.workspace = true
@@ -18,6 +23,9 @@ serde_json.workspace = true
 tokio.workspace = true
 segue-config = { path = "../segue-config" }
 segue-engine = { path = "../segue-engine" }
+segue-kernel = { path = "../segue-kernel", optional = true }
+segue-policy = { path = "../segue-policy", optional = true }
+segue-session = { path = "../segue-session", optional = true }
 segue-routing = { path = "../segue-routing" }
 segue-tun = { path = "../segue-tun" }
 segue-transport = { path = "../segue-transport" }
