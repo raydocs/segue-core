@@ -126,7 +126,7 @@ struct Question<'a> {
     qtype: u16,
 }
 
-enum Class {
+pub(crate) enum Class {
     /// Explicit proxy / reject domain rule: fake-IP, no network request.
     Fake,
     /// Explicit direct domain rule: real answer.
@@ -135,11 +135,30 @@ enum Class {
     Unmatched,
 }
 
-fn classify(policy: &Policy, name: &str) -> Class {
+pub(crate) fn classify(policy: &Policy, name: &str) -> Class {
     match policy.rules.lookup(&TargetAddr::Domain(name.to_owned())) {
         Some((_, Action::Direct)) => Class::Domestic,
         Some(_) => Class::Fake,
         None => Class::Unmatched,
+    }
+}
+
+/// How a name that will not be resolved for real is answered.
+///
+/// A is a fake IPv4. AAAA would be a fake IPv6 if the pool had a v6 range;
+/// it does not ([`crate::fakeip`] is IPv4 only), so AAAA is an empty NOERROR
+/// and the client uses the v4 address through the tunnel. Every other type
+/// is empty too: nothing is forwarded to a direct upstream.
+pub(crate) enum ProxiedAnswer {
+    FakeV4,
+    Empty,
+}
+
+pub(crate) fn proxied_answer(qtype: u16) -> ProxiedAnswer {
+    if qtype == TYPE_A {
+        ProxiedAnswer::FakeV4
+    } else {
+        ProxiedAnswer::Empty
     }
 }
 
@@ -190,14 +209,15 @@ impl SmartDns {
         if q.name.is_empty() {
             return self.passthrough(query, &q).await;
         }
-        match (classify(&policy, &q.name), q.qtype) {
-            (Class::Fake, TYPE_A) => Some(
+        match (classify(&policy, &q.name), proxied_answer(q.qtype)) {
+            (Class::Fake, ProxiedAnswer::FakeV4) => Some(
                 self.fake_answer(&q, &policy, |p| matches!(classify(p, &q.name), Class::Fake))
                     .await,
             ),
-            // The pool is IPv4 only; AAAA for proxied names is NODATA so
-            // clients use the fake A record (§5.2.6).
-            (Class::Fake, _) => Some(respond(&q, RCODE_OK, &[], 0)),
+            // AI names take this path too: lookup returns the AI tier, so
+            // they are Fake, never Domestic or Unmatched, and `resolve`
+            // (the direct upstream) is not called. AAAA is empty NOERROR.
+            (Class::Fake, ProxiedAnswer::Empty) => Some(respond(&q, RCODE_OK, &[], 0)),
             (_, TYPE_A | TYPE_AAAA) => Some(self.resolve_cached(&q).await),
             // Non-A/AAAA for domestic / unmatched names: straight through.
             (_, _) => self.passthrough(query, &q).await,
@@ -1244,6 +1264,74 @@ mod tests {
             sign(&key, 1, body.as_bytes()).unwrap().into_bytes()
         };
         (bundle, Arc::new(PolicyStore::signed(verifier, None)))
+    }
+
+    /// An AI name is fake-IP (A) or empty NOERROR (AAAA), never a query to
+    /// the domestic upstream, even when a user rule says Direct.
+    #[tokio::test]
+    async fn ai_dns_is_not_forwarded_to_a_direct_upstream() {
+        use crate::rules::{builtin_ai_list, Action, CidrTable, Matcher, Rule, RuleSet};
+
+        let (suffixes, cidrs) = builtin_ai_list();
+        let rules = RuleSet::new(
+            vec![Rule {
+                matcher: Matcher::DomainSuffix("claude.ai".into()),
+                action: Action::Direct,
+            }],
+            Action::Direct,
+        )
+        .with_ai(suffixes, &cidrs, Action::Proxy("ai".into()));
+        let store = Arc::new(PolicyStore::inline(Policy::inline(
+            rules,
+            CidrTable::default(),
+        )));
+        let pool = Arc::new(
+            FakeIpPool::new(
+                "198.18.0.0".parse().unwrap(),
+                15,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                [7u8; 32],
+            )
+            .unwrap(),
+        );
+        let dns = Arc::new(SmartDns::new(
+            store,
+            pool,
+            DnsSettings {
+                domestic: vec!["127.0.0.1:1".parse().unwrap()],
+                query_timeout: Duration::from_millis(50),
+                cache_size: 16,
+            },
+        ));
+        let a = dns
+            .handle(
+                &query_for_test(1, "api.claude.ai", TYPE_A),
+                Transport::Udp(65535),
+            )
+            .await
+            .unwrap();
+        let (_, rc, ips) = answers_for_test(&a).unwrap();
+        assert_eq!(rc, RCODE_OK);
+        assert_eq!(ips.len(), 1);
+        assert!(
+            matches!(ips[0], IpAddr::V4(v4) if v4.octets()[0] == 198),
+            "{ips:?}"
+        );
+        let aaaa = dns
+            .handle(
+                &query_for_test(2, "api.claude.ai", TYPE_AAAA),
+                Transport::Udp(65535),
+            )
+            .await
+            .unwrap();
+        let (_, rc, ips) = answers_for_test(&aaaa).unwrap();
+        assert_eq!((rc, ips.len()), (RCODE_OK, 0), "real AAAA leaked: {ips:?}");
+        assert_eq!(
+            dns.upstream_queries.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "AI name was sent to a direct upstream"
+        );
     }
 
     const PROXY_X: &str =

@@ -326,7 +326,7 @@ pub(crate) fn route(
     Some(routed)
 }
 
-fn finish(
+pub(crate) fn finish(
     s: &UdpSettings,
     action: Action,
     target: TargetAddr,

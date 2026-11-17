@@ -1,0 +1,39 @@
+# Built-in AI destinations. The kernel merges this with the signed bundle's
+# ai_domains / ai_cidrs. A line is `suffix <domain>` or `cidr <prefix>`.
+# `#` starts a comment. Suffixes match the name and every subdomain.
+#
+# These names are the account-bearing hosts of the Claude and ChatGPT
+# clients. A suffix is enough for the api/auth/console hosts under it.
+
+# Anthropic. api.anthropic.com (API key), console.anthropic.com (account),
+# statsig.anthropic.com (the client's own Statsig host, carries the user id),
+# and the claude.ai / claude.com apps.
+suffix anthropic.com
+suffix claude.ai
+suffix claude.com
+
+# OpenAI. api.openai.com and auth.openai.com (session) are under openai.com,
+# as are chat.openai.com and platform.openai.com. chatgpt.com is the current
+# app host (ab.chatgpt.com, ws.chatgpt.com, ...). oaistatic.com is the web
+# app's static host loaded inside the logged-in session. oaiusercontent.com
+# is user content (file uploads) tied to the account.
+suffix openai.com
+suffix chatgpt.com
+suffix oaistatic.com
+suffix oaiusercontent.com
+
+# Not listed, on purpose (shared infrastructure; pinning it would send other
+# apps through the AI exit):
+# - statsigapi.net, featureassets.org: Statsig's shared SaaS. Claude's own
+#   host is statsig.anthropic.com, already covered by anthropic.com.
+# - sentry.io, browser-intake-datadoghq.com: shared telemetry.
+# - auth0.com: OpenAI's tenant is auth.openai.com, covered by openai.com.
+#
+# CIDRs: none. Do not invent ranges.
+# TODO Anthropic publishes no client-facing prefixes (api.anthropic.com is
+#   behind a CDN). Check https://platform.claude.com/docs/en/api/overview
+#   before adding a cidr line.
+# TODO OpenAI's published addresses, where they exist, are OpenAI's own
+#   egress (webhooks toward the customer), not the addresses clients dial.
+#   See https://platform.openai.com/docs/guides/production-best-practices
+#   Do not treat those, or a CDN's anycast ranges, as AI destinations.
