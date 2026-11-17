@@ -209,18 +209,22 @@ impl SmartDns {
         if q.name.is_empty() {
             return self.passthrough(query, &q).await;
         }
-        match (classify(&policy, &q.name), proxied_answer(q.qtype)) {
-            (Class::Fake, ProxiedAnswer::FakeV4) => Some(
-                self.fake_answer(&q, &policy, |p| matches!(classify(p, &q.name), Class::Fake))
+        match classify(&policy, &q.name) {
+            Class::Fake => match proxied_answer(q.qtype) {
+                ProxiedAnswer::FakeV4 => Some(
+                    self.fake_answer(&q, &policy, |p| {
+                        matches!(classify(p, &q.name), Class::Fake)
+                    })
                     .await,
-            ),
-            // AI names take this path too: lookup returns the AI tier, so
-            // they are Fake, never Domestic or Unmatched, and `resolve`
-            // (the direct upstream) is not called. AAAA is empty NOERROR.
-            (Class::Fake, ProxiedAnswer::Empty) => Some(respond(&q, RCODE_OK, &[], 0)),
-            (_, TYPE_A | TYPE_AAAA) => Some(self.resolve_cached(&q).await),
+                ),
+                // AI names take this path too: lookup returns the AI tier, so
+                // they are Fake, never Domestic or Unmatched, and `resolve`
+                // (the direct upstream) is not called. AAAA is empty NOERROR.
+                ProxiedAnswer::Empty => Some(respond(&q, RCODE_OK, &[], 0)),
+            },
+            _ if matches!(q.qtype, TYPE_A | TYPE_AAAA) => Some(self.resolve_cached(&q).await),
             // Non-A/AAAA for domestic / unmatched names: straight through.
-            (_, _) => self.passthrough(query, &q).await,
+            _ => self.passthrough(query, &q).await,
         }
     }
 
@@ -1281,10 +1285,7 @@ mod tests {
             Action::Direct,
         )
         .with_ai(suffixes, &cidrs, Action::Proxy("ai".into()));
-        let store = Arc::new(PolicyStore::inline(Policy::inline(
-            rules,
-            CidrTable::default(),
-        )));
+        let store = PolicyStore::inline(Policy::inline(rules, CidrTable::default()));
         let pool = Arc::new(
             FakeIpPool::new(
                 "198.18.0.0".parse().unwrap(),

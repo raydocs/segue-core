@@ -560,7 +560,9 @@ async fn ai_auto_does_not_leave_its_egress_group() {
     );
     let ny_before = l.ny_carriers.load(Ordering::SeqCst);
     let t = Instant::now();
-    let e = l.d.dial(Some("ai"), &site(), 443).await.unwrap_err();
+    let Err(e) = l.d.dial(Some("ai"), &site(), 443).await else {
+        panic!("the AI dial was not refused");
+    };
     assert!(e.0.contains("strict"), "{e}");
     assert!(
         t.elapsed() < Duration::from_millis(200),

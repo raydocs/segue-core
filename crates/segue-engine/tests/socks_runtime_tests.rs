@@ -5,6 +5,10 @@
 //! Xray's DNS, whose `hosts` maps a test-only domain to the loopback echo
 //! server, so a domain target is resolved on the Xray side only; the local
 //! resolver accepts nothing but the SOCKS server name.
+#[path = "../../../tests/support/xray_startup.rs"]
+#[macro_use]
+#[allow(dead_code)]
+mod xray_startup;
 #[path = "hysteria_runtime/support.rs"]
 mod hysteria_support;
 use hysteria_support::{tcp_echo, udp_echo, Bootstrap, Protector, Task};

@@ -1,7 +1,6 @@
 #![allow(dead_code)]
-#[path = "../../../../tests/support/xray_startup.rs"]
-#[macro_use]
-mod xray_startup;
+// xray_startup is declared once at each test crate's root (it is shared
+// with other support files; a second declaration is clippy::duplicate_mod).
 use serde_json::{json, Value};
 use std::{
     net::{IpAddr, Ipv4Addr},
@@ -125,7 +124,7 @@ impl XrayServer {
     /// ports; any other exit panics with its log.
     async fn wait_ready(&mut self) -> bool {
         let log_path = self.directory.join("server.log");
-        self::xray_startup::wait_ready(
+        crate::xray_startup::wait_ready(
             &mut self.child,
             || std::fs::read_to_string(&log_path).unwrap_or_default(),
             |log| log.contains("core: Xray 26.11.9 started"),

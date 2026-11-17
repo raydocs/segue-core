@@ -120,7 +120,6 @@ async fn start_portal_with(
         .await;
         Some((portal, public))
     })
-    .await
 }
 
 /// Our bridge for a portal at `portal`: `stream` and `flow` as the portal's
