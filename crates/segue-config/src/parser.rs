@@ -33,9 +33,10 @@ mod xray_lists;
 use xray_lists::PlainDomain;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::surface;
@@ -344,6 +345,7 @@ fn parse_xray_json_with_loader_and_limits(
         matcher_budget: MatcherBudget::new(matcher_budget_limits),
         selector_budget: SelectorBudget::default(),
         parsing_xhttp_download: false,
+        srs_cache: HashMap::new(),
     };
     let config = parser.parse_config();
 
@@ -370,6 +372,9 @@ struct Parser<'a> {
     matcher_budget: MatcherBudget,
     selector_budget: SelectorBudget,
     parsing_xhttp_download: bool,
+    /// Decoded `ext-srs:` files, keyed by the reference path, so one file is
+    /// inflated once per parse.
+    srs_cache: HashMap<String, Arc<segue_routing::srs::SrsRuleSet>>,
 }
 
 impl Parser<'_> {
@@ -3137,6 +3142,7 @@ mod tests {
             matcher_budget: MatcherBudget::new(DEFAULT_MATCHER_BUDGET_LIMITS),
             selector_budget: SelectorBudget::default(),
             parsing_xhttp_download: false,
+            srs_cache: HashMap::new(),
         };
         let spec = format!("test{}", "@AdS".repeat(MAX_CONFIG_GEODATA_ATTR_FILTERS + 1));
 
@@ -3158,6 +3164,7 @@ mod tests {
             matcher_budget: MatcherBudget::new(DEFAULT_MATCHER_BUDGET_LIMITS),
             selector_budget: SelectorBudget::default(),
             parsing_xhttp_download: false,
+            srs_cache: HashMap::new(),
         };
         let attrs = (0..=MAX_CONFIG_GEODATA_ATTR_FILTERS)
             .map(|index| format!("attr{index}"))
@@ -3254,5 +3261,198 @@ mod tests {
         Regex = 1,
         Domain = 2,
         Full = 3,
+    }
+
+    #[test]
+    fn ext_srs_rules_match_domains_and_ips_and_skip_unsupported_items() {
+        let asset_dir = unique_temp_dir("ext-srs");
+        fs::write(
+            asset_dir.join("domain-v2.srs"),
+            include_bytes!("../../segue-routing/fixtures/domain-v2.srs"),
+        )
+        .unwrap();
+        fs::write(
+            asset_dir.join("ip-v2.srs"),
+            include_bytes!("../../segue-routing/fixtures/ip-v2.srs"),
+        )
+        .unwrap();
+        fs::write(
+            asset_dir.join("process-v2.srs"),
+            include_bytes!("../../segue-routing/fixtures/process-v2.srs"),
+        )
+        .unwrap();
+        fs::write(
+            asset_dir.join("mixed-v2.srs"),
+            include_bytes!("../../segue-routing/fixtures/mixed-v2.srs"),
+        )
+        .unwrap();
+        let raw = r#"{
+          "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+          "routing": { "rules": [
+            { "domain": ["ext-srs:domain-v2.srs"], "outboundTag": "domain" },
+            { "ip": ["ext-srs:ip-v2.srs"], "port": "443", "outboundTag": "ip" },
+            { "domain": ["ext-srs:process-v2.srs", "keyword:google"], "outboundTag": "process" },
+            { "domain": ["ext-srs:mixed-v2.srs"], "port": "443", "network": "tcp", "outboundTag": "mixed" }
+          ]}
+        }"#;
+
+        let parsed =
+            super::parse_xray_json_with_geodata_dirs(raw, std::slice::from_ref(&asset_dir))
+                .expect("ext-srs config");
+        let rules = &parsed.config.routing.rules;
+        let tagged = |tag: &str| {
+            rules
+                .iter()
+                .filter(|rule| rule.target.tag() == tag)
+                .collect::<Vec<_>>()
+        };
+
+        let domain = tagged("domain");
+        assert_eq!(domain.len(), 1);
+        assert!(domain[0].matches(None, Some("example.com"), None));
+        assert!(domain[0].matches(None, Some("sing-box.sagernet.org"), None));
+        assert!(domain[0].matches(None, Some("example.com.cn"), None));
+        assert!(!domain[0].matches(None, Some("com.cn"), None));
+        assert!(domain[0].matches(None, Some("ads.tracker.test"), None));
+        assert!(!domain[0].matches(None, Some("tracker.test"), None));
+
+        let ip_rules = tagged("ip");
+        assert_eq!(ip_rules.len(), 1);
+        let ten = "10.1.2.3".parse().unwrap();
+        let eleven = "11.0.0.1".parse().unwrap();
+        let mut route = crate::RouteContext::inbound(None);
+        route.source = Some(std::net::SocketAddr::from(([192, 0, 2, 1], 9)));
+        assert!(ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&ten),
+            Some(crate::Network::Tcp),
+            Some(443)
+        ));
+        assert!(!ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&ten),
+            Some(crate::Network::Tcp),
+            Some(80)
+        ));
+        assert!(!ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&eleven),
+            Some(crate::Network::Tcp),
+            Some(443)
+        ));
+        route.source = Some(std::net::SocketAddr::from(([192, 0, 2, 2], 9)));
+        assert!(!ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&ten),
+            Some(crate::Network::Tcp),
+            Some(443)
+        ));
+
+        let process = tagged("process");
+        assert!(process
+            .iter()
+            .any(|rule| rule.matches(None, Some("keep.example"), None)));
+        assert!(process
+            .iter()
+            .any(|rule| rule.matches(None, Some("www.google.com"), None)));
+        assert!(!process
+            .iter()
+            .any(|rule| rule.matches(None, Some("drop.example"), None)));
+        assert!(parsed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("process_name")));
+
+        let mixed = tagged("mixed");
+        assert_eq!(mixed.len(), 2);
+        let inside = "192.0.2.10".parse().unwrap();
+        // The file also requires source port 53.
+        let mut mixed_route = crate::RouteContext::inbound(None);
+        mixed_route.source = Some(std::net::SocketAddr::from(([203, 0, 113, 8], 53)));
+        assert!(mixed.iter().any(|rule| {
+            rule.matches_route(
+                &mixed_route,
+                Some("example.com"),
+                None,
+                Some(crate::Network::Tcp),
+                Some(443),
+            )
+        }));
+        assert!(mixed.iter().all(|rule| {
+            !rule.matches_route(
+                &mixed_route,
+                Some("example.com"),
+                None,
+                Some(crate::Network::Tcp),
+                Some(80),
+            )
+        }));
+        assert!(mixed.iter().any(|rule| {
+            rule.matches_route(
+                &mixed_route,
+                None,
+                Some(&inside),
+                Some(crate::Network::Tcp),
+                Some(443),
+            )
+        }));
+        assert!(mixed.iter().all(|rule| {
+            !rule.matches_route(
+                &mixed_route,
+                Some("example.com"),
+                None,
+                Some(crate::Network::Udp),
+                Some(443),
+            )
+        }));
+        mixed_route.source = Some(std::net::SocketAddr::from(([203, 0, 113, 8], 9)));
+        assert!(mixed.iter().all(|rule| {
+            !rule.matches_route(
+                &mixed_route,
+                Some("example.com"),
+                None,
+                Some(crate::Network::Tcp),
+                Some(443),
+            )
+        }));
+
+        let missing = super::parse_xray_json_with_geodata_dirs(
+            r#"{
+              "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+              "routing": { "rules": [{ "domain": ["ext-srs:missing.srs"], "outboundTag": "direct" }] }
+            }"#,
+            std::slice::from_ref(&asset_dir),
+        );
+        assert!(missing.is_err());
+
+        let escaped = super::parse_xray_json_with_geodata_dirs(
+            r#"{
+              "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+              "routing": { "rules": [{ "domain": ["ext-srs:../secret.srs"], "outboundTag": "direct" }] }
+            }"#,
+            std::slice::from_ref(&asset_dir),
+        )
+        .unwrap_err();
+        assert!(escaped.diagnostics[0].message.contains("normal components"));
+
+        let both = super::parse_xray_json_with_geodata_dirs(
+            r#"{
+              "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+              "routing": { "rules": [{
+                "domain": ["ext-srs:domain-v2.srs"],
+                "ip": ["ext-srs:ip-v2.srs"],
+                "outboundTag": "direct"
+              }] }
+            }"#,
+            std::slice::from_ref(&asset_dir),
+        )
+        .unwrap_err();
+        assert!(both.diagnostics.iter().any(|diagnostic| diagnostic.message.contains("not both")));
+
+        fs::remove_dir_all(asset_dir).unwrap();
     }
 }

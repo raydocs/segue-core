@@ -4,13 +4,16 @@ use super::xray_lists::ListEntry;
 use super::{parse_xray_duration, Parser, U16SelectorKind, OBSERVATORY_PROBE_TIMEOUT};
 use crate::surface;
 use crate::{
-    DomainNameMode, RoutingAttributes, RoutingBalancer, RoutingBalancerStrategy, RoutingConfig,
-    RoutingDomainStrategy, RoutingLeastLoadCost, RoutingLeastLoadSettings, RoutingOrigin,
-    RoutingRule, RoutingRuleTarget, RoutingUsers,
+    DomainMatcher, DomainNameMode, Network, RoutingAttributes, RoutingBalancer,
+    RoutingBalancerStrategy, RoutingConfig, RoutingDomainStrategy, RoutingLeastLoadCost,
+    RoutingLeastLoadSettings, RoutingOrigin, RoutingPortRange, RoutingRule, RoutingRuleTarget,
+    RoutingUsers,
 };
-use segue_routing::{DomainMatcherSet, IpMatcherSet, RegexMatcher};
+use segue_routing::srs::{self, FlatRule, SrsPortRange};
+use segue_routing::{Cidr, DomainMatcherSet, IpMatcherSet, RegexMatcher};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const MAX_ROUTING_BALANCERS: usize = 256;
 const MAX_ROUTING_BALANCER_SELECTORS: usize = 4_096;
@@ -492,11 +495,24 @@ impl Parser<'_> {
             return Vec::new();
         }
 
-        rules
-            .iter()
-            .enumerate()
-            .filter_map(|(index, rule)| self.parse_routing_rule(rule, index, balancer_tags))
-            .collect()
+        let mut parsed = Vec::new();
+        for (index, rule) in rules.iter().enumerate() {
+            let Some(expanded) = self.parse_routing_rule(rule, index, balancer_tags) else {
+                continue;
+            };
+            if parsed.len() + expanded.len() > self.matcher_budget.limits.routing_rules {
+                self.error(
+                    format!("$.routing.rules[{index}]"),
+                    format!(
+                        "routing config expands to more than {} rules",
+                        self.matcher_budget.limits.routing_rules
+                    ),
+                );
+                return parsed;
+            }
+            parsed.extend(expanded);
+        }
+        parsed
     }
 
     fn parse_routing_rule(
@@ -504,7 +520,7 @@ impl Parser<'_> {
         rule: &Value,
         index: usize,
         balancer_tags: &HashSet<&str>,
-    ) -> Option<RoutingRule> {
+    ) -> Option<Vec<RoutingRule>> {
         let rule_path = format!("$.routing.rules[{index}]");
         if !rule.is_object() {
             self.error(&rule_path, "routing rule must be an object");
@@ -562,17 +578,15 @@ impl Parser<'_> {
                 U16SelectorKind::RoutingPort,
             )?
             .map(|list| list.ranges);
-        let domain_matchers = self.routing_rule_domains(rule, &rule_path)?;
-        let ip_matchers = match self.string_list(rule.get("ip"), &format!("{rule_path}.ip"))? {
-            Some(entries) if !entries.is_empty() => Some(
-                self.routing_ip_matcher_set(
-                    entries
-                        .into_iter()
-                        .map(|entry| (Some(entry.text), entry.path)),
-                )?,
-            ),
-            _ => None,
-        };
+        let domain_spec = self.routing_rule_domains(rule, &rule_path)?;
+        let ip_spec = self.routing_ip_spec(rule, &rule_path)?;
+        if !domain_spec.srs.is_empty() && !ip_spec.srs.is_empty() {
+            self.error(
+                &rule_path,
+                "ext-srs may be set on domain or ip, not both",
+            );
+            return None;
+        }
         let local_os = self.parse_routing_local_os(rule, &rule_path)?;
         let origin = self.routing_rule_origin(rule, &rule_path)?;
         // As in Xray-core, any entry sets a condition, and empty names drop.
@@ -589,23 +603,33 @@ impl Parser<'_> {
         let attributes =
             self.routing_attributes(rule.get("attrs"), &format!("{rule_path}.attrs"))?;
 
-        let rule = RoutingRule {
+        let template = RoutingRule {
             inbound_tags,
             networks,
             port_ranges,
-            domain_matchers,
-            ip_matchers,
+            domain_matchers: domain_spec.matchers,
+            ip_matchers: ip_spec.matchers,
             local_os,
             origin,
             protocols,
             attributes,
             target,
         };
-        if !rule.has_condition() {
-            self.error(rule_path, "routing rule has no effective fields");
-            return None;
-        }
-        Some(rule)
+        let srs = if !domain_spec.srs.is_empty() {
+            Some((SrsSide::Domain, domain_spec.srs))
+        } else if !ip_spec.srs.is_empty() {
+            Some((SrsSide::Ip, ip_spec.srs))
+        } else {
+            None
+        };
+        let Some((side, refs)) = srs else {
+            if !template.has_condition() {
+                self.error(rule_path, "routing rule has no effective fields");
+                return None;
+            }
+            return Some(vec![template]);
+        };
+        self.expand_srs_rule(template, side, &refs, &rule_path)
     }
 
     /// `sourceIP` (or `source`), `sourcePort`, `localIP`, `localPort` and
@@ -752,16 +776,12 @@ impl Parser<'_> {
 
     /// `domain` and `domains`, each a `StringList` of domain rules. As in
     /// Xray-core, `domains` replaces `domain` when both are given, though
-    /// both must parse.
-    fn routing_rule_domains(
-        &mut self,
-        rule: &Value,
-        rule_path: &str,
-    ) -> Option<Option<DomainMatcherSet>> {
-        let domain =
-            self.routing_domain_list(rule.get("domain"), &format!("{rule_path}.domain"))?;
+    /// both must parse. `ext-srs:<path>` names a local sing-box rule-set
+    /// instead of a domain pattern.
+    fn routing_rule_domains(&mut self, rule: &Value, rule_path: &str) -> Option<DomainSpec> {
+        let domain = self.routing_domain_spec(rule.get("domain"), &format!("{rule_path}.domain"))?;
         let domains =
-            self.routing_domain_list(rule.get("domains"), &format!("{rule_path}.domains"))?;
+            self.routing_domain_spec(rule.get("domains"), &format!("{rule_path}.domains"))?;
         Some(
             if rule.get("domains").is_some_and(|value| !value.is_null()) {
                 domains
@@ -771,12 +791,298 @@ impl Parser<'_> {
         )
     }
 
-    fn routing_domain_list(
+    fn routing_domain_spec(&mut self, raw: Option<&Value>, path: &str) -> Option<DomainSpec> {
+        let Some(entries) = self.string_list(raw, path)? else {
+            return Some(DomainSpec::empty());
+        };
+        if entries.is_empty() {
+            return Some(DomainSpec::empty());
+        }
+        let mut spec = DomainSpec::empty();
+        let mut plain = Vec::new();
+        for entry in entries {
+            if let Some(file) = ext_srs_path(entry.text) {
+                if file.is_empty() {
+                    self.error(&entry.path, "ext-srs path cannot be empty");
+                    return None;
+                }
+                push_srs_ref(&mut spec.srs, file, entry.path);
+                continue;
+            }
+            plain.push(entry);
+        }
+        if plain.is_empty() {
+            return Some(spec);
+        }
+        // Parse the plain entries through the shared domain grammar by
+        // rebuilding is not available, so call domain_rule on each.
+        let mut matchers = DomainMatcherSet::builder();
+        for entry in plain {
+            let remaining = self.matcher_budget.remaining_domain_matchers();
+            if remaining == 0 {
+                self.domain_matcher_budget_error(&entry.path);
+                return None;
+            }
+            let parsed = self.domain_rule(
+                entry.text,
+                &entry.path,
+                remaining,
+                super::xray_lists::PlainDomain::Substring,
+            )?;
+            if !self.matcher_budget.consume_domain_matchers(parsed.len()) {
+                self.domain_matcher_budget_error(&entry.path);
+                return None;
+            }
+            super::insert_domain_matchers(&mut matchers, &parsed, DomainNameMode::Routing);
+        }
+        spec.matchers = Some(self.build_domain_matcher_set(matchers, path)?);
+        Some(spec)
+    }
+
+    fn routing_ip_spec(&mut self, rule: &Value, rule_path: &str) -> Option<IpSpec> {
+        let path = format!("{rule_path}.ip");
+        let Some(entries) = self.string_list(rule.get("ip"), &path)? else {
+            return Some(IpSpec::empty());
+        };
+        if entries.is_empty() {
+            return Some(IpSpec::empty());
+        }
+        let mut spec = IpSpec::empty();
+        let mut plain = Vec::new();
+        for entry in entries {
+            if let Some(file) = ext_srs_path(entry.text) {
+                if file.is_empty() {
+                    self.error(&entry.path, "ext-srs path cannot be empty");
+                    return None;
+                }
+                push_srs_ref(&mut spec.srs, file, entry.path);
+                continue;
+            }
+            plain.push((Some(entry.text), entry.path));
+        }
+        if !plain.is_empty() {
+            spec.matchers = Some(self.routing_ip_matcher_set(plain)?);
+        }
+        Some(spec)
+    }
+
+    /// Expands `ext-srs:` into one Segue rule per headless rule. Plain entries
+    /// in the same list are a separate OR branch. The routing rule's other
+    /// conditions, including the opposite list, are AND'd with each branch.
+    fn expand_srs_rule(
         &mut self,
-        raw: Option<&Value>,
+        template: RoutingRule,
+        side: SrsSide,
+        refs: &[SrsRef],
+        rule_path: &str,
+    ) -> Option<Vec<RoutingRule>> {
+        let mut flat = Vec::new();
+        for srs_ref in refs {
+            let set = self.load_srs(&srs_ref.file, &srs_ref.path)?;
+            flat.extend(set.rules.iter().cloned());
+        }
+        let mut expanded = Vec::new();
+        let plain_sibling = match side {
+            SrsSide::Domain => template.domain_matchers.is_some(),
+            SrsSide::Ip => template.ip_matchers.is_some(),
+        };
+        if plain_sibling {
+            expanded.push(template.clone());
+        }
+        for rule in &flat {
+            if let Some(rule) = self.and_srs_rule(&template, side, rule, rule_path)? {
+                expanded.push(rule);
+            }
+        }
+        if expanded.is_empty() {
+            self.warning(
+                rule_path,
+                "ext-srs produced no rules Segue can match; the routing rule matches nothing",
+            );
+        }
+        Some(expanded)
+    }
+
+    fn and_srs_rule(
+        &mut self,
+        template: &RoutingRule,
+        side: SrsSide,
+        flat: &FlatRule,
+        path: &str,
+    ) -> Option<Option<RoutingRule>> {
+        let domain_matchers = match side {
+            SrsSide::Domain => self.compile_srs_domains(&flat.domains, path)?,
+            SrsSide::Ip if template.domain_matchers.is_some() && !flat.domains.is_empty() => {
+                self.warning(
+                    path,
+                    "ext-srs domain list cannot be combined with domain and that rule matches nothing",
+                );
+                return Some(None);
+            }
+            SrsSide::Ip if flat.domains.is_empty() => template.domain_matchers.clone(),
+            SrsSide::Ip => self.compile_srs_domains(&flat.domains, path)?,
+        };
+        let ip_matchers = match side {
+            SrsSide::Ip => self.compile_srs_ips(&flat.ip_cidrs, path)?,
+            SrsSide::Domain if template.ip_matchers.is_some() && !flat.ip_cidrs.is_empty() => {
+                self.warning(
+                    path,
+                    "ext-srs ip_cidr cannot be combined with ip and that rule matches nothing",
+                );
+                return Some(None);
+            }
+            SrsSide::Domain if flat.ip_cidrs.is_empty() => template.ip_matchers.clone(),
+            SrsSide::Domain => self.compile_srs_ips(&flat.ip_cidrs, path)?,
+        };
+        let source_ips = if flat.source_ip_cidrs.is_empty() {
+            template.origin.source_ips.clone()
+        } else if template.origin.source_ips.is_some() {
+            self.warning(
+                path,
+                "ext-srs source_ip_cidr cannot be combined with sourceIP and that rule matches nothing",
+            );
+            return Some(None);
+        } else {
+            self.compile_srs_ips(&flat.source_ip_cidrs, path)?
+        };
+        let port_ranges = match intersect_port_lists(template.port_ranges.as_deref(), &flat.ports) {
+            Ok(ranges) => ranges,
+            Err(()) => {
+                self.warning(
+                    path,
+                    "ext-srs port does not overlap the routing rule and that rule matches nothing",
+                );
+                return Some(None);
+            }
+        };
+        let source_ports =
+            match intersect_port_lists(template.origin.source_ports.as_deref(), &flat.source_ports)
+            {
+                Ok(ranges) => ranges,
+                Err(()) => {
+                    self.warning(
+                        path,
+                        "ext-srs source port does not overlap the routing rule and that rule matches nothing",
+                    );
+                    return Some(None);
+                }
+            };
+        let networks = match intersect_networks(template.networks.as_deref(), &flat.networks) {
+            Ok(networks) => networks,
+            Err(()) => {
+                self.warning(
+                    path,
+                    "ext-srs network does not overlap the routing rule and that rule matches nothing",
+                );
+                return Some(None);
+            }
+        };
+        let mut origin = template.origin.clone();
+        origin.source_ips = source_ips;
+        origin.source_ports = source_ports;
+        let rule = RoutingRule {
+            inbound_tags: template.inbound_tags.clone(),
+            networks,
+            port_ranges,
+            domain_matchers,
+            ip_matchers,
+            local_os: template.local_os.clone(),
+            origin,
+            protocols: template.protocols.clone(),
+            attributes: template.attributes.clone(),
+            target: template.target.clone(),
+        };
+        if !rule.has_condition() {
+            self.warning(path, "ext-srs rule has no condition and matches nothing");
+            return Some(None);
+        }
+        Some(Some(rule))
+    }
+
+    fn compile_srs_domains(
+        &mut self,
+        domains: &[DomainMatcher],
         path: &str,
     ) -> Option<Option<DomainMatcherSet>> {
-        self.domain_rule_list(raw, path, DomainNameMode::Routing)
+        if domains.is_empty() {
+            return Some(None);
+        }
+        if !self.matcher_budget.consume_domain_matchers(domains.len()) {
+            self.domain_matcher_budget_error(path);
+            return None;
+        }
+        let mut builder = DomainMatcherSet::builder();
+        super::insert_domain_matchers(&mut builder, domains, DomainNameMode::Routing);
+        Some(Some(self.build_domain_matcher_set(builder, path)?))
+    }
+
+    fn compile_srs_ips(&mut self, cidrs: &[Cidr], path: &str) -> Option<Option<IpMatcherSet>> {
+        if cidrs.is_empty() {
+            return Some(None);
+        }
+        if !self.matcher_budget.consume_ip_matchers(cidrs.len()) {
+            self.ip_matcher_budget_error(path);
+            return None;
+        }
+        let mut builder = IpMatcherSet::builder();
+        for cidr in cidrs {
+            builder.insert_cidr(*cidr, false);
+        }
+        Some(Some(builder.build()))
+    }
+
+    fn load_srs(
+        &mut self,
+        file: &str,
+        path: &str,
+    ) -> Option<Arc<segue_routing::srs::SrsRuleSet>> {
+        if let Some(cached) = self.srs_cache.get(file) {
+            return Some(Arc::clone(cached));
+        }
+        let (mut opened, full_path) = match self.geodata_loader.open_readable(file) {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.error(path, error.to_string());
+                return None;
+            }
+        };
+        let len = match opened.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                self.error(
+                    path,
+                    format!(
+                        "failed to read rule-set `{}`: {error}",
+                        full_path.display()
+                    ),
+                );
+                return None;
+            }
+        };
+        if len > srs::MAX_SRS_FILE_BYTES {
+            self.error(
+                path,
+                format!(
+                    "rule-set is {len} bytes; maximum supported size is {} bytes",
+                    srs::MAX_SRS_FILE_BYTES
+                ),
+            );
+            return None;
+        }
+        let decoded = match srs::read_rule_set(&mut opened) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.error(path, format!("rule-set `{file}`: {error}"));
+                return None;
+            }
+        };
+        for warning in &decoded.warnings {
+            self.warning(path, format!("rule-set `{file}`: {warning}"));
+        }
+        let decoded = Arc::new(decoded);
+        self.srs_cache
+            .insert(file.to_owned(), Arc::clone(&decoded));
+        Some(decoded)
     }
 
     /// Xray's `localOS` is a Go `StringList`: an array of strings, or one
@@ -809,5 +1115,130 @@ impl Parser<'_> {
                 None
             }
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SrsSide {
+    Domain,
+    Ip,
+}
+
+struct SrsRef {
+    file: String,
+    path: String,
+}
+
+struct DomainSpec {
+    matchers: Option<DomainMatcherSet>,
+    srs: Vec<SrsRef>,
+}
+
+impl DomainSpec {
+    fn empty() -> Self {
+        Self {
+            matchers: None,
+            srs: Vec::new(),
+        }
+    }
+}
+
+struct IpSpec {
+    matchers: Option<IpMatcherSet>,
+    srs: Vec<SrsRef>,
+}
+
+impl IpSpec {
+    fn empty() -> Self {
+        Self {
+            matchers: None,
+            srs: Vec::new(),
+        }
+    }
+}
+
+fn ext_srs_path(text: &str) -> Option<&str> {
+    text.strip_prefix("ext-srs:")
+}
+
+fn push_srs_ref(refs: &mut Vec<SrsRef>, file: &str, path: String) {
+    if refs.iter().any(|known| known.file == file) {
+        return;
+    }
+    refs.push(SrsRef {
+        file: file.to_owned(),
+        path,
+    });
+}
+
+fn intersect_port_lists(
+    parent: Option<&[RoutingPortRange]>,
+    child: &[SrsPortRange],
+) -> Result<Option<Vec<RoutingPortRange>>, ()> {
+    if child.is_empty() {
+        return Ok(parent.map(|ranges| ranges.to_vec()));
+    }
+    let child_ranges = child
+        .iter()
+        .map(|range| RoutingPortRange::new(range.start, range.end))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ())?;
+    let Some(parent) = parent else {
+        return Ok(Some(child_ranges));
+    };
+    let mut overlapped = Vec::new();
+    for left in parent {
+        for right in &child_ranges {
+            let start = left.start().max(right.start());
+            let end = left.end().min(right.end());
+            if let Some(range) = (start <= end)
+                .then(|| RoutingPortRange::new(start, end).ok())
+                .flatten()
+            {
+                overlapped.push(range);
+            }
+        }
+    }
+    if overlapped.is_empty() {
+        Err(())
+    } else {
+        Ok(Some(overlapped))
+    }
+}
+
+fn intersect_networks(
+    parent: Option<&[Network]>,
+    child: &Option<Vec<segue_routing::Network>>,
+) -> Result<Option<Vec<Network>>, ()> {
+    let child = child.as_ref().map(|networks| {
+        networks
+            .iter()
+            .copied()
+            .map(map_srs_network)
+            .collect::<Vec<_>>()
+    });
+    match (parent, child) {
+        (None, None) => Ok(None),
+        (Some(parent), None) => Ok(Some(parent.to_vec())),
+        (None, Some(child)) => Ok(Some(child)),
+        (Some(parent), Some(child)) => {
+            let intersection = parent
+                .iter()
+                .copied()
+                .filter(|network| child.contains(network))
+                .collect::<Vec<_>>();
+            if intersection.is_empty() {
+                Err(())
+            } else {
+                Ok(Some(intersection))
+            }
+        }
+    }
+}
+
+fn map_srs_network(network: segue_routing::Network) -> Network {
+    match network {
+        segue_routing::Network::Tcp => Network::Tcp,
+        segue_routing::Network::Udp => Network::Udp,
     }
 }

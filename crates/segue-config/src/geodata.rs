@@ -317,6 +317,13 @@ impl GeodataLoader {
         Ok(decoded)
     }
 
+    /// Opens `file_name` under a configured geodata directory. The path must be
+    /// relative, with only normal components: the same rule as geodata files,
+    /// so a rule-set reference cannot escape the directory.
+    pub(crate) fn open_readable(&self, file_name: &str) -> Result<(File, PathBuf), GeodataError> {
+        self.open_file(file_name)
+    }
+
     fn open_file(&self, file_name: &str) -> Result<(File, PathBuf), GeodataError> {
         let requested = Path::new(file_name);
         if file_name.is_empty()
