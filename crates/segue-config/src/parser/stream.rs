@@ -1652,10 +1652,15 @@ impl Parser<'_> {
         tuic: bool,
     ) -> TlsSettings {
         self.validate_tls_settings(tls_settings, path);
-        self.parse_tls_fields(tls_settings, path)
+        self.parse_tls_fields(tls_settings, path, tuic)
     }
 
-    fn parse_tls_fields(&mut self, tls_settings: Option<&Value>, path: &str) -> TlsSettings {
+    fn parse_tls_fields(
+        &mut self,
+        tls_settings: Option<&Value>,
+        path: &str,
+        tuic: bool,
+    ) -> TlsSettings {
         let allow_insecure_path = format!("{path}.allowInsecure");
         let allow_insecure = match tls_settings.and_then(|settings| settings.get("allowInsecure")) {
             // TUIC keeps sing-box's explicit skip-verification option. The
@@ -2062,7 +2067,7 @@ impl Parser<'_> {
         {
             self.error(version_path, "only ShadowTLS version 3 is supported");
         }
-        let tls = self.parse_tls_fields(Some(settings), &path);
+        let tls = self.parse_tls_fields(Some(settings), &path, false);
         if tls.server_name.as_deref().is_none_or(str::is_empty) {
             self.error(
                 format!("{path}.serverName"),
