@@ -108,19 +108,34 @@ gate rather than discipline.
 
 | Concern | Implementation | Cite |
 | --- | --- | --- |
-| UI | React pages under `app/src/pages/tono/`, Tauri commands under `app/src-tauri/src/tono/` | `docs/architecture.md:56-66` |
-| Privileged service | `TonoService.exe` (LocalSystem) | `apps/windows/README.md:20-24` |
-| IPC | named pipe `\\.\pipe\tono-service` (plus `-dev`/`-test` variants), `PROTOCOL_EPOCH = 2`, route revisioning | `service/src/lib.rs:131-143` |
-| Kill switch | WFP: engine open, sublayer, filters by app and address; boot/crash/revocation paths each re-derive desired state | `service/src/core/wfp/mod.rs:37-41`, `:153`, `:248` |
-| Product logic | `crates/tono-core` — portable catalog, policy, credentials, connect FSM, update contract; `#![forbid(unsafe_code)]` | `crates/tono-core/src/lib.rs:1-40` |
-| Core | sing-box (default since 0.0.74) or pinned mihomo; the service owns supervision | `docs/decisions/040-2026-10-01-windows-default-core-sing-box.md`, `architecture.md:12-30` |
+| UI | React pages under `app/src/pages/tono/`, Tauri commands under `app/src-tauri/src/tono/`; the webview may call only six controller commands | `docs/architecture.md:56-66`, `app/src-tauri/tests/webview_capabilities.rs:10-18` |
+| Privileged service | `TonoService.exe` (LocalSystem), hard SCM dependency on BFE, SCM recovery actions 5 s/10 s/30 s | `apps/windows/README.md:20-24`, `service/src/bin/install_service.rs:2537`, `:2780-2805` |
+| Installation | a separate elevated `tono-service-install.exe` stages the binary, verifies SHA-256 of the staged copy, then renames; `MoveFileExW` reboot-queue when in use | `app/src-tauri/src/core/service/install.rs:512-576`, `service/src/bin/install_service.rs:75-250` |
+| IPC | HTTP/1.1 over a named pipe `\\.\pipe\tono-service`; **three** trust layers: pipe SDDL, peer-PID→token→SID + owner-token file compare, per-session token hash | `service/src/lib.rs:131-143`, `service/src/core/server/mod.rs:105-107`, `service/src/core/auth.rs:362-575` |
+| Protocol versioning | `ProtocolVersion { epoch, revision }`, epoch 2 / revision 23, with per-capability minimums so the app degrades instead of refusing | `service/src/core/structure.rs:327-401`, `service/src/lib.rs:144-235` |
+| Kill switch | WFP: one provider, **one** sublayer (arbitration is sublayer-first), weighted permits over a persistent block floor; transactional install-before-remove; exact key-set verification | `service/src/core/wfp_model.rs:47-66`, `:1847-1990`, `service/src/core/wfp/mod.rs:838-905` |
+| Product logic | `crates/tono-core` — portable catalog, policy, credentials, connect FSM, update contract; `#![forbid(unsafe_code)]`; ships no HTTP stack | `crates/tono-core/src/lib.rs:1-40`, `src/auth.rs:1-9` |
+| Core | sing-box (default since 0.0.74) or pinned mihomo; the service owns supervision, a 10 restarts/600 s watchdog, and orphan sweep with PID-identity guard | `docs/decisions/040-…-windows-default-core-sing-box.md`, `service/src/core/manager.rs:243-253`, `service/src/core/reconcile.rs:24-90` |
 | Invariants | 7 numbered security invariants, checked on every review | `apps/windows/SECURITY.md:3-28` |
-| Update | Tauri signed updater, draft release → promote workflow, manifest protocol v1 with `releaseSequence` high-water mark | `docs/UPDATE_PROTOCOL_V1.md:1-60`, `apps/windows/README.md:39-80` |
+| Restore internet | a **second** LocalSystem service `TonoRelease` on its own pipe, kill-on-close job object, so a wedged main service cannot block the escape hatch | `service/src/release_wire.rs:1-38`, `service/src/core/release/worker.rs` |
+| Update | Tauri signed updater for the ordinary path; **protected update v1** (signed manifest, compiled-in minisign key, `releaseSequence` floor, private staging, Service-only adoption) for anything that must install over a protected session | `docs/UPDATE_PROTOCOL_V1.md:1-80`, `service/src/core/update.rs:274-360`, `crates/tono-core/src/update_contract.rs:58` |
 
 The Windows service deliberately reimplements macOS's contract rather than
 sharing code, and says so (`apps/windows/README.md:26-28`); what is shared is
-`tono-core` (also, in principle, usable by a Linux nftables service —
-`docs/architecture.md:120-128`).
+`tono-core` — and even that only partially: the Service workspace does not
+depend on it, and `#[path]`-includes four individual files
+(`service/src/lib.rs:4-27`) so the wire models stay byte-identical without
+dragging catalog/async deps into the installer binaries.
+
+Two honest inconsistencies in the tree, worth knowing before treating it as a
+template: `tono-client` and `tono-service-client` are declared dependencies with
+no call sites (the real IPC client is `service/src/client/mod.rs`, with a
+parallel copy in `app/src-tauri/src/core/service/mod.rs`), and
+`register_selective_ai_block` — the failure-time selective fail-open hook — has
+no production caller, so `plan_failure` currently always resolves to a full
+release (`crates/tono-core/src/network_disposition.rs:36`, decision 031). The
+release-time AI hold is a different mechanism and *does* run (`disarm.rs:129-156`).
+**Copy the design; do not assume the shipped behaviour matches the design doc.**
 
 ### 1.4 iOS and Android
 
@@ -269,7 +284,11 @@ whether the apps are thin.
 
 Tono's answer: **the privileged component is the only protection authority**
 (`apps/windows/SECURITY.md:3-12`), and the client is not trusted to say "I am
-connected". Segue's kernel already agrees in structure —
+connected". On Windows the service goes further and *derives* the strict
+contract from the runtime graph rather than from client-supplied endpoint lists
+(`service/src/core/windows_kill_switch/strict.rs:9-60`); only routes that arm or
+widen protection additionally require the peer image to be the installed
+`Tono.exe` (`service/src/core/server/mod.rs:1241-1300`). Segue's kernel already agrees in structure —
 `KillSwitch::verdict` can only return `Proxy`/`Refuse`/`Wait` for a proxied
 action, never `Direct` (`crates/segue-kernel/src/killswitch.rs:3-11`, `:109`) —
 but that verdict only guards flows *inside* the tunnel. Packets that the OS never
@@ -293,12 +312,19 @@ Proposal:
    the "healthy" evidence the helper itself verifies (a TCP proof, as Tono's
    `TcpEndpointProof.swift`/`UnarmedReconnect.swift` do).
 4. **Fail-open vs. fail-closed is a product setting, chosen per route class.**
-   Tono's answer is a two-tier one: strict mode blocks everything; the default
+   Tono's *design* is two-tier: strict mode blocks everything; the default
    releases ordinary traffic and keeps a narrow AI hold
    (`docs/selective-fail-open.md:1-20`, decision
-   `036-2026-09-30-crash-hang-releases-then-ai-layer.md`). Segue's kernel has the
-   primitives (`Protection::Strict` / `Protection::Wait`,
-   `crates/segue-kernel/src/killswitch.rs:27-35`) but no product policy.
+   `036-2026-09-30-crash-hang-releases-then-ai-layer.md`). Its *shipped*
+   behaviour is weaker than that on Windows: the failure-time hook is
+   unregistered, so an exhausted connect releases everything (see §1.3), and the
+   hold only runs on the explicit Quit / account-replacement path. Segue's kernel
+   has the primitives (`Protection::Strict` / `Protection::Wait`,
+   `crates/segue-kernel/src/killswitch.rs:27-35`) but no product policy, and the
+   mapping from "all exits failed" to a verdict is missing entirely. Whatever is
+   chosen, the lesson is to implement it in one place (Tono's
+   `NetworkEffect` / `plan_failure`), test the table, and make the product copy
+   describe what actually ships.
    **This is an owner question, not an engineering one.**
 
 ### 3.4 Phasing
@@ -434,22 +460,42 @@ tree** — another reason the answer is "copy the design, write the code".
 10. **A decision log with owner/provisional status.** 138 records, each answering
     one question with "Chosen / Why stricter / Rejected / Applied in". This is how
     the kill-switch behaviour stayed coherent across two independent clients.
-11. **The PF/WFP details that only come from being burned.** Three worth copying
-    outright: `/etc/pf.conf` gets only `anchor "tono.killswitch"`, never
+11. **The PF/WFP details that only come from being burned.** Worth copying
+    outright: on macOS, `/etc/pf.conf` gets only `anchor "tono.killswitch"`, never
     `load anchor … from`, because the latter is what `com.apple.pfctl` reinstalls
     at boot including Safe Mode (`KillSwitchPF.swift:711-768`, decision 034);
     every rule carries a class `label` or pfctl collapses exact permits into the
     bundle permit (`KillSwitchPF.swift:345-375`); and a withdrawal kills only the
     named hosts' states instead of `pfctl -F states`
-    (`KillSwitchPF.swift:863-904`).
+    (`KillSwitchPF.swift:863-904`). On Windows: **one** WFP sublayer, because
+    arbitration is sublayer-first and a second sublayer would cut loopback/DHCP/NDP
+    the instant it armed (`wfp_model.rs:1-22`); a versioned filter-key namespace,
+    or a key-only diff adopts the old build's stale filters (`:74-94`); and
+    install-strictly-before-remove inside one transaction, so an endpoint swap
+    never passes through a direct-traffic window (`wfp/mod.rs:838-858`).
 12. **A lost arm reply keeps the fail-closed intent; a lost disarm reply is not a
     release.** `KillSwitchService.arm`'s catch block and
     `HelperManager.cleanUpAbandonedUpgrade` (`HelperManager.swift:604-625`). This
     is the single most leak-prone edge in any kill-switch client.
-13. **A separate root daemon for "restore internet".** Tono's
-    `com.raydocs.tono.release` on its own socket exists so a helper blocked in a
-    long update cannot delay the user's escape hatch
-    (`ReleaseWorker.swift:11-24`). Cheap to design in, expensive to retrofit.
+13. **A separate root daemon for "restore internet".** Tono has this on both
+    platforms: `com.raydocs.tono.release` on its own socket on macOS
+    (`ReleaseWorker.swift:11-24`) and the `TonoRelease` service on its own pipe on
+    Windows (`service/src/release_wire.rs:1-30`). It exists so a helper blocked in
+    a long update, or a wedged WFP call, cannot delay the user's escape hatch.
+    Cheap to design in, expensive to retrofit.
+14. **Order the release so DNS is restored before the firewall opens, and treat
+    an unproven restore as a failure.** Windows refuses to disarm unless the DNS
+    restore read-back succeeds, with a timeout counted as unproven
+    (`disarm.rs:209-219`), and has exactly one deliberate escape (registry-only
+    after a streak) so a machine without CIM can still Disconnect
+    (`dns/mod.rs:74-82`). macOS carries the same idea as "a missing snapshot is
+    not evidence" (`RuntimeCleanup.swift:394-403`).
+15. **A pending privileged operation must fence every other one.** Tono's update
+    attempt fences Connect, repair and startup core restore, and Disconnect is
+    explicitly *not* update cancellation (`service/src/core/update.rs:100-270`);
+    session generations make a late arm unable to touch a newer session
+    (`HelperSessionGeneration.swift`, `SocketServer.swift:1042-1090`). Segue will
+    need the same generation discipline the moment a helper exists.
 
 ### Avoid (ranked)
 
@@ -473,24 +519,31 @@ tree** — another reason the answer is "copy the design, write the code".
    in Rust, so every protection fix lands twice and the decision log fills with
    "macOS fixed it, Windows pending". Segue's core is Rust; a Rust helper for all
    three desktops removes a whole drift class.
-6. **Do not copy Tono's per-platform MTU and routing divergence blindly.** Android
+6. **Do not ship a design document as if it were the behaviour.** On Windows,
+   `plan_failure` maps every exhausted non-strict connect to a full release
+   because the selective-AI hook has no production caller
+   (`crates/tono-core/src/network_disposition.rs:36`, decision 031), while
+   `docs/selective-fail-open.md` reads as though the hold runs. Whatever Segue
+   promises about post-failure protection must be the shipped table, tested, with
+   the doc and the copy pointing at the same code.
+7. **Do not copy Tono's per-platform MTU and routing divergence blindly.** Android
    9000, iOS 4064, different rule sets because Android has `package_name`. Fine —
    but Segue should state the numbers in one shared table and let the graph differ
    only where the OS genuinely can.
-7. **Do not put `listen`/SOCKS front ends into the embedded kernel config
+8. **Do not put `listen`/SOCKS front ends into the embedded kernel config
    accidentally.** The embedding plan flags this (open question 4): the prototype
    config requires `listen` (`crates/segue-kernel/src/config.rs:278`), and an
    embedded app must not open a loopback listener it never uses.
-8. **Do not promise leak protection the OS cannot deliver.** Tono's
+9. **Do not promise leak protection the OS cannot deliver.** Tono's
    `docs/selective-fail-open.md` is essentially a long proof that PF/WFP cannot
    keep a real IP from reaching a CDN-hosted AI service after a crash. Segue will
    face the same wall; say so in the product copy, as Tono eventually did
    (`apps/ios/README.md:60-64` states iOS's ECH/DoH boundary explicitly).
-9. **Do not ship a GPL-3.0-licensed app shell on top of an MPL/proprietary core**
-   without checking the combination deliberately; Tono's own licensing is
-   inconsistent between the Rust workspace (`LicenseRef-Proprietary`) and the
-   Tauri app (`GPL-3.0-only`), which is a cautionary signal, not a template.
-10. **Do not let the update path be the last thing built.** Tono's gates G3/G4
+10. **Do not ship a GPL-3.0-licensed app shell on top of an MPL/proprietary core**
+    without checking the combination deliberately; Tono's own licensing is
+    inconsistent between the Rust workspace (`LicenseRef-Proprietary`) and the
+    Tauri app (`GPL-3.0-only`), which is a cautionary signal, not a template.
+11. **Do not let the update path be the last thing built.** Tono's gates G3/G4
     ("can ship again", "customer version = yours") are consistently the ones that
     slip, because an update mechanism that was never exercised cannot be
     qualified (decisions `025`, `032`, `118`, `119`, `120`; `RELEASE_LINES.md`
