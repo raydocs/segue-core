@@ -217,10 +217,18 @@ impl Client {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         sessions.fragments.expire(Instant::now());
-        if let Ok(Some(packet)) = sessions.fragments.feed(&packet, Instant::now()) {
-            if let Some(sink) = sessions.sinks.get(&packet.association_id) {
-                let _ = sink.try_send(packet);
+        let packet = if self.inner.native {
+            match sessions.fragments.feed(&packet, Instant::now()) {
+                Ok(Some(packet)) => packet,
+                _ => return,
             }
+        } else if packet.fragment_total == 1 {
+            packet
+        } else {
+            return;
+        };
+        if let Some(sink) = sessions.sinks.get(&packet.association_id) {
+            let _ = sink.try_send(packet);
         }
     }
 
