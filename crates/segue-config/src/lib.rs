@@ -46,6 +46,7 @@ pub use model::{
 };
 pub use model::{xdrive_default_xmux, XdriveS3Settings, XdriveService, XdriveSettings};
 pub use model::{AnyTlsOutboundSettings, MAX_ANYTLS_IDLE_SESSIONS};
+pub use model::{TuicCongestionControl, TuicSettings, TuicUdpRelayMode};
 pub use model::{
     BlackholeOutboundSettings, BlackholeResponse, HttpInboundSettings, HttpOutboundSettings,
     NoiseSegment, RealmIpMode, RealmMask, RealmPortMapping, RealmScheme, RealmStunServer,

@@ -66,7 +66,7 @@ fn tls(alpn: &[&[u8]]) -> TestTls {
 struct MockEndpoint {
     address: SocketAddr,
     tls: TestTls,
-    endpoint: quinn::Endpoint,
+    // The accept task owns the endpoint, which keeps the server socket open.
     task: JoinHandle<()>,
 }
 
@@ -75,7 +75,7 @@ async fn server(mode: TuicUdpRelayMode) -> MockEndpoint {
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(256 * 1024));
     transport.datagram_send_buffer_size(256 * 1024);
-    transport.max_concurrent_uni_streams(128.try_into().unwrap());
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(128));
     let mut config = tls.server.clone();
     config.transport_config(Arc::new(transport));
     let endpoint =
@@ -155,12 +155,7 @@ async fn server(mode: TuicUdpRelayMode) -> MockEndpoint {
             }
         }
     });
-    MockEndpoint {
-        address,
-        tls,
-        endpoint,
-        task,
-    }
+    MockEndpoint { address, tls, task }
 }
 
 async fn loopback(mode: TuicUdpRelayMode) {

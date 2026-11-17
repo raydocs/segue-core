@@ -140,7 +140,8 @@ impl Parser<'_> {
     }
 
     pub(super) fn validate_tuic_stream(
-        settings: &mut OutboundSettings,
+        &mut self,
+        settings: &OutboundSettings,
         stream: &mut StreamSettings,
         chained: bool,
         index: usize,

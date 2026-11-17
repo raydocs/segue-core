@@ -425,7 +425,7 @@ impl HysteriaClient {
         // authentication: Brutal or BBR, in its default mode by the server's
         // reply.
         let switch = Arc::new(ControllerSwitch::default());
-        let (endpoint, connection, _, wire_peer, _) = connect_quic_transport_with_datagrams(
+        let (endpoint, connection, _, wire_peer) = connect_quic_transport_with_datagrams(
             H3ConnectConfig {
                 remote_addr: config.remote_addr,
                 server_name: config.tls.server_name.clone(),

@@ -7,7 +7,7 @@
 use super::*;
 use segue_config::{TuicCongestionControl, TuicSettings, TuicUdpRelayMode};
 use segue_proxy::tuic::{self as wire, Command, Packet};
-use segue_transport::stream::H3ConnectConfig;
+use segue_transport::stream::quic::H3ConnectConfig;
 use std::collections::HashMap;
 use std::fmt;
 use std::task;
@@ -276,9 +276,7 @@ impl AsyncRead for TuicStream {
         context: &mut task::Context<'_>,
         output: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.read)
-            .poll_read(context, output)
-            .map_err(io::Error::other)
+        AsyncRead::poll_read(Pin::new(&mut self.read), context, output)
     }
 }
 
@@ -288,21 +286,22 @@ impl AsyncWrite for TuicStream {
         context: &mut task::Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.write).poll_write(context, data)
+        // `SendStream::poll_write` returns `WriteError`; the trait method returns `io::Error`.
+        AsyncWrite::poll_write(Pin::new(&mut self.write), context, data)
     }
 
     fn poll_flush(
         mut self: Pin<&mut Self>,
         context: &mut task::Context<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.write).poll_flush(context)
+        AsyncWrite::poll_flush(Pin::new(&mut self.write), context)
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         context: &mut task::Context<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.write).poll_shutdown(context)
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.write), context)
     }
 }
 
@@ -663,7 +662,7 @@ impl TuicOutbound {
         let mut token = zeroize::Zeroizing::new([0_u8; 32]);
         connection
             .export_keying_material(
-                token.as_mut(),
+                &mut token[..],
                 self.0.settings.uuid.as_bytes(),
                 self.0.settings.password.as_bytes(),
             )
@@ -680,7 +679,8 @@ impl TuicOutbound {
             .map_err(|_| TuicError::Stream)?;
         stream.finish().map_err(|_| TuicError::Stream)?;
         if let Some(accepted) = zero_rtt_accepted {
-            if !accepted.await.map_err(|_| TuicError::Connect)? {
+            // Resolves to whether the peer accepted 0-RTT; a dropped sender is false.
+            if !accepted.await {
                 connection.close(quinn::VarInt::from_u32(0xfffffff1), b"");
                 return Err(TuicError::Connect);
             }
