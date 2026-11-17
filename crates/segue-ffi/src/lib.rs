@@ -1594,9 +1594,12 @@ pub unsafe extern "C" fn xray_core_rebind_wireguard(
 
 /// Queues a carrier socket rebind for live Hysteria clients (ABI 1.7) and for
 /// every other live QUIC carrier: XHTTP, MASQUE and XDRIVE's storages over
-/// HTTP/3. Endpoint addresses and QUIC/inner flows are retained. The returned
-/// count is accepted coalesced requests, not successful binds or path
-/// validation.
+/// HTTP/3. Endpoint addresses and QUIC/inner flows are retained. An mKCP
+/// connection on its own UDP socket cannot move: it fails, its flows with
+/// it, at once if its source address changed and otherwise unless its peer
+/// is heard within seconds of the call. The returned
+/// count is accepted coalesced requests, the mKCP connections told among
+/// them, not successful binds, path validation or surviving connections.
 ///
 /// # Safety
 /// `handle` must be null or live; `accepted` must be null or writable. May run
@@ -3799,6 +3802,12 @@ unsafe fn xray_core_free_inner(handle: *mut XrayCoreHandle) {
         if let Some(config) = handle.tun_fd_config.take() {
             config.close_if_owned();
         }
+        // The handle's fields drop here, the core and then its runtime.
+        // Dropping the runtime waits for every thread of it, without a
+        // limit: once this returns none of them is inside the socket-protect
+        // callback, and the host may let go of the callback's context. Work
+        // that cannot be cancelled therefore stays off the runtime, as the
+        // system DNS lookup does (`segue_transport::SystemDnsResolver`).
     }
 }
 
@@ -4426,6 +4435,44 @@ mod tests {
         xray_core_routing_policy_snapshot_json, xray_core_set_dns_bootstrap_mode, DnsBootstrapMode,
         OutStrArgs, OutStrBuf, XrayCoreHandle, XrayDnsBootstrapMode, XrayError, XrayStatus,
     };
+
+    /// Stop joins the tasks it owns, but not every task that can dial: a
+    /// stale DNS answer, for one, is refreshed by a detached task. Freeing
+    /// the handle waits for the runtime's threads without a limit, so a
+    /// thread still inside the host's socket-protect callback has returned
+    /// from it before the host lets go of the callback's context.
+    #[test]
+    fn free_waits_for_a_runtime_thread_inside_a_host_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let (entered, has_entered) = mpsc::channel();
+        let returned = Arc::new(AtomicBool::new(false));
+        let callback_returned = Arc::clone(&returned);
+        unsafe {
+            let mut error = ptr::null_mut();
+            let handle = xray_core_new(&mut error);
+            assert!(!handle.is_null());
+            let config = CString::new(r#"{"outbounds":[{"protocol":"freedom"}]}"#).unwrap();
+            assert_eq!(
+                xray_core_load_config_json(handle, config.as_ptr(), &mut error),
+                XrayStatus::Ok
+            );
+            // What a slow callback does to the worker that called it.
+            (*handle).runtime.spawn(async move {
+                entered.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                callback_returned.store(true, Ordering::SeqCst);
+            });
+            has_entered.recv().unwrap();
+            xray_core_free(handle);
+        }
+        assert!(
+            returned.load(Ordering::SeqCst),
+            "xray_core_free returned with a runtime thread still at work"
+        );
+    }
 
     #[test]
     fn tun_mtu_is_validated_atomically_and_frozen_at_config_load() {

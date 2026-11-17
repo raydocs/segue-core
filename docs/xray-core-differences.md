@@ -967,12 +967,25 @@ x/net/icmp's reading of replies, the drop of the system's own echo and of a
 raw socket's foreign identifiers, and Go's stripping of a raw IPv4 header.
 Deliberate differences:
 
-- Each server address gets its own socket, never bound and connected to it.
-  Xray-core binds one unconnected socket per family to the wildcard, which a
-  Network Extension refuses; replies here come only from the address each
-  packet went to, as Xray-core's Linux server sends them. A family the
+- Each server address gets its own socket, where Xray-core binds one
+  unconnected socket per family to the wildcard. On Apple systems it is
+  bound to the wildcard and unconnected as well, but keeps only the replies
+  from its address, where Xray-core hands on a reply from any address with
+  that address; a Network Extension defuncts a connected ICMP socket, whose
+  local address XNU leaves empty, and where the bind is refused the socket
+  is connected instead. Elsewhere it is connected to its address, so replies
+  come only from there, as Xray-core's Linux server sends them. A family the
   addresses do not use needs no socket, where Xray-core fails every dial
   unless sockets of both families open.
+- On Apple systems a socket nothing bound takes the interface the system
+  scopes a UDP socket of the process to on its way to the same address, and
+  asks again at most once a second while it sends. Inside a Network
+  Extension the system scopes a socket to the physical interface when it
+  binds and leaves it there when the network changes. Xray-core's sockets
+  are never bound to an interface, and its server's answering the client's
+  latest address is what lets a socket here move with the network. Where
+  the system scopes no UDP socket, outside a Network Extension, the socket
+  stays unbound as Xray-core's does.
 - It must be the last UDP mask, and runs neither with udphop, xdns, realm
   nor header-custom, nor on QUIC with sudoku: Xray-core fails every dial
   with it anywhere else, the others send elsewhere, header-custom keys its
@@ -982,9 +995,9 @@ Deliberate differences:
   core starts; Xray-core never resolves it and fails every dial. With `ips`,
   a name there must still resolve.
 - An Apple datagram socket keeps the client's identifier and receives every
-  reply from its address, so replies are told apart by identifier, as on a
-  raw socket. Xray-core's datagram sockets there also read the replies meant
-  for other connections to the same server.
+  reply the system gets, so replies are told apart by identifier and
+  address, as on a raw socket. Xray-core's datagram sockets there also read
+  the replies meant for other connections.
 - An echo the socket has no room for is dropped, as a datagram would be;
   Xray-core's writer waits.
 
@@ -1560,6 +1573,58 @@ Not moved: a connection behind a `realm` mask, whose socket was introduced
 to the server and would need a new introduction; one behind `xdns` or
 `xicmp`, which carry nothing over the UDP socket; and mKCP, whose server
 tells sessions apart by the client's address.
+
+An mKCP connection on its own UDP socket, plain or introduced by `realm`,
+is put to the test instead. Xray-core's listener keys a session by the
+client's address, port and conversation
+(`transport/internet/kcp/listener.go:18-22,82-86`) and takes a datagram from
+an unknown address as a new connection (`listener.go:93-121`), so from a new
+address the session is lost; Xray-core's client sits out the 30-second
+dead-link timeout. The host's report does not say that the address changed:
+it also comes for a connection dialed on the new network before the report,
+and for a change that leaves the address as it was. So the connection first
+asks the system which address a datagram to its server leaves from: a UDP
+socket made for the question, protected as its own, is connected to the
+server, which picks a route and sends nothing. If the answer differs from the
+one at the dial, the connection fails at once. If it is the same, the address
+the server sees may still have changed behind a NAT, and the connection waits
+for its server and fails only if it is not heard. An answer the system does
+not give, for want of a route between two networks, is left to the wait as
+well: the route may come back with the same address. A failed connection's
+reads and writes report `NetworkDown`, nothing more goes out, the flows it
+carried end, and the next flow dials a new connection. Nothing redials within
+the transport. Behind `realm` the dial ends with the introduction, so a
+change during it is left to the wait.
+
+The wait follows Xray-core's timers. Its `Input` answers no ping
+(`connection.go:584-603`), so nothing can be sent to ask. A connection with
+segments unacknowledged waits three seconds: each is resent after its timeout
+and acknowledged within a round trip. An idle one waits fourteen: the
+server's ping updater runs every five seconds (`connection.go:242-247`) and
+skips a run less than three seconds after another ping (`connection.go:643`),
+so a live server is silent for under eight, and fourteen seconds hold two of
+its pings, so that one lost on the new network does not fail a live
+connection. A change during the wait starts it over.
+What counts as hearing the server is an acknowledgement or a ping that names
+a non-zero number as the next it reads (`connection.go:656`,
+`receiving.go:244`): the session a listener opens for the same conversation
+from a new address starts at zero and reads nothing while segment zero does
+not reach it again, yet answers with the same conversation. Until the server
+has acknowledged anything, any acknowledgement or ping counts.
+
+mKCP over `xdns` or `xicmp` is left alone: their sockets are not the
+session's, and Xray-core's xicmp server knows a client by the id in its
+echoes and answers wherever the last one came from
+(`transport/internet/finalmask/xicmp/server.go:164-173,283-297`).
+Evidence: `kcp::tests::a_changed_source_address_fails_the_connection_at_once`,
+`an_unchanged_or_unknown_source_address_leaves_it_to_the_wait`,
+`the_system_tells_the_source_address_without_sending`,
+`a_network_change_fails_a_connection_whose_peer_stays_silent`,
+`a_second_network_change_starts_the_wait_for_the_peer_over`,
+`a_peer_heard_after_a_network_change_keeps_the_connection`,
+`a_network_change_fails_a_connection_waiting_for_a_standalone_reply` and
+`kcp::engine::tests::a_stranger_to_the_session_is_not_taken_for_its_peer`.
+No run against Xray-core's own mKCP server covers this yet.
 
 Evidence: `xhttp_h3_takes_a_fresh_socket_when_the_network_changes` moves a
 live connection to a new local port through a relay that counts its sources,
