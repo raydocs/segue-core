@@ -23,19 +23,11 @@ async fn full_xray_encrypted_raw_tls_reality() {
         PINNED_XRAY_CORE_REVISION
     );
     let oracle = env::var_os("XRAY_VLESS_ENCRYPTION_ORACLE").expect("guarded oracle binary");
-    let mut origin = Origin(
-        Command::new(&oracle)
-            .arg("origin")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let mut line = String::new();
-    BufReader::new(origin.0.stdout.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    let address: serde_json::Value = serde_json::from_str(&line).unwrap();
+    // The oracle origin hangs up after five seconds. That is the same instant
+    // REALITY's detector sleep ends, so a client that arrived during the sleep
+    // is reset. This cover stays up.
+    let cover = spawn_reality_cover().await;
+    let cover_dest = format!("127.0.0.1:{}", cover.addr.port());
     for security in [
         XrayInboundSecurity::None,
         XrayInboundSecurity::Tls,
@@ -72,7 +64,7 @@ async fn full_xray_encrypted_raw_tls_reality() {
                         if security == XrayInboundSecurity::Reality {
                             let settings =
                                 &mut json["inbounds"][0]["streamSettings"]["realitySettings"];
-                            settings["dest"] = address["address"].clone();
+                            settings["dest"] = cover_dest.clone().into();
                             settings["serverNames"] = serde_json::json!(["encryption-oracle.test"]);
                             settings["show"] = false.into();
                         }
@@ -110,7 +102,7 @@ async fn full_xray_encrypted_raw_tls_reality() {
                     let dummy =
                         Target::new(TargetAddr::Ip(Ipv4Addr::LOCALHOST.into()), 9, Network::Tcp);
                     let _ = timeout(
-                        Duration::from_secs(5),
+                        Duration::from_secs(15),
                         open_vless_tcp_stream_with_resolver_and_dialer(
                             &outbound,
                             &dummy,
@@ -166,7 +158,7 @@ async fn full_xray_encrypted_raw_tls_reality() {
 #[tokio::test]
 #[ignore = "requires pinned Xray and local cover oracle; run scripts/check-vless-encryption-oracle.sh"]
 async fn full_xray_encrypted_reality_mldsa65_vision_profiles() {
-    let matrix = FullMatrix::new();
+    let matrix = FullMatrix::new().await;
     let generate = || {
         let output = Command::new(&matrix.oracle)
             .args(["keypair", "mldsa65"])
@@ -260,11 +252,15 @@ struct FullMatrix {
     checkout: PathBuf,
     oracle: std::ffi::OsString,
     _origin: Origin,
+    /// Fat self-signed origin the ML-DSA cases need (record room for the signature).
     origin_address: serde_json::Value,
+    /// Patient cover for every other REALITY dest. See [`spawn_reality_cover`].
+    cover_dest: String,
+    _cover: RealityCover,
 }
 
 impl FullMatrix {
-    fn new() -> Self {
+    async fn new() -> Self {
         let checkout = resolve_xray_checkout();
         assert_eq!(
             expected_xray_checkout_revision(
@@ -287,11 +283,15 @@ impl FullMatrix {
             .read_line(&mut line)
             .unwrap();
         let address: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let cover = spawn_reality_cover().await;
+        let cover_dest = format!("127.0.0.1:{}", cover.addr.port());
         Self {
             checkout,
             oracle,
             _origin: origin,
             origin_address: address["address"].clone(),
+            cover_dest,
+            _cover: cover,
         }
     }
 
@@ -351,7 +351,7 @@ impl FullMatrix {
                 }
                 if security == XrayInboundSecurity::Reality {
                     let settings = &mut json["inbounds"][0]["streamSettings"]["realitySettings"];
-                    settings["dest"] = self.origin_address.clone();
+                    settings["dest"] = self.cover_dest.clone().into();
                     settings["serverNames"] = serde_json::json!(["encryption-oracle.test"]);
                     settings["show"] = false.into();
                 }
@@ -426,7 +426,7 @@ impl FullMatrix {
         if security == XrayInboundSecurity::Reality {
             let target = Target::new(TargetAddr::Ip(Ipv4Addr::LOCALHOST.into()), 9, Network::Tcp);
             let _ = timeout(
-                Duration::from_secs(5),
+                Duration::from_secs(15),
                 open_vless_tcp_stream_with_resolver_and_dialer(
                     &outbound,
                     &target,
@@ -551,7 +551,7 @@ async fn matrix_xudp(outbound: &segue_engine::VlessTcpOutbound, dialer: &Transpo
 #[tokio::test]
 #[ignore = "requires guarded pinned Xray binary; run scripts/check-vless-encryption-oracle.sh"]
 async fn full_xray_encrypted_carrier_vision_application_matrix() {
-    let matrix = FullMatrix::new();
+    let matrix = FullMatrix::new().await;
     let mut completed = 0;
     for security in [
         XrayInboundSecurity::None,
@@ -664,7 +664,7 @@ async fn full_xray_encrypted_udp_and_vision_udp443() {
     use segue_proxy::vless::{
         encode_udp_packet, encode_xudp_new_packet, read_udp_packet, read_xudp_packet,
     };
-    let matrix = FullMatrix::new();
+    let matrix = FullMatrix::new().await;
     for security in [
         XrayInboundSecurity::None,
         XrayInboundSecurity::Tls,
