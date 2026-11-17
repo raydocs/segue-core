@@ -265,7 +265,9 @@ mod darwin {
                 &mut count,
             )
         };
-        if result != 0 {
+        // An older kernel that fills fewer words than asked leaves
+        // `phys_footprint` unwritten: treat that as no sample.
+        if result != 0 || count < TASK_VM_INFO_REV1_COUNT {
             return None;
         }
         // SAFETY: the call succeeded, so the kernel wrote the fields the
