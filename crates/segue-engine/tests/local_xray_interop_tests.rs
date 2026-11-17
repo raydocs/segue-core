@@ -266,6 +266,7 @@ async fn rust_socks_clients_open_parallel_echo_flows_through_local_xray_vless_tl
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 None,
             );
@@ -572,6 +573,7 @@ fn rust_tls_core_config_and_dialer(
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         flow,
     );
@@ -935,6 +937,7 @@ async fn run_local_xray_vless_shaped_tls_burst_interop(fingerprint: &str, flow_c
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         None,
     );
@@ -2714,6 +2717,7 @@ async fn run_local_xray_stream_transport_interop(
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
+                ech_config_list: None,
             }),
             None,
         )
@@ -3035,6 +3039,7 @@ async fn run_local_xray_xhttp_interop_with(
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: vec!["http/1.1".to_owned()],
+                ech_config_list: None,
             }),
         ),
         XhttpInteropSecurity::H2Tls => (
@@ -3047,6 +3052,7 @@ async fn run_local_xray_xhttp_interop_with(
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: vec!["h2".to_owned()],
+                ech_config_list: None,
             }),
         ),
         XhttpInteropSecurity::H2Reality => (
@@ -3064,6 +3070,7 @@ async fn run_local_xray_xhttp_interop_with(
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: vec!["h3".to_owned()],
+                ech_config_list: None,
             }),
         ),
     };
@@ -3680,6 +3687,7 @@ fn grpc_client_security(security: XrayInboundSecurity) -> StreamSecurity {
             // so an explicit list here would be inert *and* would hide the
             // fact that the profile is what supplies `h2`.
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         // The same fingerprint the base Vision REALITY scenario uses; REALITY
         // negotiates no ALPN of its own, so nothing here turns on the choice.
@@ -4229,6 +4237,7 @@ async fn udp_hop_xhttp_h3_keeps_a_flow_across_hops_to_xray() {
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: vec!["h3".to_owned()],
+                ech_config_list: None,
             }),
             XhttpMode::StreamOne,
         );
@@ -4312,6 +4321,7 @@ async fn xhttp_h3_chrome_parrot_keeps_a_flow_across_network_changes() {
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: vec!["h3".to_owned()],
+                ech_config_list: None,
             }),
             XhttpMode::StreamOne,
         );
@@ -4399,6 +4409,7 @@ async fn xhttp_h3_bbr_profiles_interop() {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: vec!["h3".to_owned()],
+                    ech_config_list: None,
                 }),
                 XhttpMode::StreamOne,
             );
@@ -4485,6 +4496,7 @@ async fn xhttp_h3_chrome_parrot_interop() {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: vec!["h3".to_owned()],
+                    ech_config_list: None,
                 }),
                 XhttpMode::StreamOne,
             );
@@ -4593,6 +4605,7 @@ async fn header_custom_udp_xhttp_h3_modes_and_noise_order() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: vec!["h3".to_owned()],
+            ech_config_list: None,
         })
     };
     let noise = serde_json::json!({"type":"noise","settings":{"noise":[

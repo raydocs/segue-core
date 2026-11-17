@@ -192,6 +192,7 @@ async fn sudoku_udp_xhttp_h3_alone_and_with_noise() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: vec!["h3".to_owned()],
+            ech_config_list: None,
         })
     };
     let mask = |password: &str| json!({"type":"sudoku","settings":{"password":password,"paddingMin":5,"paddingMax":25}});

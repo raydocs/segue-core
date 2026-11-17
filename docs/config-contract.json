@@ -1453,10 +1453,12 @@
         "alpn",
         "pinnedPeerCertSha256",
         "verifyPeerCertByName",
-        "enableSessionResumption"
+        "enableSessionResumption",
+        "echConfigList",
+        "echForceQuery"
       ],
       "id": "TLS",
-      "notes": "allowInsecure=true is rejected. fromMitm is unsupported. Fingerprints, certificate pins and name constraints use parser validation. enableSessionResumption is a boolean with no effect on a uTLS-shaped handshake, which never resumes here or in Xray-core; with fingerprint unsafe, and on QUIC, rustls resumes sessions whatever its value."
+      "notes": "allowInsecure=true is rejected. fromMitm is unsupported. Fingerprints, certificate pins and name constraints use parser validation. enableSessionResumption is a boolean with no effect on a uTLS-shaped handshake, which never resumes here or in Xray-core; with fingerprint unsafe, and on QUIC, rustls resumes sessions whatever its value. echConfigList is standard padded base64 of an ECHConfigList; the DNS resolver forms (udp://, https://, and name+scheme://) that Xray also accepts are refused. Real ECH runs only on an unshaped TLS 1.3 handshake, so it is refused with a shaping fingerprint and on QUIC carriers, which never shape but also never place rustls' own ECH extension. echForceQuery was removed by Xray and is rejected."
     },
     {
       "context": "$.outbounds[].settings (wireguard)",

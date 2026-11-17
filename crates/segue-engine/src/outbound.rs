@@ -365,6 +365,7 @@ pub(crate) enum DnsTcpConnector {
         verify_peer_cert_by_name: Vec<String>,
         alpn: Vec<String>,
         fingerprint: Option<String>,
+        ech_config_list: Option<Vec<u8>>,
     },
 }
 
@@ -595,6 +596,7 @@ impl DnsOutbound {
                 verify_peer_cert_by_name,
                 alpn,
                 fingerprint,
+                ech_config_list,
             } => {
                 let server_name = match &target.addr {
                     RoutingTargetAddr::Domain(domain) if !domain.is_empty() => domain.clone(),
@@ -610,6 +612,7 @@ impl DnsOutbound {
                     verify_peer_cert_by_name: verify_peer_cert_by_name.clone(),
                     alpn: alpn.clone(),
                     fingerprint: fingerprint.clone(),
+                    ech_config_list: ech_config_list.clone(),
                 }))
             }
         }
@@ -4428,6 +4431,7 @@ fn dns_tcp_connector(stream: &StreamSettings) -> Result<DnsTcpConnector, CoreErr
                     verify_peer_cert_by_name: tls.verify_peer_cert_by_name.clone(),
                     alpn: tls.alpn.clone(),
                     fingerprint: tls.fingerprint.clone(),
+                    ech_config_list: tls.ech_config_list.clone(),
                 }),
             )),
             Some(_) | None => Ok(DnsTcpConnector::TlsFromTarget {
@@ -4436,6 +4440,7 @@ fn dns_tcp_connector(stream: &StreamSettings) -> Result<DnsTcpConnector, CoreErr
                 verify_peer_cert_by_name: tls.verify_peer_cert_by_name.clone(),
                 alpn: tls.alpn.clone(),
                 fingerprint: tls.fingerprint.clone(),
+                ech_config_list: tls.ech_config_list.clone(),
             }),
         },
         StreamSecurity::Reality(reality) => Ok(DnsTcpConnector::Static(ConnectorConfig::Reality(
@@ -5857,6 +5862,7 @@ mod tests {
                     pinned_peer_cert_sha256: vec![[0x11; 32]],
                     verify_peer_cert_by_name: vec!["resolver-cert.example".to_owned()],
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 quic_params: None,
                 tcp_fragment: None,
@@ -5891,6 +5897,7 @@ mod tests {
                 verify_peer_cert_by_name: vec!["resolver-cert.example".to_owned()],
                 alpn: Vec::new(),
                 fingerprint: None,
+                ech_config_list: None,
             })
         );
         assert!(!explicit.supports_direct_udp());
@@ -5908,6 +5915,7 @@ mod tests {
                         pinned_peer_cert_sha256: vec![[0x22; 32]],
                         verify_peer_cert_by_name: vec!["dynamic-cert.example".to_owned()],
                         alpn: Vec::new(),
+                        ech_config_list: None,
                     }),
                     quic_params: None,
                     tcp_fragment: None,
@@ -5937,6 +5945,7 @@ mod tests {
                     verify_peer_cert_by_name: vec!["dynamic-cert.example".to_owned()],
                     alpn: Vec::new(),
                     fingerprint: None,
+                    ech_config_list: None,
                 })
             );
         }
@@ -5954,6 +5963,7 @@ mod tests {
                 pinned_peer_cert_sha256: vec![[0x33; 32]],
                 verify_peer_cert_by_name: vec!["cert.example".to_owned()],
                 alpn: vec!["http/1.1".to_owned()],
+                ech_config_list: None,
             }),
             quic_params: None,
             tcp_fragment: None,
@@ -5997,6 +6007,7 @@ mod tests {
                     pinned_peer_cert_sha256: vec![[0x44; 32]],
                     verify_peer_cert_by_name: vec!["cert.example".to_owned()],
                     alpn: vec!["h2".to_owned()],
+                    ech_config_list: None,
                 }),
                 quic_params: None,
                 tcp_fragment: None,
@@ -6027,6 +6038,7 @@ mod tests {
                 verify_peer_cert_by_name: vec!["cert.example".to_owned()],
                 alpn: vec!["h2".to_owned()],
                 fingerprint: Some("firefox".to_owned()),
+                ech_config_list: None,
             })
         );
     }
@@ -6057,6 +6069,7 @@ mod tests {
                 verify_peer_cert_by_name: vec!["cert.example".to_owned()],
                 allow_insecure: false,
                 alpn: vec!["h2".to_owned()],
+                ech_config_list: None,
             });
 
             let built = build_vless_tcp_outbound(&outbound).expect("build pinned VLESS TLS");
@@ -6069,6 +6082,7 @@ mod tests {
                     verify_peer_cert_by_name: vec!["cert.example".to_owned()],
                     alpn: vec!["h2".to_owned()],
                     fingerprint: Some("unsafe".to_owned()),
+                    ech_config_list: None,
                 })
             );
         }
@@ -6274,6 +6288,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 quic_params: None,
                 tcp_fragment: None,
@@ -8780,6 +8795,7 @@ mod tests {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: alpn.iter().map(|protocol| (*protocol).to_owned()).collect(),
+            ech_config_list: None,
         })
     }
 
@@ -9416,6 +9432,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 (None, true) => StreamSecurity::Reality(reality_settings()),
                 (None, false) => StreamSecurity::None,
@@ -9463,6 +9480,7 @@ mod tests {
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
+                ech_config_list: None,
             }),
             TargetAddr::Domain("dest.example.com".to_owned()),
         );
@@ -9643,6 +9661,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 TargetAddr::Domain("dest.example.com".to_owned()),
                 "streamSettings.tlsSettings.serverName",
@@ -9656,6 +9675,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 TargetAddr::Domain("例え.jp".to_owned()),
                 "settings.vnext[0].address",
@@ -9761,6 +9781,7 @@ mod tests {
                         pinned_peer_cert_sha256: Vec::new(),
                         verify_peer_cert_by_name: Vec::new(),
                         alpn: Vec::new(),
+                        ech_config_list: None,
                     }),
                     TargetAddr::Domain("dest.example.com".to_owned()),
                 ),
@@ -10793,6 +10814,7 @@ mod tests {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: Some("chrome".to_owned()),
+                ech_config_list: None,
             }),
             &TransportLayer::WebSocket(WebSocketConfig {
                 path: "/chat".to_owned(),
@@ -10907,6 +10929,7 @@ mod tests {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: Some("chrome".to_owned()),
+                ech_config_list: None,
             }),
             &TransportLayer::Raw,
         )

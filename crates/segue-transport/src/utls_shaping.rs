@@ -1540,6 +1540,7 @@ mod tests {
                 Vec::new()
             },
             fingerprint: Some(fingerprint.to_owned()),
+            ech_config_list: None,
         };
         for _ in 0..256 {
             let record = crate::tls::plain_tls_client_hello_bytes(&config)
@@ -1619,6 +1620,7 @@ mod tests {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: Some((*name).to_owned()),
+                ech_config_list: None,
             };
             match crate::tls::plain_tls_client_hello_bytes(&config) {
                 Ok(record) => {
@@ -1806,6 +1808,7 @@ mod tests {
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: alpn.into_iter().map(str::to_owned).collect(),
                     fingerprint: Some((*name).to_owned()),
+                    ech_config_list: None,
                 };
                 let mut ech_lengths = HashSet::new();
                 for _ in 0..256 {

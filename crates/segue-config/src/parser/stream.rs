@@ -57,6 +57,36 @@ impl Parser<'_> {
             || xdrive_h3
             || stream_network == StreamNetwork::Xhttp
                 && matches!(&security, StreamSecurity::Tls(tls) if tls.alpn == ["h3"]);
+        // Real ECH is rustls' own extension, so it can only ride a hello
+        // rustls builds. A shaping fingerprint replaces that hello with a
+        // uTLS parrot whose ECH extension is GREASE, and a QUIC carrier never
+        // shapes but also never places rustls' ECH extension. Refuse both
+        // combinations here rather than send a hello that claims ECH and
+        // carries none.
+        let ech_tls = match &security {
+            StreamSecurity::Tls(tls) if tls.ech_config_list.is_some() => Some(tls),
+            _ => None,
+        };
+        if let Some(tls) = ech_tls {
+            let ech_path =
+                format!("$.outbounds[{index}].streamSettings.tlsSettings.echConfigList");
+            let shaped = tls
+                .fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint != segue_utls::UNSAFE_TLS_FINGERPRINT);
+            if shaped {
+                self.error(
+                    ech_path.clone(),
+                    "echConfigList cannot be combined with a shaping fingerprint: the shaped hello carries only GREASE ECH; set fingerprint to unsafe",
+                );
+            }
+            if is_quic {
+                self.error(
+                    ech_path,
+                    "echConfigList is unsupported on a QUIC carrier: this client places ECH only in a rustls TCP hello",
+                );
+            }
+        }
         let mut quic_params = self.parse_quic_params(stream, stream_network, is_quic, index);
         if let Some(hop) = self.parse_udp_hop_mask(stream, is_quic, index) {
             if stream
@@ -1631,6 +1661,20 @@ impl Parser<'_> {
                     .collect()
             })
             .unwrap_or_default();
+        let ech_config_list = self.parse_tls_ech_config_list(tls_settings, path);
+        // Xray removed `echForceQuery` with its other deprecated TLS fields
+        // (none/half/full governed the DNS-fetch fallback). A config that still
+        // carries it gets Xray's own verdict — rejected — with a message that
+        // names the field instead of the generic unknown-key one.
+        if tls_settings
+            .and_then(|settings| settings.get("echForceQuery"))
+            .is_some_and(|value| !value.is_null())
+        {
+            self.error(
+                format!("{path}.echForceQuery"),
+                "field `echForceQuery` was removed by Xray; it governed the DNS-fetched ECH config, which this client does not fetch",
+            );
+        }
 
         TlsSettings {
             server_name: tls_settings
@@ -1641,7 +1685,78 @@ impl Parser<'_> {
             verify_peer_cert_by_name,
             allow_insecure,
             alpn,
+            ech_config_list,
         }
+    }
+
+    /// `tlsSettings.echConfigList`, as Xray-core's `TLSConfig.ECHConfigList`
+    /// reads it: a standard padded base64 ECHConfigList, or empty for none.
+    ///
+    /// Xray also accepts a DNS resolver form here — `udp://host[:port]`,
+    /// `https://host/dns-query`, or `name+scheme://…` — and fetches the
+    /// HTTPS RR's `ech` parameter at dial time. Segue's DNS client has no
+    /// HTTPS (type 65) query, so those forms are refused with a clear error
+    /// rather than silently sending an unencrypted hello.
+    ///
+    /// TODO: fetch the ECHConfigList from the HTTPS RR once the DNS client
+    /// can query type 65.
+    fn parse_tls_ech_config_list(
+        &mut self,
+        settings: Option<&Value>,
+        path: &str,
+    ) -> Option<Vec<u8>> {
+        use base64::Engine as _;
+
+        let path = format!("{path}.echConfigList");
+        let Some(value) = settings.and_then(|settings| settings.get("echConfigList")) else {
+            return None;
+        };
+        let encoded = match value {
+            // encoding/json unmarshals JSON null into the Go string zero value.
+            Value::Null => return None,
+            Value::String(encoded) => encoded,
+            _ => {
+                self.error(path, "field `echConfigList` must be a string or null");
+                return None;
+            }
+        };
+        // Xray's `len(c.EchConfigList) != 0` gate: an empty string is no ECH.
+        if encoded.is_empty() {
+            return None;
+        }
+        if encoded.contains("://") {
+            self.error(
+                path,
+                "echConfigList DNS resolver forms (udp://, https://, name+scheme://) are unsupported: this client cannot query the HTTPS RR; use the base64 ECHConfigList instead",
+            );
+            return None;
+        }
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            self.error(
+                path,
+                "echConfigList must be standard padded base64 of an ECHConfigList",
+            );
+            return None;
+        };
+        // ECHConfigList is `uint16 length; ECHConfig configs<length>`, so the
+        // prefix must account for every remaining byte. rustls would reject a
+        // malformed list at dial time; failing here names the field instead.
+        let Some((prefix, body)) = decoded.split_first_chunk::<2>() else {
+            self.error(path, "echConfigList decodes to fewer than 2 bytes");
+            return None;
+        };
+        if usize::from(u16::from_be_bytes(*prefix)) != body.len() {
+            self.error(
+                path,
+                "echConfigList length prefix does not match its contents",
+            );
+            return None;
+        }
+        if body.is_empty() {
+            self.error(path, "echConfigList carries no ECH config");
+            return None;
+        }
+        Some(decoded)
     }
 
     pub(super) fn validate_stream_settings_compatibility(&mut self, stream: &Value, index: usize) {

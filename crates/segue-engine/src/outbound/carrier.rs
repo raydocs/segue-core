@@ -253,6 +253,7 @@ pub(super) fn build_connector(
                 verify_peer_cert_by_name: tls.verify_peer_cert_by_name.clone(),
                 alpn: tls.alpn.clone(),
                 fingerprint: tls.fingerprint.clone(),
+                ech_config_list: tls.ech_config_list.clone(),
             })
         }
         StreamSecurity::Reality(reality) => ConnectorConfig::Reality(RealityClientConfig {
@@ -731,6 +732,7 @@ pub(super) fn realm_config(
                 .unwrap_or_default(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: settings.and_then(|tls| tls.ech_config_list.clone()),
         }
     });
     Arc::new(RealmConfig {

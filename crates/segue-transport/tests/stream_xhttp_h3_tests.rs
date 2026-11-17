@@ -2744,6 +2744,7 @@ async fn preprotected_tls_connector_protects_every_production_h3_candidate() {
         verify_peer_cert_by_name: Vec::new(),
         alpn: vec!["http/1.1".to_owned()],
         fingerprint: Some("fingerprint-is-ignored-by-h3".to_owned()),
+        ech_config_list: None,
     });
     let target = Target::new(
         TargetAddr::Ip(server_addr.ip()),

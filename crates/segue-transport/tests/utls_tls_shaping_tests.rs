@@ -94,6 +94,7 @@ mod utls_tls_shaping_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: alpn.iter().map(|value| (*value).to_owned()).collect(),
             fingerprint: Some(fingerprint.to_owned()),
+            ech_config_list: None,
         }
     }
 
@@ -547,6 +548,7 @@ mod utls_tls_shaping_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("unsafe".to_owned()),
+            ech_config_list: None,
         })
         .expect("unshaped ClientHello must be produced");
 
@@ -573,6 +575,7 @@ mod utls_tls_shaping_tests {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
                 fingerprint: fingerprint.clone(),
+                ech_config_list: None,
             })
             .expect("unshaped ClientHello must be produced");
 
@@ -599,6 +602,7 @@ mod utls_tls_shaping_tests {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: fingerprint.clone(),
+                ech_config_list: None,
             })
             .expect("unshaped ClientHello must be produced");
 
@@ -1304,6 +1308,7 @@ mod utls_tls_shaping_tests {
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: alpn.iter().map(|value| (*value).to_owned()).collect(),
                     fingerprint: Some(fingerprint.to_owned()),
+                    ech_config_list: None,
                 })
                 .unwrap_or_else(|error| {
                     panic!("{fingerprint} (alpn {alpn:?}): IP-literal ClientHello: {error}")
@@ -1408,6 +1413,7 @@ mod utls_tls_shaping_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("chrome".to_owned()),
+            ech_config_list: None,
         };
 
         // Twice through the same connector. The second dial takes the memoized
@@ -1775,6 +1781,7 @@ mod utls_tls_shaping_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some(fingerprint.to_owned()),
+            ech_config_list: None,
         };
 
         connector
