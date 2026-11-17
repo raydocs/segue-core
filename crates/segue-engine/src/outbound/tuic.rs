@@ -206,7 +206,7 @@ impl Client {
             read,
             write,
             _permit: permit,
-            client: self.clone(),
+            _client: self.clone(),
         }))
     }
 
@@ -267,7 +267,8 @@ struct TuicStream {
     read: quinn::RecvStream,
     write: quinn::SendStream,
     _permit: tokio::sync::OwnedSemaphorePermit,
-    client: Client,
+    // Held so the QUIC connection outlives every stream opened on it.
+    _client: Client,
 }
 
 impl AsyncRead for TuicStream {

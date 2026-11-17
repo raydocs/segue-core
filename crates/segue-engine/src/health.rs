@@ -29,6 +29,7 @@ pub(crate) struct ObservatoryRuntime {
 }
 
 impl ObservatoryRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: ObservatoryConfig,
         nodes: Vec<OutboundNodeId>,
@@ -84,6 +85,7 @@ impl ObservatoryActivity {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.changed.borrow().generation
     }

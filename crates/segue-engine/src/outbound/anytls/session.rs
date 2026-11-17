@@ -300,7 +300,7 @@ async fn idle_cleanup(pool: Arc<PoolShared>) {
         // both here would invert that order.
         let mut idle = lock(&pool.idle).clone();
         // Newest first, as the reference's skiplist iterates.
-        idle.sort_by(|a, b| b.seq.cmp(&a.seq));
+        idle.sort_by_key(|session| std::cmp::Reverse(session.seq));
         let mut kept = 0usize;
         let mut retire = Vec::new();
         let mut refresh = Vec::new();

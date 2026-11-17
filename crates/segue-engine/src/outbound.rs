@@ -8279,6 +8279,7 @@ mod tests {
         assert_eq!(selected.tag.as_deref(), Some("proxy-a"));
     }
 
+    #[test]
     fn least_ping_keeps_the_incumbent_within_tolerance() {
         let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
             RoutingBalancerStrategy::LeastPing(Default::default()),
@@ -8330,6 +8331,7 @@ mod tests {
         assert_eq!(select().as_deref(), Some("proxy-a"));
     }
 
+    #[test]
     fn least_ping_zero_tolerance_switches_on_any_strict_improvement() {
         let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
             RoutingBalancerStrategy::LeastPing(RoutingLeastPingSettings {
@@ -8370,6 +8372,7 @@ mod tests {
         assert_eq!(select().as_deref(), Some("proxy-b"));
     }
 
+    #[test]
     fn least_load_keeps_the_single_pick_within_ping_tolerance() {
         let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
             RoutingBalancerStrategy::LeastLoad(RoutingLeastLoadSettings::default()),
@@ -8412,6 +8415,7 @@ mod tests {
         assert_eq!(select().as_deref(), Some("proxy-b"));
     }
 
+    #[test]
     fn health_aware_selection_touches_the_observatory_and_other_strategies_do_not() {
         let activity = ObservatoryActivity::new();
         let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(

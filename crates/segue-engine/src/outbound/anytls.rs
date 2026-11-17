@@ -161,7 +161,7 @@ impl AnyTlsOutbound {
 
 /// UDP over one AnyTLS stream: a length-prefixed datagram each way, with the
 /// destination fixed by the UoT connect request.
-pub(super) struct UdpSession {
+pub(crate) struct UdpSession {
     writer: AsyncMutex<Option<tokio::io::WriteHalf<BoxedTransportStream>>>,
     reader: AsyncMutex<Reader>,
     target: Target,
