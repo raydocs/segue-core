@@ -448,16 +448,28 @@ where
     }
 }
 
-fn is_handshake_dummy(record: &[u8], mac: &Sha1Hmac) -> bool {
-    if record.len() <= TLS_HMAC_HEADER_LEN || record[..3] != [HANDSHAKE, 3, 3] {
-        return false;
+/// Cover traffic still authenticated by the handshake HMAC.
+///
+/// sing-shadowtls `verifyApplicationData` (`v3_conn.go`) with `hmacIgnore` and
+/// `update == false`: the payload is mixed into the hash and the four-byte tag
+/// is checked, but the tag itself is not written back. A match means the record
+/// is leftover relay padding and must be discarded. A mismatch drops the ignore
+/// window; the caller then authenticates with the directional chain.
+fn continuing_handshake_mac(record: &[u8], mac: &Sha1Hmac) -> Option<Sha1Hmac> {
+    if record.len() < TLS_HMAC_HEADER_LEN || record[..3] != [APPLICATION_DATA, 3, 3] {
+        return None;
     }
     let mut next = mac.clone();
     next.update(&record[TLS_HMAC_HEADER_LEN..]);
-    hmac_equal(
+    let expected = next.clone().finalize().into_bytes();
+    if hmac_equal(
         &record[TLS_HEADER_LEN..TLS_HMAC_HEADER_LEN],
-        &next.finalize().into_bytes()[..HMAC_LEN],
-    )
+        &expected[..HMAC_LEN],
+    ) {
+        Some(next)
+    } else {
+        None
+    }
 }
 
 struct RawBufferedStream {
@@ -657,8 +669,9 @@ struct ShadowTlsStream<S> {
     records: RecordReader<S>,
     write_mac: FrameMac,
     read_mac: FrameMac,
-    /// Keeps the handshake HMAC chain after the switch only for the first
-    /// application record. This is sing-shadowtls' `hmacIgnore`.
+    /// sing-shadowtls' `hmacIgnore`. Server application records that continue the
+    /// handshake HMAC are discarded until one does not, after which the inner
+    /// protocol uses the directional read chain.
     handshake_read_mac: Option<Sha1Hmac>,
     input: BytesMut,
     output: Vec<u8>,
@@ -670,8 +683,19 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     fn new(carrier: S, password: Zeroizing<String>, server_random: [u8; 32]) -> Self {
-        let write_mac = FrameMac::new(password.as_bytes(), &server_random, b'C');
-        let read_mac = FrameMac::new(password.as_bytes(), &server_random, b'S');
+        // Client writes `C` and reads `S`, as `newVerifiedConn` does in v3_client.go.
+        Self::with_directions(carrier, password, server_random, b'C', b'S')
+    }
+
+    fn with_directions(
+        carrier: S,
+        password: Zeroizing<String>,
+        server_random: [u8; 32],
+        write_direction: u8,
+        read_direction: u8,
+    ) -> Self {
+        let write_mac = FrameMac::new(password.as_bytes(), &server_random, write_direction);
+        let read_mac = FrameMac::new(password.as_bytes(), &server_random, read_direction);
         Self {
             records: RecordReader::new(carrier),
             write_mac,
@@ -708,33 +732,22 @@ where
     }
 
     fn open_record(&mut self, record: &[u8]) -> io::Result<Vec<u8>> {
-        if let Some(mac) = self.handshake_read_mac.take() {
-            if is_handshake_dummy(record, &mac) {
-                self.handshake_read_mac = Some(mac);
-                return Ok(Vec::new());
-            }
-            // The first application frame can replace the dummy and use the
-            // handshake HMAC directly before switching to the S chain.
-            if record.len() > TLS_HMAC_HEADER_LEN && record[..3] == [APPLICATION_DATA, 3, 3] {
-                let mut next = mac;
-                next.update(&record[TLS_HMAC_HEADER_LEN..]);
-                let expected = next.clone().finalize().into_bytes();
-                if hmac_equal(
-                    &record[TLS_HEADER_LEN..TLS_HMAC_HEADER_LEN],
-                    &expected[..HMAC_LEN],
-                ) {
-                    next.update(&record[TLS_HEADER_LEN..TLS_HMAC_HEADER_LEN]);
-                    self.read_mac = FrameMac { inner: next };
-                    return Ok(record[TLS_HMAC_HEADER_LEN..].to_vec());
+        if record.first() == Some(&APPLICATION_DATA) {
+            if let Some(mac) = self.handshake_read_mac.take() {
+                if let Some(next) = continuing_handshake_mac(record, &mac) {
+                    self.handshake_read_mac = Some(next);
+                    return Ok(Vec::new());
                 }
             }
         }
-        match record[0] {
-            ALERT => Err(io::Error::new(
+        match record.first().copied() {
+            Some(ALERT) => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "ShadowTLS peer alert",
             )),
-            APPLICATION_DATA if record.len() >= TLS_HMAC_HEADER_LEN && record[1..3] == [3, 3] => {
+            Some(APPLICATION_DATA)
+                if record.len() >= TLS_HMAC_HEADER_LEN && record[1..3] == [3, 3] =>
+            {
                 if self.read_mac.open(
                     &record[TLS_HMAC_HEADER_LEN..],
                     &record[TLS_HEADER_LEN..TLS_HMAC_HEADER_LEN],

@@ -33,12 +33,18 @@ fn hex(bytes: &[u8]) -> String {
 #[test]
 fn client_hello_and_xor_vectors_match_sing_shadowtls() {
     let mut hello: Vec<u8> = (0..=255).collect();
+    // verifyClientHello rejects anything that is not a ClientHello with a
+    // 32-byte session id before it checks the tag (v3_server.go).
+    hello[0] = 1;
+    hello[38] = 32;
     let random: [u8; 28] = (16..=43).collect::<Vec<_>>().try_into().unwrap();
     seal_session_id(PASSWORD, &mut hello, random).unwrap();
     let mut record = vec![HANDSHAKE, 3, 3, 0, 0];
     record[3..5].copy_from_slice(&(hello.len() as u16).to_be_bytes());
     record.extend_from_slice(&hello);
-    assert_eq!(hex(&hello[67..71]), "b77a61e4");
+    // sing-shadowtls generateSessionID (v3_client.go): HMAC-SHA1(password,
+    // hello[:39] || random(28) || 4 zero bytes || hello[71:]) truncated to 4.
+    assert_eq!(hex(&hello[67..71]), "832ac85d");
     assert!(client_hello_tag_valid(PASSWORD, &record));
     assert!(!client_hello_tag_valid(b"wrong", &record));
     let mut wrong = record;
@@ -57,18 +63,24 @@ fn client_hello_and_xor_vectors_match_sing_shadowtls() {
 fn framing_vectors_have_directional_chaining_and_transactional_open() {
     let mut write = FrameMac::new(PASSWORD, &RANDOM, b'C');
     let mut read = FrameMac::new(PASSWORD, &RANDOM, b'C');
-    for (payload, expected) in [(&b"first"[..], "6883c0d8"), (&b"second"[..], "0a1ca088")] {
+    let mut first_tag = [0u8; 4];
+    for (index, (payload, expected)) in [(&b"first"[..], "6883c0d8"), (&b"second"[..], "0a1ca088")]
+        .into_iter()
+        .enumerate()
+    {
         let tag = write.seal(payload);
         assert!(read.open(payload, &tag));
         assert_eq!(hex(&tag), expected);
-        let mut other = FrameMac::new(PASSWORD, &RANDOM, b'C');
-        assert!(other.open(payload, &tag));
-        assert_eq!(
-            other.seal(payload),
-            tag,
-            "next seal includes the previous tag"
-        );
+        if index == 0 {
+            first_tag = tag;
+        }
     }
+    // sing-shadowtls verifiedConn.putHeaderLocked / verifyApplicationData
+    // write the 4-byte tag back into the rolling HMAC. A reader that accepted
+    // "first" therefore seals "second" as the same chained tag, not a fresh one.
+    let mut other = FrameMac::new(PASSWORD, &RANDOM, b'C');
+    assert!(other.open(b"first", &first_tag));
+    assert_eq!(hex(&other.seal(b"second")), "0a1ca088");
     let mut server = FrameMac::new(PASSWORD, &RANDOM, b'S');
     assert_eq!(hex(&server.seal(b"first")), "212eaef7");
     assert_eq!(hex(&server.seal(b"second")), "8b3cff74");
@@ -84,7 +96,10 @@ fn tls13_server_hello() -> Vec<u8> {
     body.extend_from_slice(&RANDOM);
     body.push(32);
     body.extend_from_slice(&[7; 32]);
-    body.extend_from_slice(&[0x13, 1, 0, 0, 0, 6, 0, 43, 0, 2, 3, 4]);
+    // cipher 0x1301, compression 0, extensions length 6, supported_versions
+    // (43) of length 2 carrying 0x0304. An extra zero here makes the
+    // extensions length parse as 0, so the fixture would not be TLS 1.3.
+    body.extend_from_slice(&[0x13, 1, 0, 0, 6, 0, 43, 0, 2, 3, 4]);
     let handshake_len = ((body.len() - 4) as u16).to_be_bytes();
     body[2..4].copy_from_slice(&handshake_len);
     let mut record = vec![HANDSHAKE, 3, 3, 0, 0];
@@ -107,9 +122,11 @@ fn server_hello_extraction_inspects_the_extensions() {
 #[tokio::test]
 async fn framed_stream_enforces_tags_and_round_trips() {
     let (left, right) = tokio_io::duplex(128 * 1024);
+    // Client writes C and reads S; the peer is the server direction from
+    // v3_server.go (write S, read C). Two clients cannot authenticate each other.
     let (mut client, mut server) = (
         ShadowTlsStream::new(left, password(), RANDOM),
-        ShadowTlsStream::new(right, password(), RANDOM),
+        ShadowTlsStream::with_directions(right, password(), RANDOM, b'S', b'C'),
     );
     client.write_all(b"first").await.unwrap();
     server.write_all(b"reply").await.unwrap();
@@ -139,13 +156,21 @@ fn test_tls_configs() -> (Arc<rustls::ClientConfig>, Arc<rustls::ServerConfig>) 
     ));
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.clone()).unwrap();
-    let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    // Chrome's key shares include X25519MLKEM768, which ring does not implement.
+    // Shaped handshakes use the same aws-lc-rs groups as `shaping_crypto_provider`.
+    let mut shaping = rustls::crypto::aws_lc_rs::default_provider();
+    shaping.kx_groups = vec![
+        rustls::crypto::aws_lc_rs::kx_group::X25519KYBER768DRAFT00,
+        rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+        rustls::crypto::aws_lc_rs::kx_group::X25519,
+        rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+        rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+    ];
+    let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(shaping))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     client.alpn_protocols = vec![b"h2".to_vec()];
     let server = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -183,8 +208,14 @@ async fn record<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Vec<u8>> {
     Ok(record)
 }
 
-/// Standalone v3 frontend logic, intentionally test-only. Its two directions
-/// mirror copyByFrameUntilHMACMatches/copyByFrameWithModification.
+/// Test double of the sing-shadowtls v3 server (`service.go`).
+///
+/// `copyByFrameUntilHMACMatches` forwards client records until one carries the
+/// directional `C` tag. `copyByFrameWithModification` rewrites every server
+/// application record with the running handshake HMAC and does not feed the tag
+/// back into that hash. The real TLS peer is closed when the client
+/// authenticates; it is not an application echo. One more handshake-HMAC record
+/// then exercises the client's `hmacIgnore` before the inner `S` response.
 async fn relay(
     frontend: TcpStream,
     upstream: TcpStream,
@@ -196,27 +227,25 @@ async fn relay(
     let hello = record(&mut client_read).await?;
     assert!(client_hello_tag_valid(PASSWORD, &hello));
     upstream_write.write_all(&hello).await?;
+    upstream_write.flush().await?;
     let hello = record(&mut upstream_read).await?;
     let random = server_random(&hello).expect("ServerHello random");
     client_write.write_all(&hello).await?;
+    client_write.flush().await?;
 
     let toward_tls = tokio::spawn(async move {
         let mut verify = FrameMac::new(PASSWORD, &random, b'C');
         loop {
             let frame = record(&mut client_read).await?;
-            if frame.len() > TLS_HMAC_HEADER_LEN && frame[0] == APPLICATION_DATA {
-                if verify.open(
+            if frame.len() > TLS_HMAC_HEADER_LEN
+                && frame[0] == APPLICATION_DATA
+                && verify.open(
                     &frame[TLS_HMAC_HEADER_LEN..],
                     &frame[TLS_HEADER_LEN..TLS_HMAC_HEADER_LEN],
-                ) {
-                    assert_eq!(&frame[TLS_HMAC_HEADER_LEN..], REQUEST);
-                    break;
-                }
-                let mut handshake = <Sha1Hmac as KeyInit>::new_from_slice(PASSWORD).unwrap();
-                handshake.update(&random);
-                handshake.update(&frame[TLS_HMAC_HEADER_LEN..]);
-                let expected = handshake.finalize().into_bytes()[..HMAC_LEN].to_vec();
-                assert_eq!(&frame[TLS_HEADER_LEN..TLS_HMAC_HEADER_LEN], &expected);
+                )
+            {
+                assert_eq!(&frame[TLS_HMAC_HEADER_LEN..], REQUEST);
+                break;
             }
             upstream_write.write_all(&frame).await?;
             upstream_write.flush().await?;
@@ -228,29 +257,54 @@ async fn relay(
     let mut handshake = <Sha1Hmac as KeyInit>::new_from_slice(PASSWORD).unwrap();
     handshake.update(&random);
     let xor_key = xor_wrap_key(PASSWORD, &random);
-    let mut next = record(&mut upstream_read).await?;
-    while next[0] != APPLICATION_DATA {
-        client_write.write_all(&next).await?;
-        next = record(&mut upstream_read).await?;
+    loop {
+        let mut next = match record(&mut upstream_read).await {
+            Ok(frame) => frame,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        };
+        if next[0] == APPLICATION_DATA {
+            xor_wrap(&mut next[TLS_HEADER_LEN..], &xor_key);
+            handshake.update(&next[TLS_HEADER_LEN..]);
+            let tag = hmac_prefix(&handshake);
+            let transformed = negotiated_tag_frame(&next, &tag);
+            client_write.write_all(&transformed).await?;
+        } else {
+            client_write.write_all(&next).await?;
+        }
+        client_write.flush().await?;
     }
-    xor_wrap(&mut next[TLS_HEADER_LEN..], &xor_key);
-    handshake.update(&next[TLS_HEADER_LEN..]);
-    let tag = handshake.finalize().into_bytes()[..HMAC_LEN].to_vec();
-    let mut transformed = negotiated_tag_frame(&next[..], &tag);
-    client_write.write_all(&transformed).await?;
-    client_write.flush().await?;
 
     toward_tls.await??;
-    cutover.await.expect("dummy consumed by genuine TLS");
+    cutover
+        .await
+        .expect("handshake server closed after the authenticated frame");
+
+    let mut cover = DUMMY.to_vec();
+    xor_wrap(&mut cover, &xor_key);
+    handshake.update(&cover);
+    let tag = hmac_prefix(&handshake);
+    let mut cover_frame = vec![APPLICATION_DATA, 3, 3, 0, 0];
+    put_len(&mut cover_frame, cover.len() + HMAC_LEN);
+    cover_frame.extend_from_slice(&tag);
+    cover_frame.extend_from_slice(&cover);
+    client_write.write_all(&cover_frame).await?;
+
     let mut write = FrameMac::new(PASSWORD, &random, b'S');
     let tag = write.seal(RESPONSE);
-    transformed = vec![APPLICATION_DATA, 3, 3];
-    put_len(&mut transformed, RESPONSE.len() + HMAC_LEN);
-    transformed.extend_from_slice(&tag);
-    transformed.extend_from_slice(RESPONSE);
-    client_write.write_all(&transformed).await?;
+    let mut response = vec![APPLICATION_DATA, 3, 3, 0, 0];
+    put_len(&mut response, RESPONSE.len() + HMAC_LEN);
+    response.extend_from_slice(&tag);
+    response.extend_from_slice(RESPONSE);
+    client_write.write_all(&response).await?;
     client_write.flush().await?;
     Ok(())
+}
+
+fn hmac_prefix(mac: &Sha1Hmac) -> [u8; HMAC_LEN] {
+    mac.clone().finalize().into_bytes()[..HMAC_LEN]
+        .try_into()
+        .expect("HMAC-SHA1 is longer than the ShadowTLS tag")
 }
 
 fn put_len(record: &mut [u8], size: usize) {
@@ -279,11 +333,11 @@ async fn loopback_handshakes_with_real_tls_then_carries_inner_protocol() {
     let tls_server = tokio::spawn(async move {
         let (socket, _) = real_listener.accept().await.unwrap();
         let mut tls = TlsAcceptor::from(server_tls).accept(socket).await.unwrap();
-        tls.write_all(DUMMY).await.unwrap();
-        tls.flush().await.unwrap();
-        let mut dummy = [0; 17];
-        tls.read_exact(&mut dummy).await.unwrap();
-        assert_eq!(&dummy, DUMMY);
+        // sing-shadowtls closes the handshake server when the client frame
+        // authenticates. A raw FIN is not a TLS close_notify; the read ending
+        // is the signal that the relay let this peer go.
+        let mut byte = [0u8; 1];
+        let _ = tls.read(&mut byte).await;
         dummy_done_tx.send(()).unwrap();
     });
     let client = tokio::spawn(async move {
