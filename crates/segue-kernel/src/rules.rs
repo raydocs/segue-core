@@ -4,6 +4,11 @@
 //! The kernel never resolves a domain locally just to evaluate a CIDR rule:
 //! that lookup would leak the name to the local resolver before the route
 //! is known.
+//!
+//! An optional AI tier sits in front of the user rules ([`RuleSet::with_ai`]).
+//! A destination it matches is the AI action, except when a user rule that
+//! matches is an explicit [`Action::Reject`]: a block still blocks. A user
+//! Direct or Proxy rule cannot pull an AI destination off the AI exit.
 
 use std::net::IpAddr;
 
@@ -39,15 +44,69 @@ pub struct Rule {
     pub action: Action,
 }
 
+/// Index [`RuleSet::lookup`] returns when the AI tier matched and no user
+/// rule rejected the target. Not an index into the user rules.
+pub const AI_TIER_INDEX: usize = usize::MAX;
+
+/// Destinations that must use the AI exit. Built from the file in
+/// `data/ai-lock.txt` plus the signed bundle's `ai_domains` / `ai_cidrs`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiTier {
+    suffixes: Vec<String>,
+    cidrs: CidrTable,
+    action: Action,
+}
+
+impl AiTier {
+    fn matches(&self, target: &TargetAddr) -> bool {
+        match target {
+            TargetAddr::Domain(name) => {
+                let n = normalize(name);
+                self.suffixes
+                    .iter()
+                    .any(|s| segue_policy::suffix_match(&n, s))
+            }
+            TargetAddr::Ip(ip) => self.cidrs.contains(*ip),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuleSet {
     rules: Vec<Rule>,
     default: Action,
+    ai: Option<AiTier>,
 }
 
 impl RuleSet {
     pub fn new(rules: Vec<Rule>, default: Action) -> Self {
-        Self { rules, default }
+        Self {
+            rules,
+            default,
+            ai: None,
+        }
+    }
+
+    /// Install the AI tier. `suffixes` are already canonical; `cidrs` may
+    /// be empty (no published client-facing ranges).
+    pub fn with_ai(mut self, suffixes: Vec<String>, cidrs: &[Cidr], action: Action) -> Self {
+        self.ai = Some(AiTier {
+            suffixes,
+            cidrs: CidrTable::new(cidrs),
+            action,
+        });
+        self
+    }
+
+    /// The AI tier matched `target` (a block rule may still win in
+    /// [`Self::lookup`]).
+    pub fn is_ai(&self, target: &TargetAddr) -> bool {
+        self.ai.as_ref().is_some_and(|ai| ai.matches(target))
+    }
+
+    /// The action the AI tier routes to, when one is installed.
+    pub fn ai_action(&self) -> Option<&Action> {
+        self.ai.as_ref().map(|ai| &ai.action)
     }
 
     pub fn decide(&self, target: &TargetAddr) -> &Action {
@@ -58,25 +117,41 @@ impl RuleSet {
     /// only the default applies. Callers that combine two views of one flow
     /// (DNS classification, SNI vs IP) need to know "explicit match" apart
     /// from "fell through to the default".
+    ///
+    /// When the AI tier matches, an explicit [`Action::Reject`] user rule
+    /// still wins (a block is a block). Every other user rule loses: the
+    /// tier's action is returned with [`AI_TIER_INDEX`].
     pub fn lookup(&self, target: &TargetAddr) -> Option<(usize, &Action)> {
-        let lowered;
-        let domain = match target {
-            TargetAddr::Domain(name) => {
-                lowered = normalize(name);
-                Some(lowered.as_str())
+        if self.is_ai(target) {
+            if let Some(i) = self.reject_index(target) {
+                return Some((i, &self.rules[i].action));
             }
-            TargetAddr::Ip(_) => None,
-        };
+            Some((
+                AI_TIER_INDEX,
+                &self.ai.as_ref().expect("is_ai implies a tier").action,
+            ))
+        } else {
+            self.user_index(target)
+                .map(|i| (i, &self.rules[i].action))
+        }
+    }
+
+    fn user_index(&self, target: &TargetAddr) -> Option<usize> {
+        let domain = domain_of(target);
         self.rules.iter().enumerate().find_map(|(i, rule)| {
-            let hit = match (&rule.matcher, target, domain) {
-                // Same suffix rule as the relay's AI set (segue-policy).
-                (Matcher::DomainSuffix(s), _, Some(d)) => segue_policy::suffix_match(d, s),
-                (Matcher::DomainExact(s), _, Some(d)) => d == s,
-                (Matcher::DomainKeyword(s), _, Some(d)) => d.contains(s.as_str()),
-                (Matcher::Cidr(c), TargetAddr::Ip(ip), _) => c.contains(*ip),
-                _ => false,
-            };
-            hit.then_some((i, &rule.action))
+            rule_matches(&rule.matcher, target, domain.as_deref()).then_some(i)
+        })
+    }
+
+    /// First user rule that both matches and rejects. Used only after the
+    /// AI tier has matched, so a block listed after a broader Direct still
+    /// blocks an AI destination.
+    fn reject_index(&self, target: &TargetAddr) -> Option<usize> {
+        let domain = domain_of(target);
+        self.rules.iter().enumerate().find_map(|(i, rule)| {
+            (matches!(rule.action, Action::Reject)
+                && rule_matches(&rule.matcher, target, domain.as_deref()))
+            .then_some(i)
         })
     }
 
@@ -84,17 +159,79 @@ impl RuleSet {
         &self.default
     }
 
-    /// Every outbound tag a rule or the default refers to.
+    /// Every outbound tag a rule, the AI tier or the default refers to.
     pub fn proxy_tags(&self) -> impl Iterator<Item = &str> {
+        let ai = self.ai.as_ref().map(|t| &t.action);
         self.rules
             .iter()
             .map(|r| &r.action)
+            .chain(ai)
             .chain(std::iter::once(&self.default))
             .filter_map(|a| match a {
                 Action::Proxy(tag) => Some(tag.as_str()),
                 _ => None,
             })
     }
+}
+
+fn domain_of(target: &TargetAddr) -> Option<String> {
+    match target {
+        TargetAddr::Domain(name) => Some(normalize(name)),
+        TargetAddr::Ip(_) => None,
+    }
+}
+
+fn rule_matches(matcher: &Matcher, target: &TargetAddr, domain: Option<&str>) -> bool {
+    match (matcher, target, domain) {
+        // Same suffix rule as the relay's AI set (segue-policy).
+        (Matcher::DomainSuffix(s), _, Some(d)) => segue_policy::suffix_match(d, s),
+        (Matcher::DomainExact(s), _, Some(d)) => d == s,
+        (Matcher::DomainKeyword(s), _, Some(d)) => d.contains(s.as_str()),
+        (Matcher::Cidr(c), TargetAddr::Ip(ip), _) => c.contains(*ip),
+        _ => false,
+    }
+}
+
+/// The built-in AI list (`data/ai-lock.txt`): canonical suffixes and any
+/// cited CIDRs. The file is part of the crate; a bad line is a bug.
+pub fn builtin_ai_list() -> (Vec<String>, Vec<Cidr>) {
+    parse_ai_list(include_str!("../data/ai-lock.txt")).expect("builtin AI list")
+}
+
+/// `suffix name` and `cidr prefix` lines. `#` comments and blank lines skip.
+pub fn parse_ai_list(text: &str) -> Result<(Vec<String>, Vec<Cidr>), String> {
+    let mut suffixes = Vec::new();
+    let mut cidrs = Vec::new();
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let kind = parts.next().unwrap_or("");
+        let value = parts
+            .next()
+            .ok_or_else(|| format!("ai list line {}: missing value", n + 1))?;
+        if parts.next().is_some() {
+            return Err(format!("ai list line {}: extra token", n + 1));
+        }
+        match kind {
+            "suffix" => {
+                let d = segue_policy::canonical_domain(value)
+                    .ok_or_else(|| format!("ai list line {}: bad domain {value:?}", n + 1))?;
+                if !suffixes.iter().any(|s| s == &d) {
+                    suffixes.push(d);
+                }
+            }
+            "cidr" => {
+                let cidr = Cidr::parse(value)
+                    .map_err(|e| format!("ai list line {}: {e}", n + 1))?;
+                cidrs.push(cidr);
+            }
+            other => return Err(format!("ai list line {}: unknown kind {other:?}", n + 1)),
+        }
+    }
+    Ok((suffixes, cidrs))
 }
 
 pub(crate) fn normalize(name: &str) -> String {
@@ -439,5 +576,101 @@ mod tests {
             proxy.into_rule().unwrap().action,
             Action::Proxy("hk".into())
         );
+    }
+
+    #[test]
+    fn builtin_list_covers_the_named_vendors_and_no_invented_cidrs() {
+        let (suffixes, cidrs) = builtin_ai_list();
+        assert!(cidrs.is_empty(), "no published client-facing CIDR");
+        let rules = RuleSet::new(Vec::new(), Action::Direct).with_ai(
+            suffixes,
+            &cidrs,
+            Action::Proxy("ai".into()),
+        );
+        for name in [
+            "api.anthropic.com",
+            "console.anthropic.com",
+            "statsig.anthropic.com",
+            "claude.ai",
+            "API.Claude.AI.",
+            "claude.com",
+            "api.openai.com",
+            "auth.openai.com",
+            "chat.openai.com",
+            "chatgpt.com",
+            "ab.chatgpt.com",
+            "cdn.oaistatic.com",
+            "files.oaiusercontent.com",
+        ] {
+            assert_eq!(
+                rules.decide(&d(name)),
+                &Action::Proxy("ai".into()),
+                "{name}"
+            );
+        }
+        for name in ["notopenai.com", "example.com", "statsigapi.net", "sentry.io"] {
+            assert_eq!(rules.decide(&d(name)), &Action::Direct, "{name}");
+        }
+    }
+
+    #[test]
+    fn ai_tier_beats_user_rules_except_an_explicit_block() {
+        let (suffixes, _) = builtin_ai_list();
+        let cidr = Cidr::parse("203.0.113.0/24").unwrap();
+        let rules = RuleSet::new(
+            vec![
+                // A user Direct, and a broad proxy keyword that also matches
+                // the name, both lose to the tier.
+                Rule {
+                    matcher: Matcher::DomainSuffix("claude.ai".into()),
+                    action: Action::Direct,
+                },
+                Rule {
+                    matcher: Matcher::DomainKeyword("a".into()),
+                    action: Action::Proxy("overseas".into()),
+                },
+                Rule {
+                    matcher: Matcher::Cidr(cidr),
+                    action: Action::Direct,
+                },
+                // Listed after the broader rules: still an explicit block.
+                Rule {
+                    matcher: Matcher::DomainExact("blocked.openai.com".into()),
+                    action: Action::Reject,
+                },
+                Rule {
+                    matcher: Matcher::Cidr(Cidr::parse("203.0.113.9/32").unwrap()),
+                    action: Action::Reject,
+                },
+            ],
+            Action::Proxy("overseas".into()),
+        )
+        .with_ai(suffixes, &[cidr], Action::Proxy("ai".into()));
+        assert_eq!(rules.decide(&d("claude.ai")), &Action::Proxy("ai".into()));
+        assert_eq!(
+            rules.decide(&d("api.openai.com")),
+            &Action::Proxy("ai".into())
+        );
+        assert_eq!(rules.decide(&d("blocked.openai.com")), &Action::Reject);
+        assert_eq!(
+            rules.decide(&ip("203.0.113.1")),
+            &Action::Proxy("ai".into()),
+            "a direct CIDR does not pull an AI address off the AI exit"
+        );
+        assert_eq!(rules.decide(&ip("203.0.113.9")), &Action::Reject);
+        assert_eq!(
+            rules.decide(&d("example.com")),
+            &Action::Proxy("overseas".into())
+        );
+        assert_eq!(rules.lookup(&d("claude.ai")).unwrap().0, AI_TIER_INDEX);
+    }
+
+    #[test]
+    fn ai_list_parser_rejects_a_bad_line() {
+        assert!(parse_ai_list("suffix claude.ai\n").is_ok());
+        assert!(parse_ai_list("cidr 203.0.113.0/24\n").is_ok());
+        assert!(parse_ai_list("suffix .claude.ai\n").is_err());
+        assert!(parse_ai_list("nope claude.ai\n").is_err());
+        assert!(parse_ai_list("suffix\n").is_err());
     }
 }
