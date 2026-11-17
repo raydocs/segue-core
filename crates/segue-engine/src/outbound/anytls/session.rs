@@ -470,6 +470,7 @@ impl Session {
             rx,
             pending: Bytes::new(),
             fin_sent: false,
+            write_reserve: None,
         })
     }
 }
@@ -708,6 +709,32 @@ async fn dispatch(
     }
 }
 
+/// One in-flight `reserve_owned` on the session writer. Tokio 1.x `Sender` has
+/// no `poll_reserve`; `poll_write` drives this future so a full queue waits
+/// instead of dropping the waker.
+type ReservedSlot = Pin<
+    Box<
+        dyn Future<Output = Result<mpsc::OwnedPermit<WriteCommand>, mpsc::error::SendError<()>>>
+            + Send,
+    >,
+>;
+
+struct WriteSlot(ReservedSlot);
+
+impl std::fmt::Debug for WriteSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reserving")
+    }
+}
+
+/// Take one writer-queue slot. The permit is sent by `poll_write` only after
+/// this resolves, so the frame is encoded once a slot exists.
+async fn reserve_writer(
+    sender: mpsc::Sender<WriteCommand>,
+) -> Result<mpsc::OwnedPermit<WriteCommand>, mpsc::error::SendError<()>> {
+    sender.reserve_owned().await
+}
+
 /// One multiplexed stream. Dropping it sends `Fin` and returns the session to
 /// the idle pool once its last stream ends.
 #[derive(Debug)]
@@ -718,6 +745,8 @@ pub(super) struct Stream {
     rx: mpsc::Receiver<StreamEvent>,
     pending: Bytes,
     fin_sent: bool,
+    /// Set while `poll_write` is waiting for a queue slot.
+    write_reserve: Option<WriteSlot>,
 }
 
 impl Stream {
@@ -780,24 +809,52 @@ impl AsyncRead for Stream {
 
 impl AsyncWrite for Stream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         input: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.session.closed() {
+        let this = self.get_mut();
+        if this.session.closed() {
+            // Drop a waiter so a closed stream does not hold a queue slot.
+            this.write_reserve = None;
             return Poll::Ready(Err(closed()));
         }
         if input.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let frames = wire::push_frames(self.id, input);
-        match self.writer.poll_reserve(cx) {
-            Poll::Ready(Ok(permit)) => {
-                let written = input.len();
-                permit.send(WriteCommand::Data(frames));
-                Poll::Ready(Ok(written))
+        let id = this.id;
+        if this.write_reserve.is_none() {
+            match this.writer.try_reserve() {
+                Ok(permit) => {
+                    permit.send(WriteCommand::Data(wire::push_frames(id, input)));
+                    return Poll::Ready(Ok(input.len()));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Poll::Ready(Err(closed())),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let sender = this.writer.clone();
+                    let reserved: ReservedSlot = Box::pin(reserve_writer(sender));
+                    this.write_reserve = Some(WriteSlot(reserved));
+                }
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(closed())),
+        }
+        // Poll outside the borrow of `write_reserve` so the slot can be cleared.
+        let polled = {
+            let WriteSlot(slot) = this
+                .write_reserve
+                .as_mut()
+                .expect("a full writer queue stores its reservation");
+            slot.as_mut().poll(cx)
+        };
+        match polled {
+            Poll::Ready(Ok(permit)) => {
+                let _sender = permit.send(WriteCommand::Data(wire::push_frames(id, input)));
+                this.write_reserve = None;
+                Poll::Ready(Ok(input.len()))
+            }
+            Poll::Ready(Err(_)) => {
+                this.write_reserve = None;
+                Poll::Ready(Err(closed()))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
