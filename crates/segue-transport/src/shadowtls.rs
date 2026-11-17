@@ -266,6 +266,7 @@ fn seal_session_id(
 }
 
 /// Server-side verification form: the stored tag contributes four zero bytes.
+#[cfg(test)]
 fn client_hello_tag_valid(password: &[u8], record: &[u8]) -> bool {
     let hmac_start = TLS_HEADER_LEN + CLIENT_HELLO_SESSION_ID_START + 28;
     if record.len() < hmac_start + HMAC_LEN

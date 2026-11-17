@@ -731,9 +731,7 @@ fn vless_outbound(
     ctx: &mut Ctx,
 ) -> Option<Value> {
     let protocol = if vmess { "vmess" } else { "vless" };
-    let Some((server, server_port)) = server_of(map, path, ctx) else {
-        return None;
-    };
+    let (server, server_port) = server_of(map, path, ctx)?;
     let Some(credential) = string(map, "uuid").filter(|value| !value.is_empty()) else {
         ctx.warn(format!("{path}.uuid"), "missing UUID");
         return None;
@@ -874,9 +872,7 @@ fn trojan_outbound(
     path: &str,
     ctx: &mut Ctx,
 ) -> Option<Value> {
-    let Some((server, server_port)) = server_of(map, path, ctx) else {
-        return None;
-    };
+    let (server, server_port) = server_of(map, path, ctx)?;
     let Some(password) = string(map, "password").filter(|value| !value.is_empty()) else {
         ctx.warn(format!("{path}.password"), "missing password");
         return None;
@@ -895,9 +891,7 @@ fn trojan_outbound(
 }
 
 fn ss_outbound(tag: &str, map: &Map<String, Value>, path: &str, ctx: &mut Ctx) -> Option<Value> {
-    let Some((server, server_port)) = server_of(map, path, ctx) else {
-        return None;
-    };
+    let (server, server_port) = server_of(map, path, ctx)?;
     let Some(method) = string(map, "method").filter(|value| !value.is_empty()) else {
         ctx.warn(format!("{path}.method"), "missing method");
         return None;
@@ -937,9 +931,7 @@ fn hysteria2_outbound(
     path: &str,
     ctx: &mut Ctx,
 ) -> Option<Value> {
-    let Some((server, server_port)) = server_of(map, path, ctx) else {
-        return None;
-    };
+    let (server, server_port) = server_of(map, path, ctx)?;
     let Some(password) = string(map, "password").filter(|value| !value.is_empty()) else {
         ctx.warn(format!("{path}.password"), "missing password");
         return None;
@@ -1009,9 +1001,7 @@ fn anytls_outbound(
     path: &str,
     ctx: &mut Ctx,
 ) -> Option<Value> {
-    let Some((server, server_port)) = server_of(map, path, ctx) else {
-        return None;
-    };
+    let (server, server_port) = server_of(map, path, ctx)?;
     let Some(password) = string(map, "password").filter(|value| !value.is_empty()) else {
         ctx.warn(format!("{path}.password"), "missing password");
         return None;
@@ -1049,9 +1039,7 @@ fn anytls_outbound(
 }
 
 fn socks_outbound(tag: &str, map: &Map<String, Value>, path: &str, ctx: &mut Ctx) -> Option<Value> {
-    let Some((server, server_port)) = server_of(map, path, ctx) else {
-        return None;
-    };
+    let (server, server_port) = server_of(map, path, ctx)?;
     let mut settings = Map::new();
     settings.insert("address".into(), json!(server));
     settings.insert("port".into(), json!(server_port));
@@ -1073,9 +1061,7 @@ fn socks_outbound(tag: &str, map: &Map<String, Value>, path: &str, ctx: &mut Ctx
 }
 
 fn http_outbound(tag: &str, map: &Map<String, Value>, path: &str, ctx: &mut Ctx) -> Option<Value> {
-    let Some((server, server_port)) = server_of(map, path, ctx) else {
-        return None;
-    };
+    let (server, server_port) = server_of(map, path, ctx)?;
     let mut settings = Map::new();
     settings.insert("address".into(), json!(server));
     settings.insert("port".into(), json!(server_port));

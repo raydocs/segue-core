@@ -1262,7 +1262,7 @@ impl Parser<'_> {
         self.validate_masque_pair(&settings, &stream, proxy_settings.is_some(), index);
         self.validate_trojan_stream(&settings, &stream, index);
         self.validate_anytls_stream(&settings, &stream, index);
-        self.validate_tuic_stream(&mut settings, &mut stream, proxy_settings.is_some(), index);
+        self.validate_tuic_stream(&settings, &mut stream, proxy_settings.is_some(), index);
 
         // Xray v26.7.28 applies this policy only to its simplified top-level
         // VLESS settings. Its legacy `vnext` path bypasses that validation.
