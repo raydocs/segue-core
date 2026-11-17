@@ -728,6 +728,23 @@ impl Succinct {
     }
 }
 
+/// Walk a succinct set already loaded the way sing-box and mihomo store it
+/// (`leaves`, `labelBitmap`, `labels`). The wire length prefixes differ; the
+/// bitmap does not.
+pub(crate) fn succinct_keys(
+    leaves: Vec<u64>,
+    label_bitmap: Vec<u64>,
+    labels: Vec<u8>,
+) -> Result<Vec<String>, SrsError> {
+    let mut succinct = Succinct {
+        leaves,
+        label_bitmap,
+        labels,
+    };
+    succinct.validate()?;
+    succinct.keys()
+}
+
 fn bit(words: &[u64], index: usize) -> Result<u64, SrsError> {
     let word = words
         .get(index >> 6)
@@ -997,7 +1014,7 @@ fn regex_escape(text: &str) -> String {
     escaped
 }
 
-fn cidrs_for_range(start: &[u8], end: &[u8]) -> Result<Vec<Cidr>, SrsError> {
+pub(crate) fn cidrs_for_range(start: &[u8], end: &[u8]) -> Result<Vec<Cidr>, SrsError> {
     let bad_length = || SrsError::Invalid("IP address length".to_owned());
     match start.len() {
         4 => {
