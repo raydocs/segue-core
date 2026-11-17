@@ -804,7 +804,8 @@ jobs:
     # 2026-11-17). Its work directory, CARGO_HOME, RUSTUP_HOME and TMPDIR are
     # on the external disk (/Volumes/dev/ci; see the runner's .env), because
     # the internal disk is small. It is not ephemeral: every step must clean
-    # up after itself and never rely on state left by a previous run.
+    # up after itself and never rely on state left by a previous run, except
+    # the build caches below: cargo, SwiftPM and Xcode check their own inputs.
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
     runs-on: [self-hosted, macOS, ARM64, segue-macos]
     timeout-minutes: 90
@@ -839,6 +840,39 @@ jobs:
             --profile minimal \
             --component rust-src
 
+      # The checkout wipes target/ (git clean -ffdx), so without this every
+      # run would rebuild seven Rust targets from scratch. SEGUE_CI_CACHE comes
+      # from the runner's .env; its name ends in .noindex so Spotlight leaves
+      # it alone. Pull requests build without LTO and with 16 codegen units:
+      # they check that everything compiles, links and passes the Swift tests.
+      # Pushes to main and tags build with the shipping release profile.
+      - name: Use the runner's persistent build cache
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          cache="${SEGUE_CI_CACHE:-$RUNNER_TEMP/segue-ci-cache}"
+          flavour=release
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            flavour=pr
+            {
+              echo "CARGO_PROFILE_RELEASE_LTO=false"
+              echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
+            } >> "$GITHUB_ENV"
+          fi
+          mkdir -p "$cache"
+          # Keep the external disk from filling up: past 150 GiB, start over.
+          if [[ "$(du -sg "$cache" | cut -f1)" -gt 150 ]]; then
+            echo "build cache over 150 GiB; clearing it"
+            rm -rf "${cache:?}"/*
+          fi
+          {
+            echo "APPLE_CARGO_TARGET_DIR=$cache/apple-cargo-$flavour"
+            echo "SEGUE_SWIFTPM_SCRATCH=$cache/swiftpm-$flavour"
+            echo "SEGUE_SWIFTPM_HOME=$cache/swiftpm-home"
+            echo "SEGUE_CLANG_MODULE_CACHE=$cache/clang-module-cache"
+            echo "SEGUE_XCODE_DERIVED_DATA=$cache/xcode-derived-$flavour"
+          } >> "$GITHUB_ENV"
+
       - name: Build Apple XCFramework
         run: bash scripts/build-apple-xcframework.sh
 
@@ -849,12 +883,12 @@ jobs:
         run: bash scripts/fetch-geodata.sh
 
       - name: Test Swift package
-        env:
-          CLANG_MODULE_CACHE_PATH: ${{ github.workspace }}/target/mobile/apple-clang-module-cache
-          HOME: ${{ github.workspace }}/target/mobile/apple-swiftpm-test-home
         run: |
+          export CLANG_MODULE_CACHE_PATH="$SEGUE_CLANG_MODULE_CACHE"
+          export HOME="$SEGUE_SWIFTPM_HOME"
           mkdir -p "$CLANG_MODULE_CACHE_PATH" "$HOME"
-          swift test --disable-sandbox --package-path platform/apple
+          swift test --disable-sandbox --package-path platform/apple \
+            --scratch-path "$SEGUE_SWIFTPM_SCRATCH"
 
       - name: Check Apple adapter links
         env:
@@ -864,7 +898,7 @@ jobs:
       - name: Build unsigned Apple sample apps
         run: |
           project="platform/apple/XrayClient/XrayClient.xcodeproj"
-          derived_data="$RUNNER_TEMP/xray-apple-sample"
+          derived_data="$SEGUE_XCODE_DERIVED_DATA"
 
           xcodebuild \
             -project "$project" \
