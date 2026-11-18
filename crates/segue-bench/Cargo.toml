@@ -32,3 +32,6 @@ segue-routing = { path = "../segue-routing" }
 segue-transport = { path = "../segue-transport" }
 segue-tun = { path = "../segue-tun" }
 segue-utls = { path = "../segue-utls" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

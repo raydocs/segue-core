@@ -7,21 +7,128 @@
 //!
 //! No root, no `tc netem`, no host route changes: the relay only binds the
 //! loopback addresses it is told to. TCP is a reliable byte stream, so loss and
-//! reordering are applied to UDP only; TCP gets delay, jitter and the bandwidth
-//! cap (dropping bytes there would corrupt the stream rather than emulate a
-//! retransmission).
+//! reordering are applied to UDP only unless [`TcpLoss::Emulate`] is on. With
+//! the mode off, TCP gets delay, jitter and the bandwidth cap (dropping bytes
+//! there would corrupt the stream rather than emulate a retransmission).
+//!
+//! # TCP loss-recovery emulation
+//!
+//! [`TcpLoss::Emulate`] (CLI `--tcp-loss emulate`, off by default) never drops
+//! a TCP byte. Each read chunk, capped at [`TCP_SEGMENT_CAP`] (1400 B), is one
+//! segment. A segment the profile's [`LossModel`] marks lost is delivered
+//! later, and every segment behind it waits (head-of-line), then flushes in
+//! order. This is a model of TCP recovery, not TCP, and a Linux `tc netem`
+//! job will calibrate it later.
+//!
+//! Loss is drawn once per segment, per direction, from the seeded [`Rng`].
+//! The retransmission is drawn again at once on the same model (a burst can
+//! consume the retry). Drawing it up front, rather than when the timer fires,
+//! keeps the loss sequence a function of `(profile, seed, segment sizes)` and
+//! not of the clock.
+//!
+//! `rtt` is twice the profile's one-way `delay` (jitter is not part of it).
+//! `inflight` is the number of later segments sent within one `rtt` of the
+//! lost one. A lost segment is delivered after:
+//!
+//! - `inflight >= 3`: fast retransmit, one `rtt`;
+//! - otherwise a tail-loss probe, `2 × rtt`;
+//! - each lost retransmission adds an RTO of `max(200 ms, 3 × rtt)`, doubling
+//!   per further loss, each step capped at 8 s, and at most
+//!   [`TCP_MAX_RETX`] retries.
+//!
+//! The first segment in each direction stands for the SYN / first handshake
+//! flight: a loss delays it 1 s (macOS initial RTO), and a lost retransmission
+//! delays it another 1 s. Further losses of that flight use the RTO ladder.
+//! Segments that were not lost still take the profile's one-way delay, jitter,
+//! reorder extra and bandwidth cap. A lost segment's recovery delay replaces
+//! that one-way delay (the round trip already includes it), and it does not
+//! consume the bandwidth cap.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep_until, Instant};
 
 use crate::{parse_u64, required_value, BenchError};
+
+/// Largest chunk treated as one TCP segment in loss-recovery emulation.
+const TCP_SEGMENT_CAP: usize = 1400;
+/// Later segments inside one RTT that trigger fast retransmit instead of a tail-loss probe.
+const TCP_FAST_RETRANS_INFLIGHT: usize = 3;
+/// macOS initial RTO for the SYN / first flight.
+const TCP_SYN_RTO: Duration = Duration::from_secs(1);
+/// Floor on a data RTO. The model uses 200 ms, not RFC 6298's 1 s.
+const TCP_RTO_FLOOR: Duration = Duration::from_millis(200);
+/// Data RTO is at least this many round trips.
+const TCP_RTO_RTT_FACTOR: u32 = 3;
+/// Cap on a single RTO backoff step.
+const TCP_RTO_CAP: Duration = Duration::from_secs(8);
+/// Stop redrawing a retransmission after this many losses so a certain-loss
+/// profile cannot spin. The 8 s step cap still applies to every step.
+const TCP_MAX_RETX: u32 = 16;
+/// Splits the two directions so they do not share one loss sequence.
+const DIRECTION_SEED_XOR: u64 = 0x5DEE_CE66_D1CE_4E5B;
+
+fn direction_seed(seed: u64, toward_client: bool) -> u64 {
+    if toward_client {
+        seed ^ DIRECTION_SEED_XOR
+    } else {
+        seed
+    }
+}
+
+/// Round trip used by TCP recovery emulation: twice the profile's one-way delay.
+fn profile_rtt(profile: &ImpairProfile) -> Duration {
+    profile.delay.saturating_mul(2)
+}
+
+fn add_instant(base: Instant, delay: Duration) -> Instant {
+    base.checked_add(delay).unwrap_or(base)
+}
+
+/// Initial data RTO: `max(200 ms, 3 × rtt)`, capped at 8 s.
+fn rto_step(rtt: Duration) -> Duration {
+    TCP_RTO_FLOOR
+        .max(rtt.saturating_mul(TCP_RTO_RTT_FACTOR))
+        .min(TCP_RTO_CAP)
+}
+
+/// Extra delay from `losses` failed retransmissions. Each step doubles, capped at 8 s.
+fn rto_ladder(rtt: Duration, losses: u32) -> Duration {
+    let mut step = rto_step(rtt);
+    let mut extra = Duration::ZERO;
+    for _ in 0..losses {
+        extra = extra.saturating_add(step);
+        step = TCP_RTO_CAP.min(step.saturating_mul(2));
+    }
+    extra
+}
+
+/// SYN / first-flight recovery: 1 s, plus another 1 s if that retry is lost.
+/// Anything beyond the second loss uses the data RTO ladder.
+fn syn_recovery(rtt: Duration, retx_losses: u32) -> Duration {
+    let mut delay = TCP_SYN_RTO;
+    if retx_losses >= 1 {
+        delay = delay.saturating_add(TCP_SYN_RTO);
+    }
+    delay.saturating_add(rto_ladder(rtt, retx_losses.saturating_sub(1)))
+}
+
+/// Data-segment recovery once `inflight` is known.
+fn data_recovery(rtt: Duration, inflight: usize, retx_losses: u32) -> Duration {
+    let base = if inflight >= TCP_FAST_RETRANS_INFLIGHT {
+        rtt
+    } else {
+        rtt.saturating_mul(2)
+    };
+    base.saturating_add(rto_ladder(rtt, retx_losses))
+}
 
 /// SplitMix64. Small, fast and good enough for impairment decisions; keeping it
 /// local avoids pulling `rand` into the bench crate just for this.
@@ -342,8 +449,54 @@ pub struct ImpairOptions {
     pub seed: u64,
     pub udp: bool,
     pub tcp: bool,
+    /// TCP loss recovery emulation. Off keeps the historical TCP path.
+    pub tcp_loss: TcpLoss,
     /// Stop after this long; `None` runs until Ctrl-C.
     pub duration: Option<Duration>,
+}
+
+/// How the TCP relay treats the profile's loss model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TcpLoss {
+    /// Delay, jitter and the bandwidth cap only. Loss draws are ignored and
+    /// every byte is forwarded. This is the historical behaviour.
+    #[default]
+    Off,
+    /// Delay a lost segment by the recovery model in the module docs.
+    /// Bytes are never dropped.
+    Emulate,
+}
+
+/// Bytes the TCP relay has written, per direction.
+#[derive(Debug, Default)]
+pub struct RelayBytes {
+    /// Client → upstream.
+    pub up: AtomicU64,
+    /// Upstream → client.
+    pub down: AtomicU64,
+}
+
+/// A loopback TCP impairment relay. Dropping it asks the accept loop to stop.
+pub struct TcpRelay {
+    pub local: SocketAddr,
+    pub bytes: Arc<RelayBytes>,
+    stop: watch::Sender<bool>,
+}
+
+impl Drop for TcpRelay {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+    }
+}
+
+impl TcpRelay {
+    pub fn up_bytes(&self) -> u64 {
+        self.bytes.up.load(Ordering::Relaxed)
+    }
+
+    pub fn down_bytes(&self) -> u64 {
+        self.bytes.down.load(Ordering::Relaxed)
+    }
 }
 
 impl Eq for ImpairOptions {}
@@ -355,6 +508,7 @@ pub fn parse_impair_args(args: &[String]) -> Result<ImpairOptions, BenchError> {
     let mut seed = 0u64;
     let mut udp = true;
     let mut tcp = true;
+    let mut tcp_loss = TcpLoss::Off;
     let mut duration = None;
 
     let mut index = 0;
@@ -409,6 +563,15 @@ pub fn parse_impair_args(args: &[String]) -> Result<ImpairOptions, BenchError> {
                     flag,
                 )?));
             }
+            "--tcp-loss" => match required_value(args, &mut index, flag)? {
+                "off" => tcp_loss = TcpLoss::Off,
+                "emulate" => tcp_loss = TcpLoss::Emulate,
+                other => {
+                    return Err(BenchError::InvalidArguments(format!(
+                        "unsupported tcp loss mode `{other}` (expected off or emulate)"
+                    )))
+                }
+            },
             other => {
                 return Err(BenchError::InvalidArguments(format!(
                     "unknown argument `{other}`\n{}",
@@ -437,6 +600,7 @@ pub fn parse_impair_args(args: &[String]) -> Result<ImpairOptions, BenchError> {
         seed,
         udp,
         tcp,
+        tcp_loss,
         duration,
     })
 }
@@ -542,8 +706,8 @@ async fn relay_udp_client(
     profile: ImpairProfile,
     seed: u64,
 ) -> Result<(), BenchError> {
-    let mut up_shaper = Shaper::new(profile.clone(), seed);
-    let mut down_shaper = Shaper::new(profile, seed ^ 0x5DEE_CE66_D1CE_4E5B);
+    let mut up_shaper = Shaper::new(profile.clone(), direction_seed(seed, false));
+    let mut down_shaper = Shaper::new(profile, direction_seed(seed, true));
     let mut up_pending = Pending::default();
     let mut down_pending = Pending::default();
     let mut buffer = vec![0u8; 65_535];
@@ -616,6 +780,7 @@ async fn run_tcp(options: ImpairOptions) -> Result<(), BenchError> {
             action: format!("binding TCP {}", options.listen),
             source,
         })?;
+    let bytes = Arc::new(RelayBytes::default());
     loop {
         let (client, _) = listener.accept().await.map_err(|source| BenchError::Io {
             action: "accepting on the impair TCP listener".to_owned(),
@@ -624,9 +789,77 @@ async fn run_tcp(options: ImpairOptions) -> Result<(), BenchError> {
         let upstream_addr = options.upstream;
         let profile = options.profile.clone();
         let seed = options.seed;
+        let tcp_loss = options.tcp_loss;
+        let bytes = Arc::clone(&bytes);
         tokio::spawn(async move {
-            let _ = relay_tcp_client(client, upstream_addr, profile, seed).await;
+            let _ = relay_tcp_client(client, upstream_addr, profile, seed, tcp_loss, bytes).await;
         });
+    }
+}
+
+/// Bind a TCP impairment relay. `listen` may be port 0; [`TcpRelay::local`] is
+/// the bound address. Used by in-process tests. The CLI uses [`run`].
+pub async fn serve_tcp(
+    listen: SocketAddr,
+    upstream: SocketAddr,
+    profile: ImpairProfile,
+    seed: u64,
+    tcp_loss: TcpLoss,
+) -> Result<TcpRelay, BenchError> {
+    let listener = TcpListener::bind(listen)
+        .await
+        .map_err(|source| BenchError::Io {
+            action: format!("binding TCP {listen}"),
+            source,
+        })?;
+    let local = listener.local_addr().map_err(|source| BenchError::Io {
+        action: "reading the impair TCP listen address".to_owned(),
+        source,
+    })?;
+    let bytes = Arc::new(RelayBytes::default());
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let bytes_task = Arc::clone(&bytes);
+    tokio::spawn(async move {
+        let _ = accept_tcp(
+            listener, upstream, profile, seed, tcp_loss, bytes_task, stop_rx,
+        )
+        .await;
+    });
+    Ok(TcpRelay {
+        local,
+        bytes,
+        stop: stop_tx,
+    })
+}
+
+async fn accept_tcp(
+    listener: TcpListener,
+    upstream: SocketAddr,
+    profile: ImpairProfile,
+    seed: u64,
+    tcp_loss: TcpLoss,
+    bytes: Arc<RelayBytes>,
+    mut stop: watch::Receiver<bool>,
+) -> Result<(), BenchError> {
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
+                }
+            }
+            accepted = listener.accept() => {
+                let (client, _) = accepted.map_err(|source| BenchError::Io {
+                    action: "accepting on the impair TCP listener".to_owned(),
+                    source,
+                })?;
+                let profile = profile.clone();
+                let bytes = Arc::clone(&bytes);
+                tokio::spawn(async move {
+                    let _ = relay_tcp_client(client, upstream, profile, seed, tcp_loss, bytes).await;
+                });
+            }
+        }
     }
 }
 
@@ -635,6 +868,8 @@ async fn relay_tcp_client(
     upstream_addr: SocketAddr,
     profile: ImpairProfile,
     seed: u64,
+    tcp_loss: TcpLoss,
+    bytes: Arc<RelayBytes>,
 ) -> Result<(), BenchError> {
     let upstream = TcpStream::connect(upstream_addr)
         .await
@@ -642,35 +877,87 @@ async fn relay_tcp_client(
             action: format!("connecting TCP to {upstream_addr}"),
             source,
         })?;
+    if tcp_loss == TcpLoss::Emulate {
+        // Small segments must not sit in Nagle while a recovery timer runs.
+        // Off mode does not set this: that path's timing stays as it was.
+        let _ = client.set_nodelay(true);
+        let _ = upstream.set_nodelay(true);
+    }
     let (client_read, client_write) = client.into_split();
     let (upstream_read, upstream_write) = upstream.into_split();
-    let up = tokio::spawn(relay_tcp_direction(
-        client_read,
-        upstream_write,
-        profile.clone(),
-        seed,
-    ));
-    let down = tokio::spawn(relay_tcp_direction(
-        upstream_read,
-        client_write,
-        profile,
-        seed ^ 0x5DEE_CE66_D1CE_4E5B,
-    ));
+    let up_bytes = Arc::clone(&bytes);
+    let down_bytes = bytes;
+    let up_profile = profile.clone();
+    let up = tokio::spawn(async move {
+        match tcp_loss {
+            TcpLoss::Off => {
+                relay_tcp_direction(
+                    client_read,
+                    upstream_write,
+                    up_profile,
+                    direction_seed(seed, false),
+                    up_bytes,
+                    true,
+                )
+                .await
+            }
+            TcpLoss::Emulate => {
+                relay_tcp_direction_emulate(
+                    client_read,
+                    upstream_write,
+                    up_profile,
+                    direction_seed(seed, false),
+                    up_bytes,
+                    true,
+                )
+                .await
+            }
+        }
+    });
+    let down = tokio::spawn(async move {
+        match tcp_loss {
+            TcpLoss::Off => {
+                relay_tcp_direction(
+                    upstream_read,
+                    client_write,
+                    profile,
+                    direction_seed(seed, true),
+                    down_bytes,
+                    false,
+                )
+                .await
+            }
+            TcpLoss::Emulate => {
+                relay_tcp_direction_emulate(
+                    upstream_read,
+                    client_write,
+                    profile,
+                    direction_seed(seed, true),
+                    down_bytes,
+                    false,
+                )
+                .await
+            }
+        }
+    });
     let _ = up.await;
     let _ = down.await;
     Ok(())
 }
 
 /// TCP is reliable, so only delay, jitter and the bandwidth cap apply here.
+/// A loss draw skips the delay (the historical path) and still forwards the bytes.
 async fn relay_tcp_direction<R, W>(
     mut reader: R,
     mut writer: W,
     profile: ImpairProfile,
     seed: u64,
+    bytes: Arc<RelayBytes>,
+    toward_upstream: bool,
 ) -> Result<(), BenchError>
 where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
     let mut shaper = Shaper::new(profile, seed);
     let mut buffer = vec![0u8; 16 * 1024];
@@ -697,6 +984,265 @@ where
                 action: "writing to the impair TCP relay".to_owned(),
                 source,
             })?;
+        add_bytes(&bytes, toward_upstream, len);
+    }
+}
+
+fn add_bytes(bytes: &RelayBytes, toward_upstream: bool, len: usize) {
+    let counter = if toward_upstream {
+        &bytes.up
+    } else {
+        &bytes.down
+    };
+    counter.fetch_add(len as u64, Ordering::Relaxed);
+}
+
+async fn relay_tcp_direction_emulate<R, W>(
+    reader: R,
+    writer: W,
+    profile: ImpairProfile,
+    seed: u64,
+    bytes: Arc<RelayBytes>,
+    toward_upstream: bool,
+) -> Result<(), BenchError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    relay_tcp_emulate_with(
+        reader,
+        writer,
+        TcpDirection::new(profile, seed),
+        bytes,
+        toward_upstream,
+    )
+    .await
+}
+
+async fn relay_tcp_emulate_with<R, W>(
+    mut reader: R,
+    mut writer: W,
+    mut direction: TcpDirection,
+    bytes: Arc<RelayBytes>,
+    toward_upstream: bool,
+) -> Result<(), BenchError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0u8; TCP_SEGMENT_CAP];
+    loop {
+        let now = Instant::now();
+        let deadline = direction.next_deadline(now);
+        let sleep = async {
+            match deadline {
+                Some(instant) => sleep_until(instant).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            read = reader.read(&mut buffer), if !direction.eof => {
+                let len = read.map_err(|source| BenchError::Io {
+                    action: "reading from the impair TCP relay".to_owned(),
+                    source,
+                })?;
+                if len == 0 {
+                    direction.mark_eof(Instant::now());
+                } else {
+                    direction.push(Instant::now(), &buffer[..len]);
+                }
+            }
+            _ = sleep, if deadline.is_some() => {}
+        }
+        let now = Instant::now();
+        while let Some(payload) = direction.pop_ready(now) {
+            let len = payload.len();
+            writer
+                .write_all(&payload)
+                .await
+                .map_err(|source| BenchError::Io {
+                    action: "writing to the impair TCP relay".to_owned(),
+                    source,
+                })?;
+            add_bytes(&bytes, toward_upstream, len);
+        }
+        if direction.finished() {
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+    }
+}
+
+/// One direction of a TCP relay in loss-recovery emulation.
+struct TcpDirection {
+    profile: ImpairProfile,
+    rng: Rng,
+    loss: LossModel,
+    rtt: Duration,
+    next_free: Option<Instant>,
+    queue: VecDeque<Seg>,
+    /// Segments seen. The next push is the SYN flight when this is zero.
+    seen: u64,
+    eof: bool,
+    /// Test-only loss script. `None` draws from [`LossModel`].
+    script: Option<VecDeque<(bool, u32)>>,
+}
+
+struct Seg {
+    data: Vec<u8>,
+    sent: Instant,
+    arrival: Instant,
+    /// Lost data segment whose recovery delay is not known yet.
+    pending_recovery: bool,
+    retx_losses: u32,
+}
+
+impl TcpDirection {
+    fn new(profile: ImpairProfile, seed: u64) -> Self {
+        let loss = profile.loss_model();
+        let rtt = profile_rtt(&profile);
+        Self {
+            profile,
+            rng: Rng::new(seed),
+            loss,
+            rtt,
+            next_free: None,
+            queue: VecDeque::new(),
+            seen: 0,
+            eof: false,
+            script: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn scripted(profile: ImpairProfile, script: Vec<(bool, u32)>) -> Self {
+        let mut direction = Self::new(profile, 0);
+        direction.script = Some(script.into());
+        direction
+    }
+
+    fn mark_eof(&mut self, now: Instant) {
+        self.eof = true;
+        self.decide(now);
+    }
+
+    fn finished(&self) -> bool {
+        self.eof && self.queue.is_empty()
+    }
+
+    fn push(&mut self, now: Instant, data: &[u8]) {
+        let (lost, retx_losses) = self.draw_loss();
+        self.enqueue(now, data, lost, retx_losses);
+    }
+
+    /// `lost` / `retx_losses` bypass the RNG. Tests use this for exact timers.
+    #[cfg(test)]
+    fn push_controlled(&mut self, now: Instant, data: &[u8], lost: bool, retx_losses: u32) {
+        self.enqueue(now, data, lost, retx_losses);
+    }
+
+    fn enqueue(&mut self, now: Instant, data: &[u8], lost: bool, retx_losses: u32) {
+        let first = self.seen == 0;
+        self.seen += 1;
+        let (arrival, pending_recovery) = if !lost {
+            (self.base_arrival(now, data.len()), false)
+        } else if first {
+            (add_instant(now, syn_recovery(self.rtt, retx_losses)), false)
+        } else {
+            (now, true)
+        };
+        self.queue.push_back(Seg {
+            data: data.to_vec(),
+            sent: now,
+            arrival,
+            pending_recovery,
+            retx_losses,
+        });
+        self.decide(now);
+    }
+
+    fn draw_loss(&mut self) -> (bool, u32) {
+        if let Some(script) = self.script.as_mut() {
+            return script.pop_front().unwrap_or((false, 0));
+        }
+        let lost = self.loss.drop_packet(&mut self.rng);
+        if !lost {
+            return (false, 0);
+        }
+        let mut retx_losses = 0u32;
+        while retx_losses < TCP_MAX_RETX && self.loss.drop_packet(&mut self.rng) {
+            retx_losses += 1;
+        }
+        (true, retx_losses)
+    }
+
+    /// One-way delay, jitter, reorder extra and bandwidth, without a loss draw.
+    fn base_arrival(&mut self, now: Instant, len: usize) -> Instant {
+        let start = match self.next_free {
+            Some(free) => now.max(free),
+            None => now,
+        };
+        if let Some(rate) = self.profile.bandwidth {
+            if rate > 0 {
+                let seconds = len as f64 / rate as f64;
+                self.next_free = Some(start + Duration::from_secs_f64(seconds));
+            }
+        }
+        let jitter = self.profile.jitter.as_secs_f64();
+        let offset = if jitter > 0.0 {
+            self.rng.next_range(-jitter, jitter)
+        } else {
+            0.0
+        };
+        let mut delay = self.profile.delay.as_secs_f64() + offset;
+        if self.profile.reorder > 0.0 && self.rng.next_f64() < self.profile.reorder {
+            delay += self.profile.reorder_extra.as_secs_f64();
+        }
+        start + Duration::from_secs_f64(delay.max(0.0))
+    }
+
+    fn decide(&mut self, now: Instant) {
+        let rtt = self.rtt;
+        let eof = self.eof;
+        let n = self.queue.len();
+        for i in 0..n {
+            if !self.queue[i].pending_recovery {
+                continue;
+            }
+            let sent = self.queue[i].sent;
+            let window_end = add_instant(sent, rtt);
+            let inflight = self
+                .queue
+                .iter()
+                .skip(i + 1)
+                .filter(|seg| seg.sent <= window_end)
+                .count();
+            if inflight >= TCP_FAST_RETRANS_INFLIGHT || eof || now >= window_end {
+                let retx_losses = self.queue[i].retx_losses;
+                let delay = data_recovery(rtt, inflight, retx_losses);
+                self.queue[i].arrival = add_instant(sent, delay);
+                self.queue[i].pending_recovery = false;
+            }
+        }
+    }
+
+    fn next_deadline(&mut self, now: Instant) -> Option<Instant> {
+        self.decide(now);
+        let front = self.queue.front()?;
+        if front.pending_recovery {
+            return Some(add_instant(front.sent, self.rtt));
+        }
+        Some(front.arrival)
+    }
+
+    fn pop_ready(&mut self, now: Instant) -> Option<Vec<u8>> {
+        self.decide(now);
+        let front = self.queue.front()?;
+        if front.pending_recovery || front.arrival > now {
+            return None;
+        }
+        self.queue.pop_front().map(|seg| seg.data)
     }
 }
 
@@ -849,6 +1395,7 @@ mod tests {
         assert_eq!(options.profile.name, "cn163-peak");
         assert_eq!(options.seed, 7);
         assert!(options.udp && options.tcp);
+        assert_eq!(options.tcp_loss, TcpLoss::Off);
     }
 
     #[test]
@@ -863,5 +1410,391 @@ mod tests {
         ]
         .map(str::to_owned);
         assert!(parse_impair_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_impair_args_accepts_tcp_loss_emulate() {
+        let args = [
+            "--listen",
+            "127.0.0.1:1080",
+            "--upstream",
+            "127.0.0.1:9000",
+            "--tcp-loss",
+            "emulate",
+        ]
+        .map(str::to_owned);
+        let options = parse_impair_args(&args).unwrap();
+        assert_eq!(options.tcp_loss, TcpLoss::Emulate);
+    }
+
+    #[test]
+    fn parse_impair_args_rejects_an_unknown_tcp_loss_mode() {
+        let args = [
+            "--listen",
+            "127.0.0.1:1080",
+            "--upstream",
+            "127.0.0.1:9000",
+            "--tcp-loss",
+            "drop",
+        ]
+        .map(str::to_owned);
+        assert!(parse_impair_args(&args).is_err());
+    }
+
+    fn test_now() -> Instant {
+        Instant::from_std(std::time::Instant::now())
+    }
+
+    /// One-way delay, no jitter, no loss. `rtt` is twice `delay_ms`.
+    fn quiet(delay_ms: u64) -> ImpairProfile {
+        let mut profile = profile("clean").unwrap();
+        profile.delay = Duration::from_millis(delay_ms);
+        profile
+    }
+
+    #[test]
+    fn fast_retransmit_holds_the_hole_for_one_rtt() {
+        let mut direction = TcpDirection::new(quiet(85), 1);
+        let t0 = test_now();
+        // Not the SYN flight: a clean first segment, then a lost one with 3 followers.
+        direction.push_controlled(t0, b"syn", false, 0);
+        direction.push_controlled(t0 + Duration::from_millis(1), b"lost", true, 0);
+        direction.push_controlled(t0 + Duration::from_millis(2), b"a", false, 0);
+        direction.push_controlled(t0 + Duration::from_millis(3), b"b", false, 0);
+        direction.push_controlled(t0 + Duration::from_millis(4), b"c", false, 0);
+
+        let syn_due = t0 + Duration::from_millis(85);
+        assert_eq!(direction.pop_ready(syn_due), Some(b"syn".to_vec()));
+        // Followers are only one way out, but the hole is in front of them.
+        assert!(direction
+            .pop_ready(t0 + Duration::from_millis(169))
+            .is_none());
+        let due = t0 + Duration::from_millis(1 + 170);
+        assert_eq!(direction.pop_ready(due), Some(b"lost".to_vec()));
+        assert_eq!(direction.pop_ready(due), Some(b"a".to_vec()));
+        assert_eq!(direction.pop_ready(due), Some(b"b".to_vec()));
+        assert_eq!(direction.pop_ready(due), Some(b"c".to_vec()));
+        assert!(direction.queue.is_empty());
+    }
+
+    #[test]
+    fn tail_loss_uses_two_rtts_when_fewer_than_three_follow() {
+        let mut direction = TcpDirection::new(quiet(85), 1);
+        let t0 = test_now();
+        direction.push_controlled(t0, b"syn", false, 0);
+        let sent = t0 + Duration::from_millis(10);
+        direction.push_controlled(sent, b"tail", true, 0);
+        direction.push_controlled(sent + Duration::from_millis(10), b"one", false, 0);
+
+        assert_eq!(
+            direction.pop_ready(t0 + Duration::from_millis(85)),
+            Some(b"syn".to_vec())
+        );
+        // Window still open and inflight is 1: recovery is not decided yet.
+        assert_eq!(
+            direction.next_deadline(sent + Duration::from_millis(169)),
+            Some(sent + Duration::from_millis(170))
+        );
+        // The window just closed, so the tail-loss probe is 2 * rtt, not yet due.
+        assert!(direction
+            .pop_ready(sent + Duration::from_millis(170))
+            .is_none());
+        let due = sent + Duration::from_millis(340);
+        assert_eq!(direction.pop_ready(due), Some(b"tail".to_vec()));
+        assert_eq!(direction.pop_ready(due), Some(b"one".to_vec()));
+    }
+
+    #[test]
+    fn retransmission_loss_adds_a_doubling_rto() {
+        let mut direction = TcpDirection::new(quiet(85), 1);
+        let t0 = test_now();
+        direction.push_controlled(t0, b"syn", false, 0);
+        // inflight will be 3, two retransmission losses.
+        // delay = rtt + RTO + 2*RTO, RTO = max(200ms, 3*170ms) = 510ms.
+        direction.push_controlled(t0, b"lost", true, 2);
+        direction.push_controlled(t0 + Duration::from_millis(1), b"a", false, 0);
+        direction.push_controlled(t0 + Duration::from_millis(2), b"b", false, 0);
+        direction.push_controlled(t0 + Duration::from_millis(3), b"c", false, 0);
+        let delay = Duration::from_millis(170 + 510 + 1020);
+        assert!(direction
+            .pop_ready(t0 + delay - Duration::from_millis(1))
+            .is_some()); // SYN only
+        assert!(direction
+            .pop_ready(t0 + delay - Duration::from_millis(1))
+            .is_none());
+        assert_eq!(direction.pop_ready(t0 + delay), Some(b"lost".to_vec()));
+    }
+
+    #[test]
+    fn syn_loss_is_one_second_then_another() {
+        let t0 = test_now();
+        let mut once = TcpDirection::new(quiet(85), 1);
+        once.push_controlled(t0, b"syn", true, 0);
+        assert!(once.pop_ready(t0 + Duration::from_millis(999)).is_none());
+        assert_eq!(
+            once.pop_ready(t0 + Duration::from_secs(1)),
+            Some(b"syn".to_vec())
+        );
+
+        let mut twice = TcpDirection::new(quiet(85), 1);
+        twice.push_controlled(t0, b"syn", true, 1);
+        assert!(twice.pop_ready(t0 + Duration::from_millis(1999)).is_none());
+        assert_eq!(
+            twice.pop_ready(t0 + Duration::from_secs(2)),
+            Some(b"syn".to_vec())
+        );
+
+        // A third loss leaves the SYN special case and adds one RTO step.
+        let mut more = TcpDirection::new(quiet(85), 1);
+        more.push_controlled(t0, b"syn", true, 2);
+        let due = t0 + Duration::from_secs(2) + Duration::from_millis(510);
+        assert!(more.pop_ready(due - Duration::from_millis(1)).is_none());
+        assert_eq!(more.pop_ready(due), Some(b"syn".to_vec()));
+    }
+
+    #[test]
+    fn emulate_loss_draws_match_the_profile_model() {
+        // Jitter and reorder also consume the seeded RNG. Zero them here so the
+        // loss draws line up with a LossModel walked on its own; the cadence
+        // test below uses the real profile, jitter included.
+        let mut profile = profile("cn163-peak").unwrap();
+        profile.jitter = Duration::ZERO;
+        profile.reorder = 0.0;
+        let now = test_now();
+        for seed in [1u64, 2, 3, 99] {
+            let mut model = profile.loss_model();
+            let mut rng = Rng::new(seed);
+            let mut direction = TcpDirection::new(profile.clone(), seed);
+            for i in 0..200 {
+                let lost = model.drop_packet(&mut rng);
+                let mut retx = 0u32;
+                if lost {
+                    while retx < TCP_MAX_RETX && model.drop_packet(&mut rng) {
+                        retx += 1;
+                    }
+                }
+                direction.push(now, b"x");
+                let seg = direction.queue.back().unwrap();
+                assert_eq!(seg.retx_losses, retx, "seed {seed} seg {i}");
+                if lost && i > 0 {
+                    // Nothing later has been pushed yet, so the window is open
+                    // and inflight is still 0.
+                    assert!(seg.pending_recovery, "seed {seed} seg {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emulate_recovery_is_deterministic_for_a_seed() {
+        let profile = profile("cn163-peak").unwrap();
+        let now = test_now();
+        for seed in [1u64, 2, 3] {
+            let mut left = TcpDirection::new(profile.clone(), seed);
+            let mut right = TcpDirection::new(profile.clone(), seed);
+            for _ in 0..200 {
+                left.push(now, b"x");
+                right.push(now, b"x");
+            }
+            let left: Vec<_> = left
+                .queue
+                .iter()
+                .map(|seg| (seg.retx_losses, seg.pending_recovery, seg.arrival))
+                .collect();
+            let right: Vec<_> = right
+                .queue
+                .iter()
+                .map(|seg| (seg.retx_losses, seg.pending_recovery, seg.arrival))
+                .collect();
+            assert_eq!(left, right, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn eof_closes_the_inflight_window() {
+        let mut direction = TcpDirection::new(quiet(85), 1);
+        let t0 = test_now();
+        direction.push_controlled(t0, b"syn", false, 0);
+        direction.push_controlled(t0, b"tail", true, 0);
+        direction.mark_eof(t0);
+        // No followers and the window is forced shut: tail-loss probe, 2 * rtt.
+        assert_eq!(
+            direction.pop_ready(t0 + Duration::from_millis(85)),
+            Some(b"syn".to_vec())
+        );
+        assert!(direction
+            .pop_ready(t0 + Duration::from_millis(339))
+            .is_none());
+        assert_eq!(
+            direction.pop_ready(t0 + Duration::from_millis(340)),
+            Some(b"tail".to_vec())
+        );
+    }
+
+    /// Download direction of the token harness: 30 B every 20 ms.
+    /// cn163-peak must produce a gap over 300 ms for each benchmark seed,
+    /// or the end-to-end sanity check cannot pass.
+    #[test]
+    fn cn163_peak_token_cadence_stalls_for_benchmark_seeds() {
+        for seed in [1u64, 2, 3] {
+            let gap = token_cadence_max_gap("cn163-peak", direction_seed(seed, true));
+            assert!(
+                gap > Duration::from_millis(300),
+                "seed {seed} down-direction max gap {} ms",
+                gap.as_millis()
+            );
+        }
+    }
+
+    fn token_cadence_max_gap(name: &str, seed: u64) -> Duration {
+        let profile = profile(name).unwrap();
+        let mut direction = TcpDirection::new(profile, seed);
+        let base = test_now();
+        let n = 500u64;
+        let mut next_push = 0u64;
+        let mut now = base;
+        let mut last: Option<Instant> = None;
+        let mut max_gap = Duration::ZERO;
+        let mut steps = 0u32;
+        while next_push < n || !direction.queue.is_empty() {
+            steps += 1;
+            assert!(steps < 100_000, "cadence simulation did not finish");
+            while next_push < n {
+                let sent = base + Duration::from_millis(20 * next_push);
+                if sent > now {
+                    break;
+                }
+                direction.push(sent, &[0u8; 30]);
+                next_push += 1;
+            }
+            let mut progressed = false;
+            while let Some(_payload) = direction.pop_ready(now) {
+                if let Some(prev) = last {
+                    let gap = now.checked_duration_since(prev).unwrap_or(Duration::ZERO);
+                    if gap > max_gap {
+                        max_gap = gap;
+                    }
+                }
+                last = Some(now);
+                progressed = true;
+            }
+            let next_send = if next_push < n {
+                Some(base + Duration::from_millis(20 * next_push))
+            } else {
+                None
+            };
+            let next_due = direction.next_deadline(now);
+            let next = match (next_send, next_due) {
+                (Some(send), Some(due)) => send.min(due),
+                (Some(send), None) => send,
+                (None, Some(due)) => due,
+                (None, None) => break,
+            };
+            if next > now {
+                now = next;
+            } else if !progressed {
+                now += Duration::from_micros(1);
+            }
+        }
+        max_gap
+    }
+
+    fn duplex_pair() -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    ) {
+        let (input_w, input_r) = tokio::io::duplex(4096);
+        let (output_w, output_r) = tokio::io::duplex(4096);
+        (input_w, input_r, output_w, output_r)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_off_still_forwards_bytes_the_loss_model_would_drop() {
+        let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
+        let mut profile = profile("clean").unwrap();
+        profile.loss = 1.0;
+        profile.delay = Duration::from_millis(85);
+        let bytes = Arc::new(RelayBytes::default());
+        tokio::spawn(async move {
+            let _ = relay_tcp_direction(input_r, output_w, profile, 1, bytes, true).await;
+        });
+        input_w.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        // Historical path: a loss draw skips the delay and still writes.
+        tokio::time::timeout(Duration::from_millis(5), output_r.read_exact(&mut buf))
+            .await
+            .expect("off mode held bytes the loss model dropped")
+            .unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_off_applies_one_way_delay_when_nothing_is_lost() {
+        let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
+        let bytes = Arc::new(RelayBytes::default());
+        tokio::spawn(async move {
+            let _ = relay_tcp_direction(input_r, output_w, quiet(85), 1, bytes, true).await;
+        });
+        input_w.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        let early =
+            tokio::time::timeout(Duration::from_millis(84), output_r.read_exact(&mut buf)).await;
+        assert!(early.is_err(), "off mode released a segment early");
+        output_r.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_emulate_applies_one_way_delay_when_nothing_is_lost() {
+        let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
+        let bytes = Arc::new(RelayBytes::default());
+        tokio::spawn(async move {
+            let _ = relay_tcp_direction_emulate(input_r, output_w, quiet(85), 1, bytes, true).await;
+        });
+        input_w.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        let early =
+            tokio::time::timeout(Duration::from_millis(84), output_r.read_exact(&mut buf)).await;
+        assert!(early.is_err(), "emulate released a clean segment early");
+        output_r.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_emulate_fast_retransmit_releases_after_one_rtt() {
+        let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
+        let bytes = Arc::new(RelayBytes::default());
+        // SYN clean, then a lost segment with three clean followers. No jitter.
+        let script = vec![(false, 0), (true, 0), (false, 0), (false, 0), (false, 0)];
+        let direction = TcpDirection::scripted(quiet(85), script);
+        tokio::spawn(async move {
+            let _ = relay_tcp_emulate_with(input_r, output_w, direction, bytes, true).await;
+        });
+        // One write would be one segment. Yields do not advance the paused clock,
+        // so each byte is its own segment at the same instant.
+        for byte in [b's', b'A', b'B', b'C', b'D'] {
+            input_w.write_all(&[byte]).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        let mut buf = [0u8; 5];
+        let early = tokio::time::timeout(
+            Duration::from_millis(84),
+            output_r.read_exact(&mut buf[..1]),
+        )
+        .await;
+        assert!(early.is_err(), "clean first segment arrived early");
+        output_r.read_exact(&mut buf[..1]).await.unwrap();
+        assert_eq!(buf[0], b's');
+        // Now is one-way delay. The hole is due one rtt (85 ms later).
+        let held = tokio::time::timeout(
+            Duration::from_millis(84),
+            output_r.read_exact(&mut buf[1..]),
+        )
+        .await;
+        assert!(held.is_err(), "hole was filled before one rtt");
+        output_r.read_exact(&mut buf[1..]).await.unwrap();
+        assert_eq!(&buf, b"sABCD");
     }
 }
