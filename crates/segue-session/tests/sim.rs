@@ -81,6 +81,13 @@ struct Sim {
     /// network changed and the old path just went silent... or keeps
     /// delivering late frames).
     silent_abandon: bool,
+    /// Keep a redundant carrier bound whenever the session is established.
+    keep_redundant: bool,
+    /// The spare's REDUNDANT_OK is never delivered (an old relay, or a
+    /// black hole). The client must drop that carrier after `t_attach`.
+    drop_redundant_ok: bool,
+    /// Drop relay→client bytes on this carrier.
+    mute_rx: Option<u64>,
     max_client_recv_buffered: usize,
     max_relay_send_buffered: usize,
 }
@@ -131,6 +138,9 @@ impl Sim {
             site_reads: true,
             drop_on_relay_close: 0,
             silent_abandon: false,
+            keep_redundant: false,
+            drop_redundant_ok: false,
+            mute_rx: None,
             max_client_recv_buffered: 0,
             max_relay_send_buffered: 0,
         }
@@ -181,7 +191,10 @@ impl Sim {
             }
         }
         p.c2r.clear();
-        if !p.r2c.is_empty() {
+        if self.mute_rx == Some(cid) {
+            // The client never sees this carrier's downlink (no REDUNDANT_OK).
+            p.r2c.clear();
+        } else if !p.r2c.is_empty() {
             let bytes: Vec<u8> = p.r2c.drain(..).collect();
             p.cdec.push(&bytes);
             loop {
@@ -228,6 +241,20 @@ impl Sim {
             self.pipes.insert(cid, Pipe::new());
             self.relay.add_carrier(cid);
             self.client.attach(cid, now);
+        }
+        if self.keep_redundant {
+            self.client.request_redundant();
+        }
+        if self.client.wants_redundant() {
+            self.next_cid += 1;
+            let cid = self.next_cid;
+            self.carriers_opened += 1;
+            self.pipes.insert(cid, Pipe::new());
+            self.relay.add_carrier(cid);
+            if self.drop_redundant_ok && self.mute_rx.is_none() {
+                self.mute_rx = Some(cid);
+            }
+            self.client.attach_redundant(cid, now);
         }
 
         self.drain_events();
@@ -309,8 +336,18 @@ impl Sim {
             }
         }
 
-        // Transmit.
+        // Transmit on the current carrier and, if any, the spare (only
+        // REDUNDANT_ATTACH until it is bound).
+        let mut send_on = Vec::new();
         if let Some(cid) = self.client.carrier() {
+            send_on.push(cid);
+        }
+        if let Some(cid) = self.client.redundant_carrier() {
+            if !send_on.contains(&cid) {
+                send_on.push(cid);
+            }
+        }
+        for cid in send_on {
             if let Some(p) = self.pipes.get_mut(&cid) {
                 while let Some(f) = self.client.poll_transmit(cid, now) {
                     p.c2r.extend(f.to_bytes());
@@ -688,6 +725,148 @@ fn stale_frames_from_a_superseded_carrier_are_harmless() {
         s.step();
     }
     s.assert_exact();
+}
+
+fn wait_until_redundant(s: &mut Sim) -> u64 {
+    for _ in 0..20_000 {
+        if s.client.redundant_bound() {
+            return s.client.redundant_carrier().unwrap();
+        }
+        s.step();
+    }
+    panic!(
+        "redundant carrier never bound, state {:?}",
+        s.client.state()
+    );
+}
+
+#[test]
+fn redundant_carrier_dies_session_continues_exact() {
+    let mut s = Sim::new(11, 200_000, 300_000);
+    s.keep_redundant = true;
+    let spare = wait_until_redundant(&mut s);
+    let gen = s.client.gen();
+    let fruitless = s.client.fruitless_carriers();
+    s.keep_redundant = false;
+    s.cut(spare);
+    assert!(s.client.redundant_carrier().is_none());
+    assert_eq!(s.client.fruitless_carriers(), fruitless);
+    assert!(s.client.carrier().is_some());
+    s.run(200_000);
+    s.assert_exact();
+    assert_eq!(s.client.gen(), gen, "losing the spare is not a re-attach");
+}
+
+#[test]
+fn current_dies_with_redundant_bound_session_continues_exact() {
+    let mut s = Sim::new(12, 200_000, 300_000);
+    s.keep_redundant = true;
+    let spare = wait_until_redundant(&mut s);
+    let gen = s.client.gen();
+    s.keep_redundant = false;
+    assert!(s.cut_current());
+    // The spare is promoted: same generation, no new dial.
+    assert_eq!(s.client.carrier(), Some(spare));
+    assert_eq!(s.client.gen(), gen);
+    assert!(!s.client.is_closed());
+    s.run(200_000);
+    s.assert_exact();
+    assert_eq!(s.client.gen(), gen, "promotion is not a RESUME");
+    assert_eq!(s.connects, 1);
+}
+
+#[test]
+fn no_redundant_ok_drops_the_spare_and_leaves_the_session() {
+    let mut s = Sim::new(13, 400_000, 400_000);
+    s.keep_redundant = true;
+    s.drop_redundant_ok = true;
+    let mut spare = None;
+    for _ in 0..5_000 {
+        s.step();
+        if let Some(cid) = s.client.redundant_carrier() {
+            spare = Some(cid);
+            s.keep_redundant = false;
+            break;
+        }
+        assert!(!s.client.is_closed());
+    }
+    let spare = spare.expect("spare was not dialed");
+    assert!(!s.client.redundant_bound());
+    let fruitless = s.client.fruitless_carriers();
+    // Hold the download so the session cannot finish before t_attach (2s,
+    // and each step is 1ms). The spare must go; the session stays.
+    s.app_reads = false;
+    for _ in 0..2_500 {
+        s.step();
+        assert!(
+            !s.client.is_closed(),
+            "session ended while the spare timed out"
+        );
+    }
+    assert_ne!(s.client.redundant_carrier(), Some(spare));
+    assert!(!s.client.redundant_bound());
+    assert_eq!(s.client.fruitless_carriers(), fruitless);
+    s.app_reads = true;
+    s.drop_redundant_ok = false;
+    s.mute_rx = None;
+    s.run(200_000);
+    s.assert_exact();
+}
+
+#[test]
+fn randomized_faults_with_redundant_never_lose_or_duplicate() {
+    let seeds: u64 = std::env::var("SEGUE_SIM_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let mut refused = 0;
+    for seed in 0..seeds {
+        let mut r = StdRng::seed_from_u64(seed ^ 0x5eed);
+        let up = r.gen_range(0..300_000);
+        let down = r.gen_range(0..400_000);
+        let mut s = Sim::new(seed, up, down);
+        s.keep_redundant = true;
+        s.p_cut = [0.0, 0.0005, 0.002, 0.01][r.gen_range(0..4)];
+        s.p_deliver = [1.0, 0.7, 0.3][r.gen_range(0..3)];
+        s.drop_on_relay_close = r.gen_range(0..3);
+        s.silent_abandon = r.gen_bool(0.3);
+        // Cut the spare as often as the current carrier.
+        let cut_spare = r.gen_bool(0.5);
+        let mut steps = 0;
+        while !s.finished() {
+            if s.keep_redundant && cut_spare && s.p_cut > 0.0 && s.rng.gen_bool(s.p_cut) {
+                if let Some(cid) = s.client.redundant_carrier() {
+                    s.cut(cid);
+                }
+            }
+            s.step();
+            steps += 1;
+            if steps == 150_000 {
+                s.p_cut = 0.0;
+            }
+            assert!(
+                steps < 400_000,
+                "seed {seed}: no progress, client {:?}",
+                s.client.state()
+            );
+        }
+        if s.connects == 0 {
+            assert_eq!(
+                s.client.close_reason(),
+                Some(CloseReason::Reset(code::UNKNOWN_SESSION)),
+                "seed {seed}"
+            );
+            refused += 1;
+            continue;
+        }
+        assert!(s.up.starts_with(&s.up_got), "seed {seed}: uplink corrupted");
+        assert!(
+            s.down.starts_with(&s.down_got),
+            "seed {seed}: downlink corrupted"
+        );
+        s.assert_exact();
+    }
+    assert!(refused < seeds as usize, "every seed was refused");
 }
 
 #[allow(dead_code)]

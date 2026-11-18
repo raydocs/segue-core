@@ -157,6 +157,8 @@ outside the session crate.
 | 0x35 | PARK_ACK | `count:varint`, then per entry `session_id:16b`, `req_id:varint`, `attach_gen:u32be`, `accepted:u8` (0/1), `park_gen:u32be` (`codec.rs:704-716`) |
 | 0x36 | STALL | `count:varint`, then per entry `session_id:16b`, `attach_gen:u32be` (`codec.rs:717-723`) |
 | 0x37–0x3B | RESOLVE, RESOLVED, REFRESH, REFRESHED, REVOKED | recognised, payload unparsed by this crate (`codec.rs:970-976`); REVOKED payload is `[code:u8]` by writer convention (`crates/segue-session/src/relay.rs:991-997`) |
+| 0x3C | REDUNDANT_ATTACH | **v0.6 draft**, `FLAG_IGNORABLE`. See §2.7 |
+| 0x3D | REDUNDANT_OK | **v0.6 draft**, `FLAG_IGNORABLE`. See §2.7 |
 
 Entry `count`s are checked against the remaining payload length up front (every
 entry is ≥ 16 bytes), so an absurd count is malformed before any allocation
@@ -248,6 +250,71 @@ target example.com:443, exit_class 1, no t_stall_ms, no first_data):
   03 0B 65 78 61 6D 70 6C 65 2E 63 6F 6D 01 BB   # atyp 3, len 11, port 443
   01                                   # exit_class
 ```
+
+### 2.7 Redundant carrier (v0.6 draft)
+
+No version bump. Both frames are encoded with `FLAG_IGNORABLE` (`0x80`), so a
+relay or client that does not know `0x3C`/`0x3D` skips them. The client closes
+the spare carrier if no `REDUNDANT_OK` arrives within `t_attach` and continues
+on the single current carrier. OPEN, RESUME and DATA are unchanged.
+
+`REDUNDANT_ATTACH` is the first frame on the second carrier:
+
+```
+session_id:16
+resume_secret:32
+attach_gen:u32be          the session's current generation, not a new one
+recv_offset:varint        client's snapshot
+max_offset:varint         client's advertised window
+```
+
+`REDUNDANT_OK`, written on that same carrier:
+
+```
+attach_gen:u32be
+recv_offset:varint        relay's snapshot (as in RESUMED)
+max_offset:varint
+```
+
+Authentication is the RESUME proof: `session_id` plus `resume_secret`
+(constant-time compare). There is no ticket. The relay accepts it only when
+`attach_gen` equals the session's current generation.
+
+Rules:
+
+- The relay binds the carrier as **redundant** and does **not** call `switch`.
+  The current carrier stays current and is not closed. At most one spare; a
+  second `REDUNDANT_ATTACH` replaces the first and closes it.
+- An unknown session, a tombstone, a bad secret, a wrong generation, or a
+  snapshot past anything the relay has sent closes **that carrier only**.
+- Binding reserves no session memory and does not change admission floors.
+  The process carrier-slot limit (the relay's `max_carriers` semaphore)
+  refuses the new connection before the session table sees it. A full relay
+  never drops a session to free a slot for a spare.
+- Until `REDUNDANT_OK` with the matching `attach_gen`, the client writes
+  nothing but `REDUNDANT_ATTACH` on the spare. After that, DATA/ACK/FIN/RST
+  on it are applied like on the current carrier. Receive dedup by offset
+  makes a duplicate free. A gap or a bad offset on the spare is ignored;
+  it does not reset the session. RST still resets the session.
+- This stage does **not** duplicate DATA. The relay still writes session
+  DATA only to the current carrier. ACKs (the window rides in them) may be
+  written to both, from one function (`mirror_to_redundant`) so a later
+  stage can extend it to small DATA.
+- A spare that closes, sticks, fails to decode, or is REJECTed is dropped
+  alone: no re-attach, no `MAX_FRUITLESS` count, no `Health::Failed`, no
+  quality "carrier lost".
+- If the **current** carrier closes or is given up as stuck while a spare
+  is bound, both sides **promote** it. Same `attach_gen`, no RESUME. Each
+  side replays unacked bytes from its last acknowledged offset (the relay's
+  `recv_offset` in `REDUNDANT_OK` is that snapshot at bind time; later ACKs
+  move it). Dedup keeps the replay from being delivered twice.
+- A move of the current carrier (RESUME on another carrier, including an
+  OPEN retry treated as resume) **drops** the spare. The spare was
+  authenticated at the old generation; leaving it bound would make that
+  generation ambiguous.
+- The client asks for a spare explicitly (`request_redundant` /
+  `run_client_ctl_with_redundant`). Nothing turns it on by default, and the
+  kernel does not.
 
 ## 3. Auth material and the control stream (spec §3)
 
@@ -748,6 +815,7 @@ parse/encode, no behaviour), **hook-only** (interface exists, no producer),
 | WAKE | **not started** (M9+) | frame defined `codec.rs:684-693`; "PARK/WAKE as a whole is M9+" (`lib.rs:9-11`, `lib.rs:16-17`) |
 | Cross-instance hand-off (§9.2) | **not started** | any other `anchor_instance_id` → `unknown_session` (`relay.rs:568-571`, `relay.rs:502-504`) |
 | Cross-node forwarding | **not started** (M9+) | `crates/segue-session/src/lib.rs:16-17`, `crates/segue-relay/src/lib.rs:19-21` |
+| Redundant carrier, no DATA duplication (v0.6 draft, §2.7) | implemented, off by default | `REDUNDANT_ATTACH`/`REDUNDANT_OK`; relay binds without `switch`; client promotes the spare if the current carrier dies |
 | Session layer on mobile (FFI) | **not shipped** | `segue-session`/`segue-kernel` are behind the `proprietary-kernel` feature, "Deliberately not enabled in platform/build scripts yet" (`crates/segue-ffi/Cargo.toml:14-20`); no reference in `platform/android` or `platform/apple` |
 
 ## 12. What this gives an AI app that Xray/sing-box/mihomo do not

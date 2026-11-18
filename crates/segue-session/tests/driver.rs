@@ -2,13 +2,16 @@
 //! stream, carriers that are cut after a byte budget (mid-frame), a relay and
 //! a site. Checks exact delivery in both directions and a single site connect.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use segue_session::client::{ClientSession, CloseReason, OpenParams};
 use segue_session::codec::{Kind, Target};
-use segue_session::driver::{run_client, run_relay, BoxCarrier, Connector, SiteConnector};
+use segue_session::driver::{
+    run_client, run_client_ctl_with_redundant, run_relay, BoxCarrier, ClientCtl, Connector,
+    SiteConnector,
+};
 use segue_session::pool::Pool;
 use segue_session::relay::{AllowAll, RelayTable};
 use segue_session::Config;
@@ -184,6 +187,154 @@ async fn duplex_disconnect_mid_transfer_resumes_without_loss_or_duplication() {
         o.carriers
     );
     assert_eq!(o.connects, 1, "site connected more than once");
+}
+
+/// Open, add a redundant carrier, move 1 MiB each way, then drop either
+/// carrier. Bytes match and no third carrier is dialed: the spare's death
+/// is local, and the current carrier's death promotes the spare.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redundant_either_carrier_cut_mid_transfer() {
+    for kill_current in [true, false] {
+        let o = tokio::time::timeout(Duration::from_secs(30), redundant_cut(kill_current))
+            .await
+            .unwrap_or_else(|_| panic!("timed out kill_current={kill_current}"));
+        assert_eq!(o.reason, CloseReason::Clean, "kill_current={kill_current}");
+        assert_eq!(o.connects, 1, "kill_current={kill_current}");
+        assert_eq!(
+            o.carriers, 2,
+            "kill_current={kill_current}: a third carrier means promotion or the spare failed"
+        );
+    }
+}
+
+async fn redundant_cut(kill_current: bool) -> Outcome {
+    let mut cfg = Config::default();
+    cfg.timing.t_stall = Duration::from_secs(60);
+    cfg.timing.t_live = Duration::from_secs(60);
+    cfg.timing.t_attach = Duration::from_secs(60);
+    let up = pattern(1 << 20, 9);
+    let down = pattern(1 << 20, 8);
+    let client_pool = Pool::new(8 << 20);
+    let relay_pool = Pool::new(8 << 20);
+    let session = ClientSession::new(cfg.clone(), &client_pool, params(), Instant::now()).unwrap();
+    let table = RelayTable::new(cfg, relay_pool, Box::new(AllowAll), INSTANCE);
+
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(4);
+    let carriers = Arc::new(AtomicUsize::new(0));
+    // Set once the spare carrier's ferry is running, so the current carrier
+    // is not cut before REDUNDANT_OK can land.
+    let spare_up = Arc::new(AtomicBool::new(false));
+    let connector: Connector = {
+        let carriers = carriers.clone();
+        let spare_up = spare_up.clone();
+        Arc::new(move || {
+            let accept_tx = accept_tx.clone();
+            let n = carriers.fetch_add(1, Ordering::SeqCst);
+            let spare_up = spare_up.clone();
+            Box::pin(async move {
+                let (client_end, p1) = tokio::io::duplex(64 << 10);
+                let (p2, relay_end) = tokio::io::duplex(64 << 10);
+                tokio::spawn(async move {
+                    let mut a = p1;
+                    let mut b = p2;
+                    let mut ab = vec![0u8; 8192];
+                    let mut bb = vec![0u8; 8192];
+                    let mut passed = 0usize;
+                    let spare_deadline = (n == 1 && !kill_current)
+                        .then(|| tokio::time::Instant::now() + Duration::from_millis(80));
+                    loop {
+                        // Slow the current carrier until the spare exists so
+                        // the cut lands in the middle of the 1 MiB, not after.
+                        if n == 0 && kill_current && !spare_up.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                        // The spare has carried the attach (and, shortly, the
+                        // OK). The current carrier may die only after that.
+                        if n == 1 && passed >= 64 {
+                            spare_up.store(true, Ordering::SeqCst);
+                        }
+                        if spare_deadline.is_some_and(|t| tokio::time::Instant::now() >= t) {
+                            return;
+                        }
+                        if n == 0 && kill_current && spare_up.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            return;
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(5)), if spare_deadline.is_some() => {}
+                            r = a.read(&mut ab) => match r {
+                                Ok(0) | Err(_) => return,
+                                Ok(k) => {
+                                    if b.write_all(&ab[..k]).await.is_err() { return; }
+                                    passed += k;
+                                }
+                            },
+                            r = b.read(&mut bb) => match r {
+                                Ok(0) | Err(_) => return,
+                                Ok(k) => {
+                                    if a.write_all(&bb[..k]).await.is_err() { return; }
+                                    passed += k;
+                                }
+                            },
+                        }
+                    }
+                });
+                accept_tx
+                    .send(Box::new(relay_end))
+                    .await
+                    .map_err(|_| std::io::Error::other("relay gone"))?;
+                Ok(Box::new(client_end) as BoxCarrier)
+            })
+        })
+    };
+
+    let connects = Arc::new(AtomicUsize::new(0));
+    let (site_tx, site_rx) = oneshot::channel();
+    let site_tx = Arc::new(Mutex::new(Some(site_tx)));
+    let site_conn: SiteConnector = {
+        let connects = connects.clone();
+        let down = down.clone();
+        Arc::new(move |_t, _k| {
+            connects.fetch_add(1, Ordering::SeqCst);
+            let (ours, theirs) = tokio::io::duplex(64 << 10);
+            if let Some(tx) = site_tx.lock().unwrap().take() {
+                tokio::spawn(site(theirs, down.clone(), tx));
+            }
+            Box::pin(async move { Ok(Box::new(ours) as BoxCarrier) })
+        })
+    };
+    let relay = tokio::spawn(run_relay(table, accept_rx, site_conn, None));
+    let (add_tx, add_rx) = mpsc::unbounded_channel();
+    let _ = add_tx.send(());
+    let (app, app_far) = tokio::io::duplex(64 << 10);
+    let client = tokio::spawn(run_client_ctl_with_redundant(
+        session,
+        app_far,
+        connector,
+        ClientCtl::default(),
+        add_rx,
+    ));
+    let (mut ar, mut aw) = tokio::io::split(app);
+    let upc = up.clone();
+    let app_writer = tokio::spawn(async move {
+        aw.write_all(&upc).await.unwrap();
+        aw.shutdown().await.unwrap();
+    });
+    let mut got_down = Vec::new();
+    ar.read_to_end(&mut got_down).await.unwrap();
+    app_writer.await.unwrap();
+    let reason = client.await.unwrap();
+    let got_up = site_rx.await.unwrap();
+    relay.abort();
+    assert_eq!(got_up.len(), up.len(), "uplink length");
+    assert!(got_up == up, "uplink corrupted");
+    assert_eq!(got_down.len(), down.len(), "downlink length");
+    assert!(got_down == down, "downlink corrupted");
+    Outcome {
+        reason,
+        carriers: carriers.load(Ordering::SeqCst),
+        connects: connects.load(Ordering::SeqCst),
+    }
 }
 
 /// CPU time of the calling thread (a current-thread runtime runs every task
