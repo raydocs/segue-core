@@ -56,11 +56,35 @@ async fn check(
         XrayInboundSecurity::None => {}
     }
     eprintln!("sudoku over {name}");
-    let result = timeout(
-        Duration::from_secs(60),
-        exercise(profile(server.addr.port(), stream.clone(), masks), true),
-    )
-    .await;
+    // REALITY's dest is the public www.google.com: Xray probes it during the
+    // handshake, and on a CI runner that probe sometimes stalls, so Xray
+    // closes the client (`early eof`). That is the runner's network, not the
+    // mask. Repeat only that outcome, at most twice; every byte must still
+    // round-trip on the attempt that counts.
+    let attempts = if security == XrayInboundSecurity::Reality {
+        3
+    } else {
+        1
+    };
+    let mut result = None;
+    for attempt in 1..=attempts {
+        let outcome = timeout(
+            Duration::from_secs(60),
+            exercise(
+                profile(server.addr.port(), stream.clone(), masks.clone()),
+                true,
+            ),
+        )
+        .await;
+        let early_eof =
+            matches!(&outcome, Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof);
+        result = Some(outcome);
+        if !early_eof || attempt == attempts {
+            break;
+        }
+        eprintln!("sudoku over {name}: early eof from the REALITY dest probe, attempt {attempt} of {attempts}");
+    }
+    let result = result.expect("at least one attempt");
     assert!(
         matches!(result, Ok(Ok(()))),
         "{name}: {result:?}; {}",
