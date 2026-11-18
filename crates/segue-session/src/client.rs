@@ -611,6 +611,19 @@ impl ClientSession {
         if self.carrier != Some(cid) {
             return;
         }
+        // The peer holds everything it needs: our whole upload is
+        // acknowledged and its FIN is acknowledged by us, so no new
+        // carrier can ever move a byte for this session — a carrier
+        // closing now is the peer's own clean end of it (§5.1 "通道判死"
+        // does not apply: the path is not being judged, the session is
+        // over). The session ends locally once the app has taken what is
+        // buffered ([`Self::check_done`]); redialling here could only
+        // fetch the peer's tombstone, and did so on a loaded machine
+        // whenever the app drained slower than the peer's final frames.
+        if self.send.done() && self.recv.fin_acked() {
+            self.carrier = None;
+            return;
+        }
         self.carrier_lost(now, stuck);
         self.carrier = None;
         if self.is_closed() {
