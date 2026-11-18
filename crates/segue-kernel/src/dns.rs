@@ -33,11 +33,13 @@
 //! it is passed on byte for byte. A truncated upstream reply is fetched
 //! again over TCP; replies to UDP clients are cut to their EDNS size.
 //!
-//! Not done: ECS, binding
-//! upstream sockets to a protected interface (the shell's job under TUN).
+//! Not done: ECS. Upstream sockets are bound to a physical interface when
+//! [`SmartDns::set_upstream_interface`] was called (macOS tun mode); otherwise
+//! they follow the system route.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -115,6 +117,8 @@ pub struct SmartDns {
     upstream_limit: tokio::sync::Semaphore,
     /// Upstream exchanges started (tests use it to check cache hits).
     pub upstream_queries: std::sync::atomic::AtomicUsize,
+    /// `IP_BOUND_IF` index for domestic sockets. 0: unbound.
+    bind_if: AtomicU32,
 }
 
 /// The parsed single question of a query.
@@ -173,7 +177,14 @@ impl SmartDns {
             refreshing: Mutex::new(HashSet::new()),
             upstream_limit: tokio::sync::Semaphore::new(MAX_UPSTREAM_IN_FLIGHT),
             upstream_queries: Default::default(),
+            bind_if: AtomicU32::new(0),
         }
+    }
+
+    /// Pin domestic upstream sockets to this interface index. `0` clears it.
+    /// Used by macOS tun mode so a resolver query cannot re-enter the utun.
+    pub fn set_upstream_interface(&self, index: u32) {
+        self.bind_if.store(index, Ordering::Relaxed);
     }
 
     /// Answer one DNS message. None means "drop it" (not even a header).
@@ -412,13 +423,14 @@ impl SmartDns {
         self.upstream_queries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let packet = Arc::new(packet);
+        let bind_if = self.bind_if.load(Ordering::Relaxed);
         let mut set: JoinSet<std::io::Result<Vec<u8>>> = JoinSet::new();
         for &server in &self.s.domestic {
             let packet = packet.clone();
             let deadline = tokio::time::Instant::now() + self.s.query_timeout;
             set.spawn(async move {
                 let late = || std::io::Error::from(std::io::ErrorKind::TimedOut);
-                let reply = tokio::time::timeout_at(deadline, exchange(server, &packet))
+                let reply = tokio::time::timeout_at(deadline, exchange(server, &packet, bind_if))
                     .await
                     .map_err(|_| late())??;
                 if reply[2] & FLAG_TC == 0 {
@@ -428,9 +440,10 @@ impl SmartDns {
                 // (RFC 7766). A truncated reply is never an answer (r11
                 // R2): if TCP fails, times out, ends mid-frame or is
                 // truncated too, this server gave nothing.
-                let full = tokio::time::timeout_at(deadline, exchange_tcp(server, &packet))
-                    .await
-                    .map_err(|_| late())??;
+                let full =
+                    tokio::time::timeout_at(deadline, exchange_tcp(server, &packet, bind_if))
+                        .await
+                        .map_err(|_| late())??;
                 if full[2] & FLAG_TC != 0 {
                     return Err(std::io::ErrorKind::InvalidData.into());
                 }
@@ -456,15 +469,34 @@ impl SmartDns {
     }
 }
 
+/// `IP_BOUND_IF` for a domestic socket. Loopback resolvers stay unbound:
+/// pinning them to the physical NIC would make `127.0.0.1` unreachable.
+#[cfg(unix)]
+fn bind_upstream(fd: std::os::fd::RawFd, bind_if: u32, server: SocketAddr) -> std::io::Result<()> {
+    if bind_if == 0 || server.ip().is_loopback() {
+        return Ok(());
+    }
+    crate::tun_setup::bind_fd_to_interface(fd, bind_if)
+}
+
 /// One UDP exchange. Replies with the wrong ID or question are ignored
 /// (spoofed or late), not treated as the answer.
-async fn exchange(server: SocketAddr, packet: &[u8]) -> std::io::Result<Vec<u8>> {
+async fn exchange(server: SocketAddr, packet: &[u8], bind_if: u32) -> std::io::Result<Vec<u8>> {
     let bind: SocketAddr = if server.is_ipv4() {
         (Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
         (Ipv6Addr::UNSPECIFIED, 0).into()
     };
     let sock = UdpSocket::bind(bind).await?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        bind_upstream(sock.as_raw_fd(), bind_if, server)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = bind_if;
+    }
     sock.connect(server).await?;
     sock.send(packet).await?;
     question_bytes(packet).ok_or(std::io::ErrorKind::InvalidInput)?;
@@ -478,10 +510,24 @@ async fn exchange(server: SocketAddr, packet: &[u8]) -> std::io::Result<Vec<u8>>
 }
 
 /// One exchange over TCP (after a truncated UDP reply).
-async fn exchange_tcp(server: SocketAddr, packet: &[u8]) -> std::io::Result<Vec<u8>> {
+async fn exchange_tcp(server: SocketAddr, packet: &[u8], bind_if: u32) -> std::io::Result<Vec<u8>> {
     question_bytes(packet).ok_or(std::io::ErrorKind::InvalidInput)?;
     let len = u16::try_from(packet.len()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
-    let mut conn = TcpStream::connect(server).await?;
+    let mut conn = if bind_if == 0 || server.ip().is_loopback() {
+        TcpStream::connect(server).await?
+    } else {
+        let socket = if server.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            bind_upstream(socket.as_raw_fd(), bind_if, server)?;
+        }
+        socket.connect(server).await?
+    };
     let mut framed = Vec::with_capacity(packet.len() + 2);
     framed.extend_from_slice(&len.to_be_bytes());
     framed.extend_from_slice(packet);

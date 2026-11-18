@@ -20,4 +20,5 @@ pub mod session;
 pub mod sniff;
 pub mod socks;
 pub mod tun;
+pub mod tun_setup;
 pub mod udp;

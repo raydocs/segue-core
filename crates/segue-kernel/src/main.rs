@@ -7,15 +7,18 @@
 //!
 //! Exit codes are [`segue_kernel::process::ExitCode`]: 0 clean (also
 //! `--help`), 1 runtime, 2 usage, 3 config or state path, 4 tun setup.
-//! `SIGTERM` and `SIGINT` flush the fake-IP journal, remove the control
-//! token and exit 0. The same cleanup runs when a listener fails; that
-//! path still exits 1.
+//! `SIGTERM` and `SIGINT` close the tunnel flows, remove utun routes, flush
+//! the fake-IP journal, remove the control token and exit 0. The same
+//! cleanup runs when a listener or the tun stack fails; that path still
+//! exits 1. Tun setup failure (utun, address, routes) exits 4 and removes
+//! any route it already added.
 
 use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use segue_engine::{TunFdClosePolicy, TunFdConfig, TunFdPacketFormat, TunFdRuntime};
 use segue_kernel::config::KernelConfig;
 use segue_kernel::control::{self, Control};
 use segue_kernel::dial::EngineDialer;
@@ -26,7 +29,11 @@ use segue_kernel::policy;
 use segue_kernel::process::{self, Args, ExitCode as Code, Log, RunArgs, RunFailure};
 use segue_kernel::session::KernelDialer;
 use segue_kernel::socks::{serve, Kernel};
+use segue_kernel::tun::TunStack;
+use segue_kernel::tun_setup::{TunAddress, TunSession};
 use segue_kernel::udp::Udp;
+use segue_transport::TransportDialer;
+use segue_tun::{TunConfig, TunEndpoint};
 
 fn usage_text() {
     eprintln!(
@@ -132,9 +139,23 @@ fn run_kernel(args: &RunArgs) -> Result<Code, RunFailure> {
 }
 
 async fn run_session(config: &KernelConfig, log: &Log) -> Result<Code, RunFailure> {
+    let relays: Vec<_> = config.exits.iter().map(|e| e.relay.ip()).collect();
+    // Route install is synchronous and must finish before any dial, while the
+    // system default route is still the physical one. Nothing else is running
+    // on this thread yet.
+    let mut tun = TunSession::prepare(config.tun.as_ref(), &config.outbounds, &relays)
+        .map_err(RunFailure::tun)?;
+    for note in tun.notes() {
+        log.line(note);
+    }
+    let transport = match tun.protector() {
+        Some(protector) => TransportDialer::system_with_socket_protector(Some(protector)),
+        None => TransportDialer::system(),
+    }
+    .map_err(|e| RunFailure::runtime(format!("transport: {e}")))?;
     let dialer = Arc::new(KernelDialer::new(
         Arc::new(
-            EngineDialer::new(&config.outbounds)
+            EngineDialer::with_transport_dialer(&config.outbounds, Arc::new(transport))
                 .map_err(|e| RunFailure::runtime(format!("dialer: {e}")))?,
         ),
         config.exits.clone(),
@@ -163,9 +184,16 @@ async fn run_session(config: &KernelConfig, log: &Log) -> Result<Code, RunFailur
             c.token_file.display()
         ));
         let ctl = Arc::new(Control::new(dialer.clone(), config.policy.clone(), token));
+        if let Some(name) = tun.name() {
+            ctl.set_tun(
+                Some(name.to_string()),
+                segue_kernel::control::TunSnapshot::INSTALLED,
+            );
+        }
         tokio::spawn(control::serve(l, ctl));
     }
     let mut fake_ip = None;
+    let mut smart = None;
     if let Some(d) = &config.dns {
         // Key + bindings persisted (spec §5.2.2), so a restart never
         // reinterprets an address a client still caches.
@@ -202,6 +230,10 @@ async fn run_session(config: &KernelConfig, log: &Log) -> Result<Code, RunFailur
             pool.clone(),
             d.settings.clone(),
         ));
+        if tun.interface_index() != 0 {
+            dns.set_upstream_interface(tun.interface_index());
+        }
+        smart = Some(dns.clone());
         let udp = tokio::net::UdpSocket::bind(d.listen)
             .await
             .map_err(|e| RunFailure::runtime(format!("dns {}: {e}", d.listen)))?;
@@ -226,10 +258,24 @@ async fn run_session(config: &KernelConfig, log: &Log) -> Result<Code, RunFailur
         hidden: Default::default(),
         flows: Some(flows),
     });
+    let mut tun_task = match (tun.raw_fd(), config.tun.as_ref()) {
+        (Some(fd), Some(addr)) => Some(drive_tun(fd, addr, kernel.clone(), smart)?),
+        (Some(_), None) => return Err(RunFailure::tun("utun fd without a tun address")),
+        _ => None,
+    };
     let stopped = tokio::select! {
         r = serve(listener, kernel) => Stop::Serve(r),
+        r = wait_tun(tun_task.as_mut()) => Stop::Tun(r),
         name = wait_for_stop() => Stop::Signal(name),
     };
+    if let Some(drive) = tun_task {
+        drive.runtime.stop().await;
+        if !matches!(stopped, Stop::Tun(_)) {
+            drive.handle.abort();
+            let _ = drive.handle.await;
+        }
+    }
+    tun.shutdown();
     if let Some(pool) = fake_ip {
         if let Err(e) = pool.save_durable().await {
             log.line(format!("fake-ip state: {e}"));
@@ -252,11 +298,63 @@ async fn run_session(config: &KernelConfig, log: &Log) -> Result<Code, RunFailur
             Ok(Code::Clean)
         }
         Stop::Serve(Err(e)) => Err(RunFailure::runtime(format!("socks: {e}"))),
+        Stop::Tun(Ok(())) => {
+            log.line("tun closed, stopped");
+            Ok(Code::Clean)
+        }
+        Stop::Tun(Err(e)) => Err(RunFailure::runtime(format!("tun: {e}"))),
+    }
+}
+
+struct TunDrive {
+    runtime: TunFdRuntime,
+    handle: tokio::task::JoinHandle<io::Result<()>>,
+}
+
+fn drive_tun(
+    fd: std::os::raw::c_int,
+    addr: &TunAddress,
+    kernel: Arc<Kernel>,
+    dns: Option<Arc<SmartDns>>,
+) -> Result<TunDrive, RunFailure> {
+    let endpoint = Arc::new(TunEndpoint::new(TunConfig {
+        mtu: addr.mtu as usize,
+        queue_depth: 512,
+    }));
+    let runtime = TunFdRuntime::start(
+        TunFdConfig::new(
+            fd,
+            TunFdPacketFormat::DarwinUtun,
+            TunFdClosePolicy::Borrowed,
+        ),
+        endpoint.clone(),
+    )
+    .map_err(|e| RunFailure::tun(format!("utun fd: {e}")))?;
+    let mut stack = TunStack::for_kernel(kernel, dns);
+    stack.config.mtu = addr.mtu as usize;
+    stack.config.v4_addr = addr.v4;
+    if let Some(v6) = &addr.v6 {
+        stack.config.v6_addr = v6.addr;
+    }
+    let handle = tokio::spawn(stack.run(endpoint));
+    Ok(TunDrive { runtime, handle })
+}
+
+/// The tun task, or a future that never completes when tun mode is off.
+async fn wait_tun(drive: Option<&mut TunDrive>) -> io::Result<()> {
+    let Some(drive) = drive else {
+        std::future::pending::<()>().await;
+        return Ok(());
+    };
+    match (&mut drive.handle).await {
+        Ok(result) => result,
+        Err(e) => Err(io::Error::other(format!("tun task: {e}"))),
     }
 }
 
 enum Stop {
     Serve(io::Result<()>),
+    Tun(io::Result<()>),
     Signal(&'static str),
 }
 
