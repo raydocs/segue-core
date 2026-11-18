@@ -224,6 +224,11 @@ expected_job_headers="$(cat <<'EXPECTED'
   secrets:
   candidate-ci:
   rust:
+  rust-checks:
+  rust-test-engine:
+  rust-test-transport:
+  rust-test-config:
+  rust-test-support:
   tproxy-linux:
   go-oracles:
   go-oracles-protocols:
@@ -387,6 +392,47 @@ EXPECTED
 
 expected_rust="$(cat <<'EXPECTED'
   rust:
+    needs:
+      - rust-checks
+      - rust-test-engine
+      - rust-test-transport
+      - rust-test-config
+      - rust-test-support
+    if: always() && cancelled() == false && (github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Require every Rust shard
+        env:
+          CHECKS: ${{ needs.rust-checks.result }}
+          ENGINE: ${{ needs.rust-test-engine.result }}
+          TRANSPORT: ${{ needs.rust-test-transport.result }}
+          CONFIG: ${{ needs.rust-test-config.result }}
+          SUPPORT: ${{ needs.rust-test-support.result }}
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local name="$1"
+            local result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "rust-$name did not succeed: ${result:-missing}" >&2
+              fail=1
+            else
+              echo "rust-$name succeeded"
+            fi
+          }
+          check checks "$CHECKS"
+          check test-engine "$ENGINE"
+          check test-transport "$TRANSPORT"
+          check test-config "$CONFIG"
+          check test-support "$SUPPORT"
+          exit "$fail"
+EXPECTED
+)"
+
+expected_rust_checks="$(cat <<'EXPECTED'
+  rust-checks:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -444,8 +490,6 @@ expected_rust="$(cat <<'EXPECTED'
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::perf -W clippy::suspicious
-      - name: Test
-        run: cargo test --workspace --exclude segue-fuzz --all-targets --locked
       - name: Test proprietary-kernel FFI skeleton
         run: cargo test -p segue-ffi --features proprietary-kernel
       - name: Replay fuzz seed corpora
@@ -528,5 +572,8 @@ assert_equal 'prerelease publication dependencies' "$(needs_body "$normalized_pu
 
 normalized_rust_job="$(normalize_yaml_body "$rust_job")"
 assert_equal 'Rust CI job' "$normalized_rust_job" "$expected_rust"
+rust_checks_job="$(job_body rust-checks)"
+[[ -n "$rust_checks_job" ]] || die 'Rust checks job is missing'
+assert_equal 'Rust checks job' "$(normalize_yaml_body "$rust_checks_job")" "$expected_rust_checks"
 
 echo 'scheduled interoperability workflow matches its reviewed canonical policy'

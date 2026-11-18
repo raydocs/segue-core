@@ -49,6 +49,16 @@ class CandidateCIGates(unittest.TestCase):
             with self.subTest(outcome=outcome), self.assertRaises(ValueError):
                 self.check(jobs=self.with_conclusion("extra", outcome))
 
+    def test_rust_shard_failure_rejects_the_candidate(self):
+        # Shards are additional jobs. A failed one must not bind, even though
+        # only the `rust` aggregate is a required check name.
+        for name in ("rust-checks", "rust-test-engine", "rust-test-transport",
+                     "rust-test-config", "rust-test-support"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.check(jobs=self.with_conclusion(name, "failure"))
+        skipped = self.with_conclusion("rust-test-engine", "skipped")
+        self.check(jobs=skipped)
+
     def test_unrelated_or_incomplete_runs_rejected(self):
         for key, value in (("head_sha", "b" * 40), ("event", "push"), ("event", "schedule"),
                            ("path", "other.yml"), ("status", "in_progress")):

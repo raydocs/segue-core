@@ -138,8 +138,57 @@ grep -Fq 'cargo +nightly-2026-05-22 install cargo-fuzz --version 0.13.2 --locked
   die "RC fuzz gate does not pin cargo-fuzz"
 grep -Fq 'bash scripts/run-v05-host-hardening.sh fuzz' "$WORKFLOW" || \
   die "RC fuzz gate does not run the extended hardening campaign"
-grep -Fq 'cargo test --workspace --exclude segue-fuzz --all-targets --locked' "$WORKFLOW" || \
-  die "ordinary workspace tests can execute unbounded libFuzzer targets"
+# Shards replace `cargo test --workspace --exclude segue-fuzz --all-targets
+# --locked`. --all-targets on segue-fuzz would launch its libFuzzer mains, so
+# that package must not appear, and every other workspace member must be named
+# by exactly one shard.
+if {
+    job_body rust-test-engine
+    job_body rust-test-transport
+    job_body rust-test-config
+    job_body rust-test-support
+  } | grep 'cargo test' | grep -Fq 'segue-fuzz'; then
+  die "a Rust test shard names segue-fuzz; --all-targets would launch libFuzzer"
+fi
+shard_packages="$(
+  {
+    job_body rust-test-engine
+    job_body rust-test-transport
+    job_body rust-test-config
+    job_body rust-test-support
+  } | awk '
+    /cargo test --all-targets --locked/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "-p" && (i + 1) <= NF) print $(i + 1)
+      }
+    }
+  ' | LC_ALL=C sort
+)"
+workspace_packages="$(
+  awk '
+    /^members = \[/ { capture = 1; next }
+    capture && /^\]/ { exit }
+    capture {
+      line = $0
+      sub(/#.*/, "", line)
+      if (match(line, /"[^"]+"/)) print substr(line, RSTART + 1, RLENGTH - 2)
+    }
+  ' "$WORKSPACE_ROOT/Cargo.toml" | while IFS= read -r member; do
+    sed -n 's/^name = "\([^"]*\)"$/\1/p' "$WORKSPACE_ROOT/$member/Cargo.toml" | head -n 1
+  done | grep -vx 'segue-fuzz' | LC_ALL=C sort
+)"
+if [[ "$shard_packages" != "$workspace_packages" ]]; then
+  echo "Rust test shards do not partition the workspace exactly once" >&2
+  echo "shards:" >&2
+  printf '%s\n' "$shard_packages" >&2
+  echo "workspace minus segue-fuzz:" >&2
+  printf '%s\n' "$workspace_packages" >&2
+  exit 1
+fi
+for shard in rust-test-engine rust-test-transport rust-test-config rust-test-support; do
+  grep -Fq 'cargo test --all-targets --locked' <<<"$(job_body "$shard")" || \
+    die "$shard dropped --all-targets --locked"
+done
 
 if grep -Fq -- '--clobber' <<<"$publish_job"; then
   die "prerelease retries can overwrite an existing asset"
@@ -268,11 +317,23 @@ done
 # A stable tag skips exactly the gates its candidate run proved, and only
 # after its own history scan and evidence pass does it bind to that run.
 stable_tag_skip="    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')"
-for job in rust tproxy-linux android supply-chain \
+for job in rust-checks rust-test-engine rust-test-transport rust-test-config \
+  rust-test-support tproxy-linux android supply-chain \
   go-oracles-protocols go-oracles-carriers go-oracles-wireguard go-oracles-tunnels; do
   grep -Fxq "$stable_tag_skip" <<<"$(job_body "$job")" || \
     die "$job does not run for every event except a stable tag push"
 done
+# rust and go-oracles stay the required checks. Each uses the same stable-tag
+# predicate, but always() so a failed shard turns the check red instead of
+# skipping it.
+rust_gate="$(job_body rust)"
+grep -Fxq "    if: always() && cancelled() == false && (github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.'))" <<<"$rust_gate" || \
+  die "rust does not stay skipped on a stable tag and red when a shard fails"
+for shard in rust-checks rust-test-engine rust-test-transport rust-test-config rust-test-support; do
+  grep -Fxq "      - $shard" <<<"$rust_gate" || die "rust does not wait for $shard"
+done
+grep -Fxq '            if [[ "$result" != "success" ]]; then' <<<"$rust_gate" || \
+  die "rust does not fail when a shard is not successful"
 # go-oracles stays the required check. It uses the same stable-tag predicate,
 # but always() so a failed shard turns the check red instead of skipping it.
 go_oracles="$(job_body go-oracles)"

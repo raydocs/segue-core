@@ -266,11 +266,57 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  # Required-check name. fmt, clippy, docs and script checks stay in
+  # rust-checks. Workspace tests run on the four shards below, one -p group
+  # each, so every member except segue-fuzz is tested once with
+  # --all-targets --locked. segue-engine, segue-transport and segue-config are
+  # each their own shard; the fourth holds the remaining crates. This job
+  # fails unless every shard succeeded. always() keeps a shard failure red
+  # instead of skipped; cancelled() == false still skips the gate when the
+  # run is cancelled, and the event clause still skips a stable tag push.
   rust:
+    needs:
+      - rust-checks
+      - rust-test-engine
+      - rust-test-transport
+      - rust-test-config
+      - rust-test-support
+    if: always() && cancelled() == false && (github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Require every Rust shard
+        env:
+          CHECKS: ${{ needs.rust-checks.result }}
+          ENGINE: ${{ needs.rust-test-engine.result }}
+          TRANSPORT: ${{ needs.rust-test-transport.result }}
+          CONFIG: ${{ needs.rust-test-config.result }}
+          SUPPORT: ${{ needs.rust-test-support.result }}
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local name="$1"
+            local result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "rust-$name did not succeed: ${result:-missing}" >&2
+              fail=1
+            else
+              echo "rust-$name succeeded"
+            fi
+          }
+          check checks "$CHECKS"
+          check test-engine "$ENGINE"
+          check test-transport "$TRANSPORT"
+          check test-config "$CONFIG"
+          check test-support "$SUPPORT"
+          exit "$fail"
+
+  rust-checks:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    # Full debug info for the workspace tests and the fuzz replay fills the
+    # Full debug info for clippy, docs and the fuzz replay fills the
     # GitHub-hosted disk; line tables keep panic locations.
     env:
       CARGO_INCREMENTAL: "0"
@@ -337,11 +383,6 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::perf -W clippy::suspicious
 
-      - name: Test
-        # `--all-targets` overrides the fuzz bins' `test = false` metadata and
-        # would otherwise launch their libFuzzer mains without a run bound.
-        run: cargo test --workspace --exclude segue-fuzz --all-targets --locked
-
       - name: Test proprietary-kernel FFI skeleton
         run: cargo test -p segue-ffi --features proprietary-kernel
 
@@ -365,6 +406,144 @@ jobs:
 
       - name: Test mobile build-script guards
         run: bash scripts/tests/check-mobile-toolchains.test.sh
+
+  rust-test-engine:
+    # Largest crate, so it does not share a runner with another package's tests.
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
+      - name: Test
+        # --all-targets on segue-fuzz would launch its libFuzzer mains. This
+        # shard names segue-engine only, with the same locked all-targets flags
+        # the single workspace test used.
+        run: cargo test --all-targets --locked -p segue-engine
+
+  rust-test-transport:
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
+      - name: Test
+        run: cargo test --all-targets --locked -p segue-transport
+
+  rust-test-config:
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
+      - name: Test
+        run: cargo test --all-targets --locked -p segue-config
+
+  rust-test-support:
+    # Every remaining workspace member except segue-fuzz. Kept together so the
+    # three large crates above each get their own runner.
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
+      - name: Test
+        run: cargo test --all-targets --locked -p segue-bench -p segue-cli -p segue-ffi -p segue-kernel -p segue-policy -p segue-proxy -p segue-relay -p segue-routing -p segue-runtime -p segue-session -p segue-tun -p segue-utls -p segue-vless-encryption -p segue-wireguard
 
   tproxy-linux:
     # The GitHub-hosted kernel does not ship the TPROXY modules this check
