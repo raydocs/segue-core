@@ -1,0 +1,1 @@
+TUIC: the CONNECT header now leaves with the first payload instead of in its own QUIC packet, as sing-box's TUIC client does, saving a round trip on every new flow. The header still leaves alone after 300 ms if no payload follows. See `docs/notes/tuic-tail.md` for the ping-pong p99 analysis and the remaining BBR-sender hypothesis.
