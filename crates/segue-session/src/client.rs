@@ -23,6 +23,7 @@ use crate::codec::{
 use crate::flow::{RecvHalf, SendHalf};
 use crate::park::{ParkDecision, ParkTracker};
 use crate::pool::Pool;
+use crate::quality::QualityEvent;
 use crate::{Config, ProtoError};
 
 pub type CarrierId = u64;
@@ -205,6 +206,11 @@ pub struct ClientSession {
     rx_partial: bool,
     /// Latest health report not yet taken (see [`Health`]).
     health: Option<Health>,
+    /// Path-quality evidence not yet taken (see [`QualityEvent`]).
+    quality: Option<QualityEvent>,
+    /// Bytes this session has reported as sent to its exit's quality
+    /// tracker, so each [`QualityEvent::Replay`] carries a delta.
+    quality_sent: u64,
     /// When [`Health::Up`] was last reported (see [`HEALTH_REFRESH`]).
     up_reported: Option<Instant>,
     /// When [`Health::Up`] or [`Health::Alive`] was last reported.
@@ -289,6 +295,8 @@ impl ClientSession {
             fruitless: 0,
             rx_partial: false,
             health: None,
+            quality: None,
+            quality_sent: 0,
             up_reported: None,
             alive_reported: None,
             evidence_at: None,
@@ -395,6 +403,17 @@ impl ClientSession {
             self.state = State::Attaching;
             self.recv.new_path(now);
             self.recv.mark_acked();
+            // Everything sent but not acknowledged goes out again on this
+            // carrier: that is the path's replay cost (see
+            // [`QualityEvent::Replay`]). Both figures are deltas since the
+            // last report, so the exit's tracker sums them across sessions.
+            let sent_hw = self.send.sent_hw();
+            let sent = sent_hw.saturating_sub(self.quality_sent);
+            let replayed = sent_hw.saturating_sub(self.send.acked());
+            if sent > 0 || replayed > 0 {
+                self.quality = Some(QualityEvent::Replay { sent, replayed });
+                self.quality_sent = sent_hw;
+            }
             Frame::Resume(Resume {
                 version: VERSION,
                 ticket: self.params.ticket.clone(),
@@ -537,6 +556,11 @@ impl ClientSession {
         self.health.take()
     }
 
+    /// The latest [`QualityEvent`] since the last call.
+    pub fn take_quality(&mut self) -> Option<QualityEvent> {
+        self.quality.take()
+    }
+
     /// The current carrier is being given up (closed, stalled, or held a
     /// frame too long). Losing one that moved nothing while something was
     /// expected on it backs off the next attempt, exponentially, and the
@@ -577,6 +601,7 @@ impl ClientSession {
             self.health = Some(Health::Failed);
             self.up_reported = None;
             self.alive_reported = None;
+            self.quality = Some(QualityEvent::CarrierLost);
         }
         if self.progressed {
             // Budget: a carrier that moved data resets it.

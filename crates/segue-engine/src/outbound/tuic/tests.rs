@@ -254,3 +254,94 @@ fn config_defaults_and_never_treats_quic_as_a_tcp_stream() {
     config.stream.network = Network::Tcp;
     assert!(TuicOutbound::new(&config).is_err());
 }
+
+/// A carrier that records every `poll_write` and never yields read data.
+#[derive(Default)]
+struct Recorder {
+    writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+impl AsyncRead for Recorder {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for Recorder {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.writes.lock().unwrap().push(input.to_vec());
+        Poll::Ready(Ok(input.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl TransportStream for Recorder {
+    fn poll_read_direct(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.poll_read(cx, output)
+    }
+    fn poll_write_direct(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write(cx, input)
+    }
+}
+
+/// The CONNECT header must share the first payload's write, as sing-box's
+/// TUIC client does, instead of costing its own round trip.
+#[tokio::test]
+async fn connect_header_leaves_with_the_first_payload() {
+    let recorder = Recorder::default();
+    let writes = recorder.writes.clone();
+    let header = wire::encode(&Command::Connect(Target::new(
+        RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        443,
+        RoutingNetwork::Tcp,
+    )))
+    .unwrap();
+    let mut stream = coalesced(Box::new(recorder), &header);
+    stream.write_all(b"payload").await.unwrap();
+    stream.flush().await.unwrap();
+    let writes = writes.lock().unwrap();
+    assert_eq!(writes.len(), 1, "header and payload share one write");
+    assert_eq!(writes[0], [header.as_slice(), b"payload"].concat());
+}
+
+/// With no payload, the header still leaves once the wait expires.
+#[tokio::test]
+async fn connect_header_leaves_alone_when_no_payload_follows() {
+    let recorder = Recorder::default();
+    let writes = recorder.writes.clone();
+    let header = wire::encode(&Command::Connect(Target::new(
+        RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        443,
+        RoutingNetwork::Tcp,
+    )))
+    .unwrap();
+    let mut stream = coalesced(Box::new(recorder), &header);
+    let mut byte = [0_u8; 1];
+    let read =
+        tokio::time::timeout(std::time::Duration::from_millis(50), stream.read(&mut byte)).await;
+    assert!(read.is_err(), "the recorder never yields read data");
+    let writes = writes.lock().unwrap();
+    assert_eq!(writes.len(), 1, "the header left on its own");
+    assert_eq!(writes[0], header);
+}

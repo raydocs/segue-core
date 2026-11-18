@@ -4,6 +4,7 @@
 //! association has a bounded receive queue; native datagrams go through
 //! bounded reassembly, while the QUIC mode sends each Packet on its own
 //! unidirectional stream. Authentication uses TLS keying material export.
+use super::first_payload::{flush_header_alone, FirstPayloadDeadline, HeldHeader};
 use super::*;
 use segue_config::{TuicCongestionControl, TuicSettings, TuicUdpRelayMode};
 use segue_proxy::tuic::{self as wire, Command, Packet};
@@ -192,22 +193,19 @@ impl Client {
             .map_err(|_| TuicError::Limit)?;
         let header =
             wire::encode(&Command::Connect(target.clone())).map_err(|_| TuicError::Stream)?;
-        let (mut write, read) = self
+        let (write, read) = self
             .inner
             .connection
             .open_bi()
             .await
             .map_err(|_| TuicError::Stream)?;
-        write
-            .write_all(&header)
-            .await
-            .map_err(|_| TuicError::Stream)?;
-        Ok(Box::new(TuicStream {
+        let stream = TuicStream {
             read,
             write,
             _permit: permit,
             _client: self.clone(),
-        }))
+        };
+        Ok(coalesced(Box::new(stream), &header))
     }
 
     fn deliver(&self, packet: Packet) {
@@ -269,6 +267,22 @@ struct TuicStream {
     _permit: tokio::sync::OwnedSemaphorePermit,
     // Held so the QUIC connection outlives every stream opened on it.
     _client: Client,
+}
+
+/// Wraps a fresh CONNECT stream so the header leaves with the first payload.
+///
+/// The relay polls reads from the start, so the wait is driven from
+/// `poll_read`: a payload already buffered on the upload half shares the
+/// header's write, and the header leaves alone once the wait expires. Any
+/// write, flush or shutdown disarms it.
+fn coalesced(stream: BoxedTransportStream, header: &[u8]) -> BoxedTransportStream {
+    // No timer: like VLESS (#63), the first read only yields once so a payload
+    // already buffered shares the header's write; a server-first flow sends
+    // the header on the next read instead of waiting out a 300 ms hold.
+    Box::new(FirstPayloadDeadline::for_vless(
+        HeldHeader::new(stream, header),
+        flush_header_alone,
+    ))
 }
 
 impl AsyncRead for TuicStream {

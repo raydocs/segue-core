@@ -623,6 +623,70 @@ fn opened_resets_the_recovery_budget_and_resumed_does_not() {
     assert_eq!(c.fruitless_carriers(), 1, "RESUMED is not progress");
 }
 
+/// Path quality (see `segue_session::quality`): a carrier lost with
+/// something expected on it is a stall, and the bytes replayed onto the
+/// next carrier are reported as deltas, so the exit's tracker can sum
+/// them across sessions.
+#[test]
+fn carrier_loss_and_replay_are_reported_as_quality_events() {
+    use segue_session::codec::{Opened, Resumed};
+    use segue_session::quality::QualityEvent;
+    let t0 = Instant::now();
+    let mut c = client(t0);
+    c.attach(1, t0);
+    while c.poll_transmit(1, t0).is_some() {}
+    c.on_frame(
+        1,
+        Frame::Opened(Opened {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            recv_offset: 0,
+            max_offset: 1 << 20,
+            window_cap: 1 << 20,
+            ack_bytes: 0,
+        }),
+        t0,
+    )
+    .unwrap();
+    assert_eq!(c.take_quality(), None, "OPENED is not a quality event");
+    // Send 100 bytes, none acknowledged, then lose the carrier.
+    assert_eq!(c.write(&[7u8; 100]), 100);
+    while c.poll_transmit(1, t0).is_some() {}
+    c.on_carrier_stuck(1, t0);
+    assert_eq!(c.take_quality(), Some(QualityEvent::CarrierLost));
+    // The next carrier replays all 100 bytes: a delta of 100 sent, 100
+    // replayed.
+    let t = t0 + Duration::from_secs(5);
+    c.attach(2, t);
+    assert_eq!(
+        c.take_quality(),
+        Some(QualityEvent::Replay {
+            sent: 100,
+            replayed: 100
+        })
+    );
+    while c.poll_transmit(2, t).is_some() {}
+    c.on_frame(
+        2,
+        Frame::Resumed(Resumed {
+            instance_id: INSTANCE,
+            attach_gen: c.gen(),
+            // The relay got all 100 bytes: nothing left to replay.
+            recv_offset: 100,
+            max_offset: 1 << 20,
+        }),
+        t,
+    )
+    .unwrap();
+    // Nothing new sent and nothing unacked: the next attach reports no
+    // replay.
+    c.on_carrier_stuck(2, t);
+    let _ = c.take_quality();
+    let t = t + Duration::from_secs(5);
+    c.attach(3, t);
+    assert_eq!(c.take_quality(), None, "nothing to replay");
+}
+
 /// r10 N6: health and the recovery budget are separate. A carrier that
 /// moved data and then stalls is a failure for health (before, it
 /// reported nothing), though it does not count against the budget; and

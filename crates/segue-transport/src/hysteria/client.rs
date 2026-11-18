@@ -469,15 +469,7 @@ impl HysteriaClient {
             let _ = poll_fn(|cx| driver.poll_close(cx)).await;
             driver_connection.close(VarInt::from_u32(0x100), b"");
         }));
-        let padding = random_padding(256, 2048);
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri("https://hysteria/auth")
-            .header("hysteria-auth", auth)
-            .header("hysteria-cc-rx", config.receive_bytes_per_second)
-            .header("hysteria-padding", padding)
-            .body(())
-            .map_err(|_| HysteriaError::Configuration)?;
+        let request = auth_request(auth, config.receive_bytes_per_second)?;
         let mut stream = sender
             .send_request(request)
             .await
@@ -614,6 +606,25 @@ impl HysteriaClient {
     }
 }
 
+/// The authentication request, as Xray's Hysteria dialer and sing-quic's
+/// client both send it: `Hysteria-Auth`, the receive rate in
+/// `Hysteria-CC-RX` (zero, never `auto`, when the client declares none), and
+/// 256–2048 bytes of padding.
+fn auth_request(
+    auth: HeaderValue,
+    receive_bytes_per_second: u64,
+) -> Result<Request<()>, HysteriaError> {
+    let padding = random_padding(256, 2048);
+    Request::builder()
+        .method(Method::POST)
+        .uri("https://hysteria/auth")
+        .header("hysteria-auth", auth)
+        .header("hysteria-cc-rx", receive_bytes_per_second)
+        .header("hysteria-padding", padding)
+        .body(())
+        .map_err(|_| HysteriaError::Configuration)
+}
+
 pub(super) fn random_padding(min: usize, max: usize) -> String {
     let mut rng = rand::thread_rng();
     let length = rng.gen_range(min..max);
@@ -655,6 +666,30 @@ fn parse_auth_headers(headers: &http::HeaderMap) -> Result<(bool, u64), Hysteria
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_request_announces_the_receive_rate_as_a_plain_number() {
+        let request = auth_request(HeaderValue::from_static("synthetic-auth"), 0).unwrap();
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(request.uri().to_string(), "https://hysteria/auth");
+        assert_eq!(
+            request.headers().get("hysteria-auth").unwrap(),
+            "synthetic-auth"
+        );
+        // Xray and sing-quic both send the number; `auto` is a server-only
+        // reply value, and a client that declares no rate sends zero.
+        assert_eq!(request.headers().get("hysteria-cc-rx").unwrap(), "0");
+        let padding = request
+            .headers()
+            .get("hysteria-padding")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!((256..2048).contains(&padding.len()), "{}", padding.len());
+
+        let request = auth_request(HeaderValue::from_static("synthetic-auth"), 2_500_000).unwrap();
+        assert_eq!(request.headers().get("hysteria-cc-rx").unwrap(), "2500000");
+    }
 
     #[test]
     fn auth_response_requires_single_valid_udp_and_rate_headers() {

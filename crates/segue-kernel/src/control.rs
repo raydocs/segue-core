@@ -9,6 +9,13 @@
 //! | Request | Body | Answer |
 //! |---|---|---|
 //! | `GET /v1/status` | | `{"state", "posture", "exit_choice", "current_exit", "exits", "revoked", "control_refused", "policy", "tun"}` |
+//!
+//! `exits` is `[{"name": "la", "quality": {"srtt_ms", "loss", "stalls"}}]`:
+//! the measured path quality behind the `auto` exit choice (see
+//! [`crate::session::ExitQuality`]). `srtt_ms` is `null` until the first
+//! control PING/PONG; `loss` is the fraction of sent bytes replayed onto a
+//! new carrier; `stalls` counts carriers given up with something expected
+//! on them.
 //! | `POST /v1/connect` | | status |
 //! | `POST /v1/disconnect` | | status |
 //! | `POST /v1/exit` | `{"exit": "auto" \| "la" \| "ny" ...}` | status |
@@ -122,7 +129,20 @@ impl Control {
             "posture": posture,
             "exit_choice": s.choice.name(),
             "current_exit": s.current_exit,
-            "exits": s.exits,
+            "exits": s
+                .quality
+                .iter()
+                .map(|e| {
+                    json!({
+                        "name": e.name,
+                        "quality": {
+                            "srtt_ms": e.quality.srtt.map(|d| d.as_millis() as u64),
+                            "loss": e.quality.loss,
+                            "stalls": e.quality.stalls,
+                        },
+                    })
+                })
+                .collect::<Vec<_>>(),
             "revoked": s.revoked.is_some(),
             "control_refused": s
                 .control_refused
@@ -472,7 +492,14 @@ mod tests {
         assert_eq!(s["posture"], "connecting");
         assert_eq!(s["exit_choice"], "auto");
         assert_eq!(s["current_exit"], "la");
-        assert_eq!(s["exits"], json!(["la", "ny"]));
+        assert_eq!(s["exits"][0]["name"], "la");
+        assert_eq!(s["exits"][1]["name"], "ny");
+        assert!(
+            s["exits"][0]["quality"]["srtt_ms"].is_null(),
+            "no sample yet"
+        );
+        assert_eq!(s["exits"][0]["quality"]["loss"], 0.0);
+        assert_eq!(s["exits"][0]["quality"]["stalls"], 0);
         assert_eq!(s["policy"]["source"], "inline");
         assert!(s["tun"]["interface"].is_null());
         assert_eq!(s["tun"]["routes"], "absent");

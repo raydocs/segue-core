@@ -290,6 +290,11 @@ pub async fn serve_socks_listener(
                     }
                 };
                 accept_backoff.reset();
+                // Go's `net.TCPConn` sets TCP_NODELAY on every accepted
+                // connection, so Xray-core's SOCKS reply and the first
+                // downlink bytes never wait for a delayed ACK. Without it the
+                // reply can sit up to 40 ms on a fresh flow.
+                let _ = stream.set_nodelay(true);
                 let settings = Arc::clone(&settings);
                 let inbound_tag = inbound_tag.clone();
                 let config = Arc::clone(&config);
