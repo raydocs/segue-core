@@ -17,7 +17,7 @@
 //! to the previous process.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 /// Transport the local socket speaks. Not [`crate::tun::Proto`]: this
@@ -310,6 +310,8 @@ const CACHE_CAP: usize = 4096;
 /// layout checks run on every OS). A non-macOS library build has no caller.
 #[cfg(any(test, target_os = "macos"))]
 mod pcb {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
     use super::*;
 
     /// `xinpgen` is 24 bytes on the current export. The header's own `xig_len`
