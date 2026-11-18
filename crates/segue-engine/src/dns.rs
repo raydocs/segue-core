@@ -989,10 +989,20 @@ async fn exchange_over_datagrams(
     loop {
         tokio::select! {
             reply = session.recv() => {
-                let reply = reply.map_err(io::Error::other)?;
+                let reply = match reply {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        eprintln!("FLAKE-DIAG datagram session recv error: {error}");
+                        return Err(io::Error::other(error));
+                    }
+                };
                 if dns_response_matches_query(query, &reply.payload) {
                     return Ok(reply.payload);
                 }
+                eprintln!(
+                    "FLAKE-DIAG datagram reply mismatch: query hex={:02x?} reply hex={:02x?}",
+                    query, reply.payload
+                );
             }
             _ = resend.tick(), if resends => {
                 session

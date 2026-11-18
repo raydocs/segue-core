@@ -782,8 +782,39 @@ async fn resolve_dns_hijack_response(
         )
         .await
         {
-            Ok(result) => dns_hijack_resolution(&question, result),
-            Err(_) => DnsHijackResolution::ServerFailure,
+            Ok(result) => {
+                if matches!(
+                    result,
+                    Err(
+                        TransportError::DnsNoData(_, _)
+                            | TransportError::DnsNameError(_, _)
+                            | TransportError::NoResolvedAddress(_, _)
+                            | TransportError::DnsRcode(_, _, _)
+                    )
+                ) || result.as_ref().is_ok_and(|lookup| {
+                    lookup
+                        .ips()
+                        .filter(|address| matches!(
+                            (question.qtype, address),
+                            (DNS_TYPE_A, IpAddr::V4(_)) | (DNS_TYPE_AAAA, IpAddr::V6(_))
+                        ))
+                        .count()
+                        == 0
+                }) {
+                    eprintln!(
+                        "FLAKE-DIAG hijack resolve {:?} qtype={} -> {result:?}",
+                        question.domain, question.qtype
+                    );
+                }
+                dns_hijack_resolution(&question, result)
+            }
+            Err(_) => {
+                eprintln!(
+                    "FLAKE-DIAG hijack resolve {:?} qtype={} -> timeout",
+                    question.domain, question.qtype
+                );
+                DnsHijackResolution::ServerFailure
+            }
         }
     };
     build_dns_hijack_response(&query, &question, resolution, max_payload, include_edns)

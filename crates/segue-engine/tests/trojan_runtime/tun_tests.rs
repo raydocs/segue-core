@@ -151,6 +151,9 @@ async fn tun_dns_wire_and_managed_destination_lookup(
         core.tun().push_inbound(Bytes::from(ipv4_udp_packet(client_ip, 53044, anchor, 53, &query))).await.unwrap();
         let reply = poll_tun_outbound_until_with_timeout(core.tun(), trojan_support::DEADLINE, |packet| ipv4_udp_payload(packet).is_some_and(|p| p.get(..2) == Some(&0x7262_u16.to_be_bytes()))).await;
         let response = ipv4_udp_payload(&reply).unwrap();
+        if dns_response_answer_ipv4(response).is_none() {
+            eprintln!("FLAKE-DIAG dns reply hex={:02x?}", response);
+        }
         assert_eq!(dns_response_answer_ipv4(response), Some(Ipv4Addr::LOCALHOST));
         assert_ipv4_udp_packet(&reply, anchor, 53, client_ip, 53044, response);
         assert_eq!(protector.0.load(Ordering::SeqCst), 1);

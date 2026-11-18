@@ -1898,7 +1898,10 @@ impl ConfiguredDnsResolver {
                 Ok(ConfiguredServerResult::Negative(negative)) => {
                     return ServerLookup::Negative(negative);
                 }
-                Err(_) => {
+                Err(error) => {
+                    eprintln!(
+                        "FLAKE-DIAG server lookup {current_domain} failed: {error}; depth={depth}"
+                    );
                     return if cname_ttl_cap.is_some() {
                         ServerLookup::Negative(ConfiguredDnsNegative::NoData)
                     } else {
@@ -2057,12 +2060,22 @@ impl ConfiguredDnsResolver {
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dns query timed out"))??;
         let observed_at = Instant::now();
+        let response_bytes = response.clone();
 
         match parse_dns_response(&query, &response, record_type)? {
             response @ (ParsedDnsResponse::Answer(_)
             | ParsedDnsResponse::NoData
             | ParsedDnsResponse::NameError
-            | ParsedDnsResponse::ServerFailure(_)) => Ok((response, observed_at)),
+            | ParsedDnsResponse::ServerFailure(_)) => {
+                if !matches!(response, ParsedDnsResponse::Answer(_)) {
+                    eprintln!(
+                        "FLAKE-DIAG exchange {domain} type {record_type:?} non-answer {response:?}; wire len={} hex={:02x?}",
+                        response_bytes.len(),
+                        response_bytes
+                    );
+                }
+                Ok((response, observed_at))
+            }
             ParsedDnsResponse::Truncated => {
                 if initial_transport != DnsQueryTransportKind::Udp {
                     return Err(invalid_dns_response(

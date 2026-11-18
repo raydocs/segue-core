@@ -11594,7 +11594,10 @@ async fn spawn_observed_udp_dns_a_server_with_delay(
             let response = match dns_query_record_type(query) {
                 Some(1) => build_dns_a_response_for_query(query, answer),
                 Some(28) => build_dns_nodata_response_for_query(query),
-                record_type => panic!("unexpected observed DNS query type {record_type:?}"),
+                record_type => panic!(
+                    "unexpected observed DNS query type {record_type:?} len={len} hex={:02x?}",
+                    query
+                ),
             };
             sleep(response_delay).await;
             socket.send_to(&response, peer).await.unwrap();
