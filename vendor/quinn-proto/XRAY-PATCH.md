@@ -345,3 +345,5 @@ the shrunken link delivers it, and one loss repairs the send. Black-hole
 detection itself is unchanged: a round trip longer than the gap still sends both
 probes first, and the same four bursts still lower the MTU. The test still
 requires the bytes to arrive and at least one loss.
+
+- 2026-11-18: `blackhole_after_mtu_change_is_detected_with_latency` (40 ms latency) keeps upstream's black-hole assertions (>=3 losses, >=3 congestion events, 1 black hole) for the spaced-probe patch; the zero-latency upstream test now accepts the one-loss repair.
