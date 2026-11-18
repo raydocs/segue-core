@@ -17,6 +17,7 @@
     allow(dead_code)
 )]
 
+use std::net::IpAddr;
 use std::{fmt, io, sync::Arc};
 
 use crate::{SocketHandle, SocketProtector};
@@ -102,6 +103,13 @@ impl SocketProtector for SocketOptionsProtector {
             inner.protect(socket)?;
         }
         self.options.apply(socket, self.report.as_deref())
+    }
+
+    fn protects_destination(&self, dest: IpAddr) -> bool {
+        match &self.inner {
+            Some(inner) => inner.protects_destination(dest),
+            None => true,
+        }
     }
 
     fn multipath_tcp(&self) -> bool {

@@ -13,7 +13,9 @@
 //! that default in place. Exit addresses are host routes via the physical
 //! gateway, scoped to that interface (`RTF_IFSCOPE`), installed *before* the
 //! split defaults so the carrier is never captured. Direct and domestic
-//! sockets are also bound with `IP_BOUND_IF` / `IPV6_BOUND_IF`.
+//! sockets are also bound with `IP_BOUND_IF` / `IPV6_BOUND_IF`, except a dial
+//! whose next hop is loopback: the physical NIC cannot reach `127.0.0.0/8`
+//! or `::1`.
 //!
 //! Nothing in the pure half opens a socket. The syscalls are
 //! `cfg(target_os = "macos")`.
@@ -737,8 +739,24 @@ pub fn bind_fd_to_interface(fd: RawFd, index: u32) -> io::Result<()> {
 }
 
 /// Socket protector that pins every dial the transport opens to one interface.
+///
+/// Loopback next hops are left unbound. `IP_BOUND_IF` on the physical NIC
+/// has no route to `127.0.0.0/8` or `::1`, so a local exit (a SOCKS server
+/// on `127.0.0.1`) would never complete its handshake. Every other
+/// destination stays pinned, which is what keeps the tunnel's own traffic
+/// out of the utun.
 pub struct InterfaceBind {
     index: u32,
+}
+
+/// `127.0.0.0/8`, `::1`, and an IPv4-mapped loopback.
+pub(crate) fn destination_is_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
 }
 
 impl InterfaceBind {
@@ -765,6 +783,10 @@ impl SocketProtector for InterfaceBind {
                 "IP_BOUND_IF is macOS-only",
             ))
         }
+    }
+
+    fn protects_destination(&self, dest: IpAddr) -> bool {
+        !destination_is_loopback(dest)
     }
 }
 
@@ -883,6 +905,8 @@ mod sys {
 
     pub struct LiveTun {
         fd: Option<OwnedFd>,
+        /// utun name for `SIOCIFDESTROY`. Empty for a test fd that is not a utun.
+        name: String,
         routes: Vec<super::RouteSpec>,
     }
 
@@ -892,6 +916,8 @@ mod sys {
         }
 
         pub fn shutdown(&mut self) {
+            // Routes first. They point at this utun; a split default left
+            // behind blackholes the host until something else deletes it.
             let routes = std::mem::take(&mut self.routes);
             for spec in routes.into_iter().rev() {
                 if let Err(e) = write_route(&spec, RouteOp::Delete) {
@@ -900,8 +926,52 @@ mod sys {
                     }
                 }
             }
-            self.fd.take();
+            // The packet runtime (`TunFdClosePolicy::Borrowed`) holds a
+            // duplicate of this control socket and does not close the
+            // caller's descriptor. The caller stops that runtime first, so
+            // this close is the last reference, and the utun disappears with
+            // it. SIGKILL never reaches this function: the kernel closes
+            // whatever fds the process still holds, which is the only
+            // teardown a killed process gets.
+            if let Some(fd) = self.fd.take() {
+                close_control(fd);
+            }
+            // Closing the control fd is what destroys a utun. `SIOCIFDESTROY`
+            // covers a graceful stop whose last close did not tear the
+            // interface down. It cannot run after SIGKILL.
+            if !self.name.is_empty() {
+                if let Err(e) = destroy_interface(&self.name) {
+                    if e.raw_os_error() != Some(libc::ENXIO)
+                        && e.raw_os_error() != Some(libc::EINVAL)
+                    {
+                        eprintln!("segue-kernel: destroy {}: {e}", self.name);
+                    }
+                }
+                self.name.clear();
+            }
         }
+    }
+
+    /// One `close`. Not retried: after `EINTR` the descriptor's state is
+    /// unspecified, and a second close can hit a number the kernel has reused.
+    fn close_control(fd: OwnedFd) {
+        use std::os::fd::IntoRawFd;
+        let raw = fd.into_raw_fd();
+        // SAFETY: `raw` is the control descriptor this `OwnedFd` owned.
+        let rc = unsafe { libc::close(raw) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EBADF) {
+                eprintln!("segue-kernel: close utun: {err}");
+            }
+        }
+    }
+
+    fn destroy_interface(name: &str) -> io::Result<()> {
+        let sock = inet_socket(libc::AF_INET)?;
+        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+        set_ifr_name(&mut ifr.ifr_name, name)?;
+        ioctl(sock.as_raw_fd(), libc::SIOCIFDESTROY, &mut ifr)
     }
 
     pub fn bring_up(
@@ -913,13 +983,14 @@ mod sys {
         let result = configure(&fd, &name, index, addr, outbounds, relays);
         match result {
             Ok((routes, notes, physical)) => Ok(TunSession {
-                name: Some(name),
+                name: Some(name.clone()),
                 // The index callers bind to is the physical NIC, not the utun.
                 index: physical,
                 protector: Some(Arc::new(InterfaceBind::new(physical))),
                 notes,
                 live: Some(LiveTun {
                     fd: Some(fd),
+                    name,
                     routes,
                 }),
             }),
@@ -1430,13 +1501,75 @@ mod sys {
             return Ok(n as usize);
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+
+        use super::super::TunSession;
+        use super::LiveTun;
+
+        fn pipe_ends() -> (OwnedFd, RawFd, RawFd) {
+            let mut ends = [0; 2];
+            assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+            // SAFETY: pipe() just returned this read end.
+            let owned = unsafe { OwnedFd::from_raw_fd(ends[0]) };
+            (owned, ends[0], ends[1])
+        }
+
+        fn session_holding(fd: OwnedFd) -> TunSession {
+            TunSession {
+                name: None,
+                index: 0,
+                protector: None,
+                notes: Vec::new(),
+                // Empty name: this fd is a pipe, not a utun. `SIOCIFDESTROY`
+                // must not run against a real interface.
+                live: Some(LiveTun {
+                    fd: Some(fd),
+                    name: String::new(),
+                    routes: Vec::new(),
+                }),
+            }
+        }
+
+        fn assert_closed(raw: RawFd) {
+            let rc = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+            let err = std::io::Error::last_os_error();
+            assert_eq!(rc, -1);
+            assert_eq!(err.raw_os_error(), Some(libc::EBADF), "{err}");
+        }
+
+        #[test]
+        fn shutdown_closes_an_injected_control_fd() {
+            let (fd, raw, write) = pipe_ends();
+            let mut session = session_holding(fd);
+            session.shutdown();
+            assert_closed(raw);
+            // Idempotent: the descriptor is already gone, routes too.
+            session.shutdown();
+            unsafe { libc::close(write) };
+        }
+
+        #[test]
+        fn drop_closes_an_injected_control_fd() {
+            let (fd, raw, write) = pipe_ends();
+            {
+                let _session = session_holding(fd);
+            }
+            assert_closed(raw);
+            unsafe { libc::close(write) };
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::net::Ipv6Addr;
+    #[cfg(target_os = "macos")]
+    use std::net::SocketAddr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn tun() -> TunAddress {
         TunAddress::default()
@@ -1714,6 +1847,10 @@ mod tests {
             std::mem::size_of::<libc::sockaddr_in>()
         );
         assert_eq!(std::mem::size_of::<libc::ifreq>(), 32);
+        assert_eq!(
+            ioc_in(b'i', 121, std::mem::size_of::<libc::ifreq>()) as libc::c_ulong,
+            libc::SIOCIFDESTROY
+        );
     }
 
     #[test]
@@ -1735,5 +1872,126 @@ mod tests {
             panic!("a TUN session was prepared off macOS");
         };
         assert!(err.contains("macOS"), "{err}");
+    }
+
+    #[test]
+    fn loopback_next_hop_is_not_pinned_to_the_nic() {
+        let bind = InterfaceBind::new(1);
+        let loopback = [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(127, 255, 255, 255)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            "::ffff:127.0.0.1".parse().unwrap(),
+            "::ffff:127.1.2.3".parse().unwrap(),
+        ];
+        for ip in loopback {
+            assert!(destination_is_loopback(ip), "{ip}");
+            assert!(!bind.protects_destination(ip), "{ip}");
+        }
+        let pinned = [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            "2001:db8::1".parse().unwrap(),
+            "::ffff:8.8.8.8".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+        ];
+        for ip in pinned {
+            assert!(!destination_is_loopback(ip), "{ip}");
+            assert!(bind.protects_destination(ip), "{ip}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn non_loopback_interface() -> u32 {
+        let mut buf = [0 as libc::c_char; libc::IFNAMSIZ];
+        for index in 1..128u32 {
+            buf.fill(0);
+            // SAFETY: buf is IFNAMSIZ bytes, which is what if_indextoname writes.
+            let rc = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
+            if rc.is_null() {
+                continue;
+            }
+            let bytes: Vec<u8> = buf
+                .iter()
+                .take_while(|c| **c != 0)
+                .map(|c| *c as u8)
+                .collect();
+            let name = String::from_utf8_lossy(&bytes);
+            if !name.starts_with("lo") {
+                return index;
+            }
+        }
+        panic!("no non-loopback interface; cannot prove IP_BOUND_IF is skipped");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bound_if(fd: std::os::fd::RawFd, ipv6: bool) -> i32 {
+        let mut value: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let (level, name) = if ipv6 {
+            (libc::IPPROTO_IPV6, 125) // IPV6_BOUND_IF
+        } else {
+            (libc::IPPROTO_IP, 25) // IP_BOUND_IF
+        };
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                name,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        value
+    }
+
+    /// A protector pinned to a real NIC must still reach a loopback listener.
+    /// Binding that socket to the NIC would make `127.0.0.1` / `::1` fail.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn protected_dial_reaches_a_loopback_listener() {
+        use std::os::fd::AsRawFd;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let index = non_loopback_interface();
+        let bind = InterfaceBind::new(index);
+
+        let v4 = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let v4_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, v4.local_addr().unwrap().port()));
+        let mut client = segue_transport::connect_tcp_stream(v4_addr, Some(&bind))
+            .await
+            .unwrap_or_else(|err| panic!("dial {v4_addr} via if {index}: {err}"));
+        assert_eq!(
+            bound_if(client.as_raw_fd(), false),
+            0,
+            "loopback dial was pinned to interface {index}"
+        );
+        client.write_all(b"v4").await.unwrap();
+        let (mut accepted, _) = v4.accept().await.unwrap();
+        let mut got = [0u8; 2];
+        accepted.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"v4");
+
+        let v6 = tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let v6_addr = SocketAddr::from((Ipv6Addr::LOCALHOST, v6.local_addr().unwrap().port()));
+        let mut client = segue_transport::connect_tcp_stream(v6_addr, Some(&bind))
+            .await
+            .unwrap_or_else(|err| panic!("dial {v6_addr} via if {index}: {err}"));
+        assert_eq!(bound_if(client.as_raw_fd(), true), 0);
+        client.write_all(b"v6").await.unwrap();
+        let (mut accepted, _) = v6.accept().await.unwrap();
+        accepted.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"v6");
     }
 }
