@@ -1,6 +1,20 @@
 use super::*;
 use segue_vless_encryption::{Client, EncryptedStream};
 
+/// The pooled gRPC connection accepted the call and then closed the uplink
+/// before any byte of it was sent. The pool has marked that connection
+/// unusable; one fresh dial is the recovery grpc-go makes on `GOAWAY`.
+pub(super) fn grpc_uplink_closed(error: &CoreError) -> bool {
+    let CoreError::Io(io) = error else {
+        return false;
+    };
+    io.get_ref()
+        .and_then(|inner| inner.downcast_ref::<segue_transport::TransportError>())
+        .is_some_and(|error| {
+            matches!(error, segue_transport::TransportError::Grpc(reason) if reason == "the gRPC uplink is closed")
+        })
+}
+
 pub(super) async fn wrap(
     mut stream: BoxedTransportStream,
     client: Option<&Client>,

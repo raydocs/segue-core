@@ -16,6 +16,7 @@
 
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -161,6 +162,12 @@ pub(crate) struct H2Connection {
     /// Shared with the keepalive, which pings only a connection that has one —
     /// see [`super::keepalive`].
     calls: Arc<OpenCalls>,
+    /// Set when a call finds the uplink already gone. The driver can still be
+    /// running — h2 does not finish it until the last stream drains — and
+    /// `SendRequest::ready` can still succeed for one more call. A body write
+    /// is what notices. The pool treats that as retirement so the retry dials
+    /// again instead of handing out the same connection.
+    connection_failed: Arc<AtomicBool>,
 }
 
 impl H2Connection {
@@ -169,7 +176,11 @@ impl H2Connection {
     /// Completion is not success — see [`H2ConnectionDriver`] — so this asks
     /// whether the driver is *finished*, not whether it failed.
     pub(crate) fn is_live(&self) -> bool {
-        !self.driver.is_finished()
+        !self.connection_failed.load(Ordering::Acquire) && !self.driver.is_finished()
+    }
+
+    pub(crate) fn connection_failed_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.connection_failed)
     }
 
     pub(crate) fn has_been_idle_for(&self, duration: Duration) -> bool {
@@ -299,6 +310,7 @@ pub(crate) async fn h2_handshake(
         send_request,
         driver,
         calls,
+        connection_failed: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -537,6 +549,7 @@ pub(crate) async fn open_grpc_call(
         call.mode,
         Arc::clone(&connection.driver),
         connection.calls.open(),
+        connection.connection_failed_flag(),
     ))
 }
 

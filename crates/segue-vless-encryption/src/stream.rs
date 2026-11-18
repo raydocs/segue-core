@@ -58,7 +58,16 @@ pub struct EncryptedStream<S> {
     resumed_suite: CipherSuite,
     pub(crate) candidate: Option<Candidate>,
     lease: Option<Lease>,
+    /// Armed once the resumption hello has been handed to the carrier. Until
+    /// then a first-payload hold is not the server's silence.
     confirmation_deadline: Option<Pin<Box<Sleep>>>,
+    /// Ticket expiry from the peer. The 30s budget is measured from the hello
+    /// write and then clipped to this instant; Xray confirms a resumed session
+    /// by the first response bytes and has no separate timer.
+    ticket_expires: Option<Instant>,
+    /// `prewrite` was merged into `pending`; arm the budget when that buffer
+    /// has been written.
+    arm_confirmation: bool,
 }
 
 /// Incremental XorConn framing. The CTR state is shared with the preceding
@@ -143,6 +152,8 @@ impl<S> EncryptedStream<S> {
             candidate: None,
             lease: None,
             confirmation_deadline: None,
+            ticket_expires: None,
+            arm_confirmation: false,
         }
     }
 
@@ -185,8 +196,21 @@ impl<S> EncryptedStream<S> {
             resumed_suite: suite,
             candidate: None,
             lease: Some(lease),
-            confirmation_deadline: Some(Box::pin(tokio::time::sleep_until(confirmation_deadline))),
+            // Not armed yet: `confirmation_deadline` is the ticket expiry. The
+            // budget starts in `drain` after the hello reaches the carrier.
+            confirmation_deadline: None,
+            ticket_expires: Some(confirmation_deadline),
+            arm_confirmation: false,
         }
+    }
+
+    fn arm_confirmation_deadline(&mut self) {
+        let budget = Instant::now() + crate::handshake::HANDSHAKE_TIMEOUT;
+        let deadline = match self.ticket_expires.take() {
+            Some(expires) => budget.min(expires),
+            None => budget,
+        };
+        self.confirmation_deadline = Some(Box::pin(tokio::time::sleep_until(deadline)));
     }
 
     fn check_confirmation_deadline(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
@@ -235,9 +259,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
         if self.failed {
             return Poll::Ready(Err(invalid_data()));
         }
-        if let Err(error) = self.check_confirmation_deadline(cx) {
-            return self.fail(error);
-        }
         if output.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
@@ -259,7 +280,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
             return Poll::Ready(Err(error));
         }
         let start = output.filled().len();
-        if let Err(error) = ready!(Pin::new(&mut self.inner).poll_read(cx, output)) {
+        if let Err(error) = ready!(self.poll_carrier_read(cx, output)) {
             return self.fail(error);
         }
         if let Some(mask) = &mut self.read_mask {
@@ -326,7 +347,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
         }
         self.pending.clear();
         self.pending_pos = 0;
+        if self.arm_confirmation {
+            self.arm_confirmation = false;
+            self.arm_confirmation_deadline();
+        }
         Poll::Ready(Ok(()))
+    }
+
+    /// Reads the carrier. A due confirmation budget loses to bytes that are
+    /// already buffered: Xray treats the first authenticated record as the
+    /// confirmation, and a timer that wins the same wakeup would discard it.
+    fn poll_carrier_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Pending => match self.check_confirmation_deadline(cx) {
+                Ok(()) => Poll::Pending,
+                Err(error) => Poll::Ready(Err(error)),
+            },
+            ready => ready,
+        }
     }
 
     fn poll_flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -357,6 +399,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
             mask.apply(&mut self.pending[..5])?;
         }
         if let Some(prefix) = self.prewrite.take() {
+            self.arm_confirmation = true;
             let mut joined = Zeroizing::new(Vec::with_capacity(prefix.len() + self.pending.len()));
             joined.extend_from_slice(&prefix);
             joined.extend_from_slice(&self.pending);
@@ -392,6 +435,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
     }
 }
 
+macro_rules! carrier_read_len {
+    ($this:ident, $cx:ident, $slice:expr) => {{
+        let polled = {
+            let mut buf = ReadBuf::new($slice);
+            match Pin::new(&mut $this.inner).poll_read($cx, &mut buf) {
+                Poll::Ready(Ok(())) => Ok(buf.filled().len()),
+                Poll::Ready(Err(error)) => Err(error),
+                Poll::Pending => Ok(usize::MAX),
+            }
+        };
+        match polled {
+            Ok(usize::MAX) => {
+                return match $this.check_confirmation_deadline($cx) {
+                    Ok(()) => Poll::Pending,
+                    Err(error) => $this.fail(error),
+                };
+            }
+            Ok(n) => n,
+            Err(error) => return $this.fail(error),
+        }
+    }};
+}
+
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for EncryptedStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -401,9 +467,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for EncryptedStream<S> {
         let this = self.get_mut();
         if this.failed {
             return Poll::Ready(Err(invalid_data()));
-        }
-        if let Err(error) = this.check_confirmation_deadline(cx) {
-            return this.fail(error);
         }
         if output.remaining() == 0 {
             return Poll::Ready(Ok(()));
@@ -437,11 +500,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for EncryptedStream<S> {
             if this.read_aead.is_none() {
                 while this.server_random_pos < this.server_random.len() {
                     let start = this.server_random_pos;
-                    let mut buf = ReadBuf::new(&mut this.server_random[start..]);
-                    if let Err(error) = ready!(Pin::new(&mut this.inner).poll_read(cx, &mut buf)) {
-                        return this.fail(error);
-                    }
-                    let n = buf.filled().len();
+                    let n = carrier_read_len!(this, cx, &mut this.server_random[start..]);
                     if n == 0 {
                         return this.fail(io::Error::from(io::ErrorKind::UnexpectedEof));
                     }
@@ -463,11 +522,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for EncryptedStream<S> {
             }
             if !this.padding && this.body.is_empty() {
                 while this.header_pos < 5 {
-                    let mut buf = ReadBuf::new(&mut this.header[this.header_pos..]);
-                    if let Err(error) = ready!(Pin::new(&mut this.inner).poll_read(cx, &mut buf)) {
-                        return this.fail(error);
-                    }
-                    let n = buf.filled().len();
+                    let n = carrier_read_len!(this, cx, &mut this.header[this.header_pos..]);
                     if n == 0 {
                         if this.header_pos == 0 {
                             // EOF before the first authenticated resumed
@@ -494,11 +549,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for EncryptedStream<S> {
                 this.body_pos = 0;
             }
             while this.body_pos < this.body.len() {
-                let mut buf = ReadBuf::new(&mut this.body[this.body_pos..]);
-                if let Err(error) = ready!(Pin::new(&mut this.inner).poll_read(cx, &mut buf)) {
-                    return this.fail(error);
-                }
-                let n = buf.filled().len();
+                let n = carrier_read_len!(this, cx, &mut this.body[this.body_pos..]);
                 if n == 0 {
                     return this.fail(io::Error::from(io::ErrorKind::UnexpectedEof));
                 }
