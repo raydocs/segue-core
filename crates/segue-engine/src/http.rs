@@ -83,6 +83,10 @@ pub async fn serve_http_listener(
                     }
                 };
                 accept_backoff.reset();
+                // Go's `net.TCPConn` sets TCP_NODELAY on every accepted
+                // connection, so Xray-core's `200 Connection established`
+                // never waits for a delayed ACK.
+                let _ = stream.set_nodelay(true);
                 let accounts = Arc::clone(&accounts);
                 let inbound_tag = inbound_tag.clone();
                 let config = Arc::clone(&config);
