@@ -62,6 +62,8 @@ use tokio::task::JoinHandle;
 
 mod choice;
 pub use choice::AutoChoice;
+#[allow(dead_code)] // the connector starts using this in the next commit
+mod race;
 
 use crate::dial::{Datagrams, DialError, Dialer};
 
