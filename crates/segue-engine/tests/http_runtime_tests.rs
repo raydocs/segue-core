@@ -565,14 +565,13 @@ async fn http_runtime_refuses_udp_without_dialing_the_proxy() {
     .unwrap();
 }
 
-/// `socks-in` → `entry` carried over `hop`; the core's own `upstream-in`
-/// SOCKS inbound and Freedom stand in for a remote SOCKS server.
-fn chain_profile(entry: Value, hop: Value, upstream_port: u16) -> Value {
+/// `socks-in` → `entry` carried over `hop`; the remote SOCKS server the chain
+/// ends in is [`upstream_socks_server`], a core of its own outside this
+/// profile.
+fn chain_profile(entry: Value, hop: Value) -> Value {
     json!({
         "inbounds": [
             {"tag":"socks-in", "protocol":"socks", "listen":"127.0.0.1", "port":0,
-             "settings":{"auth":"noauth"}},
-            {"tag":"upstream-in", "protocol":"socks", "listen":"127.0.0.1", "port":upstream_port,
              "settings":{"auth":"noauth"}}
         ],
         "outbounds": [
@@ -586,16 +585,33 @@ fn chain_profile(entry: Value, hop: Value, upstream_port: u16) -> Value {
     })
 }
 
+/// The remote SOCKS server a chain's `entry` outbound ends in, with Freedom
+/// answering behind it. Its inbound binds port 0 and the real port is read
+/// back after `start`, so no parallel test's socket can take the port
+/// between picking it and binding it.
+async fn upstream_socks_server() -> (Core, u16) {
+    let profile = json!({
+        "inbounds": [
+            {"tag":"upstream-in", "protocol":"socks", "listen":"127.0.0.1", "port":0,
+             "settings":{"auth":"noauth"}}
+        ],
+        "outbounds": [{"tag":"direct", "protocol":"freedom"}]
+    });
+    let (mut core, _, _) = core(profile);
+    core.start().await.unwrap();
+    let port = core
+        .inbound_addr(Some("upstream-in"))
+        .expect("upstream-in stays bound")
+        .port();
+    (core, port)
+}
+
 #[tokio::test]
 async fn http_runtime_chains_in_both_directions() {
     timeout(DEADLINE, async {
         let (echo, _echo) = tcp_echo().await;
         let proxy = ScriptedProxy::start(Reply::Tunnel(b""), None, echo.ip()).await;
-        let upstream_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let (mut upstream, upstream_port) = upstream_socks_server().await;
         let http = |tag: &str| {
             json!({"tag":tag, "protocol":"http", "settings":{
                 "address":"127.0.0.1", "port":proxy.address.port(), "user":USER, "pass":PASS}})
@@ -615,7 +631,7 @@ async fn http_runtime_chains_in_both_directions() {
             (carried(http("entry")), socks("hop")),
         ] {
             let before = proxy.captured().len();
-            let (mut core, _, _) = core(chain_profile(entry, hop, upstream_port));
+            let (mut core, _, _) = core(chain_profile(entry, hop));
             core.start().await.unwrap();
             let socks_in = core.inbound_addr(Some("socks-in")).unwrap();
             let (mut stream, reply) = connect(socks_in, Destination::Ip(echo)).await;
@@ -631,6 +647,7 @@ async fn http_runtime_chains_in_both_directions() {
         assert!(captured[1]
             .head
             .starts_with(&format!("CONNECT {echo} HTTP/1.1\r\n")));
+        upstream.stop().await.unwrap();
     })
     .await
     .unwrap();
@@ -828,18 +845,14 @@ async fn http_runtime_hop_headers_name_the_client_the_chain_carries() {
     timeout(DEADLINE, async {
         let (echo, _echo) = tcp_echo().await;
         let proxy = ScriptedProxy::start(Reply::Tunnel(b""), None, echo.ip()).await;
-        let upstream_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let (mut upstream, upstream_port) = upstream_socks_server().await;
         let entry = json!({"tag":"entry", "protocol":"socks", "settings":{
             "address":"127.0.0.1", "port":upstream_port},
             "proxySettings": {"tag":"hop", "transportLayer":true}});
         let hop = json!({"tag":"hop", "protocol":"http", "settings":{
             "address":"127.0.0.1", "port":proxy.address.port(),
             "headers": {"X-Source": "{{.Source}}", "X-Target": "{{.Target}}"}}});
-        let (mut core, _, _) = core(chain_profile(entry, hop, upstream_port));
+        let (mut core, _, _) = core(chain_profile(entry, hop));
         core.start().await.unwrap();
         let socks_in = core.inbound_addr(Some("socks-in")).unwrap();
         let (mut stream, reply) = connect(socks_in, Destination::Ip(echo)).await;
@@ -856,6 +869,7 @@ async fn http_runtime_hop_headers_name_the_client_the_chain_carries() {
             Some(format!("tcp:{}", stream.local_addr().unwrap()).as_str())
         );
         core.stop().await.unwrap();
+        upstream.stop().await.unwrap();
     })
     .await
     .unwrap();
