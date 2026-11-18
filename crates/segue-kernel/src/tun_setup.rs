@@ -1567,7 +1567,9 @@ mod sys {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    #[cfg(target_os = "macos")]
+    use std::net::SocketAddr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn tun() -> TunAddress {
         TunAddress::default()
