@@ -1833,6 +1833,11 @@ fn build_quinn_config(
     })?;
 
     let mut transport = TransportConfig::default();
+    // quic-go's DefaultInitialRTT. The 333 ms prior makes the first probe,
+    // before a sample exists, about a second; 100 ms matches the stacks we
+    // interoperate with and keeps a lost handshake flight to a couple of
+    // hundred milliseconds.
+    transport.initial_rtt(Duration::from_millis(100));
     transport
         .max_idle_timeout(Some(idle_timeout))
         .keep_alive_interval(config.quic.keep_alive_interval)

@@ -14,9 +14,9 @@ const DIAL_DEADLINE: Duration = Duration::from_secs(10);
 /// tried, so a dead address leaves time for the next.
 const CANDIDATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 /// The last address's attempt, which is the only one for a server with one
-/// address. Quinn's first probe timeout is a second, from its 333 ms initial
-/// RTT, against quic-go's 300 ms, so three seconds carried two Initials
-/// where Xray-core's client sends four or five, and a lossy path failed.
+/// address. The first probe, before an RTT sample, is 200 ms (twice the 100 ms
+/// initial RTT, as in quic-go). Eight seconds still covers several lost
+/// Initials on a lossy path.
 const LAST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// How long the connect attempt with `remaining` addresses left, itself

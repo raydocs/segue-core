@@ -321,3 +321,16 @@ The complete 361-test library suite (313 before, plus upstream's new tests,
 including `oversized_retry_token`, `oversized_cached_initial_token`,
 `large_initial_token_leaves_room_for_close`, `max_stream_data_over_stream_limit`
 and the DATAGRAM accounting tests) passes in the reconstruction.
+
+## Loss recovery on a bursty path
+
+Before any RTT sample, the probe timeout followed `initial + 4 * (initial / 2)`,
+three times the initial RTT. quic-go uses `2 * initial` until the first sample
+(`RTTStats::PTO`), and that is what `RttEstimator::pto_base` does now.
+
+A PTO sends two datagrams. They used to leave in the same turn, so a burst of a
+few packets erased both and the next probe waited out a doubled timeout. The
+second datagram is now held for 10 ms (`LOSS_PROBE_SPACING`), long enough to
+clear that burst and far shorter than a round trip. The driver's transmit loop
+reuses one timestamp, so `poll_transmit` returns nothing until that deadline
+instead of emitting the second datagram immediately.

@@ -332,9 +332,18 @@ impl RttEstimator {
         self.min
     }
 
-    // PTO computed as described in RFC9002#6.2.1
+    // PTO computed as described in RFC9002#6.2.1.
+    //
+    // Before any sample, quic-go uses `2 * initial RTT` and ignores the
+    // speculative variance of `initial/2`. Counting that variance makes the
+    // first probe `3 * initial` (about a second at the 333 ms default) and
+    // turns one handshake loss into a multi-second stall.
     pub(crate) fn pto_base(&self) -> Duration {
-        self.get() + cmp::max(4 * self.var, TIMER_GRANULARITY)
+        if self.smoothed.is_none() {
+            self.latest.saturating_mul(2)
+        } else {
+            self.get() + cmp::max(4 * self.var, TIMER_GRANULARITY)
+        }
     }
 
     pub(crate) fn update(&mut self, ack_delay: Duration, rtt: Duration) {
