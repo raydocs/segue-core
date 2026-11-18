@@ -27,6 +27,7 @@ use segue_kernel::dial::{DialError, Dialer, EngineDialer, Stream};
 use segue_kernel::rules::{Action, RuleSet};
 use segue_kernel::session::{Exit, KernelDialer, SegueRoute};
 use segue_kernel::socks::{serve, Kernel, REP_OK};
+use segue_kernel::tun_setup::InterfaceBind;
 use segue_relay::cidr::Cidr;
 use segue_relay::config::Config;
 use segue_relay::dial::Resolver;
@@ -35,7 +36,7 @@ use segue_relay::server::{serve as serve_relay, Relay};
 use segue_relay::system_clock;
 use segue_relay::ticket::{generate_pkcs8, Claims, ExitClass, Signer};
 use segue_session::pool::Pool;
-use segue_transport::TransportDialer;
+use segue_transport::{SocketHandle, SocketProtector, TransportDialer};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -710,4 +711,129 @@ async fn direct_path_breaks_on_the_same_cut() {
         "direct app connection ended cleanly ({:?}) instead of breaking",
         out.end
     );
+}
+
+/// Counts `protect` calls and forwards the real NIC bind, including the
+/// loopback exemption. A carrier to `127.0.0.1` must not be pinned: the
+/// physical NIC has no route there, and off macOS the bind is an error.
+struct CountingBind {
+    inner: InterfaceBind,
+    calls: AtomicUsize,
+}
+
+impl SocketProtector for CountingBind {
+    fn protect(&self, socket: SocketHandle) -> io::Result<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.protect(socket)
+    }
+
+    fn protects_destination(&self, dest: IpAddr) -> bool {
+        self.inner.protects_destination(dest)
+    }
+}
+
+fn physical_interface_index() -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0 as libc::c_char; libc::IFNAMSIZ];
+        for index in 1..128u32 {
+            buf.fill(0);
+            // SAFETY: buf is IFNAMSIZ bytes, which is what if_indextoname writes.
+            let rc = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
+            if rc.is_null() {
+                continue;
+            }
+            let bytes: Vec<u8> = buf
+                .iter()
+                .take_while(|c| **c != 0)
+                .map(|c| *c as u8)
+                .collect();
+            let name = String::from_utf8_lossy(&bytes);
+            if !name.starts_with("lo") {
+                return index;
+            }
+        }
+        panic!("no non-loopback interface; cannot prove the loopback carrier stays unbound");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // protect() is an error for a non-zero index. The loopback rule must
+        // skip it, or the carrier dial fails with "IP_BOUND_IF is macOS-only".
+        1
+    }
+}
+
+fn protected_freedom_carrier(bind: Arc<CountingBind>) -> Arc<dyn Dialer> {
+    let mut specs = BTreeMap::new();
+    specs.insert("tcp".to_owned(), json!({"protocol": "freedom"}));
+    let transport = Arc::new(
+        TransportDialer::system_with_socket_protector(Some(bind)).expect("protected transport"),
+    );
+    let engine = EngineDialer::with_transport_dialer(&specs, transport).expect("freedom outbound");
+    Arc::new(engine)
+}
+
+async fn serve_echo() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 32];
+                let Ok(n) = sock.read(&mut buf).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                let _ = sock.write_all(&buf[..n]).await;
+            });
+        }
+    });
+    addr
+}
+
+/// A kernel session to a segue-relay on `127.0.0.1`, with the tun protector
+/// installed, must connect. No root and no utun: the carrier is loopback, so
+/// it is not bound to the physical NIC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_session_reaches_a_loopback_relay() {
+    let origin = serve_echo().await;
+    let env = relay_env();
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay_listener.local_addr().unwrap();
+    assert!(relay_addr.ip().is_loopback(), "{relay_addr}");
+    let (stop, stop_rx) = watch::channel(false);
+    let relay = env.relay.clone();
+    tokio::spawn(async move {
+        serve_relay(relay, relay_listener, stop_rx).await;
+    });
+    let bind = Arc::new(CountingBind {
+        inner: InterfaceBind::new(physical_interface_index()),
+        calls: AtomicUsize::new(0),
+    });
+    let dialer = session_dialer(
+        protected_freedom_carrier(bind.clone()),
+        relay_addr,
+        ticket(&env),
+    );
+    let socks = spawn_socks(dialer, "ov").await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut conn = socks_connect(socks, "echo.test", origin.port()).await;
+        conn.write_all(b"ping\n").await.unwrap();
+        let mut got = [0u8; 5];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ping\n");
+    })
+    .await
+    .expect("loopback session timed out");
+    assert_eq!(
+        bind.calls.load(Ordering::SeqCst),
+        0,
+        "session carrier to {relay_addr} was pinned to the physical NIC"
+    );
+    let _ = stop.send(true);
 }

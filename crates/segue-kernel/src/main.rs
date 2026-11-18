@@ -122,6 +122,16 @@ fn run_kernel(args: &RunArgs) -> Result<Code, RunFailure> {
         let path = args.log.as_deref().unwrap_or(Path::new("-"));
         RunFailure::config(format!("log {}: {e}", path.display()))
     })?;
+    let result = run_loaded(args, &log);
+    if let Err(failure) = &result {
+        // stderr still comes from main. --log used to miss this: tun setup
+        // exits 4 after the policy lines, and the helper only reads the file.
+        log.record(failure);
+    }
+    result
+}
+
+fn run_loaded(args: &RunArgs, log: &Log) -> Result<Code, RunFailure> {
     let text = std::fs::read_to_string(&args.config)
         .map_err(|e| RunFailure::config(format!("{}: {e}", args.config.display())))?;
     let base = args.config.parent().unwrap_or(Path::new("."));
@@ -135,7 +145,7 @@ fn run_kernel(args: &RunArgs) -> Result<Code, RunFailure> {
         .enable_all()
         .build()
         .map_err(|e| RunFailure::runtime(format!("runtime: {e}")))?;
-    runtime.block_on(run_session(&config, &log))
+    runtime.block_on(run_session(&config, log))
 }
 
 async fn run_session(config: &KernelConfig, log: &Log) -> Result<Code, RunFailure> {
