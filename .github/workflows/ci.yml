@@ -601,8 +601,16 @@ jobs:
             [[ $try == 3 ]] && exit 1
             sleep 10
           done
+          # Not the linux-image-generic metapackage: it depends on ~0.5 GB of
+          # linux-firmware-* that a VM boot never reads, and one slow mirror
+          # took 17 min for a single firmware .deb. Install the versioned image
+          # and its modules only.
+          image="$(apt-cache depends linux-image-generic | grep -oE 'linux-image-[0-9][^ ]*-generic' | head -n 1)"
+          test -n "$image"
+          version="${image#linux-image-}"
+          echo "kernel package: $image"
           sudo DEBIAN_FRONTEND=noninteractive timeout 1200 apt-get "${apt_opts[@]}" install -y -q --no-install-recommends \
-            qemu-system-x86 virtme-ng linux-image-generic iptables iproute2 busybox-static
+            qemu-system-x86 virtme-ng "$image" "linux-modules-$version" iptables iproute2 busybox-static
           sudo chown -R "$USER" ~/apt-archives
           kernel="$(ls /boot/vmlinuz-*-generic | sort -V | tail -n 1)"
           test -n "$kernel"

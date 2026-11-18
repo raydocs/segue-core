@@ -8,15 +8,23 @@
 //! `proxy/shadowsocks/client.go:118-131`,
 //! `proxy/shadowsocks_2022/outbound.go:130-150`). Writing the header eagerly
 //! instead gives the first record a fixed, header-only size.
+//!
+//! VLESS does not keep that 500 ms wait. A server-first download never
+//! writes, and the server cannot speak until the request arrives, so the
+//! wait was the whole time-to-first-byte. [`FirstPayloadDeadline::for_vless`]
+//! still shares a write with a payload that is already buffered, and sends
+//! the header alone on the following read otherwise. Vision pads an empty
+//! frame then, the same bytes Xray-core sends when its wait expires.
 use super::*;
 use std::future::Future;
 use std::task::ready;
 use tokio::time::Sleep;
 
-/// Xray-core's VLESS wait for the first payload
-/// (`ReadMultiBufferTimeout(time.Millisecond * 500)`).
-pub(super) const VLESS_FIRST_PAYLOAD_WAIT: Duration = Duration::from_millis(500);
 /// Xray-core's Trojan wait (`buf.CopyOnceTimeout(..., time.Millisecond*100)`).
+/// Xray-core's VLESS `ReadMultiBufferTimeout`. Kept only for the reverse
+/// tunnel request, where setup latency does not matter and the bridge stays
+/// byte- and timing-identical to Xray-core's.
+pub(super) const VLESS_REVERSE_FIRST_PAYLOAD_WAIT: Duration = Duration::from_millis(500);
 pub(super) const TROJAN_FIRST_PAYLOAD_WAIT: Duration = Duration::from_millis(100);
 /// Xray-core's VMess wait, the same for every command
 /// (`buf.CopyOnceTimeout(input, bodyWriter, time.Millisecond*100)`).
@@ -171,47 +179,99 @@ impl TransportStream for HeldHeader {
     }
 }
 
+/// How a held header decides that no payload is coming.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// Xray-core's bounded wait. The read proceeds; the header leaves when
+    /// the sleep ends.
+    Timer,
+    /// VLESS: one read poll yields so the relay can poll its upload first.
+    Yield,
+    /// That yield happened and nothing was written. The next read sends.
+    Send,
+    /// `on_timeout` has run; the header is being flushed.
+    Flushing,
+    /// A write, flush or shutdown took the header, or it has already left.
+    Off,
+}
+
 /// Outer wrapper that bounds how long a held header waits for a payload.
 ///
-/// The relay polls reads from the start, so the deadline is driven from
-/// `poll_read`: once it expires without a write, `on_timeout` runs (Vision
-/// queues its empty padding frame there) and the stream is flushed, which
-/// sends the held header. Any write, flush or shutdown disarms it.
+/// The relay polls reads from the start, so the decision is driven from
+/// `poll_read`: once the wait is over without a write, `on_timeout` runs
+/// (Vision queues its empty padding frame there) and the stream is flushed,
+/// which sends the held header. Any write, flush or shutdown disarms it.
+///
+/// [`Self::for_vless`] does not sleep. The first read only yields, so a
+/// payload already buffered on the upload half of the same relay shares the
+/// header's write. The next read, still with no write, sends the header.
 pub(super) struct FirstPayloadDeadline<S> {
     inner: S,
-    deadline: Option<Pin<Box<Sleep>>>,
+    sleep: Option<Pin<Box<Sleep>>>,
+    hold: Hold,
     on_timeout: fn(&mut S) -> io::Result<()>,
-    flushing: bool,
 }
 
 impl<S> FirstPayloadDeadline<S> {
     pub(super) fn new(inner: S, wait: Duration, on_timeout: fn(&mut S) -> io::Result<()>) -> Self {
         Self {
             inner,
-            deadline: Some(Box::pin(tokio::time::sleep(wait))),
+            sleep: Some(Box::pin(tokio::time::sleep(wait))),
+            hold: Hold::Timer,
             on_timeout,
-            flushing: false,
+        }
+    }
+
+    /// VLESS. See [`Hold::Yield`].
+    pub(super) fn for_vless(inner: S, on_timeout: fn(&mut S) -> io::Result<()>) -> Self {
+        Self {
+            inner,
+            sleep: None,
+            hold: Hold::Yield,
+            on_timeout,
         }
     }
 
     fn disarm(&mut self) {
-        self.deadline = None;
-        self.flushing = false;
+        self.sleep = None;
+        self.hold = Hold::Off;
     }
 }
 
 impl<S: TransportStream> FirstPayloadDeadline<S> {
     fn poll_expired(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(deadline) = &mut self.deadline {
-            if deadline.as_mut().poll(cx).is_ready() {
-                self.deadline = None;
-                (self.on_timeout)(&mut self.inner)?;
-                self.flushing = true;
+        match self.hold {
+            Hold::Off => return Poll::Ready(Ok(())),
+            Hold::Yield => {
+                self.hold = Hold::Send;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
+            Hold::Send => {
+                // Drop the hold before `on_timeout` so a failure cannot
+                // queue Vision's empty frame twice.
+                self.hold = Hold::Off;
+                (self.on_timeout)(&mut self.inner)?;
+                self.hold = Hold::Flushing;
+            }
+            Hold::Timer => {
+                let ready = match self.sleep.as_mut() {
+                    Some(sleep) => sleep.as_mut().poll(cx).is_ready(),
+                    None => true,
+                };
+                if !ready {
+                    return Poll::Ready(Ok(()));
+                }
+                self.sleep = None;
+                self.hold = Hold::Off;
+                (self.on_timeout)(&mut self.inner)?;
+                self.hold = Hold::Flushing;
+            }
+            Hold::Flushing => {}
         }
-        if self.flushing {
+        if self.hold == Hold::Flushing {
             ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
-            self.flushing = false;
+            self.hold = Hold::Off;
         }
         Poll::Ready(Ok(()))
     }
@@ -272,8 +332,8 @@ impl<S: TransportStream> TransportStream for FirstPayloadDeadline<S> {
 
     #[cfg(target_os = "linux")]
     fn raw_read(&mut self) -> segue_transport::RawRead<'_> {
-        // Reads drive the deadline and the flush that follows it.
-        if self.deadline.is_some() || self.flushing {
+        // Reads drive the hold and the flush that follows it.
+        if self.hold != Hold::Off {
             return segue_transport::RawRead::NotYet;
         }
         self.inner.raw_read()
@@ -400,26 +460,81 @@ mod tests {
         assert_eq!(writes.lock().unwrap().len(), 2);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn header_is_sent_alone_only_after_the_wait_expires() {
-        let (mut stream, writes) = held(VLESS_FIRST_PAYLOAD_WAIT);
-        let mut byte = [0; 1];
-        let early = VLESS_FIRST_PAYLOAD_WAIT - Duration::from_millis(1);
-        assert!(tokio::time::timeout(early, stream.read(&mut byte))
-            .await
-            .is_err());
-        assert!(writes.lock().unwrap().is_empty());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(2), stream.read(&mut byte))
-                .await
-                .is_err()
+    fn vless_held() -> (FirstPayloadDeadline<HeldHeader>, Writes) {
+        let recorder = Recorder::default();
+        let writes = recorder.writes.clone();
+        let stream = FirstPayloadDeadline::for_vless(
+            HeldHeader::new(Box::new(recorder), HEADER),
+            flush_header_alone,
         );
+        (stream, writes)
+    }
+
+    fn poll_now<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        Pin::new(future).poll(&mut context)
+    }
+
+    /// A server-first read sends the header on the poll after the yield, not
+    /// after 500 ms. The first poll must not send: the relay still has to
+    /// poll its upload.
+    #[tokio::test]
+    async fn vless_read_without_a_payload_sends_the_header_on_the_next_poll() {
+        let (mut stream, writes) = vless_held();
+        let mut byte = [0; 1];
+        let mut read = std::pin::pin!(stream.read(&mut byte));
+        assert!(poll_now(&mut read).is_pending());
+        assert!(writes.lock().unwrap().is_empty(), "the yield must not send");
+        assert!(poll_now(&mut read).is_pending());
         assert_eq!(*writes.lock().unwrap(), [HEADER.to_vec()]);
         stream.write_all(b"late payload").await.unwrap();
         assert_eq!(
             *writes.lock().unwrap(),
             [HEADER.to_vec(), b"late payload".to_vec()]
         );
+    }
+
+    /// A payload written before any read still shares the header's write, and
+    /// a later read does not send a second copy.
+    #[tokio::test]
+    async fn vless_payload_written_before_the_read_shares_the_header() {
+        let (mut stream, writes) = vless_held();
+        stream.write_all(b"first payload").await.unwrap();
+        stream.flush().await.unwrap();
+        assert_eq!(
+            *writes.lock().unwrap(),
+            [b"request-headerfirst payload".to_vec()]
+        );
+        let mut byte = [0; 1];
+        let mut read = std::pin::pin!(stream.read(&mut byte));
+        assert!(poll_now(&mut read).is_pending());
+        assert!(poll_now(&mut read).is_pending());
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "the read must not send again"
+        );
+    }
+
+    /// The relay polls the download first. That poll yields; a payload
+    /// already waiting on the upload half then shares the header's write.
+    #[tokio::test]
+    async fn vless_payload_ready_on_the_other_half_shares_the_header() {
+        let (stream, writes) = vless_held();
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let mut byte = [0; 1];
+        let mut read = std::pin::pin!(reader.read(&mut byte));
+        assert!(poll_now(&mut read).is_pending());
+        assert!(writes.lock().unwrap().is_empty(), "the yield must not send");
+        writer.write_all(b"first payload").await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(
+            *writes.lock().unwrap(),
+            [b"request-headerfirst payload".to_vec()]
+        );
+        assert!(poll_now(&mut read).is_pending());
+        assert_eq!(writes.lock().unwrap().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -443,13 +558,12 @@ mod tests {
     fn vision(recorder: Recorder) -> FirstPayloadDeadline<VisionOutboundStream> {
         let carrier: BoxedTransportStream = Box::new(HeldHeader::new(Box::new(recorder), HEADER));
         let stream = VlessResponseStream::new(VisionTransportStream::new(carrier));
-        FirstPayloadDeadline::new(
+        FirstPayloadDeadline::for_vless(
             VisionOutboundStream::new(VisionStream::new(
                 stream,
                 [7; 16],
                 segue_proxy::vless::DEFAULT_VISION_SEED,
             )),
-            VLESS_FIRST_PAYLOAD_WAIT,
             |stream| stream.inner.queue_empty_padding_frame(),
         )
     }
@@ -471,16 +585,16 @@ mod tests {
         assert_eq!(writes[0][VISION_PREFIX..][..12], *b"client hello");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn vision_timeout_pads_an_empty_frame_behind_the_header() {
+    #[tokio::test]
+    async fn vision_read_without_a_payload_pads_an_empty_frame_behind_the_header() {
         let recorder = Recorder::default();
         let writes = recorder.writes.clone();
         let mut stream = vision(recorder);
         let mut byte = [0; 1];
-        let wait = VLESS_FIRST_PAYLOAD_WAIT + Duration::from_millis(1);
-        assert!(tokio::time::timeout(wait, stream.read(&mut byte))
-            .await
-            .is_err());
+        let mut read = std::pin::pin!(stream.read(&mut byte));
+        assert!(poll_now(&mut read).is_pending());
+        assert!(writes.lock().unwrap().is_empty(), "the yield must not send");
+        assert!(poll_now(&mut read).is_pending());
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
         assert!(writes[0].starts_with(HEADER));
