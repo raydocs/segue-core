@@ -4971,9 +4971,9 @@ const PROFILE_44: UtlsClientHelloProfile = UtlsClientHelloProfile {
 /// Resolves a fingerprint name to the ClientHello shape it stands for.
 ///
 /// `random` and `randomized` do not name a fixed shape. Xray's `init()` draws
-/// one of `ModernFingerprints` from `crypto/rand` at process start and pins it
-/// for the process's lifetime, so those names mean a different real browser on
-/// every install; this reproduces that. Both properties matter, and they pull
+/// one X25519MLKEM768 fingerprint from `crypto/rand` at process start and pins
+/// it for the process's lifetime, so those names mean a different real browser
+/// on every install; this reproduces that (PR #7432). Both properties matter, and they pull
 /// in opposite directions: a name that never varies gives our whole user base
 /// one shared signature, while a name that varies *between connections* makes
 /// a single client stand out more than a fixed one ever would. Hence one draw,
@@ -4991,24 +4991,18 @@ pub(crate) fn profile_for_fingerprint(
     }
 }
 
-/// REALITY has its own cached draws so every choice meets the new server's
-/// hybrid key-share requirement. Ordinary TLS retains the full browser pool.
+/// REALITY keeps its own cached draws, independent of the plain-TLS pin, but
+/// both draw from the X25519MLKEM768 subset. Xray's `init()` fills the two
+/// map entries from two draws of that one pool (PR #7432).
 pub(crate) fn reality_profile_for_fingerprint(
     fingerprint: &str,
 ) -> Option<&'static UtlsClientHelloProfile> {
     let fingerprint = segue_utls::normalize_reality_supported_fingerprint(fingerprint)?;
     static RANDOM: OnceLock<&'static str> = OnceLock::new();
     static RANDOMIZED: OnceLock<&'static str> = OnceLock::new();
-    let draw = || {
-        let names = segue_utls::XRAY_REALITY_MODERN_FINGERPRINTS;
-        let mut entropy = [0u8; 8];
-        let _ = OsRng.try_fill_bytes(&mut entropy);
-        let index = (u128::from(u64::from_be_bytes(entropy)) * names.len() as u128) >> 64;
-        names[index as usize]
-    };
     named_profile(match fingerprint {
-        "random" => RANDOM.get_or_init(draw),
-        "randomized" => RANDOMIZED.get_or_init(draw),
+        "random" => RANDOM.get_or_init(draw_modern_fingerprint),
+        "randomized" => RANDOMIZED.get_or_init(draw_modern_fingerprint),
         name => name,
     })
 }
@@ -5029,13 +5023,16 @@ fn process_randomized_fingerprint() -> &'static str {
     DRAWN.get_or_init(draw_modern_fingerprint)
 }
 
-/// Draws one of Xray's `ModernFingerprints` from the OS CSPRNG.
+/// Draws one X25519MLKEM768 fingerprint from the OS CSPRNG.
 ///
 /// Every call is an independent draw. Production code reaches the *cached*
 /// draw through `fingerprint: "random"`; this is public so tests can sample
-/// the distribution without spawning processes.
+/// the distribution without spawning processes. The candidate list is the
+/// post-quantum subset of Xray's `ModernFingerprints` (PR #7432), not the
+/// whole table: a process-lifetime pin without the hybrid share cannot dial
+/// a current REALITY server, and named non-PQ fingerprints still resolve.
 pub fn draw_modern_fingerprint() -> &'static str {
-    let names = segue_utls::XRAY_MODERN_FINGERPRINTS;
+    let names = segue_utls::XRAY_REALITY_MODERN_FINGERPRINTS;
     let mut entropy = [0u8; 8];
     if OsRng.try_fill_bytes(&mut entropy).is_err() {
         // Xray discards this error too -- `bigInt, _ := rand.Int(...)` leaves
@@ -5048,14 +5045,14 @@ pub fn draw_modern_fingerprint() -> &'static str {
     modern_fingerprint_at(u64::from_be_bytes(entropy))
 }
 
-/// Maps 64 bits of entropy onto the name table.
+/// Maps 64 bits of entropy onto the post-quantum name table.
 ///
-/// Multiply-shift rather than `% len`: 12 has the factor 3, which divides no
-/// power of two, so a modulo would make the first names likelier than the last. This
-/// keeps the skew under `len / 2^64` -- around 6e-19 -- and, unlike the
-/// rejection sampling an exactly-uniform draw needs, it cannot loop.
+/// Multiply-shift rather than `% len`: the pool length is not a power of two,
+/// so a modulo would make the first names likelier than the last. This keeps
+/// the skew under `len / 2^64` and, unlike the rejection sampling an
+/// exactly-uniform draw needs, it cannot loop.
 fn modern_fingerprint_at(entropy: u64) -> &'static str {
-    let names = segue_utls::XRAY_MODERN_FINGERPRINTS;
+    let names = segue_utls::XRAY_REALITY_MODERN_FINGERPRINTS;
     let index = (u128::from(entropy) * names.len() as u128) >> 64;
     names[index as usize]
 }

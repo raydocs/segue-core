@@ -90,14 +90,15 @@ pub const XRAY_UTLS_FINGERPRINTS: &[&str] = &[
 /// Xray's `ModernFingerprints` (`transport/internet/tls/tls.go`), in Xray's
 /// own source order.
 ///
-/// This is the set `fingerprint: "random"` draws from. Xray's `init()` picks
-/// one member with `crypto/rand` at process start and pins it for the
-/// process's lifetime, so the name resolves to a different real browser on
-/// every install.
-///
-/// Plain TLS keeps this complete upstream pool. REALITY uses the smaller
-/// [`XRAY_REALITY_MODERN_FINGERPRINTS`] pool because the new server rejects
-/// older key shares that are still valid for ordinary TLS.
+/// Xray's `init()` used to pick `fingerprint: "random"` from this whole list.
+/// PR #7432 (open against Xray-core, the post-quantum shaping follow-up)
+/// moves every member that does not carry X25519MLKEM768 into
+/// `OtherFingerprints`, so `random` and `randomized` draw only from
+/// [`XRAY_REALITY_MODERN_FINGERPRINTS`]. Named fingerprints outside that
+/// subset still resolve: a config that asks for `hellofirefox_120` gets it.
+/// Plain TLS and REALITY share the restricted draw, because Xray fills both
+/// map entries from the one reduced pool and a process-lifetime pin that
+/// misses the hybrid share cannot dial a current REALITY server at all.
 pub const XRAY_MODERN_FINGERPRINTS: &[&str] = &[
     "hellofirefox_120",
     "hellofirefox_148",
@@ -553,6 +554,40 @@ mod tests {
     #[test]
     fn modern_fingerprints_match_xrays_table_size() {
         assert_eq!(XRAY_MODERN_FINGERPRINTS.len(), 12);
+    }
+
+    /// Xray PR #7432: `random` draws only fingerprints whose ClientHello
+    /// carries X25519MLKEM768. The other seven modern names stay selectable
+    /// by name and are not candidates.
+    #[test]
+    fn random_draw_pool_is_only_x25519mlkem768_fingerprints() {
+        const WITH_HYBRID: &[&str] = &[
+            "hellofirefox_148",
+            "hellochrome_131",
+            "hellochrome_133",
+            "hellochrome_155",
+            "hellosafari_26_3",
+        ];
+        const WITHOUT_HYBRID: &[&str] = &[
+            "hellofirefox_120",
+            "hellochrome_120",
+            "helloios_13",
+            "helloios_14",
+            "helloedge_106",
+            "hello360_11_0",
+            "helloqq_11_1",
+        ];
+
+        assert_eq!(XRAY_REALITY_MODERN_FINGERPRINTS, WITH_HYBRID);
+        for name in WITH_HYBRID {
+            assert!(is_reality_fingerprint_hybrid(name), "{name}");
+        }
+        for name in WITHOUT_HYBRID {
+            assert!(XRAY_MODERN_FINGERPRINTS.contains(name), "{name}");
+            assert!(!is_reality_fingerprint_hybrid(name), "{name}");
+            assert!(!XRAY_REALITY_MODERN_FINGERPRINTS.contains(name), "{name}");
+            assert_eq!(normalize_utls_fingerprint(name), Some(*name), "{name}");
+        }
     }
 
     #[test]

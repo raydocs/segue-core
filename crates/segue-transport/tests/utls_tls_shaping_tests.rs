@@ -759,26 +759,43 @@ mod utls_tls_shaping_tests {
     /// hand our whole user base one shared signature -- the opposite of what
     /// the name promises.
     ///
-    /// A thousand draws from eleven names leave a given name unseen with
-    /// probability `(10/11)^1000`, about `4e-42`, so requiring all eleven is
-    /// not a flaky assertion; it is how a stuck draw gets caught.
+    /// PR #7432 keeps only the fingerprints that carry X25519MLKEM768. A
+    /// thousand draws from five names leave a given name unseen with
+    /// probability `(4/5)^1000`, about `1e-97`, so requiring all five is not
+    /// a flaky assertion; it is how a stuck draw, or one that still reaches
+    /// a non-PQ name, gets caught.
     #[test]
-    fn the_random_draw_covers_every_modern_fingerprint() {
+    fn the_random_draw_covers_only_x25519mlkem768_fingerprints() {
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..1000 {
             let drawn = segue_transport::draw_modern_fingerprint();
             assert!(
-                segue_utls::XRAY_MODERN_FINGERPRINTS.contains(&drawn),
-                "drew {drawn}, which is not one of Xray's ModernFingerprints"
+                segue_utls::XRAY_REALITY_MODERN_FINGERPRINTS.contains(&drawn),
+                "drew {drawn}, which has no X25519MLKEM768 share"
+            );
+            assert!(
+                segue_utls::is_reality_fingerprint_hybrid(drawn),
+                "{drawn} is not a hybrid fingerprint"
             );
             seen.insert(drawn);
         }
 
         assert_eq!(
             seen.len(),
-            segue_utls::XRAY_MODERN_FINGERPRINTS.len(),
-            "every modern fingerprint must be reachable, saw {seen:?}"
+            segue_utls::XRAY_REALITY_MODERN_FINGERPRINTS.len(),
+            "every PQ fingerprint must be reachable, saw {seen:?}"
         );
+        for excluded in [
+            "hellofirefox_120",
+            "hellochrome_120",
+            "helloios_13",
+            "helloios_14",
+            "helloedge_106",
+            "hello360_11_0",
+            "helloqq_11_1",
+        ] {
+            assert!(!seen.contains(excluded), "drew non-PQ {excluded}");
+        }
     }
 
     /// Two connections on one fixed name must reduce to one shape, or the
@@ -823,7 +840,7 @@ mod utls_tls_shaping_tests {
     /// on its own -- a real browser shape, not a synthesized one.
     #[test]
     fn random_names_resolve_to_a_modern_fingerprints_shape() {
-        let candidates = segue_utls::XRAY_MODERN_FINGERPRINTS
+        let candidates = segue_utls::XRAY_REALITY_MODERN_FINGERPRINTS
             .iter()
             .map(|fingerprint| shape_of(fingerprint))
             .collect::<Vec<_>>();
