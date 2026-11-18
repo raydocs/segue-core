@@ -389,7 +389,7 @@ pub const DEFAULT_FAKE_IP_EXEMPT_DOMAINS: &[&str] = &[
     "domain:local",
 ];
 
-/// The compiled form of [`DEFAULT_FAKE_IP_EXEMPT_DOMAINS`].
+/// The compiled form of the built-in `DEFAULT_FAKE_IP_EXEMPT_DOMAINS` list.
 pub fn default_fake_ip_exempt_domains() -> DomainMatcherSet {
     let matchers: Vec<DomainMatcher> = DEFAULT_FAKE_IP_EXEMPT_DOMAINS
         .iter()
