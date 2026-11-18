@@ -2151,6 +2151,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls",
+ "segue-bench",
  "segue-config",
  "segue-engine",
  "segue-policy",
