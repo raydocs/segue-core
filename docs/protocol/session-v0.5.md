@@ -426,3 +426,192 @@ quiet without closing must not pin what admission needs" (`flow.rs:508-516`,
 `update_credit` `flow.rs:747-766`). Under pressure (`under_pressure`,
 `pool.rs:222`) a receiver's desired credit is capped at the pool's fair share
 (`pool.rs:229`, `flow.rs:742-744`).
+
+## 5. State machines (spec §5)
+
+Timers carry the spec's own defaults; the spec marks its §5 timers
+"待仿真" ("to be simulated") and the `Timing` struct holds exactly those
+defaults (`crates/segue-session/src/lib.rs:45-135`):
+
+| timer | default | meaning (citing line) |
+|-------|---------|------------------------|
+| `t_attach` | 2 s | client: give up one attach attempt, retry on a new carrier (`lib.rs:48-49`) |
+| `t_stall` | 1 s | client: unacked data and nothing received → re-attach (KERNEL_SPEC §7.2 数据停滞, `max(1 s, 4×SRTT)`; SRTT not modelled, `lib.rs:50-52`) |
+| `t_live` | 3 s | relay: unacked downlink, no ACK progress → DETACHED (`lib.rs:53-54`) |
+| `t_detached` | 30 s | both: how long a session may live without a working carrier (`lib.rs:55-56`) |
+| `t_open_retry` | 15 s | client: how long OPEN may be retried before the local connection is reset (`lib.rs:57-58`) |
+| `t_tomb` | 60 s | relay: tombstone lifetime (`lib.rs:59-60`) |
+| `ack_delay` | 20 ms | delayed-ACK floor (`lib.rs:61-62`) |
+| `idle_after` | 1 s | receive credit falls back to the floor after this idle (`lib.rs:63-64`) |
+| `max_lifetime` | 24 h | relay: absolute lifetime from OPEN; RESUME does not extend it (§5.2 "会话超过最长寿命 → RST(max_lifetime)", `lib.rs:65-67`) |
+| `t_ctrl_idle` | 30 s | relay: control stream closed after this with no frame (`lib.rs:68-72`) |
+| `site_flush_idle` / `site_flush_max` | 30 s / 300 s | relay: bounds on handing the upload tail to the site; past either the session is reset (`site_reset`), never CLEAN (`lib.rs:73-82`) |
+
+Client configuration is validated: `t_stall` ≥ 100 ms (`MIN_CLIENT_STALL`,
+`lib.rs:89-92`, r10 N3) and its milliseconds must fit the wire field
+(`validate_client`, `lib.rs:107-125`). The client sends `t_stall` as
+`t_stall_ms`; the relay keeps a stalled session alive with keepalive ACKs at
+half the **shorter** of its own and the announced bound, never below the
+100 ms floor, so "a peer cannot make the relay send ACKs in a loop"
+(`relay.rs:874-885`, `lib.rs:83-92`).
+
+### 5.1 Channel health and channel death (§5.1 通道判死)
+
+Sessions multiplex over a *channel* (control stream + carriers) to one relay.
+A `STALL` for `(session_id, attach_gen)` from the control stream moves that
+session to a new carrier at once — the relay holds unacknowledged data for it
+(B1, `client.rs:481-491`). A control stream that answers nothing for
+`dead_after`, or breaks after being accepted, means "the channel is dead,
+move every session of that exit" (`ControlHint::Dead`, `driver.rs:1813-1831`;
+kernel wiring `crates/segue-kernel/src/session/mod.rs:32-37`). Without the
+STALL half "a download-only session has nothing unacknowledged upstream and
+would never notice the stall" (`mod.rs:36-37`).
+
+### 5.2 Relay session table (§5.2)
+
+States per session (`SessionState`, `relay.rs:104-108`):
+`Connecting → Active ⇄ Detached`, plus a **tombstone** after any end.
+
+- **OPEN** creates the entry in `Connecting` and asks the caller (event
+  `Connect`) to dial the site exactly once per session (A2): "the session
+  entry exists before the connect starts, so an OPEN retry or a duplicate
+  OPEN that arrives while connecting finds it" (`relay.rs:4-7`,
+  `on_first` `relay.rs:540-566`). The site connect carries *that OPEN's* grant,
+  so "a site connect is decided by the ticket of its own OPEN, never by
+  per-device state another OPEN or RESUME may have changed" (`relay.rs:35-42`).
+- **`connect_done(Ok)`** → `Active` (or `Detached` if the carrier was already
+  lost); `connect_done(Err(code))` ends the session with that code and RST
+  (`relay.rs:727-750`). Because OPENED is sent only after the site connect
+  worked, "the app gets success only after the relay answered OPENED"
+  (`crates/segue-kernel/src/session/mod.rs:17-20`) — a refused session is a
+  dial error at the front end, never retried direct.
+- **DETACHED:** the carrier is gone (closed, decode error, or superseded by a
+  newer generation). The session survives `t_detached`; while DETACHED the
+  relay stops reading the site (`site_read_capacity` returns 0, `relay.rs:916-921`)
+  but keeps buffering downlink. `t_live` with unacked downlink and no ACK
+  progress also marks DETACHED and emits `RelayEvent::Stall` + STALL frames on
+  the device's control streams (B1, `relay.rs:1078-1090`).
+- **Re-attach:** the first frame on a new carrier must be RESUME (or an OPEN
+  retry); after tomb/instance/secret/ticket/generation checks the table
+  performs the atomic `switch` (§4.4) and answers RESUMED (`on_first`
+  `relay.rs:567-627`, `switch` `relay.rs:629-670`).
+- **Ends:** any end writes a **tombstone** `{close_code, final_recv_offset,
+  final_sent_offset}` kept for `t_tomb`, so a late re-attach of an ended
+  session gets `REJECT(closed)` with the final offsets instead of
+  `unknown_session` (`finish` `relay.rs:753-776`; `code::CLEAN` note
+  `codec.rs:100-103`). Timeouts: `max_lifetime` from OPEN → `RST(max_lifetime)`
+  ("RESUME does not extend it"); DETACHED longer than `t_detached` →
+  `close(idle)`; site reset → tombstone `site_reset` (`handle_timeout`
+  `relay.rs:1056-1112`, `site_reset` `relay.rs:936-942`).
+- **Upload drain honesty:** with `confirm_site_flush(true)` (the driver's
+  production mode) the client's FIN is acknowledged only after the site took
+  every uploaded byte and the write side was shut down; a site that fails or
+  never finishes is reset, "so a truncated upload is never reported clean"
+  (`relay.rs:255-273`, `site_flushed` `relay.rs:964-976`,
+  `held_fin` handling `relay.rs:672-700`; tests
+  `crates/segue-session/tests/driver.rs:800`, `driver.rs:1245-1270`).
+
+### 5.3 Client session (§5.3)
+
+States (`State`, `client.rs:45-51`): `Opening → Active ⇄ Attaching`,
+then `Closed(CloseReason)`. `CloseReason` (`client.rs:56-64`) is the **§8
+local mapping** — how the *local* connection (to the app) must end:
+`Clean` (local FIN), `Reset(code)` (local RST carrying the protocol code),
+`Refused(code)` (never sent anywhere else, e.g. `capacity`,
+`home_unavailable`) (`client.rs:54-55`, `from_reject` `client.rs:66-84`).
+
+Transitions:
+
+- `attach(carrier)`: first attempt sends OPEN (with `first_data` bounded by
+  the frame budget minus the worst-case header, `client.rs:374-390`,
+  `open_header_len` `client.rs:445-455`); a retry sends OPEN with
+  `retry = true` and `anchor_instance_id = instance_hint`; after any OPENED
+  it sends RESUME with the client snapshot and `attach_gen + 1`
+  (`client.rs:358-412`).
+- OPENED (matching generation) → `Active`; OPENED "proves the path (the relay
+  reached the site)" and resets the recovery budget once per session
+  (`client.rs:701-721`). RESUMED (or an OPEN retry answered as RESUME, R2-2b)
+  → `Active`, replay rewound to the relay's snapshot; "a bare RESUMED is not
+  progress — a path that answers RESUME and then stalls keeps counting against
+  the bound" (`client.rs:723-748`).
+- REJECT: `stale_gen` is ignored (an older generation answered);
+  `anchor_unreachable` (B2) → drop the carrier and retry with backoff (≤ 5 s)
+  until `t_detached`; `version` is accepted across generations (r10 N3, a v4
+  peer cannot read our generation); anything else closes the session via
+  `CloseReason::from_reject` — in particular `closed` maps to `Clean` only in
+  the B6 case: the relay closed cleanly, our FIN reached it
+  (`final_recv_offset == fin + 1`) and we already hold its FIN — "the only
+  thing lost was an ACK" (`client.rs:750-782`; sim test
+  `lost_final_ack_is_resolved_by_tombstone_as_clean`,
+  `crates/segue-session/tests/sim.rs:552`).
+- Carrier loss (closed, stuck — a frame held transport blocks too long —
+  stall timer `t_stall`, STALL hint, unanswered attach after `t_attach`):
+  redial. A carrier lost "while something was expected on it and nothing
+  moved" counts against `MAX_FRUITLESS` = 8 with exponential backoff
+  200 ms → 2 s (`client.rs:101-112`, `carrier_lost` `client.rs:555-597`);
+  end-to-end progress or the one OPENED resets the count. The 8th fruitless
+  carrier closes the session with `LOCAL_GIVE_UP` = `connect_timeout`
+  (`client.rs:101`, `client.rs:585-590`).
+- Timeouts (`handle_timeout`, `client.rs:1030-1075`): OPEN not answered within
+  `t_open_retry` → local reset; detached longer than `t_detached` → local
+  reset; attach unanswered within `t_attach` → new carrier (counts as
+  expected-loss); confirmed + unacked + silent for `t_stall` → re-attach;
+  receive idle → recompute credit.
+- Clean end: both FINs acked and all data delivered → `Closed(Clean)`
+  (`check_done` `client.rs:842-848`).
+
+**Health reports** (for the caller's exit health, r9 F5): `Up` (OPENED, or
+data moved end to end, refreshed every 1 s while moving), `Failed` (a carrier
+was given up with something expected), `GaveUp`, and `Alive(rx_at)` — bytes
+arrived that move nothing end-to-end (a partial frame, a keepalive ACK):
+path liveness, not proof, never touching the recovery budget (`Health`
+`client.rs:122-153`, `made_progress` `client.rs:797-813`, `alive`
+`client.rs:815-831`).
+
+### 5.4 UDP (§5.4)
+
+`Kind::Udp` exists in OPEN and the DGRAM frame is fully specified (§2.3), but
+UDP sessions are not implemented end to end: the relay's ticket check refuses
+`Kind::Udp` with `exit_denied` ("This relay carries TCP only; Home UDP is
+never offered (§5.5.5)", `crates/segue-relay/src/ticket.rs:233-241`), and the
+kernel never carries UDP to a home-role route — "a fixed property of the Home
+exit (§5.4), not a setting" (`crates/segue-kernel/src/session/mod.rs:41-43`,
+`mod.rs:1050-1055`).
+
+### 5.5 Close semantics (§5.5)
+
+"Anything but a clean close is a local RST" (`crates/segue-kernel/src/session/stream.rs:5-7`):
+the driver can only end its pipe with EOF, so `SessionStream` turns an EOF
+whose reported reason is not `CloseReason::Clean` into `ECONNRESET` for the
+SOCKS/TUN front end (`stream.rs:44-61`, `closed_err`/`closed_text`
+`mod.rs:1012-1031`). On the relay side, the symmetric rule is the upload-drain
+honesty of §5.2: a truncated upload or a failed site write/shutdown resets,
+never reports clean (`tests/driver.rs:800`, `driver.rs:1245-1270`).
+
+### 5.6 PARK and WAKE (§5.6, R2-2c)
+
+PARK/WAKE as a whole is a later milestone (M9+). Implemented: the **request
+matching rule** only (`crates/segue-session/src/park.rs:1-6`):
+
+- at most one pending PARK per session; a new request supersedes the old
+  (`park.rs:26-31`);
+- a PARK_ACK counts only if its `req_id` equals the pending one **and** its
+  `attach_gen` equals the generation the request was made at **and** that is
+  still the current generation (`on_ack`, `park.rs:40-53`);
+- anything else — late, stale, unsolicited, or after a re-attach — is
+  `Ignored` (no effect) (`park.rs:12-21`);
+- new data to send or a re-attach cancels the pending request without waiting
+  for the ACK (`cancel`, `park.rs:34-36`; wired at `client.rs:1134-1140`).
+
+The client may request a PARK only while `Active`, with nothing pending
+uplink and nothing buffered downlink (`request_park`, `client.rs:1153-1167`).
+WAKE, park generations and parked-state storage are not implemented.
+
+### 5.7 Home lines (relay side)
+
+KERNEL_SPEC §5.6/§5.7/D2, not session-protocol state, but it defines the
+`home_unavailable` (29) code path: an AI-class session dials through the
+device's primary Home (Decodo ISP SOCKS5) line; when that line is DOWN the
+dial is refused with `home_unavailable` — "never sent direct and never moved
+to another line unless failover is switched on"
+(`crates/segue-relay/src/home.rs:1-7`, `crates/segue-relay/src/dial.rs:389-396`).
