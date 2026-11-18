@@ -1,0 +1,10 @@
+# AI tools matched by the owning process, not by destination. Shared
+# telemetry and CDN hosts cannot be listed (see data/ai-lock.txt); a flow
+# from one of these processes still takes the AI exit when no domain or
+# CIDR did. A line is `name <file>`, `path <absolute path>`, `bundle <id>`
+# or `cmd <argv>`. `#` starts a comment. Only `name` and `path` match;
+# `bundle` and `cmd` are stored for a later check. `name` is the executable
+# file name, not a substring.
+
+name claude
+name codex

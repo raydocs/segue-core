@@ -22,7 +22,10 @@
 //! `ai_domains` and `ai_cidrs` are the bundle's AI list (the same fields the
 //! relay reads). The kernel merges them with the built-in list
 //! ([`crate::rules::builtin_ai_list`]) into a first-tier match that beats
-//! every user rule except an explicit reject. There is no separate `ai`
+//! every user rule except an explicit reject. `ai_processes` is the same
+//! line format as `data/ai-processes.txt` (`name` / `path` / `bundle` /
+//! `cmd`); it is merged with that file and matches the owning process when
+//! the destination tier did not. There is no separate `ai`
 //! object and no version gate: those two fields have been in the body since
 //! the signed format, and skipping the built-in list on an older `version`
 //! would leave that bundle able to send Claude or ChatGPT direct. A bundle
@@ -61,6 +64,10 @@ pub struct Body {
     /// AI IP ranges (the relay's AI set reads the same list).
     #[serde(default)]
     pub ai_cidrs: Vec<String>,
+    /// Process patterns, one `name` / `path` / `bundle` / `cmd` line each.
+    /// Merged with `data/ai-processes.txt`. Only `name` and `path` match.
+    #[serde(default)]
+    pub ai_processes: Vec<String>,
     #[serde(default)]
     pub rules: Vec<RuleSpec>,
     pub default: Action,
@@ -304,6 +311,12 @@ impl Verifier {
             let cidr = Cidr::parse(c).map_err(|e| bad(format!("ai_cidrs[{i}]: {e}")))?;
             ai_ips.push(cidr);
         }
+        let mut processes = crate::owner::builtin_ai_processes();
+        for (i, line) in b.ai_processes.iter().enumerate() {
+            processes
+                .push_line(line)
+                .map_err(|e| bad(format!("ai_processes[{i}]: {e}")))?;
+        }
         let mut rules = Vec::with_capacity(b.rules.len());
         let ech_public_names = b
             .ech_public_names
@@ -324,11 +337,9 @@ impl Verifier {
             };
             rules.push(r.into_rule().map_err(|e| bad(format!("rules[{i}]: {e}")))?);
         }
-        let set = RuleSet::new(rules, b.default.clone()).with_ai(
-            suffixes,
-            &ai_ips,
-            Action::Proxy(self.ai_route.clone()),
-        );
+        let set = RuleSet::new(rules, b.default.clone())
+            .with_ai(suffixes, &ai_ips, Action::Proxy(self.ai_route.clone()))
+            .with_processes(processes);
         for tag in set.proxy_tags() {
             if !self.known.contains(tag) {
                 return Err(bad(format!("refers to unknown route {tag:?}")));
@@ -1017,5 +1028,18 @@ mod tests {
             assert!(read_private_key(&p).unwrap_err().contains("chmod 600"));
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ai_processes_field_defaults_empty_and_parses() {
+        let body: Body = serde_json::from_str(
+            r#"{"version":1,"expires_at":1,"default":{"type":"direct"},"ai_processes":["name claude"]}"#,
+        )
+        .unwrap();
+        assert_eq!(body.ai_processes, vec!["name claude".to_string()]);
+        let bare: Body =
+            serde_json::from_str(r#"{"version":1,"expires_at":1,"default":{"type":"reject"}}"#)
+                .unwrap();
+        assert!(bare.ai_processes.is_empty());
     }
 }

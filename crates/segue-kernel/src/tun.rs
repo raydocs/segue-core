@@ -1938,16 +1938,24 @@ pub struct Dial {
     pub tag: Option<String>,
     /// What to dial: the destination IP, or a name (fake-IP, sniffed SNI).
     pub target: TargetAddr,
+    /// Why the AI tier claimed this flow: `domain`, `cidr`, or
+    /// `process:<name>`. None for a user rule or the default.
+    pub ai_reason: Option<String>,
 }
 
 impl Dial {
     fn from_action(action: &Action, target: TargetAddr) -> Option<Self> {
         match action {
             Action::Reject => None,
-            Action::Direct => Some(Self { tag: None, target }),
+            Action::Direct => Some(Self {
+                tag: None,
+                target,
+                ai_reason: None,
+            }),
             Action::Proxy(tag) => Some(Self {
                 tag: Some(tag.clone()),
                 target,
+                ai_reason: None,
             }),
         }
     }
@@ -2025,9 +2033,27 @@ pub enum PrepareDial {
     Refuse,
 }
 
+fn owner_proto(proto: Proto) -> crate::owner::Proto {
+    match proto {
+        Proto::Tcp => crate::owner::Proto::Tcp,
+        Proto::Udp => crate::owner::Proto::Udp,
+    }
+}
+
+fn flow_query(key: &FlowKey) -> crate::rules::FlowQuery<'static> {
+    crate::rules::FlowQuery {
+        proto: owner_proto(key.proto),
+        local: key.src,
+        resolver: crate::owner::system_owner(),
+    }
+}
+
 fn ip_route(rules: &RuleSet, key: &FlowKey) -> Option<Dial> {
     let target = TargetAddr::Ip(key.dst.ip());
-    Dial::from_action(rules.decide(&target), target)
+    let decided = rules.explain(&target, Some(flow_query(key)));
+    let mut dial = Dial::from_action(decided.action, target)?;
+    dial.ai_reason = decided.ai_reason.as_ref().map(|r| r.label());
+    Some(dial)
 }
 
 /// IP rules only; UDP refused.
@@ -2114,8 +2140,18 @@ impl TunRouter for TunKernel {
         if policy.refuse_all {
             return None;
         }
-        crate::socks::sniffed_route(&policy, key.dst, found, &self.kernel.hidden)
-            .map(|(tag, target)| Dial { tag, target })
+        let choice = crate::socks::sniffed_choice(
+            &policy,
+            key.dst,
+            found,
+            &self.kernel.hidden,
+            Some(flow_query(key)),
+        )?;
+        Some(Dial {
+            tag: choice.tag,
+            target: choice.target,
+            ai_reason: choice.ai_reason,
+        })
     }
 
     fn route_udp(&self, key: &FlowKey) -> UdpRoute {
@@ -2127,8 +2163,12 @@ impl TunRouter for TunKernel {
         };
         let ip = key.dst.ip();
         let addr = TargetAddr::Ip(ip);
-        let dial = crate::udp::route(&self.kernel, &udp.settings, &addr, key.dst.port())
-            .map(|(tag, target)| Dial { tag, target });
+        let dial = crate::udp::route(&self.kernel, &udp.settings, &addr, key.dst.port(), key.src)
+            .map(|(tag, target, ai_reason)| Dial {
+                tag,
+                target,
+                ai_reason,
+            });
         match dial {
             None => UdpRoute::Refuse,
             Some(d) if crate::udp::plain(&self.kernel, ip) => UdpRoute::Plain(d),
@@ -3148,6 +3188,7 @@ mod tests {
         let plan = TcpPlan::Dial(Dial {
             tag: None,
             target: TargetAddr::Ip(key.dst.ip()),
+            ai_reason: None,
         });
         let task = relay(ctx, plan, key, Arc::new(Link::default()), down_rx, up_tx);
         // Socket (storage is pooled), table entries (key → entry, id → key,

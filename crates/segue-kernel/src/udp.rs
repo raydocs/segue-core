@@ -237,7 +237,7 @@ fn uplink(
         // so is a first datagram shaped like a short header (r9 F1).
         return udp.drop_one();
     }
-    let Some((tag, target)) = route(kernel, &udp.settings, &key.0, port) else {
+    let Some((tag, target, _reason)) = route(kernel, &udp.settings, &key.0, port, client) else {
         return udp.drop_one();
     };
     if !reserve(queued, payload.len(), udp.settings.queue_bytes) {
@@ -289,23 +289,38 @@ pub(crate) fn route(
     s: &UdpSettings,
     addr: &TargetAddr,
     port: u16,
-) -> Option<(Option<String>, TargetAddr)> {
+    local: SocketAddr,
+) -> Option<(Option<String>, TargetAddr, Option<String>)> {
     let policy = kernel.policy.current();
     if policy.refuse_all {
         return None;
     }
-    let (action, target) = match addr {
+    let flow = Some(crate::rules::FlowQuery {
+        proto: crate::owner::Proto::Udp,
+        local,
+        resolver: crate::owner::system_owner(),
+    });
+    let (action, target, reason) = match addr {
         TargetAddr::Ip(ip) if kernel.fake_ip.as_ref().is_some_and(|p| p.contains(*ip)) => {
             // A fake address is never dialled as an IP.
             // Authorized against the policy in force now; the pool only
-            // remembers the name.
+            // remembers the name. Unmatched names keep the foreign route.
             let entry = kernel.fake_ip.as_ref()?.lookup(*ip)?;
-            (
-                policy.decide_fake(&entry.domain).clone(),
-                TargetAddr::Domain(entry.domain),
-            )
+            let domain = TargetAddr::Domain(entry.domain);
+            let decided = policy.rules.explain(&domain, flow);
+            let action = if decided.matched.is_none() {
+                policy.foreign.clone()
+            } else {
+                decided.action.clone()
+            };
+            let reason = decided.ai_reason.as_ref().map(|r| r.label());
+            (action, domain, reason)
         }
-        _ => (policy.rules.decide(addr).clone(), addr.clone()),
+        _ => {
+            let decided = policy.rules.explain(addr, flow);
+            let reason = decided.ai_reason.as_ref().map(|r| r.label());
+            (decided.action.clone(), addr.clone(), reason)
+        }
     };
     let routed = finish(s, action, target, port)?;
     let decided = match &routed.0 {
@@ -323,7 +338,7 @@ pub(crate) fn route(
     ) {
         return None;
     }
-    Some(routed)
+    Some((routed.0, routed.1, reason))
 }
 
 pub(crate) fn finish(
