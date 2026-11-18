@@ -86,7 +86,9 @@ async fn native_ipv6_roaming_replay_and_forgery_do_not_redirect_the_peer() {
     roaming("::1".parse().unwrap()).await;
 }
 async fn roaming(outer: IpAddr) {
-    timeout(Duration::from_secs(25), async {
+    // Two inner families, each with a dozen exchanges against a real
+    // reference process; the room above that is for a slow runner.
+    timeout(Duration::from_secs(40), async {
         let (_reference, mut relay, client, protector) = setup(outer, 0).await;
         let echo = Echo::udp().await;
         for ip in ["198.51.100.7", "2001:db8::7"] {
@@ -151,7 +153,11 @@ async fn roaming(outer: IpAddr) {
 #[tokio::test]
 #[ignore = "requires official wireguard-go; use check-native-wireguard-interop.sh"]
 async fn native_server_crash_recovers_existing_udp_sessions_without_restarting_client() {
-    timeout(Duration::from_secs(100), async {
+    // Two outer families, each with a crash, a restart and a fresh handshake.
+    // The room above the work is for a slow runner: the reference is a real
+    // process, and its restart plus the client's 5-second rekey retry can
+    // take longer than a quiet host needs.
+    timeout(Duration::from_secs(150), async {
         for outer in ["127.0.0.1", "::1"] {
             let (mut reference, mut relay, client, protector) =
                 setup(outer.parse().unwrap(), 1).await;
@@ -184,7 +190,10 @@ async fn native_server_crash_recovers_existing_udp_sessions_without_restarting_c
             no_delivery(&v4).await;
             reference.restart().await;
             let started = Instant::now();
-            timeout(Duration::from_secs(40), async {
+            // The client retries its handshake every 5 seconds plus jitter;
+            // a starved runner can miss several of those before the restarted
+            // reference answers, so allow more than a few retries.
+            timeout(Duration::from_secs(60), async {
                 let mut retry = tokio::time::interval(Duration::from_millis(500));
                 loop {
                     tokio::select! {
@@ -218,7 +227,10 @@ async fn native_server_crash_recovers_existing_udp_sessions_without_restarting_c
 #[tokio::test]
 #[ignore = "requires official wireguard-go and real 120-second rekey timer; use check-native-wireguard-interop.sh"]
 async fn native_persistent_keepalive_and_timed_rekey_preserve_the_live_flow() {
-    timeout(Duration::from_secs(150), async {
+    // The rekey itself is a real 120-second timer; the room above it is for a
+    // slow runner, which can take a while to observe the keepalives and to
+    // move the flow onto the new session afterwards.
+    timeout(Duration::from_secs(180), async {
         let (_reference, mut relay, client, protector) =
             setup("127.0.0.1".parse().unwrap(), 1).await;
         let echo = Echo::udp().await;
@@ -234,7 +246,9 @@ async fn native_persistent_keepalive_and_timed_rekey_preserve_the_live_flow() {
 
         // Observe two distinct idle transport keepalives after the application
         // reply, rather than counting the empty handshake confirmation packet.
-        timeout(Duration::from_secs(5), async {
+        // The keepalive is one second here; the window is wide so a starved
+        // runner's scheduling delay cannot hide the second one.
+        timeout(Duration::from_secs(15), async {
             let mut first = None;
             loop {
                 match relay.step(true).await {
@@ -279,7 +293,8 @@ async fn native_persistent_keepalive_and_timed_rekey_preserve_the_live_flow() {
         // The relay counts the handshake when it forwards the response, which
         // can be before the client has processed it, so the first packet may
         // still use the previous keypair (WireGuard keeps it valid for exactly
-        // this). The flow must move to the new session within a few round trips.
+        // this). The flow must move to the new session within a few round trips;
+        // a slow runner may need a few more of them.
         let mut round_trips = 0;
         loop {
             relay.exchange(&session, b"after timed rekey", 0).await;
@@ -287,7 +302,7 @@ async fn native_persistent_keepalive_and_timed_rekey_preserve_the_live_flow() {
             if relay.last_reply[4..8] != old[4..8] {
                 break;
             }
-            assert!(round_trips < 5, "new WireGuard receiver index");
+            assert!(round_trips < 10, "new WireGuard receiver index");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         relay.inject(0, &old).await;

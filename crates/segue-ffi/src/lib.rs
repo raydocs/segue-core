@@ -1,5 +1,9 @@
 mod tun_admission;
 pub use tun_admission::*;
+#[cfg(feature = "proprietary-kernel")]
+mod kernel;
+#[cfg(feature = "proprietary-kernel")]
+pub use kernel::*;
 mod profile_import;
 pub use profile_import::xray_profile_import_json;
 
@@ -30,7 +34,16 @@ use tokio::runtime::{Builder, Runtime};
 use zeroize::Zeroize;
 
 pub const XRAY_FFI_ABI_MAJOR: u32 = 1;
-pub const XRAY_FFI_ABI_MINOR: u32 = 17;
+pub const XRAY_FFI_ABI_MINOR: u32 = {
+    #[cfg(feature = "proprietary-kernel")]
+    {
+        18
+    }
+    #[cfg(not(feature = "proprietary-kernel"))]
+    {
+        17
+    }
+};
 
 pub const XRAY_FFI_CAPABILITY_CONFIG_WARNINGS: u64 = 1 << 0;
 pub const XRAY_FFI_CAPABILITY_GEODATA_SEARCH: u64 = 1 << 1;
@@ -65,7 +78,28 @@ pub const XRAY_FFI_CAPABILITY_OUTBOUND_PROBE_CANCEL: u64 = 1 << 28;
 pub const XRAY_FFI_CAPABILITY_TUN_MTU: u64 = 1 << 29;
 pub const XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT: u64 = 1 << 30;
 
-pub const XRAY_FFI_CAPABILITIES: u64 = XRAY_FFI_CAPABILITY_CONFIG_WARNINGS
+#[cfg(feature = "proprietary-kernel")]
+pub const XRAY_FFI_CAPABILITY_KERNEL: u64 = 1 << 31;
+#[cfg(feature = "proprietary-kernel")]
+pub const XRAY_FFI_CAPABILITY_KERNEL_KILLSWITCH: u64 = 1 << 32;
+#[cfg(feature = "proprietary-kernel")]
+pub const XRAY_FFI_CAPABILITY_KERNEL_POLICY: u64 = 1 << 33;
+#[cfg(feature = "proprietary-kernel")]
+pub const XRAY_FFI_CAPABILITY_KERNEL_DNS: u64 = 1 << 34;
+#[cfg(feature = "proprietary-kernel")]
+pub const XRAY_FFI_CAPABILITY_KERNEL_STATS: u64 = 1 << 35;
+#[cfg(feature = "proprietary-kernel")]
+pub const XRAY_FFI_CAPABILITY_KERNEL_TUN_FD: u64 = 1 << 36;
+
+#[cfg(feature = "proprietary-kernel")]
+const XRAY_FFI_KERNEL_CAPABILITIES: u64 = XRAY_FFI_CAPABILITY_KERNEL
+    | XRAY_FFI_CAPABILITY_KERNEL_KILLSWITCH
+    | XRAY_FFI_CAPABILITY_KERNEL_POLICY
+    | XRAY_FFI_CAPABILITY_KERNEL_DNS
+    | XRAY_FFI_CAPABILITY_KERNEL_STATS
+    | XRAY_FFI_CAPABILITY_KERNEL_TUN_FD;
+
+const XRAY_FFI_ENGINE_CAPABILITIES: u64 = XRAY_FFI_CAPABILITY_CONFIG_WARNINGS
     | XRAY_FFI_CAPABILITY_GEODATA_SEARCH
     | XRAY_FFI_CAPABILITY_SOCKET_PROTECTION
     | XRAY_FFI_CAPABILITY_STARTUP_PROBE
@@ -96,6 +130,10 @@ pub const XRAY_FFI_CAPABILITIES: u64 = XRAY_FFI_CAPABILITY_CONFIG_WARNINGS
     | XRAY_FFI_CAPABILITY_OUTBOUND_PROBE_CANCEL
     | XRAY_FFI_CAPABILITY_TUN_MTU
     | XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT;
+#[cfg(not(feature = "proprietary-kernel"))]
+pub const XRAY_FFI_CAPABILITIES: u64 = XRAY_FFI_ENGINE_CAPABILITIES;
+#[cfg(feature = "proprietary-kernel")]
+pub const XRAY_FFI_CAPABILITIES: u64 = XRAY_FFI_ENGINE_CAPABILITIES | XRAY_FFI_KERNEL_CAPABILITIES;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,6 +562,14 @@ pub struct XrayUdpQuicBlockedEvent {
 
 pub struct XrayCoreHandle {
     core: Option<Core>,
+    // Stage 1 keeps the kernel beside the engine; the stage-2 `xray_kernel_*`
+    // entry points read these (docs/design/ffi-kernel-embedding.md).
+    #[cfg(feature = "proprietary-kernel")]
+    #[allow(dead_code)]
+    kernel: Option<Arc<segue_kernel::tun::TunStack>>,
+    #[cfg(feature = "proprietary-kernel")]
+    #[allow(dead_code)]
+    kernel_config: Option<segue_kernel::config::KernelConfig>,
     runtime: Runtime,
     pending_outbound_packets: Mutex<VecDeque<Bytes>>,
     socket_protector: Option<Arc<dyn SocketProtector>>,
@@ -651,6 +697,10 @@ unsafe fn xray_core_new_inner(error: *mut *mut XrayError) -> *mut XrayCoreHandle
 
     Box::into_raw(Box::new(XrayCoreHandle {
         core: None,
+        #[cfg(feature = "proprietary-kernel")]
+        kernel: None,
+        #[cfg(feature = "proprietary-kernel")]
+        kernel_config: None,
         runtime,
         pending_outbound_packets: Mutex::new(VecDeque::new()),
         socket_protector: None,
@@ -1594,9 +1644,12 @@ pub unsafe extern "C" fn xray_core_rebind_wireguard(
 
 /// Queues a carrier socket rebind for live Hysteria clients (ABI 1.7) and for
 /// every other live QUIC carrier: XHTTP, MASQUE and XDRIVE's storages over
-/// HTTP/3. Endpoint addresses and QUIC/inner flows are retained. The returned
-/// count is accepted coalesced requests, not successful binds or path
-/// validation.
+/// HTTP/3. Endpoint addresses and QUIC/inner flows are retained. An mKCP
+/// connection on its own UDP socket cannot move: it fails, its flows with
+/// it, at once if its source address changed and otherwise unless its peer
+/// is heard within seconds of the call. The returned
+/// count is accepted coalesced requests, the mKCP connections told among
+/// them, not successful binds, path validation or surviving connections.
 ///
 /// # Safety
 /// `handle` must be null or live; `accepted` must be null or writable. May run
@@ -3799,6 +3852,12 @@ unsafe fn xray_core_free_inner(handle: *mut XrayCoreHandle) {
         if let Some(config) = handle.tun_fd_config.take() {
             config.close_if_owned();
         }
+        // The handle's fields drop here, the core and then its runtime.
+        // Dropping the runtime waits for every thread of it, without a
+        // limit: once this returns none of them is inside the socket-protect
+        // callback, and the host may let go of the callback's context. Work
+        // that cannot be cancelled therefore stays off the runtime, as the
+        // system DNS lookup does (`segue_transport::SystemDnsResolver`).
     }
 }
 
@@ -4414,6 +4473,7 @@ fn runtime_worker_threads_for_available_parallelism(available: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::{xray_ffi_version_minor, XRAY_FFI_ABI_MINOR};
     use std::ffi::{CStr, CString};
     use std::ptr;
 
@@ -4426,6 +4486,44 @@ mod tests {
         xray_core_routing_policy_snapshot_json, xray_core_set_dns_bootstrap_mode, DnsBootstrapMode,
         OutStrArgs, OutStrBuf, XrayCoreHandle, XrayDnsBootstrapMode, XrayError, XrayStatus,
     };
+
+    /// Stop joins the tasks it owns, but not every task that can dial: a
+    /// stale DNS answer, for one, is refreshed by a detached task. Freeing
+    /// the handle waits for the runtime's threads without a limit, so a
+    /// thread still inside the host's socket-protect callback has returned
+    /// from it before the host lets go of the callback's context.
+    #[test]
+    fn free_waits_for_a_runtime_thread_inside_a_host_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let (entered, has_entered) = mpsc::channel();
+        let returned = Arc::new(AtomicBool::new(false));
+        let callback_returned = Arc::clone(&returned);
+        unsafe {
+            let mut error = ptr::null_mut();
+            let handle = xray_core_new(&mut error);
+            assert!(!handle.is_null());
+            let config = CString::new(r#"{"outbounds":[{"protocol":"freedom"}]}"#).unwrap();
+            assert_eq!(
+                xray_core_load_config_json(handle, config.as_ptr(), &mut error),
+                XrayStatus::Ok
+            );
+            // What a slow callback does to the worker that called it.
+            (*handle).runtime.spawn(async move {
+                entered.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                callback_returned.store(true, Ordering::SeqCst);
+            });
+            has_entered.recv().unwrap();
+            xray_core_free(handle);
+        }
+        assert!(
+            returned.load(Ordering::SeqCst),
+            "xray_core_free returned with a runtime thread still at work"
+        );
+    }
 
     #[test]
     fn tun_mtu_is_validated_atomically_and_frozen_at_config_load() {
@@ -4562,6 +4660,43 @@ mod tests {
         assert_eq!(status, XrayStatus::Ok);
         assert!(error.is_null());
         serde_json::from_str(unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn kernel_capability_gate_is_exactly_six_additive_bits() {
+        assert_eq!(xray_ffi_version_minor(), XRAY_FFI_ABI_MINOR);
+        #[cfg(not(feature = "proprietary-kernel"))]
+        {
+            assert_eq!(XRAY_FFI_ABI_MINOR, 17);
+            assert_eq!(
+                super::XRAY_FFI_CAPABILITIES,
+                super::XRAY_FFI_ENGINE_CAPABILITIES
+            );
+        }
+        #[cfg(feature = "proprietary-kernel")]
+        {
+            assert_eq!(XRAY_FFI_ABI_MINOR, 18);
+            let expected = super::XRAY_FFI_CAPABILITY_KERNEL
+                | super::XRAY_FFI_CAPABILITY_KERNEL_KILLSWITCH
+                | super::XRAY_FFI_CAPABILITY_KERNEL_POLICY
+                | super::XRAY_FFI_CAPABILITY_KERNEL_DNS
+                | super::XRAY_FFI_CAPABILITY_KERNEL_STATS
+                | super::XRAY_FFI_CAPABILITY_KERNEL_TUN_FD;
+            assert_eq!(expected, (0x1f_u64 << 32) | (1_u64 << 31));
+            assert_eq!(
+                super::XRAY_FFI_CAPABILITIES ^ super::XRAY_FFI_ENGINE_CAPABILITIES,
+                expected
+            );
+            let constants = [
+                super::XRAY_FFI_CAPABILITY_KERNEL,
+                super::XRAY_FFI_CAPABILITY_KERNEL_KILLSWITCH,
+                super::XRAY_FFI_CAPABILITY_KERNEL_POLICY,
+                super::XRAY_FFI_CAPABILITY_KERNEL_DNS,
+                super::XRAY_FFI_CAPABILITY_KERNEL_STATS,
+                super::XRAY_FFI_CAPABILITY_KERNEL_TUN_FD,
+            ];
+            assert_eq!(expected, constants.into_iter().sum::<u64>());
+        }
     }
 
     #[test]

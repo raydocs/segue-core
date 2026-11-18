@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use segue_config::{DnsFakeIpConfig, DnsQueryStrategy};
+use segue_config::{DnsFakeIpConfig, DnsQueryStrategy, DomainMatcherSet};
 use segue_transport::RouteProbe;
 
 /// Stateful, bounded mapping between DNS names and synthetic IPv4 addresses.
@@ -23,6 +23,8 @@ pub(crate) struct FakeIpMapper {
     first_offset: u64,
     allocation_span: u64,
     max_mappings: usize,
+    /// Names that keep a real answer, as `dns.fakeIp.exemptDomains` asks.
+    exempt_domains: DomainMatcherSet,
     reserved_ipv4: Box<[Ipv4Addr]>,
     next_offset: u64,
     entries: Vec<Option<FakeIpEntry>>,
@@ -126,6 +128,7 @@ impl FakeIpMapper {
             first_offset,
             allocation_span,
             max_mappings: usize::try_from(config.pool_size).ok()?,
+            exempt_domains: config.exempt_domains.clone(),
             reserved_ipv4: reserved_ipv4.into_boxed_slice(),
             next_offset: start % allocation_span,
             entries: Vec::new(),
@@ -168,6 +171,17 @@ impl FakeIpMapper {
     #[cfg(test)]
     pub(crate) fn mapping_count(&self) -> usize {
         self.by_domain.len()
+    }
+
+    /// Whether `domain` keeps a real answer instead of a fake IP, as
+    /// `dns.fakeIp.exemptDomains` asks. The name is matched as a DNS query
+    /// name: lowercased and without its terminal dot.
+    pub(crate) fn is_exempt(&self, domain: &str) -> bool {
+        if self.exempt_domains.is_empty() {
+            return false;
+        }
+        let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+        !normalized.is_empty() && self.exempt_domains.matches(&normalized)
     }
 
     /// Returns a stable synthetic IPv4 address for a normalized DNS name.
@@ -292,7 +306,7 @@ fn normalize_dns_domain(domain: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use segue_config::IpCidr;
+    use segue_config::{default_fake_ip_exempt_domains, IpCidr};
 
     fn config(network: Ipv4Addr, prefix: u8, pool_size: u32, ttl: u32) -> DnsFakeIpConfig {
         DnsFakeIpConfig {
@@ -300,7 +314,58 @@ mod tests {
             ipv4_pool: IpCidr::new(IpAddr::V4(network), prefix).unwrap(),
             pool_size,
             ttl,
+            exempt_domains: default_fake_ip_exempt_domains(),
         }
+    }
+
+    #[test]
+    fn default_exemptions_cover_captive_portal_ntp_and_local_names() {
+        let mapper = FakeIpMapper::from_config(
+            &config(Ipv4Addr::new(198, 18, 0, 0), 15, 32_768, 60),
+            DnsQueryStrategy::UseIp,
+            &[],
+        )
+        .unwrap();
+
+        for name in [
+            "captive.apple.com",
+            "connectivitycheck.gstatic.com",
+            "www.msftconnecttest.com",
+            "time.apple.com",
+            "pool.ntp.org",
+            "time.ntp.org",
+            "printer.lan",
+            "nas.local",
+        ] {
+            assert!(mapper.is_exempt(name), "{name} should be exempt");
+        }
+        for name in ["example.com", "ntp.org.example", "local.example"] {
+            assert!(!mapper.is_exempt(name), "{name} should not be exempt");
+        }
+    }
+
+    #[test]
+    fn exemption_matching_ignores_case_and_a_terminal_dot() {
+        let mapper = FakeIpMapper::from_config(
+            &config(Ipv4Addr::new(198, 18, 0, 0), 15, 32_768, 60),
+            DnsQueryStrategy::UseIp,
+            &[],
+        )
+        .unwrap();
+
+        assert!(mapper.is_exempt("Captive.Apple.Com."));
+        assert!(mapper.is_exempt("NAS.LOCAL"));
+    }
+
+    #[test]
+    fn an_empty_exemption_list_exempts_nothing() {
+        let mut config = config(Ipv4Addr::new(198, 18, 0, 0), 15, 32_768, 60);
+        config.exempt_domains = DomainMatcherSet::default();
+        let mapper = FakeIpMapper::from_config(&config, DnsQueryStrategy::UseIp, &[]).unwrap();
+
+        assert!(!mapper.is_exempt("captive.apple.com"));
+        assert!(!mapper.is_exempt("pool.ntp.org"));
+        assert!(!mapper.is_exempt("printer.lan"));
     }
 
     #[test]

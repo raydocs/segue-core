@@ -27,6 +27,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::dial::{Dialer, Stream};
 use crate::fakeip::FakeIpPool;
+use crate::killswitch::{self, Admission, FlowPosture, HoldGuard};
 use crate::policy::{Policy, PolicyStore};
 use crate::rules::{Action, CidrTable, RuleSet};
 use crate::sniff::{sniff, Sniff};
@@ -60,6 +61,9 @@ pub struct Kernel {
     /// Hidden-name (real ECH) flows refused locally, shared by the SOCKS
     /// and TUN front ends.
     pub hidden: HiddenRefusals,
+    /// Session kill switch. `None`: admission does not consult posture
+    /// (a lab dialer, or an engine with no session routes).
+    pub flows: Option<Arc<dyn FlowPosture>>,
 }
 
 impl Kernel {
@@ -72,7 +76,48 @@ impl Kernel {
             sniff: None,
             udp: None,
             hidden: Default::default(),
+            flows: None,
         }
+    }
+
+    /// Kill-switch verdict for `action`. With no session kill switch wired,
+    /// the answer is the one admission treats as proceed.
+    pub(crate) fn verdict_of(&self, action: &Action) -> killswitch::Verdict {
+        let Some(src) = self.flows.as_ref() else {
+            return match action {
+                Action::Reject => killswitch::Verdict::Refuse,
+                Action::Direct => killswitch::Verdict::Direct,
+                Action::Proxy(tag) => killswitch::Verdict::Proxy(tag.clone()),
+            };
+        };
+        match action {
+            Action::Proxy(tag) => match src.protection(tag) {
+                Some(protection) => killswitch::decide(src.posture(), action, protection),
+                // An engine outbound is not a session route. It is refused
+                // only while the user has Segue off, matching the dialer.
+                None => {
+                    if src.posture() == killswitch::Posture::Disconnected {
+                        killswitch::Verdict::Release
+                    } else {
+                        killswitch::Verdict::Proxy(tag.clone())
+                    }
+                }
+            },
+            other => killswitch::decide(src.posture(), other, killswitch::Protection::Wait),
+        }
+    }
+
+    /// Admission for a new flow. No kill switch: always proceed, so lab
+    /// kernels keep today's behaviour.
+    pub(crate) fn preview(&self, action: &Action, udp: bool) -> Admission {
+        if self.flows.is_none() {
+            return Admission::Proceed;
+        }
+        killswitch::admission(self.verdict_of(action), action, udp)
+    }
+
+    pub(crate) fn try_hold(&self) -> Option<HoldGuard> {
+        self.flows.as_ref().and_then(|src| src.try_hold())
     }
 }
 
@@ -188,6 +233,12 @@ async fn connect_then_reply(
         Action::Direct => None,
         Action::Proxy(tag) => Some(tag.as_str()),
     };
+    // Held, not refused, while the kill switch says Wait. The SOCKS success
+    // is still sent only after the dial, so a deadline is a normal refusal.
+    if !kill_switch_allows(kernel, action).await {
+        reply(&mut conn, REP_HOST_UNREACHABLE).await?;
+        return Ok(());
+    }
     let upstream = match dial(kernel, tag, &addr, port).await {
         Some(stream) => stream,
         None => {
@@ -209,6 +260,27 @@ async fn splice(mut conn: TcpStream, mut upstream: Stream) -> Result<(), Fail> {
             drop(upstream);
             let _ = reset(conn);
             Err(e.into())
+        }
+    }
+}
+
+/// `false`: refuse the way a failed dial is refused. [`Admission::Hold`]
+/// waits until the posture leaves Wait or the per-flow deadline passes,
+/// then refuses if it is still not a dial.
+async fn kill_switch_allows(kernel: &Kernel, action: &Action) -> bool {
+    match kernel.preview(action, false) {
+        Admission::Proceed => true,
+        Admission::Refuse => false,
+        Admission::Hold => {
+            let Some(guard) = kernel.try_hold() else {
+                return false;
+            };
+            let verdict = killswitch::wait_out(|| kernel.verdict_of(action)).await;
+            drop(guard);
+            matches!(
+                verdict,
+                killswitch::Verdict::Proxy(_) | killswitch::Verdict::Direct
+            )
         }
     }
 }
@@ -255,6 +327,16 @@ async fn sniffed(
     let Some((tag, target)) = sniffed_route(policy, dst, &found, &kernel.hidden) else {
         return reset(conn);
     };
+    let action = match &tag {
+        Some(t) => Action::Proxy(t.clone()),
+        None => Action::Direct,
+    };
+    // The success reply is already out (the handshake had to complete to
+    // sniff). A wait holds the flow; a refusal or a deadline resets it,
+    // the same as a dial that fails after the early success.
+    if !kill_switch_allows(kernel, &action).await {
+        return reset(conn);
+    }
     let tag = tag.as_deref();
     let Some(mut upstream) = dial(kernel, tag, &target, port).await else {
         return reset(conn);
@@ -285,6 +367,10 @@ pub(crate) fn stricter<'a>(
         }),
     }
 }
+
+/// Explicit block, as a value `sniffed_route` can return a reference to
+/// when the AI tier matched and a user rule rejected the flow.
+const AI_BLOCKED: Action = Action::Reject;
 
 /// Route of a bare-IP TCP flow to `dst` once sniffing is over (§5.2a.1),
 /// None to refuse. `found` is final: [`Sniff::NeedMore`] (timeout,
@@ -324,7 +410,21 @@ pub(crate) fn sniffed_route(
     let (action, name) = match (found, named) {
         (_, Some(d)) => {
             let by_domain = rules.lookup(&TargetAddr::Domain(d.clone()));
-            let a = stricter(by_ip, by_domain).unwrap_or_else(|| rules.default_action());
+            // An AI address or an AI SNI is the AI exit. A non-AI SNI must
+            // not steer an AI CIDR onto another proxy (stricter would take
+            // the domain when both sides are Proxy). An explicit Reject on
+            // either side still blocks.
+            let ai =
+                rules.is_ai(&TargetAddr::Ip(ip)) || rules.is_ai(&TargetAddr::Domain(d.clone()));
+            let blocked = matches!(by_ip, Some((_, Action::Reject)))
+                || matches!(by_domain, Some((_, Action::Reject)));
+            let a = if ai && !blocked {
+                rules.ai_action().unwrap_or(&AI_BLOCKED)
+            } else if ai {
+                &AI_BLOCKED
+            } else {
+                stricter(by_ip, by_domain).unwrap_or_else(|| rules.default_action())
+            };
             (a, Some(d))
         }
         (Sniff::Ech { .. }, None) => match by_ip {
@@ -503,4 +603,86 @@ async fn read_request(conn: &mut TcpStream) -> Result<(u8, TargetAddr, u16), Fai
 
 async fn reply(conn: &mut TcpStream, code: u8) -> std::io::Result<()> {
     conn.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+    use crate::policy::Policy;
+    use crate::rules::{builtin_ai_list, Action, Cidr, CidrTable, Matcher, Rule, RuleSet};
+    use crate::sniff::Sniff;
+
+    fn policy() -> Policy {
+        let (suffixes, cidrs) = builtin_ai_list();
+        let extra = Cidr::parse("203.0.113.0/24").unwrap();
+        let mut all = cidrs;
+        all.push(extra);
+        let rules = RuleSet::new(
+            vec![
+                Rule {
+                    matcher: Matcher::Cidr(Cidr::parse("203.0.113.0/24").unwrap()),
+                    action: Action::Direct,
+                },
+                Rule {
+                    matcher: Matcher::DomainSuffix("cdn.example".into()),
+                    action: Action::Proxy("overseas".into()),
+                },
+                Rule {
+                    matcher: Matcher::DomainExact("blocked.openai.com".into()),
+                    action: Action::Reject,
+                },
+            ],
+            Action::Proxy("overseas".into()),
+        )
+        .with_ai(suffixes, &all, Action::Proxy("ai".into()));
+        Policy::inline(rules, CidrTable::default())
+    }
+
+    fn dst(ip: &str) -> SocketAddr {
+        format!("{ip}:443").parse().unwrap()
+    }
+
+    #[test]
+    fn sniffed_ai_sni_and_ai_cidr_stay_on_the_ai_exit() {
+        let p = policy();
+        let hidden = HiddenRefusals::default();
+        // DoH bypass: the IP is not special, the SNI is an AI name.
+        let (tag, target) = sniffed_route(
+            &p,
+            dst("1.2.3.4"),
+            &Sniff::Domain("api.anthropic.com".into()),
+            &hidden,
+        )
+        .unwrap();
+        assert_eq!(tag.as_deref(), Some("ai"));
+        assert!(matches!(target, segue_routing::TargetAddr::Domain(d) if d == "api.anthropic.com"));
+        // AI CIDR with a non-AI SNI that has its own overseas rule.
+        let (tag, _) = sniffed_route(
+            &p,
+            dst("203.0.113.8"),
+            &Sniff::Domain("static.cdn.example".into()),
+            &hidden,
+        )
+        .unwrap();
+        assert_eq!(tag.as_deref(), Some("ai"));
+        // Explicit block still refuses.
+        assert!(sniffed_route(
+            &p,
+            dst("203.0.113.8"),
+            &Sniff::Domain("blocked.openai.com".into()),
+            &hidden,
+        )
+        .is_none());
+        // Non-AI SNI on a non-AI IP follows the domain rule.
+        let (tag, _) = sniffed_route(
+            &p,
+            dst("8.8.8.8"),
+            &Sniff::Domain("static.cdn.example".into()),
+            &hidden,
+        )
+        .unwrap();
+        assert_eq!(tag.as_deref(), Some("overseas"));
+    }
 }

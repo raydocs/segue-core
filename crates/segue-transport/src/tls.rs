@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// Identifies one rustls configuration shape. Two connections that agree on
-/// all six fields share a config, which matters less for build cost —
+/// every field share a config, which matters less for build cost —
 /// webpki-roots ships pre-parsed statics, so building one is microseconds —
 /// than for continuity: a `ClientConfig` owns the resumption session store, so
 /// splitting configs splits session tickets and kx hints along with them.
@@ -46,6 +46,11 @@ struct ClientConfigKey {
     verify_peer_cert_by_name: Vec<String>,
     alpn: Vec<String>,
     fingerprint: Option<String>,
+    /// Part of the shape because rustls takes ECH on the config, not at
+    /// `connect`: two outbounds to the same host with different ECHConfigLists
+    /// must not share a config, and one with ECH must not inherit another's
+    /// plain hello.
+    ech_config_list: Option<Vec<u8>>,
     alpn_policy: TlsAlpnPolicy,
 }
 
@@ -55,10 +60,12 @@ enum QuicClientConfigKey {
         allow_insecure: bool,
         pinned_peer_cert_sha256: Vec<[u8; 32]>,
         verify_peer_cert_by_name: Vec<String>,
-        alpn: Vec<u8>,
+        alpns: Vec<Vec<u8>>,
+        early_data: bool,
     },
     Pinned {
-        alpn: Vec<u8>,
+        alpns: Vec<Vec<u8>>,
+        early_data: bool,
     },
     /// Xray's ChromeParrot ClientHello, on the same trust policy as `System`
     Chrome {
@@ -190,21 +197,51 @@ impl TlsConnector {
         config: &TlsClientConfig,
         alpn: &[u8],
     ) -> Result<Arc<rustls::ClientConfig>, TransportError> {
+        self.quic_client_config_for_alpns_and_early_data(config, &[alpn], false)
+    }
+
+    /// Builds unshaped QUIC TLS 1.3 with one application ALPN fallback order.
+    pub fn quic_client_config_for_alpns(
+        &self,
+        config: &TlsClientConfig,
+        alpns: &[&[u8]],
+        enable_early_data: bool,
+    ) -> Result<Arc<rustls::ClientConfig>, TransportError> {
+        self.quic_client_config_for_alpns_and_early_data(config, alpns, enable_early_data)
+    }
+
+    fn quic_client_config_for_alpns_and_early_data(
+        &self,
+        config: &TlsClientConfig,
+        alpns: &[&[u8]],
+        enable_early_data: bool,
+    ) -> Result<Arc<rustls::ClientConfig>, TransportError> {
         // A prebuilt config cannot carry Xray's per-outbound verification
         // policy. Reject before consulting its shape-independent QUIC cache so
         // a previously cached permissive config cannot bypass this guard.
         if matches!(&*self.source, ConfigSource::Pinned(_)) {
             reject_custom_verification_with_prebuilt_config(config)?;
         }
+        // The parser refuses ECH on a QUIC carrier, and this path would drop
+        // it anyway: it builds its own config and never consults
+        // `build_client_config`. Fail rather than silently send a plaintext
+        // SNI the config asked to encrypt.
+        if config.ech_config_list.is_some() {
+            return Err(TransportError::TlsConfig(
+                "echConfigList is unsupported on a QUIC carrier".to_owned(),
+            ));
+        }
         let key = match &*self.source {
             ConfigSource::Cached(_) => QuicClientConfigKey::System {
                 allow_insecure: config.allow_insecure,
                 pinned_peer_cert_sha256: config.pinned_peer_cert_sha256.clone(),
                 verify_peer_cert_by_name: config.verify_peer_cert_by_name.clone(),
-                alpn: alpn.to_vec(),
+                alpns: alpns.iter().map(|alpn| alpn.to_vec()).collect(),
+                early_data: enable_early_data,
             },
             ConfigSource::Pinned(_) => QuicClientConfigKey::Pinned {
-                alpn: alpn.to_vec(),
+                alpns: alpns.iter().map(|alpn| alpn.to_vec()).collect(),
+                early_data: enable_early_data,
             },
         };
         let mut configs = self
@@ -225,9 +262,12 @@ impl TlsConnector {
             )?,
             ConfigSource::Pinned(pinned) => (**pinned).clone(),
         };
-        client_config.alpn_protocols = vec![alpn.to_vec()];
+        client_config.alpn_protocols = alpns.iter().map(|alpn| alpn.to_vec()).collect();
         client_config.client_hello_customizer = None;
         validate_quic_client_config(&client_config)?;
+        if enable_early_data {
+            client_config.enable_early_data = true;
+        }
         let client_config = Arc::new(client_config);
         configs.insert(key, Arc::clone(&client_config));
         Ok(client_config)
@@ -266,6 +306,11 @@ impl TlsConnector {
         if matches!(&*self.source, ConfigSource::Pinned(_)) {
             return self.quic_client_config_for(config, alpn);
         }
+        if config.ech_config_list.is_some() {
+            return Err(TransportError::TlsConfig(
+                "echConfigList is unsupported on a QUIC carrier".to_owned(),
+            ));
+        }
         let key = QuicClientConfigKey::Chrome {
             allow_insecure: config.allow_insecure,
             pinned_peer_cert_sha256: config.pinned_peer_cert_sha256.clone(),
@@ -300,6 +345,15 @@ impl TlsConnector {
         match &*self.source {
             ConfigSource::Pinned(pinned) => {
                 reject_custom_verification_with_prebuilt_config(config)?;
+                // A prebuilt config carries its own ECH decision; silently
+                // ignoring the caller's ECHConfigList would send the SNI in
+                // the clear.
+                if config.ech_config_list.is_some() {
+                    return Err(TransportError::TlsConfig(
+                        "echConfigList cannot be combined with a prebuilt TLS client config"
+                            .to_owned(),
+                    ));
+                }
                 Ok(Arc::clone(pinned))
             }
             ConfigSource::Cached(configs) => {
@@ -311,6 +365,7 @@ impl TlsConnector {
                     verify_peer_cert_by_name,
                     alpn,
                     fingerprint,
+                    ech_config_list,
                 } = config;
                 let key = ClientConfigKey {
                     allow_insecure: *allow_insecure,
@@ -318,6 +373,7 @@ impl TlsConnector {
                     verify_peer_cert_by_name: verify_peer_cert_by_name.clone(),
                     alpn: alpn.clone(),
                     fingerprint: fingerprint.clone(),
+                    ech_config_list: ech_config_list.clone(),
                     alpn_policy,
                 };
 
@@ -931,7 +987,30 @@ fn build_client_config(
     config: &TlsClientConfig,
     alpn_policy: TlsAlpnPolicy,
 ) -> Result<rustls::ClientConfig, TransportError> {
-    let client_config = match crate::utls_tls::shaping_profile(config.fingerprint.as_deref())? {
+    let shaping = crate::utls_tls::shaping_profile(config.fingerprint.as_deref())?;
+    if config.ech_config_list.is_some() && shaping.is_some() {
+        // Real ECH is rustls' own extension, so it needs rustls' own hello.
+        // The parser refuses a shaping fingerprint beside it; refuse again
+        // here for configs built without the parser.
+        return Err(TransportError::TlsConfig(
+            "echConfigList cannot be combined with a shaping fingerprint".to_owned(),
+        ));
+    }
+    if let Some(ech_config_list) = &config.ech_config_list {
+        let mut client_config = ech_client_config(
+            config.allow_insecure,
+            &config.pinned_peer_cert_sha256,
+            &config.verify_peer_cert_by_name,
+            ech_config_list,
+        )?;
+        let alpn_protocols = unshaped_alpn_protocols(&config.alpn, alpn_policy);
+        if !alpn_protocols.is_empty() {
+            client_config.alpn_protocols = alpn_protocols;
+        }
+        return Ok(client_config);
+    }
+
+    let client_config = match shaping {
         Some((fingerprint, profile)) => {
             let versions = profile_protocol_versions(profile);
             let provider = Arc::new(shaping_crypto_provider());
@@ -1138,6 +1217,71 @@ fn client_config_with_provider(
     rustls_client_config(provider, root_store, versions)
 }
 
+/// The rustls config of a real-ECH handshake: the same trust policy as an
+/// unshaped hello, on a provider that can actually do the HPKE the ECH
+/// config names, with TLS 1.3 alone — `with_ech` requires it — and the
+/// ECHConfigList the caller supplied.
+///
+/// ECH is defined for TLS 1.3 and rustls' `with_ech` caps the versions, so
+/// there is nothing for a TLS 1.2 server to negotiate: such a server fails
+/// with a version alert rather than seeing the SNI in the clear.
+fn ech_client_config(
+    allow_insecure: bool,
+    pinned_peer_cert_sha256: &[[u8; 32]],
+    verify_peer_cert_by_name: &[String],
+    ech_config_list: &[u8],
+) -> Result<rustls::ClientConfig, TransportError> {
+    if allow_insecure
+        && (!pinned_peer_cert_sha256.is_empty() || !verify_peer_cert_by_name.is_empty())
+    {
+        return Err(TransportError::TlsConfig(
+            "allow_insecure cannot be combined with pinnedPeerCertSha256 or verifyPeerCertByName"
+                .to_owned(),
+        ));
+    }
+    // HPKE suites come from aws-lc-rs; the *ring* provider an unshaped hello
+    // otherwise keeps has no HPKE at all, so `EchConfig::new` would find no
+    // compatible suite and reject every config.
+    let provider = Arc::new(crypto::aws_lc_rs::default_provider());
+    let ech_config = rustls::client::EchConfig::new(
+        rustls::pki_types::EchConfigListBytes::from(ech_config_list.to_vec()),
+        crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
+    )
+    .map_err(|error| TransportError::TlsConfig(format!("invalid ECH config list: {error}")))?;
+
+    let verifier = if allow_insecure {
+        Some(Arc::new(NoCertificateVerification {
+            provider: Arc::clone(&provider),
+        }) as Arc<dyn ServerCertVerifier>)
+    } else if !pinned_peer_cert_sha256.is_empty() || !verify_peer_cert_by_name.is_empty() {
+        Some(Arc::new(XrayCertificateVerification {
+            provider: Arc::clone(&provider),
+            system_roots: Arc::new(rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            }),
+            pins: pinned_peer_cert_sha256.to_vec(),
+            verification_names: verify_peer_cert_by_name.to_vec(),
+        }) as Arc<dyn ServerCertVerifier>)
+    } else {
+        None
+    };
+
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_ech(rustls::client::EchMode::Enable(ech_config))
+        .map_err(|error| TransportError::TlsConfig(error.to_string()))?;
+    Ok(match verifier {
+        Some(verifier) => builder
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth(),
+        None => builder
+            .with_root_certificates(rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            })
+            .with_no_client_auth(),
+    })
+}
+
 fn custom_verification_rustls_client_config(
     provider: Arc<crypto::CryptoProvider>,
     system_roots: rustls::RootCertStore,
@@ -1298,6 +1442,7 @@ mod http3_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: alpn.iter().map(|value| (*value).to_owned()).collect(),
             fingerprint: fingerprint.map(str::to_owned),
+            ech_config_list: None,
         }
     }
 
@@ -1432,6 +1577,159 @@ mod http3_tests {
         let connector = TlsConnector::with_pinned_client_config(Arc::new(tls12_only));
         assert!(matches!(
             connector.http3_client_config_for(&input(false, &[], None)),
+            Err(TransportError::TlsConfig(_))
+        ));
+    }
+
+    /// A syntactically valid ECHConfigList: one V18 config with an X25519
+    /// HPKE key, HKDF-SHA256 and AES-128-GCM, and the public name
+    /// `public.example`. The key is filler, so a server would reject the
+    /// sealed hello, but rustls accepts the list and offers ECH.
+    const TEST_ECH_CONFIG_LIST_BASE64: &str =
+        "AEH+DQA9BwAgACAREREREREREREREREREREREREREREREREREREREREREQAEAAEAAQAOcHVibGljLmV4YW1wbGUAAA==";
+
+    fn test_ech_config_list() -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(TEST_ECH_CONFIG_LIST_BASE64)
+            .expect("synthetic ECHConfigList is base64")
+    }
+
+    /// The versions a ClientHello's `supported_versions` extension lists, or
+    /// `None` when it has none. `hello` is a whole handshake record, so the
+    /// walk starts past the 5-byte record header.
+    fn supported_versions(hello: &[u8]) -> Option<Vec<u16>> {
+        const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+        let mut cursor = 5 + 4 + 2 + 32;
+        cursor += 1 + usize::from(*hello.get(cursor)?);
+        let cipher_suites_len = usize::from(u16::from_be_bytes([
+            *hello.get(cursor)?,
+            *hello.get(cursor + 1)?,
+        ]));
+        cursor += 2 + cipher_suites_len;
+        cursor += 1 + usize::from(*hello.get(cursor)?);
+        let extensions_len = usize::from(u16::from_be_bytes([
+            *hello.get(cursor)?,
+            *hello.get(cursor + 1)?,
+        ]));
+        cursor += 2;
+        let end = cursor + extensions_len;
+
+        while cursor + 4 <= end {
+            let extension_type = u16::from_be_bytes([hello[cursor], hello[cursor + 1]]);
+            let payload_len =
+                usize::from(u16::from_be_bytes([hello[cursor + 2], hello[cursor + 3]]));
+            let payload = hello.get(cursor + 4..cursor + 4 + payload_len)?;
+            if extension_type == EXT_SUPPORTED_VERSIONS {
+                let versions_len = usize::from(*payload.first()?);
+                return Some(
+                    payload
+                        .get(1..1 + versions_len)?
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                        .collect(),
+                );
+            }
+            cursor += 4 + payload_len;
+        }
+        None
+    }
+
+    #[test]
+    fn static_ech_config_list_builds_an_ech_enabled_client_config() {
+        let connector = TlsConnector::system().expect("system TLS connector");
+        let mut config = input(false, &["h2"], Some("unsafe"));
+        config.ech_config_list = Some(test_ech_config_list());
+
+        let client_config = connector
+            .client_config_for(&config)
+            .expect("ECH config builds");
+        assert_eq!(client_config.alpn_protocols, [b"h2".to_vec()]);
+        assert!(client_config.client_hello_customizer.is_none());
+
+        // The hello carries an ECH extension, and the SNI is the config's
+        // public name rather than the inner server name.
+        let hello = plain_tls_client_hello_bytes(&config).expect("ECH hello bytes");
+        // `with_ech` caps the versions to TLS 1.3, which is the only version
+        // ECH is defined for.
+        assert_eq!(
+            supported_versions(&hello),
+            Some(vec![0x0304]),
+            "an ECH hello offers TLS 1.3 alone"
+        );
+        assert!(
+            hello.windows(2).any(|window| window == &[0xfe, 0x0d][..]),
+            "the ClientHello must carry an encrypted_client_hello extension"
+        );
+        let contains = |needle: &[u8]| hello.windows(needle.len()).any(|window| window == needle);
+        assert!(
+            !contains(b"example.com"),
+            "the inner server name must not appear in the outer hello"
+        );
+        assert!(
+            contains(b"public.example"),
+            "the ECH public name is the outer SNI"
+        );
+    }
+
+    #[test]
+    fn ech_config_list_is_part_of_the_config_cache_key() {
+        let connector = TlsConnector::system().expect("system TLS connector");
+        let mut with_ech = input(false, &[], Some("unsafe"));
+        with_ech.ech_config_list = Some(test_ech_config_list());
+        let plain = input(false, &[], Some("unsafe"));
+
+        let ech_config = connector.client_config_for(&with_ech).expect("ECH config");
+        let plain_config = connector.client_config_for(&plain).expect("plain config");
+        assert!(!Arc::ptr_eq(&ech_config, &plain_config));
+
+        let ech_again = connector
+            .client_config_for(&with_ech)
+            .expect("cached ECH config");
+        assert!(Arc::ptr_eq(&ech_config, &ech_again));
+    }
+
+    #[test]
+    fn ech_config_list_is_refused_with_a_shaping_fingerprint() {
+        let connector = TlsConnector::system().expect("system TLS connector");
+        let mut config = input(false, &[], Some("chrome"));
+        config.ech_config_list = Some(test_ech_config_list());
+        assert!(matches!(
+            connector.client_config_for(&config),
+            Err(TransportError::TlsConfig(_))
+        ));
+    }
+
+    #[test]
+    fn ech_config_list_is_refused_on_quic_and_prebuilt_configs() {
+        let connector = TlsConnector::system().expect("system TLS connector");
+        let mut config = input(false, &[], Some("unsafe"));
+        config.ech_config_list = Some(test_ech_config_list());
+        assert!(matches!(
+            connector.quic_client_config_for(&config, b"h3"),
+            Err(TransportError::TlsConfig(_))
+        ));
+        assert!(matches!(
+            connector.chrome_quic_client_config_for(&config, b"h3"),
+            Err(TransportError::TlsConfig(_))
+        ));
+
+        let pinned = Arc::new(unshaped_client_config(false, &[], &[]).expect("pinned config"));
+        let connector = TlsConnector::with_pinned_client_config(pinned);
+        assert!(matches!(
+            connector.client_config_for(&config),
+            Err(TransportError::TlsConfig(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_ech_config_list_is_a_config_error() {
+        let connector = TlsConnector::system().expect("system TLS connector");
+        let mut config = input(false, &[], Some("unsafe"));
+        // A length prefix that does not match the body.
+        config.ech_config_list = Some(vec![0x00, 0x05, 0xfe, 0x0d]);
+        assert!(matches!(
+            connector.client_config_for(&config),
             Err(TransportError::TlsConfig(_))
         ));
     }

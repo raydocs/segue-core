@@ -97,6 +97,7 @@ async fn dial(fingerprint: &str, alpn: &[String], addr: SocketAddr) {
         verify_peer_cert_by_name: Vec::new(),
         alpn: alpn.to_vec(),
         fingerprint: Some(fingerprint.to_owned()),
+        ech_config_list: None,
     };
     // The handshake cannot finish against a server that stops after the
     // second ClientHello; how it ends is not what this is about.
@@ -254,26 +255,28 @@ async fn a_retry_with_a_cookie_gets_it_back_where_utls_would_place_it() {
 }
 
 /// Each ClientHello is padded as BoringSSL pads uTLS's, by its own length:
-/// Chrome 120's hello, twelve bytes short of uTLS's for the six suites rustls
-/// lacks, is padded when uTLS's is 256 to 511 bytes before padding. A P-256
+/// Chrome 120's hello, as long as uTLS's now that it offers all fifteen of
+/// its suites, is padded when it is 256 to 511 bytes before padding. A P-256
 /// share in place of the X25519 and GREASE ones adds 28 bytes, so the
 /// second ClientHello leaves the window the first sat in with the shortest
 /// ECH length; a cookie adds 10 and keeps it there.
 #[tokio::test]
 async fn hellochrome_120_pads_each_client_hello_by_its_own_length() {
-    const OFFSET: isize = 12;
     fn padding(hello: &[u8]) -> Option<usize> {
         extension_body(hello, EXT_PADDING).map(<[u8]>::len)
     }
     fn assert_pads_as_boringssl(hello: &[u8], what: &str) {
-        let unpadded = hello.len() - padding(hello).map_or(0, |padding| 4 + padding);
-        let utls = unpadded as isize + OFFSET;
+        let utls = hello.len() - padding(hello).map_or(0, |padding| 4 + padding);
         let expected = (256..512).contains(&utls).then(|| {
             let padding = 512 - utls;
-            (if padding > 4 { padding - 4 } else { 1 }) + OFFSET
+            if padding > 4 {
+                padding - 4
+            } else {
+                1
+            }
         });
         assert_eq!(
-            padding(hello).map(|padding| padding as isize),
+            padding(hello),
             expected,
             "{what}: uTLS's hello is {utls} bytes before padding"
         );
@@ -367,6 +370,7 @@ async fn shaped_handshakes_complete_through_openssl_hello_retry_requests() {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: Some(fingerprint.to_owned()),
+                ech_config_list: None,
             };
             let outcome = tokio::time::timeout(
                 Duration::from_secs(10),

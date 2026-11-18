@@ -37,7 +37,13 @@ const DNS_HIJACK_DEFAULT_TTL: u32 = 300;
 #[derive(Clone)]
 pub(super) enum TunDnsMode {
     Disabled,
-    FakeIp(Arc<Mutex<FakeIpMapper>>),
+    /// Fake IP answers, with the configured servers kept for names
+    /// `dns.fakeIp.exemptDomains` exempts: those get a real answer from the
+    /// plan, or pass through when there is none.
+    FakeIp {
+        mapper: Arc<Mutex<FakeIpMapper>>,
+        exempt_plan: Option<Arc<DnsProxyPlan>>,
+    },
     RawProxy(Arc<DnsProxyPlan>),
 }
 
@@ -47,7 +53,10 @@ impl TunDnsMode {
         fake_ip_mapper: Option<Arc<Mutex<FakeIpMapper>>>,
     ) -> Self {
         if let Some(mapper) = fake_ip_mapper {
-            return Self::FakeIp(mapper);
+            return Self::FakeIp {
+                mapper,
+                exempt_plan: DnsProxyPlan::from_config(config).map(Arc::new),
+            };
         }
         DnsProxyPlan::from_config(config)
             .map(|plan| Self::RawProxy(Arc::new(plan)))
@@ -751,7 +760,7 @@ fn build_dns_hijack_response(
 }
 
 async fn resolve_dns_hijack_response(
-    resolver: Arc<dyn DnsResolver>,
+    resolver: &dyn DnsResolver,
     query: Bytes,
     question: DnsQuestion,
     max_payload: usize,
@@ -847,7 +856,7 @@ pub(super) fn tcp_action(
         return DnsTcpAction::Pass;
     }
     match mode {
-        TunDnsMode::FakeIp(mapper) => DnsTcpAction::FakeIp(Arc::clone(mapper)),
+        TunDnsMode::FakeIp { mapper, .. } => DnsTcpAction::FakeIp(Arc::clone(mapper)),
         TunDnsMode::RawProxy(plan) if is_dns_anchor_endpoint(endpoint) => {
             DnsTcpAction::Proxy(Arc::clone(plan))
         }
@@ -892,7 +901,28 @@ pub(super) fn udp_action(
     }
     let is_anchor = is_dns_anchor_endpoint(packet.target);
     match mode {
-        TunDnsMode::FakeIp(mapper) => {
+        TunDnsMode::FakeIp {
+            mapper,
+            exempt_plan,
+        } => {
+            // An exempt name gets a real answer from the configured servers,
+            // as it would without fake IP; without any, it passes through.
+            let exempt = parse_dns_question(&packet.payload).is_some_and(|question| {
+                mapper
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_exempt(&question.domain)
+            });
+            if exempt {
+                if let Some(plan) = exempt_plan {
+                    return DnsUdpAction::Proxy(Arc::clone(plan));
+                }
+                // No configured servers: an exempt name passes through, as the
+                // mode documents, whichever address the query was sent to. A
+                // SERVFAIL reply here would be a fake answer for a name the
+                // caller asked not to fake.
+                return DnsUdpAction::Pass;
+            }
             let response = mapper
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -971,7 +1001,7 @@ pub(super) async fn bridge_udp_query(
             biased;
             () = wait_for_tun_shutdown(&mut shutdown) => return,
             response = resolve_dns_hijack_response(
-                Arc::clone(&context.dns_resolver),
+                context.dns_resolver.as_ref(),
                 packet.payload.clone(),
                 question,
                 max_payload,
@@ -1064,7 +1094,8 @@ pub(super) async fn bridge_fake_ip_tcp_flow(
         };
         decoder.push(&data.data);
 
-        let decoded = fake_ip_tcp_responses(&mapper, &mut decoder);
+        let decoded =
+            fake_ip_tcp_responses(&mapper, context.dns_resolver.as_ref(), &mut decoder).await;
         if decoded.processed_message {
             idle_sleep
                 .as_mut()
@@ -1605,7 +1636,7 @@ impl RawDnsTcpHijackLookups {
                     };
                 },
                 response = resolve_dns_hijack_response(
-                    resolver,
+                    resolver.as_ref(),
                     query,
                     question,
                     MAX_DNS_TCP_WIRE_MESSAGE_SIZE,
@@ -3263,7 +3294,7 @@ async fn open_raw_dns_tcp_candidate(
         return RawDnsTcpOpenResult::TimedOut;
     }
     let policy_timeout = match outbound.primary() {
-        TcpOutbound::Hysteria(_) | TcpOutbound::Wireguard(_) => {
+        TcpOutbound::Tuic(_) | TcpOutbound::Hysteria(_) | TcpOutbound::Wireguard(_) => {
             effective_policy_for_level(&context.config, Some(0)).handshake
         }
         TcpOutbound::Masque(_) => crate::outbound::masque::open_timeout(
@@ -3271,6 +3302,9 @@ async fn open_raw_dns_tcp_candidate(
         ),
         TcpOutbound::Freedom(_) => context.inbound_policy.handshake,
         TcpOutbound::Trojan(outbound) => {
+            effective_policy_for_level(&context.config, Some(outbound.level())).handshake
+        }
+        TcpOutbound::AnyTls(outbound) => {
             effective_policy_for_level(&context.config, Some(outbound.level())).handshake
         }
         TcpOutbound::Socks(outbound) => {
@@ -3445,8 +3479,9 @@ impl DnsTcpFrameDecoder {
     }
 }
 
-fn fake_ip_tcp_responses(
+async fn fake_ip_tcp_responses(
     mapper: &Arc<Mutex<FakeIpMapper>>,
+    resolver: &dyn DnsResolver,
     decoder: &mut DnsTcpFrameDecoder,
 ) -> FakeDnsTcpDecodeResult {
     let mut output = BytesMut::new();
@@ -3459,11 +3494,33 @@ fn fake_ip_tcp_responses(
             Err(_) => return fake_dns_tcp_decode_result(output, processed_message, true),
         };
         let query = &frame[2..];
-        let Some(response) = mapper
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .fake_dns_response(query, true)
-            .or_else(|| dns_error_response(query, DNS_RCODE_SERVFAIL, false))
+        let exempt = parse_dns_question(query).is_some_and(|question| {
+            mapper
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_exempt(&question.domain)
+        });
+        // An exempt name keeps a real answer, as it would without fake IP.
+        // A query the hijack path cannot answer (a non-address type) keeps
+        // the fake-DNS NODATA it had before.
+        let response = match (exempt, dns_hijack_question(query)) {
+            (true, Some(question)) => Some(
+                resolve_dns_hijack_response(
+                    resolver,
+                    frame.slice(2..),
+                    question,
+                    MAX_DNS_TCP_WIRE_MESSAGE_SIZE,
+                    true,
+                )
+                .await,
+            ),
+            _ => mapper
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .fake_dns_response(query, true),
+        };
+        let Some(response) =
+            response.or_else(|| dns_error_response(query, DNS_RCODE_SERVFAIL, false))
         else {
             return fake_dns_tcp_decode_result(output, processed_message, true);
         };
@@ -3525,10 +3582,12 @@ async fn proxy_udp_payload(
                 let outbound_timeout = match &outbound {
                     UdpOutbound::Freedom(_) => DNS_PROXY_FREEDOM_ATTEMPT_TIMEOUT,
                     UdpOutbound::Trojan(_)
+                    | UdpOutbound::AnyTls(_)
                     | UdpOutbound::Socks(_)
                     | UdpOutbound::Vmess(_)
                     | UdpOutbound::Shadowsocks2022(_)
                     | UdpOutbound::Vless(_)
+                    | UdpOutbound::Tuic(_)
                     | UdpOutbound::Hysteria(_)
                     | UdpOutbound::Wireguard(_)
                     | UdpOutbound::Masque(_) => DNS_PROXY_VLESS_ATTEMPT_TIMEOUT,
@@ -5198,7 +5257,7 @@ mod tests {
         )));
 
         let response = resolve_dns_hijack_response(
-            resolver,
+            resolver.as_ref(),
             query,
             question.clone(),
             MAX_DNS_TCP_WIRE_MESSAGE_SIZE,
@@ -5224,7 +5283,7 @@ mod tests {
         let plain_query = Bytes::from(dns_a_query(0x400e, "plain-tcp.example"));
         let plain_question = dns_hijack_question(&plain_query).unwrap();
         let plain_response = resolve_dns_hijack_response(
-            Arc::clone(&resolver),
+            resolver.as_ref(),
             plain_query,
             plain_question,
             MAX_DNS_TCP_WIRE_MESSAGE_SIZE,
@@ -5237,7 +5296,7 @@ mod tests {
         let edns_query = Bytes::from(dns_a_query_with_edns(0x400f, "edns-tcp.example", 1_232));
         let edns_question = dns_hijack_question(&edns_query).unwrap();
         let edns_response = resolve_dns_hijack_response(
-            resolver,
+            resolver.as_ref(),
             edns_query,
             edns_question,
             MAX_DNS_TCP_WIRE_MESSAGE_SIZE,
@@ -5270,7 +5329,7 @@ mod tests {
             let query = Bytes::from(query);
             let question = dns_hijack_question(&query).unwrap();
             let response = resolve_dns_hijack_response(
-                Arc::clone(&resolver),
+                resolver.as_ref(),
                 query,
                 question,
                 MAX_DNS_TCP_WIRE_MESSAGE_SIZE,
@@ -6220,6 +6279,7 @@ mod tests {
                 .unwrap(),
             pool_size: 32_768,
             ttl: 60,
+            exempt_domains: segue_config::default_fake_ip_exempt_domains(),
         };
         FakeIpMapper::from_config(
             &config,
@@ -6231,6 +6291,15 @@ mod tests {
 
     fn fake_ip_mapper() -> Arc<Mutex<FakeIpMapper>> {
         Arc::new(Mutex::new(new_fake_ip_mapper()))
+    }
+
+    /// The resolver a fixed fake-DNS flow falls back to for exempt names.
+    fn fake_ip_test_resolver() -> Arc<dyn DnsResolver> {
+        Arc::new(FixedDnsResolver(DnsLookup::from_ips(
+            [IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99))],
+            DNS_PORT,
+            Some(Duration::from_secs(30)),
+        )))
     }
 
     fn dns_tcp_frame(payload: &[u8]) -> Vec<u8> {
@@ -6310,20 +6379,30 @@ mod tests {
         assert_eq!(decoder.next_frame(), Ok(None));
     }
 
-    #[test]
-    fn fake_dns_tcp_decoder_keeps_fragmented_frame_until_complete() {
+    #[tokio::test]
+    async fn fake_dns_tcp_decoder_keeps_fragmented_frame_until_complete() {
         let query = dns_a_query(0x2401, "fragmented.example");
         let frame = dns_tcp_frame(&query);
         let mut decoder = DnsTcpFrameDecoder::default();
         decoder.push(&frame[..1]);
 
-        let partial = fake_ip_tcp_responses(&fake_ip_mapper(), &mut decoder);
+        let partial = fake_ip_tcp_responses(
+            &fake_ip_mapper(),
+            fake_ip_test_resolver().as_ref(),
+            &mut decoder,
+        )
+        .await;
         assert!(partial.response.is_none());
         assert!(!partial.processed_message);
         assert!(!partial.terminal_error);
 
         decoder.push(&frame[1..]);
-        let decoded = fake_ip_tcp_responses(&fake_ip_mapper(), &mut decoder);
+        let decoded = fake_ip_tcp_responses(
+            &fake_ip_mapper(),
+            fake_ip_test_resolver().as_ref(),
+            &mut decoder,
+        )
+        .await;
         let response = decoded.response.unwrap();
         assert!(decoded.processed_message);
         assert!(!decoded.terminal_error);
@@ -6335,8 +6414,8 @@ mod tests {
         assert!(decoder.buffered.is_empty());
     }
 
-    #[test]
-    fn fake_dns_tcp_decoder_recovers_a_poisoned_mapper_lock() {
+    #[tokio::test]
+    async fn fake_dns_tcp_decoder_recovers_a_poisoned_mapper_lock() {
         let mapper = fake_ip_mapper();
         let poisoned_mapper = Arc::clone(&mapper);
         assert!(std::thread::spawn(move || {
@@ -6349,7 +6428,8 @@ mod tests {
         let mut decoder = DnsTcpFrameDecoder::default();
         decoder.push(&dns_tcp_frame(&query));
 
-        let decoded = fake_ip_tcp_responses(&mapper, &mut decoder);
+        let decoded =
+            fake_ip_tcp_responses(&mapper, fake_ip_test_resolver().as_ref(), &mut decoder).await;
         let response = decoded.response.unwrap();
 
         assert!(!decoded.terminal_error);
@@ -6357,15 +6437,20 @@ mod tests {
         assert_eq!(u16::from_be_bytes([response[8], response[9]]), 1);
     }
 
-    #[test]
-    fn fake_dns_tcp_decoder_answers_coalesced_pipelined_frames() {
+    #[tokio::test]
+    async fn fake_dns_tcp_decoder_answers_coalesced_pipelined_frames() {
         let mut decoder = DnsTcpFrameDecoder::default();
         for (id, domain) in [(0x2402, "first.example"), (0x2403, "second.example")] {
             let query = dns_a_query(id, domain);
             decoder.push(&dns_tcp_frame(&query));
         }
 
-        let decoded = fake_ip_tcp_responses(&fake_ip_mapper(), &mut decoder);
+        let decoded = fake_ip_tcp_responses(
+            &fake_ip_mapper(),
+            fake_ip_test_resolver().as_ref(),
+            &mut decoder,
+        )
+        .await;
         let response = decoded.response.unwrap();
         let first_len = usize::from(u16::from_be_bytes([response[0], response[1]]));
         let second_offset = first_len + 2;
@@ -6380,26 +6465,36 @@ mod tests {
         assert!(decoder.buffered.is_empty());
     }
 
-    #[test]
-    fn fake_dns_tcp_decoder_accepts_maximum_frame_prefix_without_early_failure() {
+    #[tokio::test]
+    async fn fake_dns_tcp_decoder_accepts_maximum_frame_prefix_without_early_failure() {
         let mut decoder = DnsTcpFrameDecoder::default();
         decoder.push(&u16::MAX.to_be_bytes());
 
-        let decoded = fake_ip_tcp_responses(&fake_ip_mapper(), &mut decoder);
+        let decoded = fake_ip_tcp_responses(
+            &fake_ip_mapper(),
+            fake_ip_test_resolver().as_ref(),
+            &mut decoder,
+        )
+        .await;
 
         assert!(decoded.response.is_none());
         assert!(!decoded.processed_message);
         assert!(!decoded.terminal_error);
     }
 
-    #[test]
-    fn fake_dns_tcp_decoder_keeps_valid_response_before_partial_maximum_frame() {
+    #[tokio::test]
+    async fn fake_dns_tcp_decoder_keeps_valid_response_before_partial_maximum_frame() {
         let query = dns_a_query(0x2404, "valid.example");
         let mut decoder = DnsTcpFrameDecoder::default();
         decoder.push(&dns_tcp_frame(&query));
         decoder.push(&u16::MAX.to_be_bytes());
 
-        let decoded = fake_ip_tcp_responses(&fake_ip_mapper(), &mut decoder);
+        let decoded = fake_ip_tcp_responses(
+            &fake_ip_mapper(),
+            fake_ip_test_resolver().as_ref(),
+            &mut decoder,
+        )
+        .await;
         let response = decoded.response.unwrap();
 
         assert!(decoded.processed_message);
@@ -6639,7 +6734,10 @@ mod tests {
             DnsTcpAction::Reject
         ));
         let fake_mapper = new_fake_ip_mapper();
-        let fake_mode = TunDnsMode::FakeIp(Arc::new(Mutex::new(fake_mapper)));
+        let fake_mode = TunDnsMode::FakeIp {
+            mapper: Arc::new(Mutex::new(fake_mapper)),
+            exempt_plan: None,
+        };
         assert!(matches!(
             tcp_action(&fake_mode, anchor, None),
             DnsTcpAction::FakeIp(_)
@@ -6651,6 +6749,52 @@ mod tests {
         assert!(matches!(
             tcp_action(&TunDnsMode::Disabled, ordinary, None),
             DnsTcpAction::Pass
+        ));
+    }
+
+    #[test]
+    fn exempt_names_use_the_configured_servers_in_fixed_fake_dns_mode() {
+        let upstream = SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53));
+        let plan = Arc::new(
+            DnsProxyPlan::from_servers(&[DnsServerConfig::Ip(upstream)], "dns-route").unwrap(),
+        );
+        let mode = TunDnsMode::FakeIp {
+            mapper: fake_ip_mapper(),
+            exempt_plan: Some(plan),
+        };
+        let anchor = IpEndpoint::new(IpAddress::Ipv4(TUN_DNS_ANCHOR), DNS_PORT);
+        let packet = |domain: &str| UdpTunPacket {
+            client: IpEndpoint::new(IpAddress::Ipv4(TUN_CLIENT_IPV4), 40_000),
+            target: anchor,
+            payload: Bytes::from(dns_a_query(0x7780, domain)),
+        };
+
+        assert!(matches!(
+            udp_action(&mode, &packet("captive.apple.com"), None),
+            DnsUdpAction::Proxy(_)
+        ));
+        assert!(matches!(
+            udp_action(&mode, &packet("ordinary.example"), None),
+            DnsUdpAction::Reply(_)
+        ));
+    }
+
+    #[test]
+    fn exempt_names_pass_through_without_configured_servers() {
+        let mode = TunDnsMode::FakeIp {
+            mapper: fake_ip_mapper(),
+            exempt_plan: None,
+        };
+        let anchor = IpEndpoint::new(IpAddress::Ipv4(TUN_DNS_ANCHOR), DNS_PORT);
+        let packet = UdpTunPacket {
+            client: IpEndpoint::new(IpAddress::Ipv4(TUN_CLIENT_IPV4), 40_000),
+            target: anchor,
+            payload: Bytes::from(dns_a_query(0x7781, "captive.apple.com")),
+        };
+
+        assert!(matches!(
+            udp_action(&mode, &packet, None),
+            DnsUdpAction::Pass
         ));
     }
 

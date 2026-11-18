@@ -32,6 +32,7 @@ mod fake_dns;
 mod health;
 mod http;
 mod http_forward;
+mod memory_watch;
 mod outbound;
 mod policy;
 mod reverse;
@@ -97,6 +98,20 @@ pub struct TunRuntimeOptions {
     /// MTU of the host's TUN interface. The host must give the interface the
     /// same value (`VpnService.Builder.setMtu`, `NEPacketTunnelNetworkSettings.mtu`).
     pub mtu: TunMtu,
+    /// The process memory budget the platform kills the extension for
+    /// exceeding, in bytes: 50 MiB on iOS. When set, a watchdog samples the
+    /// process footprint about once a second and sheds idle connections and
+    /// pooled relay buffers as it approaches the limit. `None` (the default)
+    /// starts no watchdog.
+    pub memory_limit: Option<u64>,
+    /// Stop observatory probes after this much time without a connection that
+    /// uses a health-aware balancer. `None` uses 30 minutes. Probing resumes on
+    /// the next such connection and retains the observations already gathered.
+    pub observatory_idle_timeout: Option<Duration>,
+    /// Retain eager observatory probing from startup on every profile. The
+    /// default is lazy on mobile and low-memory profiles, eager on desktop and
+    /// throughput profiles. Xray's observatory JSON fields are unchanged.
+    pub eager_observatory: bool,
 }
 
 /// MTU of the TUN link, validated to [`TunMtu::MIN`]..=[`TunMtu::MAX`].
@@ -276,6 +291,22 @@ impl TunRuntimeProfile {
 }
 
 impl TunRuntimeOptions {
+    pub(crate) fn observatory_is_lazy(self) -> bool {
+        !self.eager_observatory
+            && match self.profile {
+                TunRuntimeProfile::Default => matches!(
+                    DEFAULT_DNS_RUNTIME_PROFILE,
+                    TunRuntimeProfile::Mobile
+                        | TunRuntimeProfile::MobilePlus
+                        | TunRuntimeProfile::LowMemory
+                ),
+                TunRuntimeProfile::Mobile
+                | TunRuntimeProfile::MobilePlus
+                | TunRuntimeProfile::LowMemory => true,
+                TunRuntimeProfile::Desktop | TunRuntimeProfile::Throughput => false,
+            }
+    }
+
     pub fn with_profile(profile: TunRuntimeProfile) -> Self {
         Self {
             profile,
@@ -345,11 +376,15 @@ pub enum CoreError {
     #[error(transparent)]
     Trojan(#[from] segue_proxy::trojan::WireError),
     #[error(transparent)]
+    AnyTls(#[from] segue_proxy::anytls::WireError),
+    #[error(transparent)]
     Socks(#[from] segue_proxy::outbound::SocksClientError),
     #[error(transparent)]
     Http(#[from] segue_proxy::outbound::HttpClientError),
     #[error(transparent)]
     Hysteria(#[from] segue_transport::hysteria::HysteriaError),
+    #[error(transparent)]
+    Tuic(#[from] crate::outbound::TuicError),
     #[error(transparent)]
     Wireguard(#[from] segue_wireguard::Error),
     #[error(transparent)]
@@ -850,6 +885,7 @@ impl Core {
                         | segue_config::OutboundSettings::Shadowsocks2022(_)
                         | segue_config::OutboundSettings::Socks(_)
                         | segue_config::OutboundSettings::Http(_)
+                        | segue_config::OutboundSettings::AnyTls(_)
                 )
                 && !outbound::masque::over_http2(outbound)
             {
@@ -1044,7 +1080,12 @@ impl Core {
     /// protected socket after an OS network change: XHTTP, MASQUE and
     /// XDRIVE's storages over HTTP/3. Streams and tunnels are kept; a
     /// connection behind a `realm`, `xdns` or `xicmp` mask stays as it is.
-    /// The count is of connections asked, not of paths validated.
+    /// An mKCP connection on its own UDP socket, plain or behind `realm`,
+    /// cannot move, as its server would not know the new socket: it fails
+    /// with `NetworkDown`, at once if its source address changed and
+    /// otherwise unless its peer is heard within seconds. The count
+    /// is of connections told, these among them, not of paths validated or
+    /// of connections that survive.
     pub fn rebind_quic(&self) -> u64 {
         self.transport_dialer.network_changes().notify()
     }
@@ -1518,6 +1559,16 @@ impl Core {
                 tasks.push(task);
             }
         }
+        // Only a host that set a memory limit gets a watchdog; without one no
+        // task is spawned and nothing is sampled.
+        if let Some(task) = memory_watch::spawn_memory_watchdog(
+            Arc::clone(&self.connection_registry),
+            self.tun_runtime_options.memory_limit,
+            self.runtime_logger.clone(),
+            self.shutdown.subscribe(),
+        ) {
+            tasks.push(task);
+        }
 
         self.runtime = Some(RuntimeState {
             inbounds,
@@ -1565,6 +1616,19 @@ impl Core {
                 .graph()
                 .leaf_nodes_matching_prefixes(&observatory.subject_selectors);
             if !nodes.is_empty() {
+                // Sing-box rejects an idle timeout shorter than the probe
+                // interval. Clamp instead of failing the core start: this is a
+                // runtime option, not an Xray JSON field.
+                let idle_timeout = if self.tun_runtime_options.observatory_is_lazy() {
+                    Some(
+                        self.tun_runtime_options
+                            .observatory_idle_timeout
+                            .unwrap_or(health::DEFAULT_OBSERVATORY_IDLE_TIMEOUT)
+                            .max(observatory.probe_interval),
+                    )
+                } else {
+                    None
+                };
                 let runtime = health::ObservatoryRuntime::new(
                     observatory,
                     nodes,
@@ -1573,6 +1637,7 @@ impl Core {
                     Arc::clone(&runtime_dns_resolvers.destination),
                     Arc::clone(&runtime_dns_resolvers.bootstrap),
                     Arc::clone(&self.transport_dialer),
+                    idle_timeout,
                 );
                 let task =
                     tokio::spawn(health::run_observatory(runtime, self.shutdown.subscribe()));
@@ -1948,6 +2013,29 @@ mod tests {
         DnsRules, DnsRuntimeLimits, TransportDnsQueryStrategy, TunRuntimeOptions,
         TunRuntimeProfile,
     };
+
+    #[test]
+    fn observatory_probing_is_lazy_on_phone_profiles_unless_forced_eager() {
+        for profile in [
+            TunRuntimeProfile::Mobile,
+            TunRuntimeProfile::MobilePlus,
+            TunRuntimeProfile::LowMemory,
+        ] {
+            assert!(
+                TunRuntimeOptions::with_profile(profile).observatory_is_lazy(),
+                "{profile:?}"
+            );
+            let mut forced = TunRuntimeOptions::with_profile(profile);
+            forced.eager_observatory = true;
+            assert!(!forced.observatory_is_lazy(), "{profile:?}");
+        }
+        for profile in [TunRuntimeProfile::Desktop, TunRuntimeProfile::Throughput] {
+            assert!(
+                !TunRuntimeOptions::with_profile(profile).observatory_is_lazy(),
+                "{profile:?}"
+            );
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_waits_for_runtime_shutdown_cleanup() {

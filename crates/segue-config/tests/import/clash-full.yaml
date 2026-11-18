@@ -1,0 +1,148 @@
+# Synthetic Clash/mihomo profile: fake UUIDs, keys and example.com hosts only.
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "+.lan"
+    - "+.local"
+    - "*.example.com"
+  nameserver:
+    - 1.1.1.1
+    - https://dns.example.com/dns-query
+    - system
+  fallback:
+    - 8.8.8.8
+
+proxies:
+  - name: vless-reality
+    type: vless
+    server: edge.example.com
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000001
+    network: tcp
+    tls: true
+    flow: xtls-rprx-vision
+    servername: www.example.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      short-id: 0123456789abcdef
+
+  - name: vmess-ws
+    type: vmess
+    server: ws.example.com
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000002
+    alterId: 0
+    cipher: auto
+    network: ws
+    tls: true
+    servername: ws.example.com
+    ws-opts:
+      path: /ray
+      headers:
+        Host: ws.example.com
+
+  - name: trojan-grpc
+    type: trojan
+    server: trojan.example.com
+    port: 443
+    password: synthetic-trojan-password
+    network: grpc
+    sni: trojan.example.com
+    grpc-opts:
+      grpc-service-name: GunService
+
+  - name: ss-2022
+    type: ss
+    server: ss.example.com
+    port: 8388
+    cipher: 2022-blake3-aes-128-gcm
+    password: AAAAAAAAAAAAAAAAAAAAAA==
+
+  - name: hy2
+    type: hysteria2
+    server: hy.example.com
+    port: 443
+    password: synthetic-hy2-password
+    sni: hy.example.com
+    obfs: salamander
+    obfs-password: synthetic-obfs-password
+    ports: 443,8443-8445
+
+  - name: anytls
+    type: anytls
+    server: anytls.example.com
+    port: 443
+    password: synthetic-anytls-password
+    sni: anytls.example.com
+    client-metadata: synthetic-client
+
+  - name: wg
+    type: wireguard
+    server: wg.example.com
+    port: 51820
+    ip: 10.0.0.2
+    private-key: QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=
+    public-key: BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=
+    mtu: 1420
+    dns: [1.1.1.1]
+
+  - name: socks
+    type: socks5
+    server: socks.example.com
+    port: 1080
+    username: synthetic-user
+    password: synthetic-pass
+
+  - name: http-proxy
+    type: http
+    server: http.example.com
+    port: 8080
+    username: synthetic-user
+    password: synthetic-pass
+
+  - name: tuic-unsupported
+    type: tuic
+    server: tuic.example.com
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000003
+    password: synthetic-tuic-password
+
+proxy-groups:
+  - name: auto
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    proxies: [vless-reality, vmess-ws, trojan-grpc]
+  - name: manual
+    type: select
+    proxies: [auto, ss-2022, DIRECT]
+  - name: balance
+    type: load-balance
+    proxies: [hy2, anytls]
+
+rules:
+  - DOMAIN-SUFFIX,example.com,auto
+  - DOMAIN,exact.example.org,manual
+  - DOMAIN-KEYWORD,ads,REJECT
+  - IP-CIDR,192.0.2.0/24,DIRECT,no-resolve
+  - IP-CIDR6,2001:db8::/32,DIRECT
+  - GEOIP,CN,DIRECT
+  - GEOSITE,cn,DIRECT
+  - PROCESS-NAME,curl,DIRECT
+  - RULE-SET,ads-list,REJECT
+  - DST-PORT,8443,balance
+  - MATCH,auto
+
+rule-providers:
+  ads-list:
+    type: file
+    behavior: domain
+    path: ./rules/ads.yaml

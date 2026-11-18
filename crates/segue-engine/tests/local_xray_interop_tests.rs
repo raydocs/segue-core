@@ -26,6 +26,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout, Duration, Instant};
 
+#[path = "../../../tests/support/xray_startup.rs"]
+#[macro_use]
+mod xray_startup;
+
 const TEST_UUID: &str = "00010203-0405-0607-0809-0a0b0c0d0e0f";
 const TLS_SERVER_NAME: &str = "vless.test";
 const XRAY_CORE_EXPECTED_REVISION_ENV: &str = "XRAY_CORE_EXPECTED_REVISION";
@@ -266,6 +270,7 @@ async fn rust_socks_clients_open_parallel_echo_flows_through_local_xray_vless_tl
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 None,
             );
@@ -572,6 +577,7 @@ fn rust_tls_core_config_and_dialer(
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         flow,
     );
@@ -935,6 +941,7 @@ async fn run_local_xray_vless_shaped_tls_burst_interop(fingerprint: &str, flow_c
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         None,
     );
@@ -1755,6 +1762,33 @@ fn write_xray_vless_client_config(
     fs::write(path, config).expect("write xray client config");
 }
 
+/// Xray-core's binary: `XRAY_VLESS_FULL_BINARY` when the interop scripts
+/// built it once, else a fresh `go build` into `directory`, which the
+/// started server keeps alive for as long as it runs.
+fn xray_vless_binary(xray_checkout: &Path, directory: &TempDir) -> PathBuf {
+    if let Some(built) = env::var_os("XRAY_VLESS_FULL_BINARY") {
+        return PathBuf::from(built);
+    }
+    let binary = directory
+        .path
+        .join(format!("xray{}", env::consts::EXE_SUFFIX));
+    let build_output = Command::new("go")
+        .arg("build")
+        .arg("-o")
+        .arg(&binary)
+        .arg("./main")
+        .current_dir(xray_checkout)
+        .output()
+        .expect("start go build for Xray-core");
+    assert!(
+        build_output.status.success(),
+        "go build ./main failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    binary
+}
+
 async fn start_xray_vless_server(
     xray_checkout: &Path,
     server_config: XrayVlessServerConfig,
@@ -1765,7 +1799,7 @@ async fn start_xray_vless_server(
 async fn start_xray_vless_server_customized(
     xray_checkout: &Path,
     server_config: XrayVlessServerConfig,
-    customize: impl FnOnce(&mut serde_json::Value),
+    customize: impl Fn(&mut serde_json::Value),
 ) -> XrayServer {
     start_xray_vless_server_listening(xray_checkout, server_config, customize, true).await
 }
@@ -1773,19 +1807,17 @@ async fn start_xray_vless_server_customized(
 /// [`start_xray_vless_server_customized`], waiting for the UDP listener of
 /// an mKCP or HTTP/3 inbound only when `udp_listener`: under the `xicmp`
 /// mask the inbound reads ICMP and binds no UDP port.
+///
+/// The port is picked by binding it and letting go, and a parallel test's
+/// socket can take it before Xray binds it; the server then exits with
+/// "address already in use" and the start is repeated on a fresh port, with
+/// the config rendered again for it.
 async fn start_xray_vless_server_listening(
     xray_checkout: &Path,
     server_config: XrayVlessServerConfig,
-    customize: impl FnOnce(&mut serde_json::Value),
+    customize: impl Fn(&mut serde_json::Value),
     udp_listener: bool,
 ) -> XrayServer {
-    let temp_dir = create_temp_dir("xray-rust-local-interop");
-    let binary = temp_dir
-        .path
-        .join(format!("xray{}", env::consts::EXE_SUFFIX));
-    let config_path = temp_dir.path.join("server.json");
-    let stdout_path = temp_dir.path.join("xray.stdout.log");
-    let stderr_path = temp_dir.path.join("xray.stderr.log");
     let uses_udp_listener = matches!(
         server_config.transport,
         XrayInboundTransport::Xhttp {
@@ -1793,6 +1825,32 @@ async fn start_xray_vless_server_listening(
             ..
         } | XrayInboundTransport::Kcp
     );
+    start_on_fresh_ports!(
+        "xray",
+        try_start_xray_vless_server(
+            xray_checkout,
+            server_config,
+            &customize,
+            uses_udp_listener,
+            udp_listener,
+        )
+    )
+}
+
+/// One start of [`start_xray_vless_server_listening`] on a fresh port:
+/// `None` when another socket took the port first.
+async fn try_start_xray_vless_server(
+    xray_checkout: &Path,
+    server_config: XrayVlessServerConfig,
+    customize: &impl Fn(&mut serde_json::Value),
+    uses_udp_listener: bool,
+    udp_listener: bool,
+) -> Option<XrayServer> {
+    let temp_dir = create_temp_dir("xray-rust-local-interop");
+    let binary = xray_vless_binary(xray_checkout, &temp_dir);
+    let config_path = temp_dir.path.join("server.json");
+    let stdout_path = temp_dir.path.join("xray.stdout.log");
+    let stderr_path = temp_dir.path.join("xray.stderr.log");
     let port = if uses_udp_listener {
         allocate_loopback_udp_port()
     } else {
@@ -1817,27 +1875,6 @@ async fn start_xray_vless_server_listening(
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    let binary = if let Some(built) = env::var_os("XRAY_VLESS_FULL_BINARY") {
-        PathBuf::from(built)
-    } else {
-        let build_output = Command::new("go")
-            .arg("build")
-            .arg("-o")
-            .arg(&binary)
-            .arg("./main")
-            .current_dir(xray_checkout)
-            .output()
-            .expect("start go build for Xray-core");
-        assert!(
-            build_output.status.success(),
-            "go build ./main failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&build_output.stdout),
-            String::from_utf8_lossy(&build_output.stderr)
-        );
-
-        binary
-    };
-
     let mut child = Command::new(&binary)
         .arg("run")
         .arg("-config")
@@ -1852,53 +1889,54 @@ async fn start_xray_vless_server_listening(
         .expect("start xray process");
 
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    if uses_udp_listener && udp_listener {
-        wait_for_udp_listener(&mut child, addr, &stdout_path, &stderr_path).await;
+    let ready = if uses_udp_listener && udp_listener {
+        wait_for_udp_listener(&mut child, addr, &stdout_path, &stderr_path).await
     } else if uses_udp_listener {
-        wait_for_xray_startup(&mut child, &stdout_path, &stderr_path).await;
+        wait_for_xray_startup(&mut child, &stdout_path, &stderr_path).await
     } else {
-        wait_for_tcp_listener(&mut child, addr, &stdout_path, &stderr_path).await;
+        wait_for_tcp_listener(&mut child, addr, &stdout_path, &stderr_path).await
+    };
+    if !ready {
+        return None;
     }
 
-    XrayServer {
+    Some(XrayServer {
         child,
         _temp_dir: temp_dir,
         addr,
         stdout_path,
         stderr_path,
         tls_client_config,
-    }
+    })
 }
 
+/// Xray-core's own VLESS client, its SOCKS inbound on a fresh port — one a
+/// parallel test could have taken, so the start is repeated on a new port.
 async fn start_xray_vless_client(
     xray_checkout: &Path,
     server_addr: SocketAddr,
     fingerprint: &str,
 ) -> XrayServer {
+    start_on_fresh_ports!(
+        "the xray client",
+        try_start_xray_vless_client(xray_checkout, server_addr, fingerprint)
+    )
+}
+
+/// One start of [`start_xray_vless_client`] on a fresh port: `None` when
+/// another socket took the port first.
+async fn try_start_xray_vless_client(
+    xray_checkout: &Path,
+    server_addr: SocketAddr,
+    fingerprint: &str,
+) -> Option<XrayServer> {
     let temp_dir = create_temp_dir("xray-core-client-local-interop");
-    let binary = temp_dir
-        .path
-        .join(format!("xray{}", env::consts::EXE_SUFFIX));
+    let binary = xray_vless_binary(xray_checkout, &temp_dir);
     let config_path = temp_dir.path.join("client.json");
     let stdout_path = temp_dir.path.join("xray-client.stdout.log");
     let stderr_path = temp_dir.path.join("xray-client.stderr.log");
     let port = allocate_loopback_port();
     write_xray_vless_client_config(&config_path, port, server_addr, fingerprint);
-
-    let build_output = Command::new("go")
-        .arg("build")
-        .arg("-o")
-        .arg(&binary)
-        .arg("./main")
-        .current_dir(xray_checkout)
-        .output()
-        .expect("start go build for Xray-core client");
-    assert!(
-        build_output.status.success(),
-        "go build ./main failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&build_output.stdout),
-        String::from_utf8_lossy(&build_output.stderr)
-    );
 
     let mut child = Command::new(&binary)
         .arg("run")
@@ -1914,44 +1952,47 @@ async fn start_xray_vless_client(
         .expect("start xray client process");
 
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    wait_for_tcp_listener(&mut child, addr, &stdout_path, &stderr_path).await;
+    if !wait_for_tcp_listener(&mut child, addr, &stdout_path, &stderr_path).await {
+        return None;
+    }
 
-    XrayServer {
+    Some(XrayServer {
         child,
         _temp_dir: temp_dir,
         addr,
         stdout_path,
         stderr_path,
         tls_client_config: None,
-    }
+    })
+}
+
+fn xray_logs(stdout_path: &Path, stderr_path: &Path) -> String {
+    let stdout = fs::read_to_string(stdout_path).unwrap_or_default();
+    let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
+    format!("stdout:\n{stdout}\nstderr:\n{stderr}")
 }
 
 // A successful connect to a freshly released ephemeral port does not prove
 // that our child is ready: another concurrent fixture can own it, and Linux
 // can even establish a TCP self-connection before the server binds. Wait for
 // this child's startup record before touching its listening port.
-async fn wait_for_xray_startup(child: &mut Child, stdout_path: &Path, stderr_path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let status = child.try_wait().expect("check xray process status");
-        let stdout = fs::read_to_string(stdout_path).unwrap_or_default();
-        let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
-        assert!(
-            status.is_none(),
-            "xray exited before startup: {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        if stdout.lines().chain(stderr.lines()).any(|line| {
-            line.split_once("core: Xray ")
-                .is_some_and(|(_, message)| message.ends_with(" started"))
-        }) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "xray did not report startup\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        sleep(Duration::from_millis(50)).await;
-    }
+//
+// `false` when the child exited because another socket took its port — the
+// caller then starts it again on a fresh one; any other exit panics.
+async fn wait_for_xray_startup(child: &mut Child, stdout_path: &Path, stderr_path: &Path) -> bool {
+    xray_startup::wait_ready(
+        child,
+        || xray_logs(stdout_path, stderr_path),
+        |output| {
+            output.lines().any(|line| {
+                line.split_once("core: Xray ")
+                    .is_some_and(|(_, message)| message.ends_with(" started"))
+            })
+        },
+        "xray",
+        Duration::from_secs(5),
+    )
+    .await
 }
 
 #[cfg(unix)]
@@ -2031,27 +2072,30 @@ async fn xray_readiness_requires_its_own_startup_record_even_when_port_is_occupi
     }
 }
 
+/// Whether Xray listens on `addr` before `deadline`, after its startup
+/// record: `false` when it exited because another socket took the port.
 async fn wait_for_tcp_listener(
     child: &mut Child,
     addr: SocketAddr,
     stdout_path: &Path,
     stderr_path: &Path,
-) {
-    wait_for_xray_startup(child, stdout_path, stderr_path).await;
+) -> bool {
+    if !wait_for_xray_startup(child, stdout_path, stderr_path).await {
+        return false;
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = child.try_wait().expect("check xray process status") {
-            let stdout = fs::read_to_string(stdout_path).unwrap_or_default();
-            let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
             panic!(
-                "xray exited before listening on {addr}: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                "xray exited before listening on {addr}: {status}\n{}",
+                xray_logs(stdout_path, stderr_path)
             );
         }
 
         match TcpStream::connect(addr).await {
             Ok(stream) => {
                 drop(stream);
-                return;
+                return true;
             }
             Err(error) if Instant::now() < deadline => {
                 let _ = error;
@@ -2067,20 +2111,21 @@ async fn wait_for_udp_listener(
     addr: SocketAddr,
     stdout_path: &Path,
     stderr_path: &Path,
-) {
-    wait_for_xray_startup(child, stdout_path, stderr_path).await;
+) -> bool {
+    if !wait_for_xray_startup(child, stdout_path, stderr_path).await {
+        return false;
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = child.try_wait().expect("check xray process status") {
-            let stdout = fs::read_to_string(stdout_path).unwrap_or_default();
-            let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
             panic!(
-                "xray exited before listening on UDP {addr}: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                "xray exited before listening on UDP {addr}: {status}\n{}",
+                xray_logs(stdout_path, stderr_path)
             );
         }
 
         match std::net::UdpSocket::bind(addr) {
-            Err(error) if error.kind() == ErrorKind::AddrInUse => return,
+            Err(error) if error.kind() == ErrorKind::AddrInUse => return true,
             Ok(probe) if Instant::now() < deadline => {
                 drop(probe);
                 sleep(Duration::from_millis(50)).await;
@@ -2091,9 +2136,10 @@ async fn wait_for_udp_listener(
             }
             Ok(probe) => {
                 drop(probe);
-                let stdout = fs::read_to_string(stdout_path).unwrap_or_default();
-                let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
-                panic!("xray did not bind UDP {addr}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+                panic!(
+                    "xray did not bind UDP {addr}\n{}",
+                    xray_logs(stdout_path, stderr_path)
+                );
             }
             Err(error) => panic!("could not probe Xray UDP listener {addr}: {error}"),
         }
@@ -2714,6 +2760,7 @@ async fn run_local_xray_stream_transport_interop(
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
+                ech_config_list: None,
             }),
             None,
         )
@@ -3035,6 +3082,7 @@ async fn run_local_xray_xhttp_interop_with(
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: vec!["http/1.1".to_owned()],
+                ech_config_list: None,
             }),
         ),
         XhttpInteropSecurity::H2Tls => (
@@ -3047,6 +3095,7 @@ async fn run_local_xray_xhttp_interop_with(
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: vec!["h2".to_owned()],
+                ech_config_list: None,
             }),
         ),
         XhttpInteropSecurity::H2Reality => (
@@ -3064,6 +3113,7 @@ async fn run_local_xray_xhttp_interop_with(
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: vec!["h3".to_owned()],
+                ech_config_list: None,
             }),
         ),
     };
@@ -3680,6 +3730,7 @@ fn grpc_client_security(security: XrayInboundSecurity) -> StreamSecurity {
             // so an explicit list here would be inert *and* would hide the
             // fact that the profile is what supplies `h2`.
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         // The same fingerprint the base Vision REALITY scenario uses; REALITY
         // negotiates no ALPN of its own, so nothing here turns on the choice.
@@ -4229,6 +4280,7 @@ async fn udp_hop_xhttp_h3_keeps_a_flow_across_hops_to_xray() {
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: vec!["h3".to_owned()],
+                ech_config_list: None,
             }),
             XhttpMode::StreamOne,
         );
@@ -4312,6 +4364,7 @@ async fn xhttp_h3_chrome_parrot_keeps_a_flow_across_network_changes() {
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: vec!["h3".to_owned()],
+                ech_config_list: None,
             }),
             XhttpMode::StreamOne,
         );
@@ -4399,6 +4452,7 @@ async fn xhttp_h3_bbr_profiles_interop() {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: vec!["h3".to_owned()],
+                    ech_config_list: None,
                 }),
                 XhttpMode::StreamOne,
             );
@@ -4485,6 +4539,7 @@ async fn xhttp_h3_chrome_parrot_interop() {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: vec!["h3".to_owned()],
+                    ech_config_list: None,
                 }),
                 XhttpMode::StreamOne,
             );
@@ -4593,6 +4648,7 @@ async fn header_custom_udp_xhttp_h3_modes_and_noise_order() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: vec!["h3".to_owned()],
+            ech_config_list: None,
         })
     };
     let noise = serde_json::json!({"type":"noise","settings":{"noise":[

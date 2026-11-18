@@ -3,6 +3,7 @@
 //! each flow from its documentation address to the loopback echo servers.
 use super::*;
 use sha2::Digest as _;
+use std::path::{Path, PathBuf};
 
 const MASQUE_USER: &str = "masque@test";
 const MASQUE_PASS: &str = "synthetic-masque-pass";
@@ -44,9 +45,20 @@ fn pem(label: &str, der: &[u8]) -> String {
 }
 
 /// Xray-core's MASQUE server on `alpn`: HTTP/3 on UDP, HTTP/2 on TCP.
+///
+/// The port is picked by binding it and letting go, and a parallel test's
+/// socket can take it before Xray binds it; the server then exits with
+/// "address already in use" and the start is repeated on a fresh port.
 async fn reference(alpn: &str) -> Reference {
     let binary =
         std::env::var_os("XRAY_CLIENT_PROTOCOL_BINARY").expect("run check-masque-interop.sh");
+    let binary = PathBuf::from(binary);
+    start_on_fresh_ports!("the MASQUE reference", try_reference(&binary, alpn))
+}
+
+/// One start of [`reference`] on a fresh port: `None` when another socket
+/// took the port first.
+async fn try_reference(binary: &Path, alpn: &str) -> Option<Reference> {
     let directory = std::env::temp_dir().join(format!(
         "xray-masque-tun-{}-{:016x}",
         std::process::id(),
@@ -101,21 +113,25 @@ async fn reference(alpn: &str) -> Reference {
         .stderr(log)
         .spawn()
         .unwrap();
-    let reference = Reference {
+    let mut reference = Reference {
         child,
         directory,
         port,
         pin,
     };
-    let deadline = TokioInstant::now() + Duration::from_secs(10);
-    while !std::fs::read_to_string(reference.directory.join("xray.log"))
-        .unwrap_or_default()
-        .contains("started")
+    let log_path = reference.directory.join("xray.log");
+    if !crate::xray_startup::wait_ready(
+        &mut reference.child,
+        || std::fs::read_to_string(&log_path).unwrap_or_default(),
+        |log| log.contains("started"),
+        "the MASQUE reference",
+        Duration::from_secs(10),
+    )
+    .await
     {
-        assert!(TokioInstant::now() < deadline, "Xray-core did not start");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        return None;
     }
-    reference
+    Some(reference)
 }
 
 #[tokio::test]

@@ -49,6 +49,14 @@ use crate::{
 /// bounded by the same interval so a blackholed security or h2 handshake does
 /// not pin every flow behind the operating system's TCP timeout.
 const COLD_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// A REALITY attempt gets longer than `COLD_DIAL_TIMEOUT`.
+///
+/// Xray 26.11.9's server sleeps five seconds inside `Server` when a client
+/// arrives while `GlobalPostHandshakeRecordsLens` is still the `false`
+/// placeholder (`github.com/xtls/reality` `tls.go`). grpc-go retries that
+/// first failure out to a 19s `MaxDelay`; one five-second attempt is dropped
+/// in the middle of the sleep, and the reset tears down the next dial too.
+const REALITY_COLD_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// grpc-go's default `ClientConn` idle timeout, which Xray does not override.
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -320,7 +328,12 @@ impl GrpcConnectionPool {
     ) {
         let pool = Arc::clone(self);
         tokio::spawn(async move {
-            let timeout = pool.cold_dial_timeout;
+            let timeout = match &connector {
+                ConnectorConfig::Reality(_) => REALITY_COLD_DIAL_TIMEOUT,
+                ConnectorConfig::Tcp | ConnectorConfig::Tls(_) | ConnectorConfig::ShadowTls(_) => {
+                    pool.cold_dial_timeout
+                }
+            };
             let dialled = tokio::time::timeout(timeout, async {
                 let io = dialer
                     .connect_resolved_with_alpn_policy(
@@ -366,8 +379,7 @@ impl GrpcConnectionPool {
                 }
                 Err(_) => {
                     let reason: Arc<str> = Arc::from(format!(
-                        "gRPC connection attempt timed out after {:?}",
-                        pool.cold_dial_timeout
+                        "gRPC connection attempt timed out after {timeout:?}"
                     ));
                     pool.fail_attempt(&attempt, reason).await;
                 }

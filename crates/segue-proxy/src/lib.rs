@@ -1,4 +1,5 @@
 mod aead;
+pub mod anytls;
 mod erase;
 mod record_buffer;
 
@@ -12,6 +13,7 @@ pub mod reverse;
 pub mod shadowsocks;
 pub mod shadowsocks2022;
 pub mod trojan;
+pub mod tuic;
 pub mod vless;
 pub mod vmess;
 pub mod wireguard;

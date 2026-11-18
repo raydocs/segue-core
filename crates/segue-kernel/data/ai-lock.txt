@@ -1,0 +1,109 @@
+# Built-in AI destinations. The kernel merges this with the signed bundle's
+# ai_domains / ai_cidrs. A line is `suffix <domain>` or `cidr <prefix>`.
+# `#` starts a comment. Suffixes match the name and every subdomain.
+#
+# A suffix is the whole registrable name when that name is the product, or a
+# single account-bearing host when the parent is shared (Sentry, S3, Azure).
+# Shared front doors are not listed: pinning them would send other apps
+# through the AI exit. Sources, retrieval date 2026-11-17, and the CIDR
+# decision are in docs/research/ai-destinations.md.
+
+# Anthropic. API, console, OAuth (platform.claude.com, sso.claude.com),
+# MCP proxy, downloads, and the claude.ai / claude.com apps. statsig.anthropic.com
+# is NXDOMAIN as of the retrieval date; telemetry now goes to api.anthropic.com
+# and to shared Datadog hosts, which are not listed.
+suffix anthropic.com
+suffix claude.ai
+suffix claude.com
+# Artifact frames, the Claude-in-Chrome bridge, and MCP widgets. Vendor-owned;
+# not a shared CDN name.
+suffix claudeusercontent.com
+suffix claudemcpcontent.com
+
+# OpenAI production. Codex (openai/codex @ b8f6787e, 2026-11-17) calls
+# chatgpt.com/backend-api/codex, api.openai.com, and auth.openai.com, and posts
+# metrics to ab.chatgpt.com. oaistatic.com / oaiusercontent.com are the logged-in
+# web app. Staging (chatgpt-staging.com, api.openai.org, auth.api.openai.org)
+# is not listed.
+suffix openai.com
+suffix chatgpt.com
+suffix oaistatic.com
+suffix oaiusercontent.com
+# Codex feedback DSN host (codex-rs/feedback). This org's ingest only, not
+# sentry.io. The DSN key is not stored here.
+suffix o33249.ingest.us.sentry.io
+
+# Cursor. Official network page says not to pin IPs (AWS, Vercel, Cloudflare).
+# cursorvm.com covers nested Grok Bot hosts. Sign-in is moving to spacexsi.com.
+# The sign-in page (retrieved 2026-11-17) says authenticator.cursor.sh is the
+# fallback until November 30 and does not name the year.
+suffix cursor.sh
+suffix cursor.com
+suffix cursor-cdn.com
+suffix cursorapi.com
+suffix cursorvm.com
+suffix anysphere-binaries.s3.us-east-1.amazonaws.com
+suffix agent-stores.s3.us-east-1.amazonaws.com
+suffix agent-stores.s3.amazonaws.com
+suffix cursor.blob.core.windows.net
+suffix accounts.spacex.ai
+suffix spacexsi.com
+
+# xAI / Grok, and the Cursor sign-in hosts on these names (accounts.x.ai,
+# auth.grok.com, auth.grokusercontent.com, auth.grokipedia.com). Not x.com.
+suffix x.ai
+suffix grok.com
+suffix grokusercontent.com
+suffix grokipedia.com
+
+# GitHub Copilot IDE allowlist, vendor-specific hosts only. github.com,
+# api.github.com, collector.github.com, default.exp-tas.com, and the Azure
+# wildcards are shared and are not listed.
+suffix githubcopilot.com
+suffix copilot-proxy.githubusercontent.com
+suffix origin-tracker.githubusercontent.com
+suffix copilot-telemetry.githubusercontent.com
+suffix copilot-reports.github.com
+suffix production-copilot-host.webpubsub.azure.com
+suffix production-copilot-host-centralus.webpubsub.azure.com
+suffix production-copilot-host-centralus-02.webpubsub.azure.com
+suffix production-copilot-host-eastasia.webpubsub.azure.com
+suffix production-copilot-host-austriaeast.webpubsub.azure.com
+suffix production-copilot-host-westus.webpubsub.azure.com
+suffix production-copilot-host-westus3.webpubsub.azure.com
+
+# Gemini. These names are the API, the consumer app, AI Studio, Code Assist
+# OAuth, and the Gemini CLI Code Assist backend. accounts.google.com,
+# oauth2.googleapis.com, play.googleapis.com (Clearcut), and Vertex
+# (aiplatform.googleapis.com) are shared Google and are not listed.
+suffix gemini.google.com
+suffix aistudio.google.com
+suffix codeassist.google.com
+suffix generativelanguage.googleapis.com
+suffix cloudcode-pa.googleapis.com
+
+# Inbound ranges where Anthropic says it receives connections (API and
+# Console). Published at https://platform.claude.com/docs/en/api/ip-addresses
+# on 2026-11-17. ARIN/APNIC: Anthropic, PBC, not a shared CDN. The same day's
+# DNS for api.anthropic.com was 160.79.104.10 and 2607:6bc0::10.
+# Not included: outbound source ranges 160.79.104.0/21 and 153.61.208.0/20
+# (Anthropic's own calls, not client destinations), the phased-out GCP /32s,
+# and every other vendor (Cloudflare, AWS, Vercel, Google, Azure, GitHub).
+cidr 160.79.104.0/23
+cidr 153.61.224.0/22
+cidr 2607:6bc0::/48
+
+# Not listed, on purpose (shared infrastructure):
+# - statsigapi.net, featureassets.org: Statsig SaaS. Codex metrics are on
+#   ab.chatgpt.com. Claude's old statsig.anthropic.com is under anthropic.com.
+# - sentry.io and *.ingest.sentry.io except the Codex org host above.
+# - http-intake.logs.us5.datadoghq.com, browser-intake-us5-datadoghq.com:
+#   Claude Code optional telemetry. Shared Datadog intake.
+# - challenges.cloudflare.com and any Cloudflare / Fastly / Vercel / AWS range.
+# - storage.googleapis.com, registry.npmjs.org, github.com,
+#   raw.githubusercontent.com, formulae.brew.sh: Claude Code plugins and
+#   updates, also used by everything else.
+# - accounts.google.com, oauth2.googleapis.com, www.googleapis.com,
+#   play.googleapis.com: Gemini CLI login and Clearcut.
+# - OpenAI egress files (openai.com/chatgpt-connectors.json and
+#   chatgpt-agents.json): source addresses of OpenAI's outbound calls.

@@ -296,6 +296,7 @@ mod mac {
                     ..Default::default()
                 }))),
                 hidden: Default::default(),
+                flows: None,
             });
             let dns = Arc::new(SmartDns::new(
                 policy,

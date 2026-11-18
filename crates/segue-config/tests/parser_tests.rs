@@ -7,11 +7,12 @@ use std::{
 
 use prost::Message;
 use segue_config::{
-    parse_xray_json, parse_xray_json_with_geodata_dirs, DiagnosticSeverity, DnsFakeIpConfig,
-    DnsHostTarget, DnsIpFilter, DnsNameServerConfig, DnsOutboundRuleAction, DnsOutboundSettings,
-    DnsQueryStrategy, DnsServerConfig, DnsServerEndpoint, DnsServerTransport, DomainMatcherSet,
-    HappyEyeballsSettings, InboundProtocol, IpCidr, Network, OutboundSettings, QuicBbrProfile,
-    QuicCongestion, QuicIntervalRange, QuicParamsSettings, QuicUdpHopSettings, RealityShortId,
+    default_fake_ip_exempt_domains, parse_xray_json, parse_xray_json_with_geodata_dirs,
+    DiagnosticSeverity, DnsFakeIpConfig, DnsHostTarget, DnsIpFilter, DnsNameServerConfig,
+    DnsOutboundRuleAction, DnsOutboundSettings, DnsQueryStrategy, DnsServerConfig,
+    DnsServerEndpoint, DnsServerTransport, DomainMatcherSet, HappyEyeballsSettings,
+    InboundProtocol, IpCidr, Network, OutboundSettings, QuicBbrProfile, QuicCongestion,
+    QuicIntervalRange, QuicParamsSettings, QuicUdpHopSettings, RealityShortId,
     RoutingDomainStrategy, RoutingRuleTarget, SniffingDestination, SocksInboundSettings,
     StreamSecurity, StreamTransport, TargetAddr, XhttpMode, XhttpPaddingMethod,
     XhttpPaddingPlacement, XhttpPlacement, XhttpRange, XhttpSettings, XhttpUplinkDataPlacement,
@@ -213,7 +214,6 @@ fn unsupported_modern_tls_fields_fail_closed_on_apple_xhttp_shape() {
     .unwrap();
 
     for (key, value) in [
-        ("echConfigList", "unsupported-ech"),
         ("disableSystemRoot", "unsupported-root-policy"),
         ("certificates", "unsupported-custom-trust"),
         ("pinnedPeerCertChainSha256", "unsupported-chain-pin"),
@@ -956,6 +956,7 @@ fn parses_socks_inbound_password_accounts_without_leaking_them() {
                 SocksAccount::new(b"synthetic-user", b"synthetic-pass").unwrap(),
             ]),
             udp: true,
+            udp_address: None,
         })
     );
     assert!(parsed.diagnostics.is_empty());
@@ -998,6 +999,43 @@ fn parses_socks_inbound_udp_flag_and_keeps_absent_udp_enabled() {
         assert!(parsed.diagnostics.is_empty(), "{extra}");
     }
     assert!(SocksInboundSettings::default().udp);
+}
+
+#[test]
+fn parses_socks_inbound_udp_relay_ip() {
+    for (settings, expected) in [
+        (
+            r#""ip": "127.0.0.1""#,
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ),
+        (r#""ip": "[::1]""#, Some(IpAddr::V6(Ipv6Addr::LOCALHOST))),
+        (
+            r#""ip": "0.0.0.0", "allowUnauthenticatedLan": true"#,
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        ),
+        (r#""ip": null"#, None),
+        ("", None),
+    ] {
+        let parsed =
+            parse_xray_json(&raw_with_socks_settings(settings)).expect("config should parse");
+        let InboundProtocol::Socks(socks) = &parsed.config.inbounds[0].protocol else {
+            panic!("expected a socks inbound for {settings}");
+        };
+        assert_eq!(socks.udp_address, expected, "{settings}");
+    }
+    // A domain, which Xray-core fails on at the first UDP ASSOCIATE, and a
+    // relay beyond loopback without the LAN opt-in are refused.
+    for settings in [
+        r#""ip": "localhost""#,
+        r#""ip": 1"#,
+        r#""ip": "0.0.0.0""#,
+        r#""ip": "192.0.2.7""#,
+    ] {
+        assert_parse_error_path(
+            &raw_with_socks_settings(settings),
+            "$.inbounds[0].settings.ip",
+        );
+    }
 }
 
 #[test]
@@ -1064,8 +1102,71 @@ fn parses_dns_fake_ip_ipv4_pool() {
             ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
             pool_size: 32_768,
             ttl: 120,
+            exempt_domains: default_fake_ip_exempt_domains(),
         })
     );
+}
+
+#[test]
+fn dns_fake_ip_exempt_domains_default_to_the_built_in_list() {
+    let raw = r#"{
+        "dns": {
+          "fakeIp": { "enabled": true, "ipv4Pool": "198.18.0.0/15" }
+        },
+        "inbounds": [],
+        "outbounds": [{ "tag": "direct", "protocol": "freedom" }]
+    }"#;
+
+    let parsed = parse_xray_json(raw).expect("config should parse");
+    let exempt = parsed.config.dns.fake_ip.unwrap().exempt_domains;
+
+    assert!(exempt.matches("captive.apple.com"));
+    assert!(exempt.matches("pool.ntp.org"));
+    assert!(exempt.matches("printer.lan"));
+    assert!(!exempt.matches("example.com"));
+}
+
+#[test]
+fn dns_fake_ip_exempt_domains_accept_a_custom_list() {
+    let raw = r#"{
+        "dns": {
+          "fakeIp": {
+            "enabled": true,
+            "ipv4Pool": "198.18.0.0/15",
+            "exemptDomains": ["full:only.example", "domain:corp.test"]
+          }
+        },
+        "inbounds": [],
+        "outbounds": [{ "tag": "direct", "protocol": "freedom" }]
+    }"#;
+
+    let parsed = parse_xray_json(raw).expect("config should parse");
+    let exempt = parsed.config.dns.fake_ip.unwrap().exempt_domains;
+
+    assert!(exempt.matches("only.example"));
+    assert!(exempt.matches("host.corp.test"));
+    assert!(!exempt.matches("captive.apple.com"));
+}
+
+#[test]
+fn dns_fake_ip_empty_exempt_domains_exempt_nothing() {
+    let raw = r#"{
+        "dns": {
+          "fakeIp": {
+            "enabled": true,
+            "ipv4Pool": "198.18.0.0/15",
+            "exemptDomains": []
+          }
+        },
+        "inbounds": [],
+        "outbounds": [{ "tag": "direct", "protocol": "freedom" }]
+    }"#;
+
+    let parsed = parse_xray_json(raw).expect("config should parse");
+    let exempt = parsed.config.dns.fake_ip.unwrap().exempt_domains;
+
+    assert!(exempt.is_empty());
+    assert!(!exempt.matches("captive.apple.com"));
 }
 
 #[test]
@@ -1692,6 +1793,57 @@ fn parses_ext_geodata_rules_from_named_files_and_inverse_geoip() {
 }
 
 #[test]
+fn negated_cidrs_and_negated_geoip_codes_in_one_ip_list_are_separate_matchers() {
+    // Xray-core's `buildOptimizedIPMatcher`: the negated CIDRs are one
+    // reversed matcher, the negated GeoIP codes another, and either matches.
+    let asset_dir = unique_temp_dir("negated-geoip");
+    write_geoip_dat(
+        &asset_dir,
+        "geoip.dat",
+        &[
+            TestGeoIp {
+                code: "TEST".to_owned(),
+                cidr: vec![
+                    geo_cidr(&[10, 1, 0, 0], 16),
+                    geo_cidr(&[198, 51, 100, 0], 24),
+                ],
+                reverse_match: false,
+            },
+            TestGeoIp {
+                code: "OTHER".to_owned(),
+                cidr: vec![geo_cidr(&[203, 0, 113, 0], 24)],
+                reverse_match: false,
+            },
+        ],
+    );
+    let raw = raw_with_routing(
+        r#""rules": [
+          {"type": "field", "ip": ["!10.0.0.0/8", "!geoip:test"], "outboundTag": "proxy"},
+          {"type": "field", "ip": ["!10.0.0.0/8", "!ext-ip:geoip.dat:test"], "outboundTag": "proxy"},
+          {"type": "field", "ip": ["!geoip:test", "!geoip:other"], "outboundTag": "proxy"}
+        ]"#,
+    );
+
+    let parsed =
+        parse_xray_json_with_geodata_dirs(&raw, &[asset_dir]).expect("config should parse");
+    let rules = &parsed.config.routing.rules;
+    let matches = |rule: usize, ip: [u8; 4]| rules[rule].matches_ip(Some(&IpAddr::from(ip)));
+
+    for rule in [0, 1] {
+        // Outside the code alone, outside the CIDR alone, outside both.
+        assert!(matches(rule, [10, 2, 0, 1]), "rule {rule}");
+        assert!(matches(rule, [198, 51, 100, 42]), "rule {rule}");
+        assert!(matches(rule, [8, 8, 8, 8]), "rule {rule}");
+        // Inside both the CIDR and the code.
+        assert!(!matches(rule, [10, 1, 0, 1]), "rule {rule}");
+    }
+    // Negated codes share one matcher: an address in either code is in it.
+    assert!(!matches(2, [198, 51, 100, 42]));
+    assert!(!matches(2, [203, 0, 113, 7]));
+    assert!(matches(2, [8, 8, 8, 8]));
+}
+
+#[test]
 fn rejects_missing_geodata_code_with_path() {
     let asset_dir = unique_temp_dir("missing-geodata-code");
     write_geosite_dat(
@@ -1884,7 +2036,81 @@ fn parses_least_ping_routing_balancer_strategy() {
 
     assert_eq!(
         parsed.config.routing.balancers[0].strategy,
-        segue_config::RoutingBalancerStrategy::LeastPing
+        segue_config::RoutingBalancerStrategy::LeastPing(Default::default())
+    );
+    let segue_config::RoutingBalancerStrategy::LeastPing(settings) =
+        &parsed.config.routing.balancers[0].strategy
+    else {
+        panic!("expected leastPing strategy");
+    };
+    assert_eq!(
+        settings.effective_ping_tolerance(),
+        Duration::from_millis(50)
+    );
+}
+
+#[test]
+fn parses_least_ping_and_least_load_ping_tolerance() {
+    let least_ping = raw_with_routing(
+        r#""balancers": [{
+          "tag": "automatic",
+          "selector": ["proxy"],
+          "strategy": { "type": "leastPing", "settings": { "pingTolerance": "80ms" } }
+        }]"#,
+    );
+    let parsed = parse_xray_json(&least_ping).expect("leastPing tolerance should parse");
+    assert_eq!(
+        parsed.config.routing.balancers[0].strategy,
+        segue_config::RoutingBalancerStrategy::LeastPing(segue_config::RoutingLeastPingSettings {
+            ping_tolerance: Some(Duration::from_millis(80)),
+        })
+    );
+
+    let least_load = raw_with_routing(
+        r#""balancers": [{
+          "tag": "automatic",
+          "selector": ["proxy"],
+          "strategy": {
+            "type": "leastLoad",
+            "settings": { "tolerance": 0.25, "pingTolerance": "80ms" }
+          }
+        }]"#,
+    );
+    let parsed = parse_xray_json(&least_load).expect("leastLoad tolerance should parse");
+    let segue_config::RoutingBalancerStrategy::LeastLoad(settings) =
+        &parsed.config.routing.balancers[0].strategy
+    else {
+        panic!("expected leastLoad strategy");
+    };
+    assert_eq!(settings.tolerance_millionths, 250_000);
+    assert_eq!(settings.ping_tolerance, Some(Duration::from_millis(80)));
+    assert_eq!(
+        settings.effective_ping_tolerance(),
+        Duration::from_millis(80)
+    );
+
+    let unknown = raw_with_routing(
+        r#""balancers": [{
+          "tag": "automatic",
+          "selector": ["proxy"],
+          "strategy": { "type": "leastPing", "settings": { "expected": 2 } }
+        }]"#,
+    );
+    assert_parse_error_path(
+        &unknown,
+        "$.routing.balancers[0].strategy.settings.expected",
+    );
+
+    let zero = raw_with_routing(
+        r#""balancers": [{
+          "tag": "automatic",
+          "selector": ["proxy"],
+          "strategy": { "type": "leastPing", "settings": { "pingTolerance": "0s" } }
+        }]"#,
+    );
+    assert_parse_error_path(
+        &zero,
+        "$.routing.balancers[0].strategy.settings.pingTolerance",
     );
 }
 
@@ -2224,6 +2450,52 @@ fn rejects_tls_from_mitm_context_sentinels_with_paths() {
         &verification_name,
         "$.outbounds[0].streamSettings.tlsSettings.verifyPeerCertByName",
     );
+}
+
+#[test]
+fn parses_shadowtls_v3_relay_settings() {
+    let raw = raw_with_stream_settings(
+        r#""network": "tcp", "security": "shadowtls", "shadowtlsSettings": {
+          "password": "fixture-password", "version": 3,
+          "serverName": "cover.example", "fingerprint": "chrome"
+        }"#,
+    );
+    let parsed = parse_xray_json(&raw).expect("v3 raw TCP settings must parse");
+    let StreamSecurity::ShadowTls(shadow) = &parsed.config.outbounds[0].stream.security else {
+        panic!("expected ShadowTLS");
+    };
+    assert_eq!(shadow.password.as_str(), "fixture-password");
+    assert_eq!(shadow.tls.server_name.as_deref(), Some("cover.example"));
+    assert_eq!(shadow.tls.fingerprint.as_deref(), Some("chrome"));
+}
+
+#[test]
+fn rejects_shadowtls_old_versions_missing_names_and_non_raw_streams() {
+    for (extra, path) in [
+        (
+            r#""password": "p", "version": 2, "serverName": "cover.example""#,
+            "version",
+        ),
+        (r#""password": "p", "version": 3"#, "serverName"),
+        (
+            r#""password": "p", "version": 3, "serverName": "cover.example", "fingerprint": "unsafe""#,
+            "fingerprint",
+        ),
+    ] {
+        let raw = raw_with_stream_settings(&format!(
+            r#""security": "shadowtls", "shadowtlsSettings": {{ {extra} }}"#,
+        ));
+        assert_parse_error_path(
+            &raw,
+            &format!("$.outbounds[0].streamSettings.shadowtlsSettings.{path}"),
+        );
+    }
+    let raw = raw_with_stream_settings(
+        r#""network": "ws", "security": "shadowtls", "shadowtlsSettings": {
+          "password": "p", "version": 3, "serverName": "cover.example"
+        }"#,
+    );
+    assert_parse_error_path(&raw, "$.outbounds[0].streamSettings.security");
 }
 
 #[test]
@@ -7667,6 +7939,7 @@ fn mixed_is_xrays_alias_of_the_socks_inbound() {
             )
             .unwrap()]),
             udp: false,
+            udp_address: None,
         })
     );
 }

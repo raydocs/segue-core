@@ -627,6 +627,7 @@ fn drive_spares_take_the_slot_paths_numbers() {
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
                     fingerprint: None,
+                    ech_config_list: None,
                 },
                 fronting: None,
                 xmux: crate::stream::XhttpXmuxPolicy::default(),

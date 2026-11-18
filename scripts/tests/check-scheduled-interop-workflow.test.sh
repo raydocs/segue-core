@@ -224,8 +224,17 @@ expected_job_headers="$(cat <<'EXPECTED'
   secrets:
   candidate-ci:
   rust:
+  rust-checks:
+  rust-test-engine:
+  rust-test-transport:
+  rust-test-config:
+  rust-test-support:
   tproxy-linux:
   go-oracles:
+  go-oracles-protocols:
+  go-oracles-carriers:
+  go-oracles-wireguard:
+  go-oracles-tunnels:
   rc-interop:
   scheduled-pinned-interop:
   xray-core-main-smoke:
@@ -243,13 +252,18 @@ expected_rc_interop="$(cat <<'EXPECTED'
   rc-interop:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Check out release candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
       - name: Check out pinned Xray-core oracle
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -266,6 +280,10 @@ expected_rc_interop="$(cat <<'EXPECTED'
         run: rustup toolchain install 1.96.0 --profile minimal
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ${{ github.job }}
       - name: Run release-candidate interoperability gate
         env:
           XRAY_CORE_CHECKOUT: ${{ github.workspace }}/Xray-core
@@ -276,13 +294,18 @@ EXPECTED
 expected_scheduled_pinned="$(cat <<'EXPECTED'
   scheduled-pinned-interop:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Check out scheduled xray-rust revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
       - name: Check out pinned Xray-core oracle
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -299,6 +322,10 @@ expected_scheduled_pinned="$(cat <<'EXPECTED'
         run: rustup toolchain install 1.96.0 --profile minimal
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ${{ github.job }}
       - name: Run broad pinned interoperability and resource gate
         env:
           XRAY_CORE_CHECKOUT: ${{ github.workspace }}/Xray-core
@@ -309,7 +336,7 @@ EXPECTED
 expected_main_smoke="$(cat <<'EXPECTED'
   xray-core-main-smoke:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     continue-on-error: true
     steps:
@@ -317,6 +344,11 @@ expected_main_smoke="$(cat <<'EXPECTED'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
       - name: Check out Xray-core main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -343,6 +375,10 @@ expected_main_smoke="$(cat <<'EXPECTED'
         run: rustup toolchain install 1.96.0 --profile minimal
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ${{ github.job }}
       - name: Run focused Xray-core main compatibility smoke
         env:
           XRAY_CORE_CHECKOUT: ${{ github.workspace }}/Xray-core
@@ -356,8 +392,49 @@ EXPECTED
 
 expected_rust="$(cat <<'EXPECTED'
   rust:
+    needs:
+      - rust-checks
+      - rust-test-engine
+      - rust-test-transport
+      - rust-test-config
+      - rust-test-support
+    if: always() && cancelled() == false && (github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Require every Rust shard
+        env:
+          CHECKS: ${{ needs.rust-checks.result }}
+          ENGINE: ${{ needs.rust-test-engine.result }}
+          TRANSPORT: ${{ needs.rust-test-transport.result }}
+          CONFIG: ${{ needs.rust-test-config.result }}
+          SUPPORT: ${{ needs.rust-test-support.result }}
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local name="$1"
+            local result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "rust-$name did not succeed: ${result:-missing}" >&2
+              fail=1
+            else
+              echo "rust-$name succeeded"
+            fi
+          }
+          check checks "$CHECKS"
+          check test-engine "$ENGINE"
+          check test-transport "$TRANSPORT"
+          check test-config "$CONFIG"
+          check test-support "$SUPPORT"
+          exit "$fail"
+EXPECTED
+)"
+
+expected_rust_checks="$(cat <<'EXPECTED'
+  rust-checks:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
@@ -368,12 +445,11 @@ expected_rust="$(cat <<'EXPECTED'
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Keep build outputs on the root disk
+      - name: Free disk space
         run: |
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
-          mkdir -p target
-          sudo mount --bind /opt/segue-target target
-          df -h / target
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
       - name: Check repository scripts
         run: |
           for script in scripts/*.sh scripts/tests/*.sh; do
@@ -406,12 +482,16 @@ expected_rust="$(cat <<'EXPECTED'
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ${{ github.job }}
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::perf -W clippy::suspicious
-      - name: Test
-        run: cargo test --workspace --exclude segue-fuzz --all-targets --locked
+      - name: Test proprietary-kernel FFI skeleton
+        run: cargo test -p segue-ffi --features proprietary-kernel
       - name: Replay fuzz seed corpora
         run: bash scripts/replay-fuzz-corpus.sh
       - name: Build public API documentation
@@ -453,7 +533,7 @@ EXPECTED
 expected_publish_fields="$(cat <<'EXPECTED'
     if: needs.release-metadata.outputs.is_rc == 'true'
     needs:
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
     steps:
@@ -492,5 +572,8 @@ assert_equal 'prerelease publication dependencies' "$(needs_body "$normalized_pu
 
 normalized_rust_job="$(normalize_yaml_body "$rust_job")"
 assert_equal 'Rust CI job' "$normalized_rust_job" "$expected_rust"
+rust_checks_job="$(job_body rust-checks)"
+[[ -n "$rust_checks_job" ]] || die 'Rust checks job is missing'
+assert_equal 'Rust checks job' "$(normalize_yaml_body "$rust_checks_job")" "$expected_rust_checks"
 
 echo 'scheduled interoperability workflow matches its reviewed canonical policy'

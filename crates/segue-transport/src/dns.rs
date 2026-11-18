@@ -16,9 +16,9 @@ use tokio::sync::{watch, Notify};
 use tokio::time;
 
 use crate::{
-    canonicalize_socket_addr, connect_tcp_happy_eyeballs, BoxedTransportStream,
-    HappyEyeballsConfig, RouteFamilies, RouteProbe, SocketHandle, SocketProtector, TlsClientConfig,
-    TlsConnector, TransportError,
+    canonicalize_socket_addr, connect_tcp_happy_eyeballs, memory_class, BoxedTransportStream,
+    HappyEyeballsConfig, MemoryClass, RouteFamilies, RouteProbe, SocketHandle, SocketProtector,
+    TlsClientConfig, TlsConnector, TransportError,
 };
 
 /// A DNS lookup result containing every usable address and its remaining TTL.
@@ -113,6 +113,15 @@ impl DnsLookup {
         let now = Instant::now();
         self.ttl = Some(self.remaining_ttl_at(now).unwrap_or(fallback));
         self.observed_at = now;
+        self
+    }
+
+    /// Keeps at most `max` addresses, in resolver order, so one cached entry
+    /// cannot hold an unbounded answer.
+    fn with_address_limit(mut self, max: usize) -> Self {
+        if self.socket_addrs.len() > max {
+            self.socket_addrs = Arc::from(&self.socket_addrs[..max]);
+        }
         self
     }
 
@@ -226,7 +235,7 @@ impl DnsResolver for SystemDnsResolver {
     }
 
     async fn resolve_all(&self, domain: &str, port: u16) -> Result<DnsLookup, TransportError> {
-        let addrs = tokio::net::lookup_host((domain, port))
+        let addrs = system_lookup(domain, port)
             .await
             .map_err(|source| TransportError::Dns {
                 domain: domain.to_owned(),
@@ -238,10 +247,79 @@ impl DnsResolver for SystemDnsResolver {
     }
 }
 
+/// System lookups in flight at once. Each holds a thread until `getaddrinfo`
+/// returns, which nothing can hurry, so the rest wait their turn.
+const MAX_SYSTEM_LOOKUPS: usize = 64;
+
+static SYSTEM_LOOKUPS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_SYSTEM_LOOKUPS);
+
+/// Asks the platform resolver for `domain`, on a thread of its own.
+///
+/// `getaddrinfo` cannot be cancelled. `tokio::net::lookup_host` runs it on
+/// the runtime's blocking pool, and a runtime that is dropped waits for that
+/// pool: a lookup against a network that had gone away kept `xray_core_free`
+/// from returning until the lookup gave up. That wait has to stay as it is,
+/// without a limit, because it is what tells a host that no thread of the
+/// core is inside its socket-protect callback any more. So the lookup leaves
+/// the runtime instead. Its caller may stop waiting at any time; the thread
+/// then ends by itself, having touched nothing of the core.
+async fn system_lookup(domain: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    // As `lookup_host` does, an address needs no lookup.
+    if let Ok(ip) = domain.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let domain = domain.to_owned();
+    on_lookup_thread(move || {
+        std::net::ToSocketAddrs::to_socket_addrs(&(domain.as_str(), port))
+            .map(Iterator::collect::<Vec<_>>)
+    })
+    .await?
+}
+
+/// Runs `lookup` on a thread no runtime waits for and returns what it
+/// answers. At most [`MAX_SYSTEM_LOOKUPS`] such threads live at once.
+async fn on_lookup_thread<T: Send + 'static>(
+    lookup: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<T> {
+    let permit = SYSTEM_LOOKUPS
+        .acquire()
+        .await
+        .map_err(|_| io::Error::other("system DNS lookups are closed"))?;
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("xray-system-dns".to_owned())
+        .spawn(move || {
+            // Nobody may be waiting any more.
+            let _ = answer.send(lookup());
+            drop(permit);
+        })?;
+    answered
+        .await
+        .map_err(|_| io::Error::other("the system DNS lookup ended without an answer"))
+}
+
 const DNS_DEFAULT_TTL: Duration = Duration::from_secs(300);
 const DNS_NEGATIVE_TTL: Duration = Duration::from_secs(30);
 const DNS_STATIC_HOST_TTL: Duration = Duration::from_secs(10);
-const DNS_CACHE_MAX_ENTRIES: usize = 256;
+/// Destination-cache entries on a phone or in a Network Extension, where the
+/// extension's footprint is the scarce resource.
+const DNS_CACHE_MAX_ENTRIES_CONSTRAINED: usize = 1024;
+/// Destination-cache entries on desktop and throughput profiles, as mihomo's
+/// 4096-entry default and sing-box's `max(CacheCapacity, 1024)`.
+const DNS_CACHE_MAX_ENTRIES_STANDARD: usize = 4096;
+/// Most addresses one cached answer keeps. A response the size of an upstream
+/// UDP payload can carry dozens of addresses; a destination needs a handful,
+/// and the cache bounds what each entry may hold.
+const DNS_CACHE_MAX_ADDRESSES_PER_ENTRY: usize = 16;
+
+/// Entries a destination cache built for `class` keeps.
+fn dns_cache_capacity(class: MemoryClass) -> usize {
+    match class {
+        MemoryClass::Constrained => DNS_CACHE_MAX_ENTRIES_CONSTRAINED,
+        MemoryClass::Standard => DNS_CACHE_MAX_ENTRIES_STANDARD,
+    }
+}
 const MAX_DNS_UDP_RESPONSE_SIZE: usize = 4096;
 const MAX_DNS_HTTPS_RESPONSE_SIZE: usize = u16::MAX as usize;
 const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -261,11 +339,13 @@ pub struct CachingDnsResolver {
     refresh_shutdown: watch::Sender<()>,
 }
 
-#[derive(Default)]
 struct DnsCacheState {
     resolved: HashMap<(String, u16, DnsQueryStrategy), CachedDnsOutcome>,
     in_flight: HashMap<(String, u16, DnsQueryStrategy), Arc<InFlightDnsLookup>>,
     access_sequence: u64,
+    /// Most live entries; fixed when the cache is built, so a runtime memory
+    /// class set later does not resize a cache already holding answers.
+    max_entries: usize,
 }
 
 struct CachedDnsOutcome {
@@ -276,6 +356,15 @@ struct CachedDnsOutcome {
 }
 
 impl DnsCacheState {
+    fn with_capacity(max_entries: usize) -> Self {
+        Self {
+            resolved: HashMap::new(),
+            in_flight: HashMap::new(),
+            access_sequence: 0,
+            max_entries: max_entries.max(1),
+        }
+    }
+
     fn next_access_sequence(&mut self) -> u64 {
         self.access_sequence = self.access_sequence.wrapping_add(1);
         if self.access_sequence == 0 {
@@ -435,10 +524,11 @@ impl InFlightDnsLeader {
                     } else {
                         expires_at
                     };
-                    if state.resolved.len() >= DNS_CACHE_MAX_ENTRIES {
+                    let max_entries = state.max_entries;
+                    if state.resolved.len() >= max_entries {
                         state.resolved.retain(|_, entry| entry.stale_until > now);
                     }
-                    if state.resolved.len() >= DNS_CACHE_MAX_ENTRIES {
+                    if state.resolved.len() >= max_entries {
                         let lru_key = state
                             .resolved
                             .iter()
@@ -490,14 +580,22 @@ impl Drop for InFlightDnsLeader {
 }
 
 impl CachingDnsResolver {
+    /// A cache sized for the process's current memory class: 1024 entries on
+    /// a phone or in a Network Extension, 4096 on desktop.
     pub fn new(inner: Arc<dyn DnsResolver>) -> Self {
+        Self::with_capacity(inner, dns_cache_capacity(memory_class()))
+    }
+
+    /// A cache with an explicit entry capacity, for callers that know their
+    /// own budget.
+    pub fn with_capacity(inner: Arc<dyn DnsResolver>, max_entries: usize) -> Self {
         Self {
             inner,
             ttl: DNS_DEFAULT_TTL,
             cap_authoritative_ttl: false,
             negative_ttl: DNS_NEGATIVE_TTL,
             stale_ttl: None,
-            state: Arc::new(Mutex::new(DnsCacheState::default())),
+            state: Arc::new(Mutex::new(DnsCacheState::with_capacity(max_entries))),
             refresh_shutdown: watch::channel(()).0,
         }
     }
@@ -509,7 +607,9 @@ impl CachingDnsResolver {
             cap_authoritative_ttl: true,
             negative_ttl: DNS_NEGATIVE_TTL,
             stale_ttl: None,
-            state: Arc::new(Mutex::new(DnsCacheState::default())),
+            state: Arc::new(Mutex::new(DnsCacheState::with_capacity(
+                dns_cache_capacity(memory_class()),
+            ))),
             refresh_shutdown: watch::channel(()).0,
         }
     }
@@ -525,7 +625,9 @@ impl CachingDnsResolver {
             cap_authoritative_ttl: false,
             negative_ttl: DNS_NEGATIVE_TTL,
             stale_ttl: (!stale_ttl.is_zero()).then_some(stale_ttl),
-            state: Arc::new(Mutex::new(DnsCacheState::default())),
+            state: Arc::new(Mutex::new(DnsCacheState::with_capacity(
+                dns_cache_capacity(memory_class()),
+            ))),
             refresh_shutdown: watch::channel(()).0,
         }
     }
@@ -589,6 +691,10 @@ async fn resolve_dns_lookup(
     };
     resolved
         .and_then(|lookup| lookup.ensure_non_empty(domain, port))
+        // Every caller of this cache, and the cache entry itself, sees the
+        // same bounded answer, so a large upstream response costs the same in
+        // the cache and in an outbound's candidate list.
+        .map(|lookup| lookup.with_address_limit(DNS_CACHE_MAX_ADDRESSES_PER_ENTRY))
         .map(|lookup| {
             if cap_authoritative_ttl {
                 lookup.with_ttl_cap(ttl)
@@ -1044,7 +1150,7 @@ pub async fn exchange_dns_quic_candidates(
             network_changes: None,
         };
         let (endpoint, connection, _, _) =
-            match crate::stream::connect_quic_transport(config, b"doq").await {
+            match crate::stream::connect_quic_transport(config, Some(b"doq")).await {
                 Ok(connected) => connected,
                 Err(error) => {
                     last_error = Some(io::Error::other(error));
@@ -2611,6 +2717,7 @@ fn dns_tls_client_config(server: &NameServer) -> TlsClientConfig {
         verify_peer_cert_by_name: Vec::new(),
         alpn: Vec::new(),
         fingerprint: None,
+        ech_config_list: None,
     }
 }
 
@@ -3182,18 +3289,62 @@ mod tests {
     use tokio::sync::{oneshot, Barrier, Notify};
 
     use super::{
-        build_dns_query_with_id, edns_opt_record, exchange_direct_https_candidates,
-        exchange_direct_tls_candidates, exchange_dns_https_h2, exchange_dns_quic_candidates,
-        parse_dns_response, query_udp_dns_server, select_name_server_indices, CachingDnsResolver,
-        CompiledNameServerPolicies, ConfiguredDnsAddresses, ConfiguredDnsAnswer,
-        ConfiguredDnsResolver, DnsHostTarget, DnsLookup, DnsQueryDispatch, DnsQueryMetadata,
-        DnsQueryStrategy, DnsQueryTransport, DnsQueryTransportKind, DnsRecordType, DnsResolver,
-        NameServer, NameServerPolicy, NameServerTransport, SystemRouteDnsResolver,
-        DNS_CACHE_MAX_ENTRIES,
+        build_dns_query_with_id, dns_cache_capacity, edns_opt_record,
+        exchange_direct_https_candidates, exchange_direct_tls_candidates, exchange_dns_https_h2,
+        exchange_dns_quic_candidates, parse_dns_response, query_udp_dns_server,
+        select_name_server_indices, CachingDnsResolver, CompiledNameServerPolicies,
+        ConfiguredDnsAddresses, ConfiguredDnsAnswer, ConfiguredDnsResolver, DnsHostTarget,
+        DnsLookup, DnsQueryDispatch, DnsQueryMetadata, DnsQueryStrategy, DnsQueryTransport,
+        DnsQueryTransportKind, DnsRecordType, DnsResolver, NameServer, NameServerPolicy,
+        NameServerTransport, SystemRouteDnsResolver, DNS_CACHE_MAX_ADDRESSES_PER_ENTRY,
+        DNS_CACHE_MAX_ENTRIES_CONSTRAINED, DNS_CACHE_MAX_ENTRIES_STANDARD,
     };
+    use crate::MemoryClass;
     use crate::{
         RouteFamilies, RouteProbe, SocketHandle, SocketProtector, TlsConnector, TransportError,
     };
+
+    /// `getaddrinfo` cannot be cancelled, and a runtime waits for its
+    /// blocking pool when it is dropped: a lookup there held `xray_core_free`
+    /// until it gave up. On its own thread it holds nothing.
+    #[test]
+    fn a_system_lookup_in_flight_does_not_hold_its_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (entered, has_entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let lookup = runtime.spawn(super::on_lookup_thread(move || {
+            entered.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(30));
+        }));
+        has_entered.recv().unwrap();
+
+        let start = std::time::Instant::now();
+        drop(runtime);
+        let elapsed = start.elapsed();
+
+        let _ = release.send(());
+        drop(lookup);
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_system_lookup_of_an_address_asks_nobody() {
+        assert_eq!(
+            super::system_lookup("192.0.2.7", 443).await.unwrap(),
+            [SocketAddr::from(([192, 0, 2, 7], 443))]
+        );
+        assert_eq!(
+            super::system_lookup("2001:db8::7", 53).await.unwrap(),
+            [SocketAddr::new(
+                IpAddr::V6("2001:db8::7".parse().unwrap()),
+                53
+            )]
+        );
+    }
 
     #[test]
     fn build_dns_query_uses_injected_transaction_id() {
@@ -5801,6 +5952,29 @@ mod tests {
         result: SocketAddr,
     }
 
+    struct ManyAddressResolver {
+        calls: AtomicUsize,
+        addresses: Vec<SocketAddr>,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsResolver for ManyAddressResolver {
+        async fn resolve(&self, _domain: &str, port: u16) -> Result<SocketAddr, TransportError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(SocketAddr::new(self.addresses[0].ip(), port))
+        }
+
+        async fn resolve_all(&self, _domain: &str, port: u16) -> Result<DnsLookup, TransportError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(DnsLookup::new(
+                self.addresses
+                    .iter()
+                    .map(|address| SocketAddr::new(address.ip(), port)),
+                Some(Duration::from_secs(60)),
+            ))
+        }
+    }
+
     #[async_trait::async_trait]
     impl DnsResolver for ImmediateCountingResolver {
         async fn resolve(&self, _domain: &str, port: u16) -> Result<SocketAddr, TransportError> {
@@ -5869,8 +6043,9 @@ mod tests {
             calls: AtomicUsize::new(0),
             result: SocketAddr::from(([192, 0, 2, 62], 0)),
         });
-        let resolver = CachingDnsResolver::new(inner.clone());
-        for index in 0..DNS_CACHE_MAX_ENTRIES {
+        let capacity = 8usize;
+        let resolver = CachingDnsResolver::with_capacity(inner.clone(), capacity);
+        for index in 0..capacity {
             resolver
                 .resolve(&format!("entry-{index}.example"), 443)
                 .await
@@ -5881,10 +6056,42 @@ mod tests {
         resolver.resolve("entry-0.example", 443).await.unwrap();
         resolver.resolve("entry-1.example", 443).await.unwrap();
 
+        assert_eq!(inner.calls.load(Ordering::Relaxed), capacity + 2);
+    }
+
+    #[test]
+    fn cache_capacity_follows_the_memory_class() {
         assert_eq!(
-            inner.calls.load(Ordering::Relaxed),
-            DNS_CACHE_MAX_ENTRIES + 2
+            dns_cache_capacity(MemoryClass::Constrained),
+            DNS_CACHE_MAX_ENTRIES_CONSTRAINED
         );
+        assert_eq!(
+            dns_cache_capacity(MemoryClass::Standard),
+            DNS_CACHE_MAX_ENTRIES_STANDARD
+        );
+        const { assert!(DNS_CACHE_MAX_ENTRIES_CONSTRAINED < DNS_CACHE_MAX_ENTRIES_STANDARD) };
+    }
+
+    #[tokio::test]
+    async fn caching_dns_bounds_the_addresses_one_entry_keeps() {
+        let addresses: Vec<SocketAddr> = (0..64)
+            .map(|index| SocketAddr::from(([192, 0, 2, index as u8 + 1], 0)))
+            .collect();
+        let inner = Arc::new(ManyAddressResolver {
+            calls: AtomicUsize::new(0),
+            addresses,
+        });
+        let resolver = CachingDnsResolver::with_capacity(inner.clone(), 4);
+
+        let first = resolver.resolve_all("many.example", 443).await.unwrap();
+        let cached = resolver.resolve_all("many.example", 443).await.unwrap();
+
+        assert_eq!(
+            first.socket_addrs().len(),
+            DNS_CACHE_MAX_ADDRESSES_PER_ENTRY
+        );
+        assert_eq!(cached.socket_addrs(), first.socket_addrs());
+        assert_eq!(inner.calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

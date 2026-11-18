@@ -191,6 +191,7 @@ async fn start_max(udp: Option<UdpSettings>, pool: Option<Arc<FakeIpPool>>, max:
         sniff: None,
         udp: udp.clone(),
         hidden: Default::default(),
+        flows: None,
     };
     tokio::spawn(serve(l, Arc::new(kernel)));
     Env { fake, udp, socks }

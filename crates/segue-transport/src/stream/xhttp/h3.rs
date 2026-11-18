@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
 
 use crate::quic_congestion::{
-    bbr_for_profile, quinn_bbr, BbrProfile, BrutalRate, ControllerSwitch, Installed,
+    bbr_for_profile, quinn_bbr, BbrProfile, BrutalRate, ControllerSwitch, Installed, RenoFactory,
     SwitchedFactory, STANDARD_RUNS_XRAY_BBR,
 };
 use crate::{
@@ -114,6 +114,7 @@ pub enum H3Congestion {
     /// standard initial window, unless the port of Xray's sender is chosen
     /// for it.
     BbrStandard,
+    Cubic,
     Reno,
     /// Xray's BBR sender with its conservative profile.
     BbrConservative,
@@ -148,7 +149,7 @@ impl H3Congestion {
     fn switches(self) -> bool {
         match self {
             Self::BbrStandard => STANDARD_RUNS_XRAY_BBR,
-            Self::Reno => false,
+            Self::Cubic | Self::Reno => false,
             Self::BbrConservative
             | Self::BbrAggressive
             | Self::Brutal { .. }
@@ -172,7 +173,7 @@ impl H3QuicConfig {
             })
         };
         match self.congestion {
-            H3Congestion::Reno => None,
+            H3Congestion::Cubic | H3Congestion::Reno => None,
             H3Congestion::BbrStandard => {
                 STANDARD_RUNS_XRAY_BBR.then(|| bbr_for_profile(BbrProfile::Standard))
             }
@@ -277,6 +278,11 @@ pub struct H3QuicConfig {
     /// The length of the connection IDs this end issues, as quic-go's
     /// `Transport.ConnectionIDLength`. `None` keeps the carrier's default.
     pub connection_id_len: Option<u8>,
+    /// Cache live unidirectional-stream limit, for non-HTTP QUIC clients.
+    /// `None` retains the carrier's existing default (100).
+    pub max_incoming_unidirectional_streams: Option<u64>,
+    /// Enable rustls session resumption's 0-RTT data capability.
+    pub enable_early_data: bool,
     /// Xray-core's ChromeParrot: shape the handshake like Chrome's, as Xray's
     /// Hysteria, XHTTP H3 and XDRIVE H3 dialers do unless
     /// `quicParams.disableChromeParrot` is true.
@@ -289,7 +295,7 @@ pub struct H3QuicConfig {
     /// and wants the TLS configuration from
     /// `TlsConnector::h3_client_config_for` with the same flag, which carries
     /// uTLS's Chrome QUIC ClientHello. Off by default here: the core sets it
-    /// from `disableChromeParrot`.
+    /// from `disableChromeParrot`. It remains false for TUIC.
     pub chrome_parrot: bool,
 }
 
@@ -324,6 +330,8 @@ impl Default for H3QuicConfig {
             initial_packet_size: None,
             connection_id_len: None,
             chrome_parrot: false,
+            max_incoming_unidirectional_streams: None,
+            enable_early_data: false,
         }
     }
 }
@@ -428,6 +436,7 @@ impl H3QuicConfig {
             H3Congestion::BbrStandard => "quinn-bbr-standard-approximation",
             H3Congestion::BbrConservative => "xray-bbr-conservative",
             H3Congestion::BbrAggressive => "xray-bbr-aggressive",
+            H3Congestion::Cubic => "cubic",
             H3Congestion::Reno => "new-reno",
             H3Congestion::ForceBrutal { bytes_per_second } if bytes_per_second > 0 => "brutal",
             H3Congestion::Brutal { .. } => "brutal-if-negotiated",
@@ -1236,7 +1245,7 @@ pub async fn connect_h3(config: H3ConnectConfig) -> Result<H3Client, H3Error> {
     let protector = config.socket_protector.clone();
     let network_changes = config.network_changes.clone();
     let (endpoint, connection, diagnostics, wire_peer) =
-        connect_quic_transport(config, b"h3").await?;
+        connect_quic_transport(config, Some(b"h3")).await?;
     let send_window = XhttpSendWindow::new(&connection, class);
     let hop = move_udp_carrier(
         &endpoint,
@@ -1323,13 +1332,16 @@ pub(crate) fn move_udp_carrier(
 /// UDP transport, with these deliberate differences: the timer starts once
 /// the connection exists rather than at dial, every remote hop changes the
 /// port, a remote hop also takes a fresh local socket, Quinn keeps the
-/// previous socket until the new path authenticates, and the task ends with
-/// the connection. A failed hop keeps the current protected path until the
-/// next interval, as in Xray.
+/// previous socket until a few seconds after the new path authenticates, and
+/// the task ends with the connection. A failed hop keeps the current
+/// protected path until the next interval, as in Xray.
 ///
 /// A change of the OS network takes a fresh socket towards the same peer,
 /// which Xray-core does not do: the old socket's network is gone, and the
 /// connection would otherwise sit out its idle timeout before a redial.
+/// Where the old network is still there, as cellular is under Wi-Fi, the
+/// peer's datagrams already on their way arrive on the old socket, which
+/// Quinn goes on reading for those few seconds.
 async fn follow_udp_carrier(
     endpoint: Endpoint,
     connection: quinn::Connection,
@@ -1449,9 +1461,9 @@ fn unspecified_bind_addr(remote: SocketAddr) -> SocketAddr {
 /// wire peer, which differs from the remote address only under UDP hop.
 pub(crate) async fn connect_quic_transport(
     config: H3ConnectConfig,
-    expected_alpn: &'static [u8],
+    expected_alpn: Option<&'static [u8]>,
 ) -> Result<(Endpoint, quinn::Connection, H3Diagnostics, SocketAddr), H3Error> {
-    connect_quic_transport_with_datagrams(
+    let (endpoint, connection, diagnostics, peer) = connect_quic_transport_with_datagrams(
         config,
         expected_alpn,
         None,
@@ -1459,7 +1471,8 @@ pub(crate) async fn connect_quic_transport(
         Default::default(),
         None,
     )
-    .await
+    .await?;
+    Ok((endpoint, connection, diagnostics, peer))
 }
 
 /// Optional receive/send byte budgets and advertised frame-size cap for QUIC datagrams.
@@ -1472,23 +1485,58 @@ pub(crate) async fn connect_quic_transport(
 /// the caller's switch.
 pub(crate) async fn connect_quic_transport_with_datagrams(
     config: H3ConnectConfig,
-    expected_alpn: &'static [u8],
+    expected_alpn: Option<&'static [u8]>,
     datagram_buffers: Option<(usize, usize, u16)>,
     carrier: Option<&crate::hysteria::HysteriaCarrierConfig>,
     session: crate::hysteria::carrier::CarrierSession,
     switch: Option<&Arc<ControllerSwitch>>,
 ) -> Result<(Endpoint, quinn::Connection, H3Diagnostics, SocketAddr), H3Error> {
+    let (endpoint, connection, diagnostics, address, _) = connect_quic_transport_raw(
+        config,
+        expected_alpn,
+        datagram_buffers,
+        carrier,
+        session,
+        switch,
+    )
+    .await?;
+    Ok((endpoint, connection, diagnostics, address))
+}
+
+pub(crate) async fn connect_quic_transport_raw(
+    config: H3ConnectConfig,
+    expected_alpn: Option<&'static [u8]>,
+    datagram_buffers: Option<(usize, usize, u16)>,
+    carrier: Option<&crate::hysteria::HysteriaCarrierConfig>,
+    session: crate::hysteria::carrier::CarrierSession,
+    switch: Option<&Arc<ControllerSwitch>>,
+) -> Result<
+    (
+        Endpoint,
+        quinn::Connection,
+        H3Diagnostics,
+        SocketAddr,
+        Option<quinn::ZeroRttAccepted>,
+    ),
+    H3Error,
+> {
     drop(crate::tls::parse_tls_server_name(&config.server_name)?);
     let mut config = config;
     if config.quic.chrome_parrot {
         config.quic = config.quic.populated().into_owned();
     }
     let diagnostics = config.quic.diagnostics()?;
-    if config.tls_config.alpn_protocols.len() != 1
-        || config.tls_config.alpn_protocols[0].as_slice() != expected_alpn
-    {
-        let expected = std::str::from_utf8(expected_alpn).unwrap_or("<binary>");
-        return Err(H3Error::InvalidAlpn { expected });
+    if let Some(expected_alpn) = expected_alpn {
+        if config.tls_config.alpn_protocols.len() != 1
+            || config.tls_config.alpn_protocols[0].as_slice() != expected_alpn
+        {
+            let expected = std::str::from_utf8(expected_alpn).unwrap_or("<binary>");
+            return Err(H3Error::InvalidAlpn { expected });
+        }
+    } else if config.tls_config.alpn_protocols.is_empty() {
+        return Err(H3Error::InvalidAlpn {
+            expected: "h3 or tuic",
+        });
     }
 
     let own_carrier = config.quic.hop_carrier();
@@ -1595,13 +1643,29 @@ pub(crate) async fn connect_quic_transport_with_datagrams(
     let connecting = endpoint
         .connect_with(client_config, remote_addr, &config.server_name)
         .map_err(H3Error::ConnectStart)?;
-    let connection = connecting.await.map_err(H3Error::Connect)?;
+    // 0-RTT is rustls `enable_early_data` plus `Connecting::into_0rtt`. quinn
+    // 0.11 has no `ClientConfig::enable_early_data`. Callers that ignore the
+    // acceptance future still get a fully installed congestion controller.
+    let (connection, zero_rtt_accepted) = if config.quic.enable_early_data {
+        match connecting.into_0rtt() {
+            Ok((connection, accepted)) => (connection, Some(accepted)),
+            Err(connecting) => (connecting.await.map_err(H3Error::Connect)?, None),
+        }
+    } else {
+        (connecting.await.map_err(H3Error::Connect)?, None)
+    };
     if let Some(own_switch) = own_switch {
         if let Some(installed) = config.quic.installed_controller(None) {
             own_switch.install(installed);
         }
     }
-    Ok((endpoint, connection, diagnostics, wire_peer))
+    Ok((
+        endpoint,
+        connection,
+        diagnostics,
+        wire_peer,
+        zero_rtt_accepted,
+    ))
 }
 
 /// Connects the first successful protected UDP candidate.
@@ -1802,14 +1866,19 @@ fn build_quinn_config(
             .chrome_parrot(true)
             .max_concurrent_uni_streams(varint(crate::chrome_parrot::MAX_INCOMING_UNI_STREAMS));
     }
+    if let Some(count) = config.quic.max_incoming_unidirectional_streams {
+        transport.max_concurrent_uni_streams(quinn_varint("maxIncomingUniStreams", count)?);
+    }
     match config.quic.congestion {
         H3Congestion::BbrStandard if !STANDARD_RUNS_XRAY_BBR => {
             transport.congestion_controller_factory(quinn_bbr());
         }
+        H3Congestion::Cubic => {
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+        }
         H3Congestion::Reno => {
-            transport.congestion_controller_factory(Arc::new(
-                quinn::congestion::NewRenoConfig::default(),
-            ));
+            transport.congestion_controller_factory(Arc::new(RenoFactory));
         }
         H3Congestion::ForceBrutal {
             bytes_per_second: 0,

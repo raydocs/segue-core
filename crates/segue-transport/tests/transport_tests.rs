@@ -329,6 +329,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         }
     }
 
@@ -516,6 +517,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         };
 
         let stream = connector
@@ -550,6 +552,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         };
 
         let stream = connector
@@ -576,6 +579,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         };
 
         let stream = connector
@@ -605,6 +609,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         };
 
         let result = connector.connect(&target, &config).await;
@@ -628,6 +633,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         };
 
         let result = connector.connect(&target, &config).await;
@@ -653,6 +659,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         });
 
         let stream = dialer
@@ -771,6 +778,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         });
         let race_config = happy_eyeballs_config(Duration::from_secs(60));
 
@@ -820,6 +828,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         };
         let race_config = happy_eyeballs_config(Duration::from_secs(60));
 
@@ -847,6 +856,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         };
         let scoped = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9, 17, 42));
         let result = connector.connect_socket_addr(scoped, &config).await;
@@ -1040,6 +1050,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         }));
         let target = Target::new(
             TargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
@@ -1107,9 +1118,13 @@ mod transport_tests {
 
         let result = connector.connect(&target).await;
 
+        // TcpConnector carries plaintext only: every security connector config
+        // is refused up front — REALITY and ShadowTLS share one arm with the
+        // "security" tag — so a REALITY target never dials or downgrades to a
+        // plaintext stream.
         assert!(matches!(
             result,
-            Err(TransportError::UnsupportedConnectorConfig("reality"))
+            Err(TransportError::UnsupportedConnectorConfig("security"))
         ));
     }
 
@@ -1124,6 +1139,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("chrome".to_owned()),
+            ech_config_list: None,
         };
         let firefox = TlsClientConfig {
             fingerprint: Some("firefox".to_owned()),
@@ -1163,6 +1179,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("chrome".to_owned()),
+            ech_config_list: None,
         };
 
         let original = connector.client_config_for(&chrome).expect("chrome config");
@@ -1190,6 +1207,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: vec!["h2".to_owned()],
             fingerprint: Some("unsafe".to_owned()),
+            ech_config_list: None,
         };
         let http11 = TlsClientConfig {
             alpn: vec!["http/1.1".to_owned()],
@@ -1230,6 +1248,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("chrome".to_owned()),
+            ech_config_list: None,
         };
         let insecure = TlsClientConfig {
             allow_insecure: true,
@@ -1311,6 +1330,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("chrome".to_owned()),
+            ech_config_list: None,
         };
         let unknown = TlsClientConfig {
             fingerprint: Some("nosuchbrowser".to_owned()),
@@ -1340,6 +1360,7 @@ mod transport_tests {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: Some("nosuchbrowser".to_owned()),
+                ech_config_list: None,
             })
             .expect_err("an unknown fingerprint must fail");
 
@@ -1360,6 +1381,7 @@ mod transport_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         })
     }
 

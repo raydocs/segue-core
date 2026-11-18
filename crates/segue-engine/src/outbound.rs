@@ -3,8 +3,9 @@ pub use vmess::VmessOutbound;
 mod first_payload;
 mod protocol_stream;
 use first_payload::{
-    flush_header_alone, FirstPayloadDeadline, HeldHeader, TROJAN_FIRST_PAYLOAD_WAIT,
-    VLESS_FIRST_PAYLOAD_WAIT,
+    flush_header_alone, FirstPayloadDeadline, HeldHeader, SHADOWSOCKS_2022_FIRST_PAYLOAD_WAIT,
+    SHADOWSOCKS_FIRST_PAYLOAD_WAIT, TROJAN_FIRST_PAYLOAD_WAIT, VLESS_FIRST_PAYLOAD_WAIT,
+    VMESS_FIRST_PAYLOAD_WAIT,
 };
 mod shadowsocks;
 pub use shadowsocks::Shadowsocks2022Outbound;
@@ -15,12 +16,16 @@ pub(crate) use blackhole::{
 mod encryption;
 mod trojan;
 pub use trojan::TrojanOutbound;
+mod anytls;
+pub use anytls::AnyTlsOutbound;
 mod socks;
 pub use socks::SocksOutbound;
 mod http;
 pub use http::HttpOutbound;
 pub(crate) mod hysteria;
 pub use hysteria::HysteriaOutbound;
+mod tuic;
+pub(crate) use tuic::{TuicError, TuicOutbound};
 pub(crate) mod wireguard;
 pub use wireguard::WireguardOutbound;
 pub(crate) mod masque;
@@ -66,8 +71,9 @@ use segue_config::{
     CoreConfig, DnsOutboundSettings, DomainStrategy, FreedomFinalRule, FreedomOutboundSettings,
     FreedomRedirect, Network, OutboundConfig, OutboundSettings, ProxyProtocolVersion,
     QuicParamsSettings, RouteContext, RoutingBalancerStrategy, RoutingConfig,
-    RoutingDomainStrategy, RoutingLeastLoadSettings, RoutingRule, RoutingRuleTarget,
-    StreamSecurity, StreamSettings, StreamTransport, TargetAddr, VlessUser, XhttpSettings,
+    RoutingDomainStrategy, RoutingLeastLoadSettings, RoutingLeastPingSettings, RoutingRule,
+    RoutingRuleTarget, StreamSecurity, StreamSettings, StreamTransport, TargetAddr, VlessUser,
+    XhttpSettings,
 };
 use segue_proxy::vless::{
     encode_request_header, VisionStream, VisionStreamIo, VlessCommand, VlessRequest,
@@ -89,6 +95,7 @@ use segue_transport::{
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use zeroize::Zeroizing;
 
+use crate::health::ObservatoryActivity;
 use crate::policy::effective_policy_for_level;
 use crate::{CompiledDnsOutboundPolicy, CoreError};
 pub(crate) use proxy_protocol::InboundSource;
@@ -364,6 +371,7 @@ pub(crate) enum DnsTcpConnector {
         verify_peer_cert_by_name: Vec<String>,
         alpn: Vec<String>,
         fingerprint: Option<String>,
+        ech_config_list: Option<Vec<u8>>,
     },
 }
 
@@ -411,6 +419,8 @@ pub enum TcpOutbound {
     Hysteria(HysteriaOutbound),
     Wireguard(WireguardOutbound),
     Masque(MasqueOutbound),
+    AnyTls(AnyTlsOutbound),
+    Tuic(TuicOutbound),
     Chained {
         outbound: Box<TcpOutbound>,
         proxy: Box<TcpOutbound>,
@@ -434,6 +444,8 @@ pub enum UdpOutbound {
     Hysteria(HysteriaOutbound),
     Wireguard(WireguardOutbound),
     Masque(MasqueOutbound),
+    AnyTls(AnyTlsOutbound),
+    Tuic(TuicOutbound),
 }
 
 impl UdpOutbound {
@@ -453,6 +465,8 @@ impl UdpOutbound {
             Self::Trojan(trojan) if !trojan.udp_uses_mux(target) => {
                 (trojan.carrier(), Network::Tcp)
             }
+            // AnyTLS carries UDP over a stream to the server.
+            Self::AnyTls(anytls) => (anytls.carrier(), Network::Tcp),
             Self::Vmess(vmess) if !vmess.udp_uses_mux(target) => (vmess.carrier(), Network::Tcp),
             // Shadowsocks sends its datagrams to the server over UDP.
             Self::Shadowsocks2022(shadowsocks) if !shadowsocks.udp_uses_mux(target) => {
@@ -594,6 +608,7 @@ impl DnsOutbound {
                 verify_peer_cert_by_name,
                 alpn,
                 fingerprint,
+                ech_config_list,
             } => {
                 let server_name = match &target.addr {
                     RoutingTargetAddr::Domain(domain) if !domain.is_empty() => domain.clone(),
@@ -609,6 +624,7 @@ impl DnsOutbound {
                     verify_peer_cert_by_name: verify_peer_cert_by_name.clone(),
                     alpn: alpn.clone(),
                     fingerprint: fingerprint.clone(),
+                    ech_config_list: ech_config_list.clone(),
                 }))
             }
         }
@@ -1179,6 +1195,7 @@ impl TcpOutbound {
             Self::Shadowsocks2022(shadowsocks) => Some(shadowsocks.carrier()),
             Self::Socks(socks) => Some(socks.carrier()),
             Self::Http(http) => Some(http.carrier()),
+            Self::AnyTls(anytls) => Some(anytls.carrier()),
             _ => None,
         }
     }
@@ -1263,8 +1280,10 @@ impl TcpOutbound {
             | Self::Http(_)
             | Self::Shadowsocks2022(_)
             | Self::Hysteria(_)
+            | Self::Tuic(_)
             | Self::Wireguard(_)
-            | Self::Masque(_) => None,
+            | Self::Masque(_)
+            | Self::AnyTls(_) => None,
             Self::Chained { .. } => unreachable!("primary outbound is never a chain wrapper"),
         }
     }
@@ -1330,7 +1349,19 @@ impl ResolvedTcpConnector for OutboundProxyTcpConnector {
             TcpOutbound::Hysteria(_) => Err(TransportError::ChainedOutbound(
                 "Hysteria chaining is unsupported".into(),
             )),
+            TcpOutbound::Tuic(_) => Err(TransportError::ChainedOutbound(
+                "TUIC chaining is unsupported".into(),
+            )),
             TcpOutbound::Trojan(outbound) => outbound
+                .open_resolved(
+                    original_target,
+                    &self.server_candidates,
+                    &[],
+                    &self.transport_dialer,
+                )
+                .await
+                .map_err(|error| TransportError::ChainedOutbound(error.to_string())),
+            TcpOutbound::AnyTls(outbound) => outbound
                 .open_resolved(
                     original_target,
                     &self.server_candidates,
@@ -1424,6 +1455,11 @@ fn prepare_outbound_proxy_dialer<'a>(
                 .resolve_server(dns_resolver, &transport_dialer)
                 .await?
                 .into_boxed_slice(),
+            TcpOutbound::AnyTls(outbound) if requires_local_resolution => outbound
+                .carrier()
+                .resolve_server(dns_resolver, &transport_dialer)
+                .await?
+                .into_boxed_slice(),
             TcpOutbound::Socks(outbound) if requires_local_resolution => outbound
                 .carrier()
                 .resolve_server(dns_resolver, &transport_dialer)
@@ -1445,6 +1481,7 @@ fn prepare_outbound_proxy_dialer<'a>(
                 .await?
                 .into_boxed_slice(),
             TcpOutbound::Trojan(_) => Box::default(),
+            TcpOutbound::AnyTls(_) => Box::default(),
             TcpOutbound::Socks(_) => Box::default(),
             TcpOutbound::Http(_) => Box::default(),
             TcpOutbound::Vmess(_) => Box::default(),
@@ -1457,6 +1494,9 @@ fn prepare_outbound_proxy_dialer<'a>(
             }
             TcpOutbound::Hysteria(_) => {
                 return Err(CoreError::UnsupportedOutboundProxyNetwork("Hysteria"))
+            }
+            TcpOutbound::Tuic(_) => {
+                return Err(CoreError::UnsupportedOutboundProxyNetwork("TUIC"));
             }
             // Ports are filled in per connection, from the next hop's server
             // unless the redirect names one.
@@ -1490,11 +1530,13 @@ fn proxy_chain_requires_local_resolution(proxy: &TcpOutbound) -> bool {
     match proxy.primary() {
         TcpOutbound::Vless(_)
         | TcpOutbound::Trojan(_)
+        | TcpOutbound::AnyTls(_)
         | TcpOutbound::Socks(_)
         | TcpOutbound::Http(_)
         | TcpOutbound::Vmess(_)
         | TcpOutbound::Shadowsocks2022(_)
         | TcpOutbound::Hysteria(_)
+        | TcpOutbound::Tuic(_)
         | TcpOutbound::Wireguard(_)
         | TcpOutbound::Masque(_) => false,
         TcpOutbound::Freedom(freedom) => match proxy {
@@ -1516,6 +1558,8 @@ fn proxy_chain_requires_local_resolution(proxy: &TcpOutbound) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CachedOutboundError {
     Trojan(segue_proxy::trojan::WireError),
+    AnyTls(segue_proxy::anytls::WireError),
+    Tuic(TuicError),
     NoSupportedOutbound,
     UnsupportedOutboundNetwork,
     UnsupportedOutboundSecurity,
@@ -1534,6 +1578,8 @@ impl CachedOutboundError {
     fn from_core_error(error: CoreError) -> Self {
         match error {
             CoreError::Trojan(error) => Self::Trojan(error),
+            CoreError::AnyTls(error) => Self::AnyTls(error),
+            CoreError::Tuic(error) => Self::Tuic(error),
             CoreError::NoSupportedOutbound => Self::NoSupportedOutbound,
             CoreError::UnsupportedOutboundNetwork => Self::UnsupportedOutboundNetwork,
             CoreError::UnsupportedOutboundSecurity => Self::UnsupportedOutboundSecurity,
@@ -1559,6 +1605,8 @@ impl CachedOutboundError {
     fn into_core_error(self) -> CoreError {
         match self {
             Self::Trojan(error) => CoreError::Trojan(error),
+            Self::AnyTls(error) => CoreError::AnyTls(error),
+            Self::Tuic(error) => CoreError::Tuic(error),
             Self::NoSupportedOutbound => CoreError::NoSupportedOutbound,
             Self::UnsupportedOutboundNetwork => CoreError::UnsupportedOutboundNetwork,
             Self::UnsupportedOutboundSecurity => CoreError::UnsupportedOutboundSecurity,
@@ -1588,9 +1636,11 @@ struct CachedOutboundEntry {
     dns: OnceLock<Result<DnsOutbound, CachedOutboundError>>,
     vless: OnceLock<Result<VlessTcpOutbound, CachedOutboundError>>,
     trojan: OnceLock<Result<TrojanOutbound, CachedOutboundError>>,
+    anytls: OnceLock<Result<AnyTlsOutbound, CachedOutboundError>>,
     vmess: OnceLock<Result<VmessOutbound, CachedOutboundError>>,
     shadowsocks: OnceLock<Result<Shadowsocks2022Outbound, CachedOutboundError>>,
     hysteria: OnceLock<Result<HysteriaOutbound, CachedOutboundError>>,
+    tuic: OnceLock<Result<TuicOutbound, CachedOutboundError>>,
     wireguard: OnceLock<Result<WireguardOutbound, CachedOutboundError>>,
     masque: OnceLock<Result<MasqueOutbound, CachedOutboundError>>,
 }
@@ -1608,8 +1658,10 @@ pub struct OutboundNodeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundNodeKind {
     Hysteria,
+    Tuic,
     Wireguard,
     Masque,
+    AnyTls,
     Freedom,
     Vless,
     Trojan,
@@ -1828,10 +1880,12 @@ impl OutboundGraph {
                     OutboundSettings::Vless(_) => OutboundNodeKind::Vless,
                     OutboundSettings::Trojan(_) => OutboundNodeKind::Trojan,
                     OutboundSettings::Vmess(_) => OutboundNodeKind::Vmess,
+                    OutboundSettings::Tuic(_) => OutboundNodeKind::Tuic,
                     OutboundSettings::Shadowsocks2022(_) => OutboundNodeKind::Shadowsocks2022,
                     OutboundSettings::Hysteria(_) => OutboundNodeKind::Hysteria,
                     OutboundSettings::Wireguard(_) => OutboundNodeKind::Wireguard,
                     OutboundSettings::Masque(_) => OutboundNodeKind::Masque,
+                    OutboundSettings::AnyTls(_) => OutboundNodeKind::AnyTls,
                     OutboundSettings::Dns(_) => OutboundNodeKind::Dns,
                     OutboundSettings::Blackhole(_) => OutboundNodeKind::Blackhole,
                     OutboundSettings::Loopback(_) => OutboundNodeKind::Loopback,
@@ -2073,6 +2127,7 @@ fn build_outbound_proxy_edges(
             (OutboundSettings::Blackhole(_), _) => Some("blackhole outbounds are not TCP carriers"),
             (OutboundSettings::Loopback(_), _) => Some("loopback outbounds are not TCP carriers"),
             (OutboundSettings::Hysteria(_), _) => Some("Hysteria chaining is unsupported"),
+            (OutboundSettings::Tuic(_), _) => Some("TUIC chaining is unsupported"),
             (OutboundSettings::Wireguard(_), _) => Some("WireGuard chaining is unsupported"),
             (
                 _,
@@ -2168,6 +2223,8 @@ fn least_load_cost_millionths(settings: &RoutingLeastLoadSettings, tag: &str) ->
 struct OutboundSelectorGroupState {
     override_member: AtomicUsize,
     round_robin_cursor: AtomicU64,
+    /// Member index + 1 of the hysteresis incumbent. Zero means there is none.
+    health_incumbent: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -2305,6 +2362,7 @@ pub struct OutboundSelectionOverlay {
     health: Box<[OutboundHealthAtomicState]>,
     revision: AtomicU64,
     update_lock: Mutex<()>,
+    observatory_activity: OnceLock<Arc<ObservatoryActivity>>,
 }
 
 impl OutboundSelectionOverlay {
@@ -2313,6 +2371,7 @@ impl OutboundSelectionOverlay {
             .map(|_| OutboundSelectorGroupState {
                 override_member: AtomicUsize::new(0),
                 round_robin_cursor: AtomicU64::new(0),
+                health_incumbent: AtomicUsize::new(0),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -2326,6 +2385,17 @@ impl OutboundSelectionOverlay {
             health,
             revision: AtomicU64::new(0),
             update_lock: Mutex::new(()),
+            observatory_activity: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn configure_observatory_activity(&self, activity: Arc<ObservatoryActivity>) {
+        let _ = self.observatory_activity.set(activity);
+    }
+
+    fn note_observatory_use(&self) {
+        if let Some(activity) = self.observatory_activity.get() {
+            activity.touch();
         }
     }
 
@@ -2499,14 +2569,28 @@ impl OutboundSelectionOverlay {
         self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn select(&self, group_tag: &str) -> Result<OutboundNodeId, CoreError> {
+    /// The balancer's pick, its `fallbackTag` when the strategy picks no
+    /// member, or `None` when it has no fallback either: Xray-core's
+    /// dispatcher then takes the default outbound. A `fallbackTag` naming no
+    /// outbound fails, as Xray-core closes a connection routed to a tag it
+    /// lacks.
+    ///
+    /// `leastPing` and `leastLoad` pick no member unless one is observed
+    /// healthy. `random` and `roundRobin` pick none only when every member is
+    /// unhealthy and the balancer has a `fallbackTag`, or when it has no
+    /// member at all: see [`Self::is_candidate`].
+    fn select(&self, group_tag: &str) -> Result<Option<OutboundNodeId>, CoreError> {
         let (group_index, group) = self.group_for_tag(group_tag)?;
+        if strategy_needs_observatory(group.strategy()) {
+            self.note_observatory_use();
+        }
         let state = &self.groups[group_index];
         if let Some(member_index) = state.override_member.load(Ordering::Acquire).checked_sub(1) {
             return group
                 .members()
                 .get(member_index)
                 .copied()
+                .map(Some)
                 .ok_or(CoreError::NoSupportedOutbound);
         }
         let selected = match group.strategy() {
@@ -2515,16 +2599,22 @@ impl OutboundSelectionOverlay {
                 let cursor = state.round_robin_cursor.fetch_add(1, Ordering::Relaxed);
                 self.select_round_robin_eligible(group, cursor)
             }
-            RoutingBalancerStrategy::LeastPing => self.select_least_ping(group),
-            RoutingBalancerStrategy::LeastLoad(settings) => self.select_least_load(group, settings),
+            RoutingBalancerStrategy::LeastPing(settings) => {
+                self.select_least_ping(group_index, group, settings)
+            }
+            RoutingBalancerStrategy::LeastLoad(settings) => {
+                self.select_least_load(group_index, group, settings)
+            }
         };
-        selected
-            .or_else(|| {
-                group
-                    .fallback_tag()
-                    .and_then(|tag| self.graph.node_for_tag(tag))
-            })
-            .ok_or(CoreError::NoSupportedOutbound)
+        match (selected, group.fallback_tag()) {
+            (Some(node), _) => Ok(Some(node)),
+            (None, Some(tag)) => self
+                .graph
+                .node_for_tag(tag)
+                .map(Some)
+                .ok_or(CoreError::NoSupportedOutbound),
+            (None, None) => Ok(None),
+        }
     }
 
     fn group_for_tag(&self, group_tag: &str) -> Result<(usize, &OutboundSelectorGroup), CoreError> {
@@ -2551,11 +2641,20 @@ impl OutboundSelectionOverlay {
         })
     }
 
+    /// Whether `random` and `roundRobin` may pick `node` in `group`.
+    /// Xray-core's two strategies ask the observatory only when the balancer
+    /// has a `fallbackTag` (`RandomStrategy.InjectContext`), so a balancer
+    /// without one keeps every member, the unhealthy ones too, and never
+    /// leaves its members for the default outbound.
+    fn is_candidate(&self, group: &OutboundSelectorGroup, node: OutboundNodeId) -> bool {
+        group.fallback_tag().is_none() || self.is_eligible(node)
+    }
+
     fn select_random_eligible(&self, group: &OutboundSelectorGroup) -> Option<OutboundNodeId> {
         let eligible_count = group
             .members()
             .iter()
-            .filter(|node| self.is_eligible(**node))
+            .filter(|node| self.is_candidate(group, **node))
             .count();
         if eligible_count == 0 {
             return None;
@@ -2565,7 +2664,7 @@ impl OutboundSelectionOverlay {
             .members()
             .iter()
             .copied()
-            .filter(|node| self.is_eligible(*node))
+            .filter(|node| self.is_candidate(group, *node))
             .nth(selected)
     }
 
@@ -2577,7 +2676,7 @@ impl OutboundSelectionOverlay {
         let eligible_count = group
             .members()
             .iter()
-            .filter(|node| self.is_eligible(**node))
+            .filter(|node| self.is_candidate(group, **node))
             .count();
         if eligible_count == 0 {
             return None;
@@ -2588,27 +2687,60 @@ impl OutboundSelectionOverlay {
             .members()
             .iter()
             .copied()
-            .filter(|node| self.is_eligible(*node))
+            .filter(|node| self.is_candidate(group, *node))
             .nth(selected)
     }
 
-    fn select_least_ping(&self, group: &OutboundSelectorGroup) -> Option<OutboundNodeId> {
-        group
-            .members()
-            .iter()
-            .copied()
-            .filter_map(|node| {
-                let health = self.health_state(node)?;
-                (OutboundHealthState::from_u8(health.state.load(Ordering::Acquire))
-                    == OutboundHealthState::Healthy)
-                    .then(|| (health.delay_ms.load(Ordering::Acquire), node))
-            })
-            .min_by_key(|(delay_ms, _)| *delay_ms)
-            .map(|(_, node)| node)
+    /// Keep the incumbent unless another healthy member is faster by more than
+    /// `pingTolerance` (default 50 ms). With no incumbent, the lowest delay
+    /// wins and equal delays keep the tag-sorted member order.
+    fn select_least_ping(
+        &self,
+        group_index: usize,
+        group: &OutboundSelectorGroup,
+        settings: &RoutingLeastPingSettings,
+    ) -> Option<OutboundNodeId> {
+        let tolerance_ms = duration_millis(settings.effective_ping_tolerance());
+        let incumbent = self.health_incumbent_node(group_index, group);
+        let mut best: Option<(u64, usize, OutboundNodeId)> = None;
+        let mut incumbent_delay = None;
+        for (member_index, node) in group.members().iter().copied().enumerate() {
+            let Some(health) = self.health_state(node) else {
+                continue;
+            };
+            if OutboundHealthState::from_u8(health.state.load(Ordering::Acquire))
+                != OutboundHealthState::Healthy
+            {
+                continue;
+            }
+            let delay_ms = health.delay_ms.load(Ordering::Acquire);
+            if incumbent == Some(node) {
+                incumbent_delay = Some(delay_ms);
+            }
+            let replace = match best {
+                Some((best_delay, _, _)) => delay_ms < best_delay,
+                None => true,
+            };
+            if replace {
+                best = Some((delay_ms, member_index, node));
+            }
+        }
+        let Some((best_delay, best_member, best_node)) = best else {
+            self.clear_health_incumbent(group_index);
+            return None;
+        };
+        if incumbent_delay.is_some_and(|delay| delay <= best_delay.saturating_add(tolerance_ms)) {
+            return incumbent;
+        }
+        self.groups[group_index]
+            .health_incumbent
+            .store(best_member + 1, Ordering::Release);
+        Some(best_node)
     }
 
     fn select_least_load(
         &self,
+        group_index: usize,
         group: &OutboundSelectorGroup,
         settings: &RoutingLeastLoadSettings,
     ) -> Option<OutboundNodeId> {
@@ -2673,6 +2805,8 @@ impl OutboundSelectionOverlay {
                 .then_with(|| left.4.cmp(right.4))
         });
         if candidates.is_empty() {
+            drop(candidates);
+            self.clear_health_incumbent(group_index);
             return None;
         }
 
@@ -2700,11 +2834,105 @@ impl OutboundSelectionOverlay {
             }
         };
         if selected_count == 0 {
+            drop(candidates);
+            self.clear_health_incumbent(group_index);
             return None;
+        }
+        if selected_count == 1 {
+            let best_average = candidates[0].1;
+            let best_node = candidates[0].5;
+            let ranked = candidates
+                .iter()
+                .map(|candidate| (candidate.1, candidate.5))
+                .collect::<Vec<_>>();
+            drop(candidates);
+            return Some(self.pick_single_least_load(
+                group_index,
+                group,
+                settings,
+                best_average,
+                best_node,
+                &ranked,
+            ));
         }
         let selected = rand::thread_rng().gen_range(0..selected_count);
         Some(candidates[selected].5)
     }
+
+    /// Xray's ranking is unchanged. When it yields one outbound, keep the
+    /// incumbent unless the new best average is faster by more than
+    /// `pingTolerance`. Spreading across `expected` > 1 stays random.
+    fn pick_single_least_load(
+        &self,
+        group_index: usize,
+        group: &OutboundSelectorGroup,
+        settings: &RoutingLeastLoadSettings,
+        best_average: u64,
+        best_node: OutboundNodeId,
+        ranked: &[(u64, OutboundNodeId)],
+    ) -> OutboundNodeId {
+        let tolerance_ms = duration_millis(settings.effective_ping_tolerance());
+        let incumbent_average =
+            self.health_incumbent_node(group_index, group)
+                .and_then(|incumbent| {
+                    ranked
+                        .iter()
+                        .find(|(_, node)| *node == incumbent)
+                        .map(|(average, _)| (incumbent, *average))
+                });
+        if let Some((incumbent, average)) = incumbent_average {
+            let beaten =
+                best_node != incumbent && average > best_average.saturating_add(tolerance_ms);
+            if !beaten {
+                return incumbent;
+            }
+        }
+        self.remember_health_incumbent(group_index, group, best_node);
+        best_node
+    }
+
+    fn health_incumbent_node(
+        &self,
+        group_index: usize,
+        group: &OutboundSelectorGroup,
+    ) -> Option<OutboundNodeId> {
+        let member_index = self.groups[group_index]
+            .health_incumbent
+            .load(Ordering::Acquire)
+            .checked_sub(1)?;
+        group.members().get(member_index).copied()
+    }
+
+    fn remember_health_incumbent(
+        &self,
+        group_index: usize,
+        group: &OutboundSelectorGroup,
+        node: OutboundNodeId,
+    ) {
+        let Some(member_index) = group.members().iter().position(|member| *member == node) else {
+            return;
+        };
+        self.groups[group_index]
+            .health_incumbent
+            .store(member_index + 1, Ordering::Release);
+    }
+
+    fn clear_health_incumbent(&self, group_index: usize) {
+        self.groups[group_index]
+            .health_incumbent
+            .store(0, Ordering::Release);
+    }
+}
+
+fn strategy_needs_observatory(strategy: &RoutingBalancerStrategy) -> bool {
+    matches!(
+        strategy,
+        RoutingBalancerStrategy::LeastPing(_) | RoutingBalancerStrategy::LeastLoad(_)
+    )
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Owns the lazily compiled handlers and transport resources for one graph.
@@ -3203,7 +3431,8 @@ impl OutboundRouter {
     }
 
     /// Selects the outbound of a TCP session routed by `target` that goes to
-    /// `dial_target`, which loopbacks route again.
+    /// `dial_target`. With `routeOnly` the two differ, and rules see the domain
+    /// of the first beside the IP of the second.
     pub(crate) async fn select_tcp_session_outbound_with_tag_and_resolver(
         &self,
         route: &RouteContext<'_>,
@@ -3405,7 +3634,8 @@ impl OutboundRouter {
     }
 
     /// Selects the outbound of a UDP session routed by `target` that goes to
-    /// `dial_target`, which loopbacks route again.
+    /// `dial_target`. With `routeOnly` the two differ, and rules see the domain
+    /// of the first beside the IP of the second.
     pub(crate) async fn select_udp_session_outbound_with_tag_and_resolver(
         &self,
         route: &RouteContext<'_>,
@@ -3510,9 +3740,10 @@ impl OutboundRouter {
     /// Follows loopback outbounds from `node`, as Xray-core's loopback
     /// dispatches its connection again. Routing then sees the loopback's
     /// `inboundTag` with the source, local address and user it had, but no
-    /// sniffed protocol or attributes, and checks the target given, the
-    /// address the connection goes to, without the DNS lookups of
-    /// `IPIfNonMatch` and `IPOnDemand`. Xray-core sets no limit to how many
+    /// sniffed protocol or attributes, and checks the target given without
+    /// the DNS lookups of `IPIfNonMatch` and `IPOnDemand`. That target is the
+    /// address the connection goes to, with the domain that `routeOnly`
+    /// sniffing found for it. Xray-core sets no limit to how many
     /// loopbacks follow one another, and recurses until it crashes on a loop;
     /// here more than [`MAX_LOOPBACK_HOPS`] fail the connection.
     #[expect(
@@ -3601,8 +3832,12 @@ impl OutboundRouter {
             .await
     }
 
-    /// Routes a session by `target`, then follows loopbacks by `dial_target`,
-    /// the address it goes to, which Xray-core's loopback routes again.
+    /// Routes a session by `target` and follows the loopbacks it meets.
+    /// `dial_target` is the address the session goes to. It differs from
+    /// `target` only when sniffing with `routeOnly` found a domain: `target`
+    /// is then that domain and `dial_target` the original destination, whose
+    /// IP the rules see beside the domain, at the first route and at every
+    /// loopback hop.
     async fn select_session_node_with_resolver(
         &self,
         route: &RouteContext<'_>,
@@ -3631,18 +3866,28 @@ impl OutboundRouter {
         dial_target: &Target,
         dns_resolver: &dyn DnsResolver,
     ) -> Result<OutboundNodeId, CoreError> {
-        let node =
-            match select_routed_target_with_resolver(&policy.routing, route, target, dns_resolver)
-                .await?
-            {
-                Some(target) => self.node_for_target(target)?,
-                None => self.select_default_configured_node()?,
-            };
+        // A `routeOnly` sniffed domain routes with the IP still dialed, as
+        // Xray-core keeps `ob.Target` beside `ob.RouteTarget`. A fake IP has
+        // already given way to its domain in `dial_target`, as there.
+        let node = match select_routed_target_with_resolver(
+            &policy.routing,
+            route,
+            target,
+            target_ip(dial_target),
+            dns_resolver,
+        )
+        .await?
+        {
+            Some(target) => self.node_for_target(target)?,
+            None => self.select_default_configured_node()?,
+        };
+        // A loopback's connection is the same Xray-core outbound session, so
+        // the `routeOnly` domain in `ob.RouteTarget` routes it again too.
         self.follow_loopbacks(
             policy,
             node,
             route,
-            target_domain(dial_target),
+            target_domain(target).or(target_domain(dial_target)),
             target_ip(dial_target),
             Some(target_network(dial_target)),
             Some(dial_target.port),
@@ -3674,7 +3919,10 @@ impl OutboundRouter {
     fn node_for_target(&self, target: &RoutingRuleTarget) -> Result<OutboundNodeId, CoreError> {
         match target {
             RoutingRuleTarget::Outbound(tag) => self.node_for_tag(tag),
-            RoutingRuleTarget::Balancer(tag) => self.selection().select(tag),
+            RoutingRuleTarget::Balancer(tag) => match self.selection().select(tag)? {
+                Some(node) => Ok(node),
+                None => self.select_default_configured_node(),
+            },
         }
     }
 }
@@ -3763,6 +4011,33 @@ impl OutboundFactory {
             .trojan
             .get_or_init(|| {
                 TrojanOutbound::new(configured).map_err(CachedOutboundError::from_core_error)
+            })
+            .clone();
+        if self.sessions_closed.load(Ordering::Acquire) {
+            if let Ok(outbound) = &result {
+                outbound.close();
+            }
+            return Err(CachedOutboundError::NoSupportedOutbound);
+        }
+        result
+    }
+
+    fn cached_anytls_outbound(
+        &self,
+        node: OutboundNodeId,
+    ) -> Result<AnyTlsOutbound, CachedOutboundError> {
+        if self.sessions_closed.load(Ordering::Acquire) {
+            return Err(CachedOutboundError::NoSupportedOutbound);
+        }
+        let configured = self
+            .graph
+            .configured_outbound(node)
+            .ok_or(CachedOutboundError::NoSupportedOutbound)?;
+        let result = self
+            .entry(node)?
+            .anytls
+            .get_or_init(|| {
+                AnyTlsOutbound::new(configured).map_err(CachedOutboundError::from_core_error)
             })
             .clone();
         if self.sessions_closed.load(Ordering::Acquire) {
@@ -3911,6 +4186,25 @@ impl OutboundFactory {
         result
     }
 
+    fn cached_tuic_outbound(
+        &self,
+        node: OutboundNodeId,
+    ) -> Result<TuicOutbound, CachedOutboundError> {
+        if self.sessions_closed.load(Ordering::Acquire) {
+            return Err(CachedOutboundError::NoSupportedOutbound);
+        }
+        let configured = self
+            .graph
+            .configured_outbound(node)
+            .ok_or(CachedOutboundError::NoSupportedOutbound)?;
+        self.entry(node)?
+            .tuic
+            .get_or_init(|| {
+                TuicOutbound::new(configured).map_err(CachedOutboundError::from_core_error)
+            })
+            .clone()
+    }
+
     pub(crate) fn close_sessions(&self) {
         self.sessions_closed.store(true, Ordering::Release);
         for entry in &self.entries {
@@ -3921,6 +4215,9 @@ impl OutboundFactory {
                 outbound.close();
             }
             if let Some(Ok(outbound)) = entry.trojan.get() {
+                outbound.close();
+            }
+            if let Some(Ok(outbound)) = entry.anytls.get() {
                 outbound.close();
             }
             if let Some(Ok(outbound)) = entry.shadowsocks.get() {
@@ -3938,6 +4235,9 @@ impl OutboundFactory {
             if let Some(Ok(outbound)) = entry.hysteria.get() {
                 outbound.close();
             }
+            if let Some(Ok(outbound)) = entry.tuic.get() {
+                outbound.close();
+            }
         }
     }
 
@@ -3947,6 +4247,9 @@ impl OutboundFactory {
                 outbound.join().await;
             }
             if let Some(Ok(outbound)) = entry.trojan.get() {
+                outbound.join().await;
+            }
+            if let Some(Ok(outbound)) = entry.anytls.get() {
                 outbound.join().await;
             }
             if let Some(Ok(outbound)) = entry.shadowsocks.get() {
@@ -4007,7 +4310,10 @@ impl OutboundFactory {
         }
 
         if outbound.stream.network != Network::Tcp
-            && !matches!(outbound.settings, OutboundSettings::Hysteria(_))
+            && !matches!(
+                outbound.settings,
+                OutboundSettings::Hysteria(_) | OutboundSettings::Tuic(_)
+            )
         {
             return Err(CachedOutboundError::UnsupportedOutboundNetwork);
         }
@@ -4016,6 +4322,7 @@ impl OutboundFactory {
             OutboundSettings::Hysteria(_) => self
                 .cached_hysteria_outbound(node)
                 .map(TcpOutbound::Hysteria),
+            OutboundSettings::Tuic(_) => self.cached_tuic_outbound(node).map(TcpOutbound::Tuic),
             OutboundSettings::Wireguard(_) => self
                 .cached_wireguard_outbound(node)
                 .map(TcpOutbound::Wireguard),
@@ -4024,6 +4331,9 @@ impl OutboundFactory {
             }
             OutboundSettings::Trojan(_) => {
                 self.cached_trojan_outbound(node).map(TcpOutbound::Trojan)
+            }
+            OutboundSettings::AnyTls(_) => {
+                self.cached_anytls_outbound(node).map(TcpOutbound::AnyTls)
             }
             OutboundSettings::Vmess(_) => self.cached_vmess_outbound(node).map(TcpOutbound::Vmess),
             OutboundSettings::Shadowsocks2022(_) => self
@@ -4107,6 +4417,7 @@ impl OutboundFactory {
             OutboundSettings::Hysteria(_) => self
                 .cached_hysteria_outbound(node)
                 .map(UdpOutbound::Hysteria),
+            OutboundSettings::Tuic(_) => self.cached_tuic_outbound(node).map(UdpOutbound::Tuic),
             OutboundSettings::Wireguard(_) => self
                 .cached_wireguard_outbound(node)
                 .map(UdpOutbound::Wireguard),
@@ -4115,6 +4426,9 @@ impl OutboundFactory {
             }
             OutboundSettings::Trojan(_) => {
                 self.cached_trojan_outbound(node).map(UdpOutbound::Trojan)
+            }
+            OutboundSettings::AnyTls(_) => {
+                self.cached_anytls_outbound(node).map(UdpOutbound::AnyTls)
             }
             OutboundSettings::Vmess(_) => self.cached_vmess_outbound(node).map(UdpOutbound::Vmess),
             OutboundSettings::Shadowsocks2022(_) => self
@@ -4184,11 +4498,13 @@ impl OutboundFactory {
             OutboundSettings::Freedom(_)
             | OutboundSettings::Vless(_)
             | OutboundSettings::Hysteria(_)
+            | OutboundSettings::Tuic(_)
             | OutboundSettings::Trojan(_)
             | OutboundSettings::Vmess(_)
             | OutboundSettings::Shadowsocks2022(_)
             | OutboundSettings::Wireguard(_)
             | OutboundSettings::Masque(_)
+            | OutboundSettings::AnyTls(_)
             | OutboundSettings::Socks(_)
             | OutboundSettings::Http(_) => Err(CachedOutboundError::NoSupportedOutbound),
         }
@@ -4225,11 +4541,13 @@ fn build_tcp_outbound(outbound: &OutboundConfig) -> Result<TcpOutbound, CoreErro
 
     match &outbound.settings {
         OutboundSettings::Hysteria(_) => HysteriaOutbound::new(outbound).map(TcpOutbound::Hysteria),
+        OutboundSettings::Tuic(_) => TuicOutbound::new(outbound).map(TcpOutbound::Tuic),
         OutboundSettings::Wireguard(_) => {
             WireguardOutbound::new(outbound).map(TcpOutbound::Wireguard)
         }
         OutboundSettings::Masque(_) => MasqueOutbound::new(outbound).map(TcpOutbound::Masque),
         OutboundSettings::Trojan(_) => TrojanOutbound::new(outbound).map(TcpOutbound::Trojan),
+        OutboundSettings::AnyTls(_) => AnyTlsOutbound::new(outbound).map(TcpOutbound::AnyTls),
         OutboundSettings::Vmess(_) => VmessOutbound::new(outbound).map(TcpOutbound::Vmess),
         OutboundSettings::Shadowsocks2022(_) => {
             Shadowsocks2022Outbound::new(outbound).map(TcpOutbound::Shadowsocks2022)
@@ -4257,11 +4575,13 @@ fn build_tcp_outbound(outbound: &OutboundConfig) -> Result<TcpOutbound, CoreErro
 fn build_udp_outbound(outbound: &OutboundConfig) -> Result<UdpOutbound, CoreError> {
     match &outbound.settings {
         OutboundSettings::Hysteria(_) => HysteriaOutbound::new(outbound).map(UdpOutbound::Hysteria),
+        OutboundSettings::Tuic(_) => TuicOutbound::new(outbound).map(UdpOutbound::Tuic),
         OutboundSettings::Wireguard(_) => {
             WireguardOutbound::new(outbound).map(UdpOutbound::Wireguard)
         }
         OutboundSettings::Masque(_) => MasqueOutbound::new(outbound).map(UdpOutbound::Masque),
         OutboundSettings::Trojan(_) => TrojanOutbound::new(outbound).map(UdpOutbound::Trojan),
+        OutboundSettings::AnyTls(_) => AnyTlsOutbound::new(outbound).map(UdpOutbound::AnyTls),
         OutboundSettings::Vmess(_) => VmessOutbound::new(outbound).map(UdpOutbound::Vmess),
         OutboundSettings::Shadowsocks2022(_) => {
             Shadowsocks2022Outbound::new(outbound).map(UdpOutbound::Shadowsocks2022)
@@ -4385,6 +4705,7 @@ fn dns_tcp_connector(stream: &StreamSettings) -> Result<DnsTcpConnector, CoreErr
                     verify_peer_cert_by_name: tls.verify_peer_cert_by_name.clone(),
                     alpn: tls.alpn.clone(),
                     fingerprint: tls.fingerprint.clone(),
+                    ech_config_list: tls.ech_config_list.clone(),
                 }),
             )),
             Some(_) | None => Ok(DnsTcpConnector::TlsFromTarget {
@@ -4393,6 +4714,7 @@ fn dns_tcp_connector(stream: &StreamSettings) -> Result<DnsTcpConnector, CoreErr
                 verify_peer_cert_by_name: tls.verify_peer_cert_by_name.clone(),
                 alpn: tls.alpn.clone(),
                 fingerprint: tls.fingerprint.clone(),
+                ech_config_list: tls.ech_config_list.clone(),
             }),
         },
         StreamSecurity::Reality(reality) => Ok(DnsTcpConnector::Static(ConnectorConfig::Reality(
@@ -4405,7 +4727,18 @@ fn dns_tcp_connector(stream: &StreamSettings) -> Result<DnsTcpConnector, CoreErr
                 mldsa65_verify: reality.mldsa65_verify.clone(),
             },
         ))),
+        StreamSecurity::ShadowTls(_) if shadow_tls_name_is_explicit(stream) => {
+            Ok(DnsTcpConnector::Static(carrier::build_connector(
+                &stream.security,
+                &TargetAddr::Domain("unused.invalid".to_owned()),
+            )))
+        }
+        StreamSecurity::ShadowTls(_) => Err(CoreError::UnsupportedOutboundSecurity),
     }
+}
+
+fn shadow_tls_name_is_explicit(stream: &StreamSettings) -> bool {
+    matches!(&stream.security, StreamSecurity::ShadowTls(shadow) if shadow.tls.server_name.as_deref().is_some_and(|name| !name.is_empty()))
 }
 
 fn dns_happy_eyeballs_mode(stream: &StreamSettings) -> DnsHappyEyeballsMode {
@@ -4447,7 +4780,7 @@ fn validate_stream_flow(flow: Option<&str>, security: &StreamSecurity) -> Result
         flow,
         matches!(
             security,
-            StreamSecurity::Tls(_) | StreamSecurity::Reality(_)
+            StreamSecurity::Tls(_) | StreamSecurity::Reality(_) | StreamSecurity::ShadowTls(_)
         ),
     )
     .map(|_| ())
@@ -4484,7 +4817,7 @@ fn validate_connector_flow(
         flow,
         matches!(
             transport,
-            ConnectorConfig::Tls(_) | ConnectorConfig::Reality(_)
+            ConnectorConfig::Tls(_) | ConnectorConfig::Reality(_) | ConnectorConfig::ShadowTls(_)
         ),
     )
 }
@@ -4713,6 +5046,13 @@ async fn open_plain_tcp_stream_with_resolvers_and_dialer(
                 Box::pin(outbound.open_resolved(target, &[], &[], transport_dialer)).await
             }
         }
+        TcpOutbound::AnyTls(outbound) => {
+            if requires_local_resolution {
+                Box::pin(outbound.open(target, bootstrap_resolver, transport_dialer)).await
+            } else {
+                Box::pin(outbound.open_resolved(target, &[], &[], transport_dialer)).await
+            }
+        }
         TcpOutbound::Socks(outbound) => {
             if requires_local_resolution {
                 Box::pin(outbound.open(target, bootstrap_resolver, transport_dialer)).await
@@ -4740,6 +5080,9 @@ async fn open_plain_tcp_stream_with_resolvers_and_dialer(
             } else {
                 Box::pin(outbound.open_resolved(target, &[], &[], transport_dialer)).await
             }
+        }
+        TcpOutbound::Tuic(outbound) => {
+            Box::pin(outbound.open_tcp(target, bootstrap_resolver, transport_dialer)).await
         }
         TcpOutbound::Wireguard(outbound) => {
             // Cold protocol setup contains large async state. Keep it out of
@@ -4876,7 +5219,7 @@ async fn open_vless_tcp_stream_with_resolved_server_and_dialer(
 }
 
 /// The request on `stream`, its header held until the first payload, as
-/// Xray-core's VLESS outbound sends a TCP or reverse request.
+/// Xray-core's VLESS outbound sends every request.
 fn held_request_stream(
     outbound: &VlessTcpOutbound,
     flow: VisionFlow,
@@ -5265,8 +5608,9 @@ async fn open_reverse_carrier(
     vless.open_carrier(&server, &download, &proxy_dialer).await
 }
 
-/// Writes the request header for a UDP or Mux command. Unlike a TCP request,
-/// Vision queues no empty padding frame: an XUDP or Mux frame always follows.
+/// The request for a UDP or Mux command, its header held until the first
+/// XUDP or Mux frame as for a TCP request: Xray-core's `postRequest` sends
+/// every command's header with the first payload.
 async fn open_vless_command_stream(
     outbound: &VlessTcpOutbound,
     flow: VisionFlow,
@@ -5279,32 +5623,8 @@ async fn open_vless_command_stream(
     let stream = outbound
         .open_carrier(resolved_server, resolved_download, transport_dialer)
         .await?;
-    let mut stream = encryption::wrap(stream, outbound.encryption(), flow.uses_vision()).await?;
-    let request = VlessRequest {
-        user_id: outbound.user().id,
-        command,
-        target: target.clone(),
-        flow: flow.request_flow(),
-    };
-    let header = Zeroizing::new(encode_request_header(&request)?);
-
-    stream.write_all(&header).await?;
-
-    if flow.uses_vision() {
-        let stream = VlessResponseStream::new(VisionTransportStream::new(stream));
-        return Ok(Box::new(VisionOutboundStream::new(VisionStream::new(
-            stream,
-            *outbound.user().id.as_bytes(),
-            outbound.user().vision_seed,
-        ))));
-    }
-
-    // Without Vision there is no direct mode, so the transport never needs
-    // record-aligned reads.
-    stream.release_record_alignment();
-    Ok(Box::new(VlessOutboundStream::new(
-        VlessResponseStream::new(stream),
-    )))
+    let stream = encryption::wrap(stream, outbound.encryption(), flow.uses_vision()).await?;
+    held_request_stream(outbound, flow, stream, command, target)
 }
 
 fn should_use_xudp_for_udp_target(target: &Target) -> bool {
@@ -5837,6 +6157,7 @@ mod tests {
                     pinned_peer_cert_sha256: vec![[0x11; 32]],
                     verify_peer_cert_by_name: vec!["resolver-cert.example".to_owned()],
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 quic_params: None,
                 tcp_fragment: None,
@@ -5871,6 +6192,7 @@ mod tests {
                 verify_peer_cert_by_name: vec!["resolver-cert.example".to_owned()],
                 alpn: Vec::new(),
                 fingerprint: None,
+                ech_config_list: None,
             })
         );
         assert!(!explicit.supports_direct_udp());
@@ -5888,6 +6210,7 @@ mod tests {
                         pinned_peer_cert_sha256: vec![[0x22; 32]],
                         verify_peer_cert_by_name: vec!["dynamic-cert.example".to_owned()],
                         alpn: Vec::new(),
+                        ech_config_list: None,
                     }),
                     quic_params: None,
                     tcp_fragment: None,
@@ -5917,6 +6240,7 @@ mod tests {
                     verify_peer_cert_by_name: vec!["dynamic-cert.example".to_owned()],
                     alpn: Vec::new(),
                     fingerprint: None,
+                    ech_config_list: None,
                 })
             );
         }
@@ -5934,6 +6258,7 @@ mod tests {
                 pinned_peer_cert_sha256: vec![[0x33; 32]],
                 verify_peer_cert_by_name: vec!["cert.example".to_owned()],
                 alpn: vec!["http/1.1".to_owned()],
+                ech_config_list: None,
             }),
             quic_params: None,
             tcp_fragment: None,
@@ -5977,6 +6302,7 @@ mod tests {
                     pinned_peer_cert_sha256: vec![[0x44; 32]],
                     verify_peer_cert_by_name: vec!["cert.example".to_owned()],
                     alpn: vec!["h2".to_owned()],
+                    ech_config_list: None,
                 }),
                 quic_params: None,
                 tcp_fragment: None,
@@ -6007,6 +6333,7 @@ mod tests {
                 verify_peer_cert_by_name: vec!["cert.example".to_owned()],
                 alpn: vec!["h2".to_owned()],
                 fingerprint: Some("firefox".to_owned()),
+                ech_config_list: None,
             })
         );
     }
@@ -6037,6 +6364,7 @@ mod tests {
                 verify_peer_cert_by_name: vec!["cert.example".to_owned()],
                 allow_insecure: false,
                 alpn: vec!["h2".to_owned()],
+                ech_config_list: None,
             });
 
             let built = build_vless_tcp_outbound(&outbound).expect("build pinned VLESS TLS");
@@ -6049,6 +6377,7 @@ mod tests {
                     verify_peer_cert_by_name: vec!["cert.example".to_owned()],
                     alpn: vec!["h2".to_owned()],
                     fingerprint: Some("unsafe".to_owned()),
+                    ech_config_list: None,
                 })
             );
         }
@@ -6254,6 +6583,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 quic_params: None,
                 tcp_fragment: None,
@@ -7922,9 +8252,9 @@ mod tests {
     }
 
     #[test]
-    fn least_ping_selects_lowest_healthy_delay_with_stable_tag_tiebreak() {
+    fn least_ping_tiebreak_is_tag_order_when_there_is_no_incumbent() {
         let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
-            RoutingBalancerStrategy::LeastPing,
+            RoutingBalancerStrategy::LeastPing(Default::default()),
         ))));
         let proxy_a = graph.node_for_tag("proxy-a").unwrap();
         let proxy_b = graph.node_for_tag("proxy-b").unwrap();
@@ -7933,7 +8263,7 @@ mod tests {
 
         router
             .selection()
-            .record_health_success(proxy_a, Duration::from_millis(40), 1_000);
+            .record_health_success(proxy_a, Duration::from_millis(10), 1_000);
         router
             .selection()
             .record_health_success(proxy_b, Duration::from_millis(10), 1_000);
@@ -7944,19 +8274,183 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert_eq!(selected.tag.as_deref(), Some("proxy-b"));
+        // Members are tag-sorted, so the first minimum is proxy-a when nothing
+        // is incumbent yet.
+        assert_eq!(selected.tag.as_deref(), Some("proxy-a"));
+    }
+
+    #[test]
+    fn least_ping_keeps_the_incumbent_within_tolerance() {
+        let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
+            RoutingBalancerStrategy::LeastPing(Default::default()),
+        ))));
+        let proxy_a = graph.node_for_tag("proxy-a").unwrap();
+        let proxy_b = graph.node_for_tag("proxy-b").unwrap();
+        let router = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(graph)));
+        let target = domain_tcp_target("example.test");
+        let select = || {
+            router
+                .select_tcp_outbound_for_session_with_tag(
+                    &segue_config::RouteContext::default(),
+                    &target,
+                    true,
+                )
+                .unwrap()
+                .tag
+        };
 
         router
             .selection()
-            .record_health_success(proxy_a, Duration::from_millis(10), 2_000);
-        let selected = router
+            .record_health_success(proxy_a, Duration::from_millis(100), 1_000);
+        router
+            .selection()
+            .record_health_success(proxy_b, Duration::from_millis(140), 1_000);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+
+        // 40 ms better is inside the default 50 ms tolerance: do not flap.
+        router
+            .selection()
+            .record_health_success(proxy_b, Duration::from_millis(60), 2_000);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+
+        // Strictly more than 50 ms switches, and the new pick becomes incumbent.
+        router
+            .selection()
+            .record_health_success(proxy_b, Duration::from_millis(40), 3_000);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+
+        router
+            .selection()
+            .record_health_success(proxy_a, Duration::from_millis(10), 4_000);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+
+        router
+            .selection()
+            .record_health_failure(proxy_b, OutboundHealthFailure::Timeout, 5_000);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+    }
+
+    #[test]
+    fn least_ping_zero_tolerance_switches_on_any_strict_improvement() {
+        let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
+            RoutingBalancerStrategy::LeastPing(RoutingLeastPingSettings {
+                ping_tolerance: Some(Duration::ZERO),
+            }),
+        ))));
+        let proxy_a = graph.node_for_tag("proxy-a").unwrap();
+        let proxy_b = graph.node_for_tag("proxy-b").unwrap();
+        let router = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(graph)));
+        let target = domain_tcp_target("example.test");
+        let select = || {
+            router
+                .select_tcp_outbound_for_session_with_tag(
+                    &segue_config::RouteContext::default(),
+                    &target,
+                    true,
+                )
+                .unwrap()
+                .tag
+        };
+
+        router
+            .selection()
+            .record_health_success(proxy_a, Duration::from_millis(50), 1_000);
+        router
+            .selection()
+            .record_health_success(proxy_b, Duration::from_millis(80), 1_000);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+
+        router
+            .selection()
+            .record_health_success(proxy_b, Duration::from_millis(49), 2_000);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+
+        router
+            .selection()
+            .record_health_success(proxy_a, Duration::from_millis(49), 3_000);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+    }
+
+    #[test]
+    fn least_load_keeps_the_single_pick_within_ping_tolerance() {
+        let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
+            RoutingBalancerStrategy::LeastLoad(RoutingLeastLoadSettings::default()),
+        ))));
+        let proxy_a = graph.node_for_tag("proxy-a").unwrap();
+        let proxy_b = graph.node_for_tag("proxy-b").unwrap();
+        let router = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(graph)));
+        let target = domain_tcp_target("example.test");
+        let select = || {
+            router
+                .select_tcp_outbound_for_session_with_tag(
+                    &segue_config::RouteContext::default(),
+                    &target,
+                    true,
+                )
+                .unwrap()
+                .tag
+        };
+        let fill = |node, delay_ms: u64| {
+            for sample in 0..16 {
+                router.selection().record_health_success(
+                    node,
+                    Duration::from_millis(delay_ms),
+                    sample as u64,
+                );
+            }
+        };
+
+        fill(proxy_a, 100);
+        fill(proxy_b, 140);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+
+        fill(proxy_b, 60);
+        assert_eq!(select().as_deref(), Some("proxy-a"));
+
+        fill(proxy_b, 40);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+
+        fill(proxy_a, 10);
+        assert_eq!(select().as_deref(), Some("proxy-b"));
+    }
+
+    #[test]
+    fn health_aware_selection_touches_the_observatory_and_other_strategies_do_not() {
+        let activity = ObservatoryActivity::new();
+        let graph = Arc::new(OutboundGraph::new(Arc::new(selector_group_config(
+            RoutingBalancerStrategy::LeastPing(Default::default()),
+        ))));
+        let router = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(graph)));
+        router
+            .selection()
+            .configure_observatory_activity(Arc::clone(&activity));
+        let target = domain_tcp_target("example.test");
+        let _ = router
             .select_tcp_outbound_for_session_with_tag(
                 &segue_config::RouteContext::default(),
                 &target,
                 true,
             )
             .unwrap();
-        assert_eq!(selected.tag.as_deref(), Some("proxy-a"));
+        assert_eq!(activity.generation(), 1);
+
+        let random = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(Arc::new(
+            OutboundGraph::new(Arc::new(selector_group_config(
+                RoutingBalancerStrategy::Random,
+            ))),
+        ))));
+        random
+            .selection()
+            .configure_observatory_activity(Arc::clone(&activity));
+        let _ = random
+            .select_tcp_outbound_for_session_with_tag(
+                &segue_config::RouteContext::default(),
+                &target,
+                true,
+            )
+            .unwrap();
+        assert_eq!(activity.generation(), 1);
     }
 
     #[test]
@@ -8285,6 +8779,112 @@ mod tests {
             .unwrap();
 
         assert!(matches!(selected, TcpOutbound::Freedom(_)));
+    }
+
+    #[test]
+    fn empty_selector_group_without_fallback_takes_the_default_outbound() {
+        // Xray-core: the balancer's pick fails, PickRoute errs, and the
+        // dispatcher takes the default handler instead of closing.
+        let mut config = selector_group_config(RoutingBalancerStrategy::Random);
+        config.routing.balancers[0].selectors = vec!["absent".to_owned()];
+        config.routing.balancers[0].fallback_tag = None;
+        let router = OutboundRouter::new(Arc::new(config));
+
+        let selected = router
+            .select_tcp_outbound_for_session_with_tag(
+                &segue_config::RouteContext::default(),
+                &domain_tcp_target("example.test"),
+                true,
+            )
+            .expect("default outbound");
+
+        assert_eq!(selected.tag.as_deref(), Some("direct"));
+    }
+
+    #[test]
+    fn empty_selector_group_with_a_missing_fallback_tag_fails() {
+        let mut config = selector_group_config(RoutingBalancerStrategy::Random);
+        config.routing.balancers[0].selectors = vec!["absent".to_owned()];
+        config.routing.balancers[0].fallback_tag = Some("missing".to_owned());
+        let router = OutboundRouter::new(Arc::new(config));
+
+        assert!(matches!(
+            router.select_tcp_outbound_for_session(None, &domain_tcp_target("example.test")),
+            Err(CoreError::NoSupportedOutbound)
+        ));
+    }
+
+    /// The tag a balancer of `strategy` routes to once observation has marked
+    /// both its members unhealthy. `direct` is the default outbound and
+    /// `spare` the outbound a `fallback_tag` names; neither is a member.
+    fn tag_with_every_member_unhealthy(
+        strategy: RoutingBalancerStrategy,
+        fallback_tag: Option<&str>,
+    ) -> String {
+        let mut config = selector_group_config(strategy);
+        config.outbounds.push(direct_selection_freedom("spare"));
+        config.routing.balancers[0].fallback_tag = fallback_tag.map(str::to_owned);
+        let graph = Arc::new(OutboundGraph::new(Arc::new(config)));
+        let members = ["proxy-a", "proxy-b"].map(|tag| graph.node_for_tag(tag).unwrap());
+        let router = OutboundRouter::from_factory(Arc::new(OutboundFactory::new(graph)));
+        for member in members {
+            router
+                .selection()
+                .record_health_failure(member, OutboundHealthFailure::Timeout, 1_000);
+        }
+        router
+            .select_tcp_outbound_for_session_with_tag(
+                &segue_config::RouteContext::default(),
+                &domain_tcp_target("example.test"),
+                true,
+            )
+            .expect("a route")
+            .tag
+            .expect("a tagged outbound")
+    }
+
+    fn every_strategy() -> [RoutingBalancerStrategy; 4] {
+        [
+            RoutingBalancerStrategy::Random,
+            RoutingBalancerStrategy::RoundRobin,
+            RoutingBalancerStrategy::LeastPing(Default::default()),
+            RoutingBalancerStrategy::LeastLoad(RoutingLeastLoadSettings::default()),
+        ]
+    }
+
+    #[test]
+    fn random_and_round_robin_without_fallback_keep_unhealthy_members() {
+        // Xray-core's two strategies take the observatory only when the
+        // balancer has a `fallbackTag`, so without one they never leave the
+        // members for the default outbound.
+        for strategy in [
+            RoutingBalancerStrategy::Random,
+            RoutingBalancerStrategy::RoundRobin,
+        ] {
+            let tag = tag_with_every_member_unhealthy(strategy.clone(), None);
+            assert!(tag.starts_with("proxy-"), "{strategy:?} took {tag}");
+        }
+    }
+
+    #[test]
+    fn least_ping_and_least_load_without_fallback_take_the_default_outbound() {
+        // Both always read the observatory, and with no healthy member their
+        // empty pick sends Xray-core's dispatcher to the default handler.
+        for strategy in [
+            RoutingBalancerStrategy::LeastPing(Default::default()),
+            RoutingBalancerStrategy::LeastLoad(RoutingLeastLoadSettings::default()),
+        ] {
+            let tag = tag_with_every_member_unhealthy(strategy.clone(), None);
+            assert_eq!(tag, "direct", "{strategy:?}");
+        }
+    }
+
+    #[test]
+    fn every_strategy_takes_its_fallback_when_all_members_are_unhealthy() {
+        for strategy in every_strategy() {
+            let tag = tag_with_every_member_unhealthy(strategy.clone(), Some("spare"));
+            assert_eq!(tag, "spare", "{strategy:?}");
+        }
     }
 
     #[test]
@@ -8654,6 +9254,7 @@ mod tests {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: alpn.iter().map(|protocol| (*protocol).to_owned()).collect(),
+            ech_config_list: None,
         })
     }
 
@@ -9290,6 +9891,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 (None, true) => StreamSecurity::Reality(reality_settings()),
                 (None, false) => StreamSecurity::None,
@@ -9337,6 +9939,7 @@ mod tests {
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
+                ech_config_list: None,
             }),
             TargetAddr::Domain("dest.example.com".to_owned()),
         );
@@ -9517,6 +10120,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 TargetAddr::Domain("dest.example.com".to_owned()),
                 "streamSettings.tlsSettings.serverName",
@@ -9530,6 +10134,7 @@ mod tests {
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
                     alpn: Vec::new(),
+                    ech_config_list: None,
                 }),
                 TargetAddr::Domain("例え.jp".to_owned()),
                 "settings.vnext[0].address",
@@ -9635,6 +10240,7 @@ mod tests {
                         pinned_peer_cert_sha256: Vec::new(),
                         verify_peer_cert_by_name: Vec::new(),
                         alpn: Vec::new(),
+                        ech_config_list: None,
                     }),
                     TargetAddr::Domain("dest.example.com".to_owned()),
                 ),
@@ -10515,7 +11121,7 @@ mod tests {
             .unwrap()
             .with_reality_engine(engine.clone());
 
-        let (_stream, framing) = open_vless_udp_stream_with_resolver_and_dialer(
+        let (mut stream, framing) = open_vless_udp_stream_with_resolver_and_dialer(
             &outbound,
             &target,
             &SystemDnsResolver,
@@ -10525,6 +11131,9 @@ mod tests {
         .expect("open VLESS UDP/443 stream with explicit udp443 Vision flow");
 
         assert_eq!(framing, VlessUdpFraming::Xudp);
+        // The header waits for the first XUDP frame and leaves in front of it.
+        stream.write_all(b"first frame").await.unwrap();
+        stream.flush().await.unwrap();
         let expected_header = encode_request_header(&VlessRequest {
             user_id: outbound.user().id,
             command: VlessCommand::Mux,
@@ -10533,11 +11142,21 @@ mod tests {
         })
         .unwrap();
         let mut received_header = vec![0; expected_header.len()];
-        protected_side
-            .read_exact(&mut received_header)
-            .await
-            .expect("read VLESS header from protected stream");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            protected_side.read_exact(&mut received_header),
+        )
+        .await
+        .expect("the header leaves with the first frame")
+        .expect("read VLESS header from protected stream");
         assert_eq!(received_header, expected_header);
+        let (_, content_len, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_vision_frame(&mut protected_side, true),
+        )
+        .await
+        .expect("the first frame follows the header");
+        assert_eq!(content_len, b"first frame".len());
         assert!(engine.seen().is_some());
     }
 
@@ -10611,15 +11230,28 @@ mod tests {
         .unwrap()
         .len();
         let mut header = vec![0; header_len];
-        protected_side.read_exact(&mut header).await.unwrap();
         for (index, payload) in [b"first".as_slice(), b"second", b"third"]
             .into_iter()
             .enumerate()
         {
             stream.write_all(payload).await.unwrap();
             stream.flush().await.unwrap();
-            let (_, content_len, padding_len) =
-                read_vision_frame(&mut protected_side, index == 0).await;
+            // The header leaves with the first frame.
+            if index == 0 {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    protected_side.read_exact(&mut header),
+                )
+                .await
+                .expect("the header leaves with the first frame")
+                .unwrap();
+            }
+            let (_, content_len, padding_len) = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_vision_frame(&mut protected_side, index == 0),
+            )
+            .await
+            .expect("the frame arrives");
             assert_eq!(content_len, payload.len());
             assert_eq!(padding_len, 0, "frame {index}");
         }
@@ -10641,6 +11273,7 @@ mod tests {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: Some("chrome".to_owned()),
+                ech_config_list: None,
             }),
             &TransportLayer::WebSocket(WebSocketConfig {
                 path: "/chat".to_owned(),
@@ -10755,6 +11388,7 @@ mod tests {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: Some("chrome".to_owned()),
+                ech_config_list: None,
             }),
             &TransportLayer::Raw,
         )
@@ -11804,6 +12438,78 @@ mod testpre_tests {
             443,
             RoutingNetwork::Tcp,
         )
+    }
+
+    /// A UDP or Mux request header waits for the first frame and leaves with
+    /// it, as Xray-core's `postRequest` sends the header of every command.
+    #[tokio::test]
+    async fn vless_command_header_waits_for_the_first_frame() {
+        let (port, mut connections) = server().await;
+        let outbound = vless(port, 0);
+        let flow = validate_outbound_flow(&outbound).unwrap();
+        let dialer = TransportDialer::system().unwrap();
+        let server_addr = [SocketAddr::from((Ipv4Addr::LOCALHOST, port))];
+        let wait = Duration::from_secs(5);
+        let target = target();
+        for command in [VlessCommand::Udp, VlessCommand::Mux] {
+            let open = open_vless_command_stream(
+                &outbound,
+                flow,
+                command,
+                &target,
+                &server_addr,
+                &[],
+                &dialer,
+            );
+            let mut stream = tokio::time::timeout(wait, open).await.unwrap().unwrap();
+            let mut connection = tokio::time::timeout(wait, connections.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut byte = [0; 1];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), connection.read(&mut byte))
+                    .await
+                    .is_err(),
+                "{command:?}: the header left before the first frame"
+            );
+            stream.write_all(b"first frame").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut header = [0; 17];
+            tokio::time::timeout(wait, connection.read_exact(&mut header))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(header[0], 0);
+            assert_eq!(&header[1..], uuid::Uuid::parse_str(ID).unwrap().as_bytes());
+
+            // Without a frame the header leaves alone once Xray-core's wait
+            // is over, driven by the relay's read. The wait starts when the
+            // stream is built, so it is measured from before the open.
+            let opened = tokio::time::Instant::now();
+            let open = open_vless_command_stream(
+                &outbound,
+                flow,
+                command,
+                &target,
+                &server_addr,
+                &[],
+                &dialer,
+            );
+            let mut stream = tokio::time::timeout(wait, open).await.unwrap().unwrap();
+            let mut connection = tokio::time::timeout(wait, connections.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::select! {
+                read = stream.read(&mut byte) => panic!("{command:?}: {read:?}"),
+                received = tokio::time::timeout(wait, connection.read_exact(&mut header)) => {
+                    received.expect("the header leaves alone").unwrap();
+                }
+            }
+            assert!(opened.elapsed() >= VLESS_FIRST_PAYLOAD_WAIT, "{command:?}");
+            assert_eq!(header[0], 0);
+        }
     }
 
     /// Nothing opens before the first request. Then each of the `testpre`

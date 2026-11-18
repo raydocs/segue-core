@@ -1,12 +1,15 @@
 mod config;
+mod import;
 
 pub use config::ConfigCommand;
+pub use import::ImportCommand;
 
 use std::{
     env, fs,
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
+    task::Poll,
 };
 
 use segue_config::{parse_xray_json_with_geodata_dirs, CoreConfig, Diagnostic};
@@ -16,12 +19,13 @@ use segue_engine::{
 };
 use thiserror::Error;
 
-const USAGE: &str = "usage: segue run -config <config.json>\n       segue config <check|contract|example> (see config --help)";
+const USAGE: &str = "usage: segue run -config <config.json>\n       segue config <check|contract|example> (see config --help)\n       segue import <file> [--format clash|singbox] [-o out.json] (see import --help)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliArgs {
     Run { config_path: PathBuf },
     Config { command: ConfigCommand },
+    Import { command: ImportCommand },
 }
 
 #[derive(Debug, Error)]
@@ -37,6 +41,8 @@ pub enum CliError {
     ConfigParse(String),
     #[error("configuration check failed")]
     ConfigCheckFailed { code: u8 },
+    #[error("{0}")]
+    ImportFailed(String),
     #[error("failed to write output: {source}")]
     Output { source: std::io::Error },
     #[error("core error: {0}")]
@@ -54,6 +60,9 @@ where
 
     if args.get(1).is_some_and(|command| command == "config") {
         return config::parse_args(&args[2..]).map(|command| CliArgs::Config { command });
+    }
+    if args.get(1).is_some_and(|command| command == "import") {
+        return import::parse_args(&args[2..]).map(|command| CliArgs::Import { command });
     }
 
     match args.as_slice() {
@@ -364,10 +373,19 @@ where
                 .map(|addr| (inbound.tag.clone(), addr))
         })
         .collect::<Vec<_>>();
+    // Poll the shutdown future once before reporting the bound inbounds. A
+    // signal-backed future installs its handlers on its first poll, and the
+    // report is the readiness line that supervisors and tests wait for, so a
+    // stop signal sent after it always takes the graceful path below.
+    let mut shutdown = std::pin::pin!(shutdown);
+    let stop_requested =
+        std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_ready())).await;
     if !bound.is_empty() {
         eprintln!("{}", format_bound_inbounds(&bound));
     }
-    shutdown.await;
+    if !stop_requested {
+        shutdown.await;
+    }
     if let Some(runtime) = tun_fd_runtime.take() {
         runtime.stop().await;
     }
@@ -384,6 +402,7 @@ where
 {
     match parse_cli_args(args)? {
         CliArgs::Config { command } => config::run(command),
+        CliArgs::Import { command } => import::run(command),
         CliArgs::Run { config_path } => {
             let (config, diagnostics) = load_config_with_diagnostics(&config_path)?;
             if !diagnostics.is_empty() {

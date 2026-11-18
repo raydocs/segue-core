@@ -26,6 +26,7 @@ final class XrayPacketTunnelProviderTests: XCTestCase {
             (.startSuperseded, 6),
             (.invalidGeodataConfiguration, 7),
             (.startupProbeTimedOut, 8),
+            (.tunFileDescriptorStopped, 9),
         ]
 
         for (error, expectedCode) in expectedCodes {
@@ -426,6 +427,124 @@ final class XrayPacketTunnelProviderTests: XCTestCase {
         workQueue.sync {}
         XCTAssertEqual(workExecutionCount, 1)
         withExtendedLifetime(repeatedTasks) {}
+    }
+
+    func testDNSBootstrapStartBehindBusyGateRunsOnceTheHolderLeaves() {
+        let workQueue = DispatchQueue(label: "test.dns-bootstrap.waiting.worker", attributes: .concurrent)
+        let workGate = XrayPacketTunnelWorkGate()
+        let timerQueue = DispatchQueue(label: "test.dns-bootstrap.waiting.timer")
+        let completionQueue = DispatchQueue(label: "test.dns-bootstrap.waiting.completion")
+        let firstWorkerEntered = expectation(description: "first gated worker entered")
+        let firstCompletion = expectation(description: "superseded start completed")
+        let replacedCompletion = expectation(description: "replaced waiter timed out")
+        let secondCompletion = expectation(description: "waiting start completed")
+        let firstWorkerGate = DispatchSemaphore(value: 0)
+
+        let firstTask = XrayPacketTunnelBoundedTask<Int>(
+            deadline: .now() + .seconds(5),
+            workQueue: workQueue,
+            workGate: workGate,
+            timerQueue: timerQueue,
+            completionQueue: completionQueue,
+            timeoutError: XrayPacketTunnelProviderError.dnsBootstrapTimedOut
+        ) { _ in
+            firstCompletion.fulfill()
+        }
+        XCTAssertTrue(
+            firstTask.start { _ in
+                firstWorkerEntered.fulfill()
+                firstWorkerGate.wait()
+                return 1
+            }
+        )
+        wait(for: [firstWorkerEntered], timeout: 1)
+
+        let replacedTask = XrayPacketTunnelBoundedTask<Int>(
+            deadline: .now() + .milliseconds(200),
+            workQueue: workQueue,
+            workGate: workGate,
+            timerQueue: timerQueue,
+            completionQueue: completionQueue,
+            timeoutError: XrayPacketTunnelProviderError.dnsBootstrapTimedOut
+        ) { result in
+            guard case .failure(XrayPacketTunnelProviderError.dnsBootstrapTimedOut) = result else {
+                return XCTFail("expected the replaced waiter to time out, got \(result)")
+            }
+            replacedCompletion.fulfill()
+        }
+        XCTAssertFalse(replacedTask.start { _ in 2 })
+
+        let secondTask = XrayPacketTunnelBoundedTask<Int>(
+            deadline: .now() + .seconds(5),
+            workQueue: workQueue,
+            workGate: workGate,
+            timerQueue: timerQueue,
+            completionQueue: completionQueue,
+            timeoutError: XrayPacketTunnelProviderError.dnsBootstrapTimedOut
+        ) { result in
+            XCTAssertEqual(try? result.get(), 3)
+            secondCompletion.fulfill()
+        }
+        XCTAssertFalse(secondTask.start { _ in 3 })
+        wait(for: [replacedCompletion], timeout: 2)
+
+        firstTask.cancel(with: XrayPacketTunnelProviderError.startSuperseded)
+        wait(for: [firstCompletion], timeout: 1)
+        firstWorkerGate.signal()
+        wait(for: [secondCompletion], timeout: 2)
+        XCTAssertTrue(workGate.tryAcquire())
+    }
+
+    func testTunFdLoopWatchReportsTheFirstLoopExitOnce() {
+        let queue = DispatchQueue(label: "test.tun-fd-loop-watch")
+        let stopped = expectation(description: "loop exit reported")
+        let extraReport = expectation(description: "no second report")
+        extraReport.isInverted = true
+        var reads = 0
+        var reports = 0
+        // Unreadable at first, then running, then one loop gone, then both.
+        let counts: [UInt64?] = [nil, 0, 0, 1, 2]
+
+        let watch = XrayTunFdLoopWatch(
+            queue: queue,
+            interval: .milliseconds(5),
+            leeway: .milliseconds(1),
+            loopExits: {
+                defer { reads += 1 }
+                return counts[min(reads, counts.count - 1)]
+            },
+            onStopped: {
+                reports += 1
+                if reports == 1 {
+                    stopped.fulfill()
+                } else {
+                    extraReport.fulfill()
+                }
+            }
+        )
+
+        wait(for: [stopped], timeout: 2)
+        wait(for: [extraReport], timeout: 0.1)
+        queue.sync {}
+        XCTAssertEqual(reads, 4)
+        XCTAssertFalse(watch.cancel())
+    }
+
+    func testCancelledTunFdLoopWatchNeverReports() {
+        let queue = DispatchQueue(label: "test.tun-fd-loop-watch.cancelled")
+        let report = expectation(description: "no report after cancel")
+        report.isInverted = true
+
+        let watch = XrayTunFdLoopWatch(
+            queue: queue,
+            interval: .milliseconds(5),
+            leeway: .milliseconds(1),
+            loopExits: { 1 },
+            onStopped: { report.fulfill() }
+        )
+        XCTAssertTrue(watch.cancel())
+
+        wait(for: [report], timeout: 0.1)
     }
 
     func testDNSBootstrapOverallDeadlineSkipsRemainingLookupsAfterLateReturn() {
@@ -2005,6 +2124,40 @@ final class XrayPacketTunnelProviderTests: XCTestCase {
             XCTAssertEqual(prepared.excludedServerAddresses, ["192.0.2.8"])
             XCTAssertFalse(XrayPacketTunnelProvider.configSummary(prepared.json).contains("00112233-4455-6677-8899-aabbccddeeff"))
         }
+    }
+
+    func testVlessPinningPreservesBothConfigFormsAndCredentials() throws {
+        for settings in [
+            #"{"address":"Vless.Example.","port":443,"id":"00112233-4455-6677-8899-aabbccddeeff","encryption":"none"}"#,
+            #"{"vnext":[{"address":"Vless.Example.","port":443,"users":[{"id":"00112233-4455-6677-8899-aabbccddeeff","encryption":"none"}]}]}"#,
+        ] {
+            let json = "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":\(settings)}]}"
+            let prepared = try XrayPacketTunnelProvider.configPinningOutboundServerAddresses(
+                resolvedConfig(json: json), resolveAddress: { domain in
+                    XCTAssertEqual(domain, "vless.example")
+                    return ["192.0.2.8"]
+                }
+            )
+            let original = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? NSDictionary)
+            let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(prepared.json.utf8)) as? NSDictionary)
+            XCTAssertEqual(root["outbounds"] as? NSArray, original["outbounds"] as? NSArray)
+            XCTAssertEqual(prepared.excludedServerAddresses, ["192.0.2.8"])
+            XCTAssertFalse(XrayPacketTunnelProvider.configSummary(prepared.json).contains("00112233-4455-6677-8899-aabbccddeeff"))
+        }
+    }
+
+    func testFlatVlessWithAnAddressNeedsNoLookup() throws {
+        // The shape of the v0.10 device fixtures' mKCP, mask, XDRIVE and
+        // reverse-bridge cases: a literal server address in the simplified form.
+        let json = #"{"dns":{"servers":["198.51.100.53:5353"]},"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"address":"192.0.2.7","port":443,"id":"00112233-4455-6677-8899-aabbccddeeff","encryption":"none"},"streamSettings":{"network":"kcp"}}]}"#
+        let prepared = try XrayPacketTunnelProvider.configPinningOutboundServerAddresses(
+            resolvedConfig(json: json), resolveAddress: { domain in
+                XCTFail("unexpected lookup of \(domain)")
+                return nil
+            }
+        )
+        XCTAssertEqual(prepared.json, json)
+        XCTAssertEqual(prepared.excludedServerAddresses, ["192.0.2.7"])
     }
 
     func testShadowsocks2022PinningPreservesBothConfigFormsAndCredentials() throws {

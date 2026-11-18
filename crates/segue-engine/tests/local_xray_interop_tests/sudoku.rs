@@ -56,11 +56,35 @@ async fn check(
         XrayInboundSecurity::None => {}
     }
     eprintln!("sudoku over {name}");
-    let result = timeout(
-        Duration::from_secs(60),
-        exercise(profile(server.addr.port(), stream.clone(), masks), true),
-    )
-    .await;
+    // REALITY's dest is the public www.google.com: Xray probes it during the
+    // handshake, and on a CI runner that probe sometimes stalls, so Xray
+    // closes the client (`early eof`). That is the runner's network, not the
+    // mask. Repeat only that outcome, at most twice; every byte must still
+    // round-trip on the attempt that counts.
+    let attempts = if security == XrayInboundSecurity::Reality {
+        3
+    } else {
+        1
+    };
+    let mut result = None;
+    for attempt in 1..=attempts {
+        let outcome = timeout(
+            Duration::from_secs(60),
+            exercise(
+                profile(server.addr.port(), stream.clone(), masks.clone()),
+                true,
+            ),
+        )
+        .await;
+        let early_eof =
+            matches!(&outcome, Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof);
+        result = Some(outcome);
+        if !early_eof || attempt == attempts {
+            break;
+        }
+        eprintln!("sudoku over {name}: early eof from the REALITY dest probe, attempt {attempt} of {attempts}");
+    }
+    let result = result.expect("at least one attempt");
     assert!(
         matches!(result, Ok(Ok(()))),
         "{name}: {result:?}; {}",
@@ -192,6 +216,7 @@ async fn sudoku_udp_xhttp_h3_alone_and_with_noise() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: vec!["h3".to_owned()],
+            ech_config_list: None,
         })
     };
     let mask = |password: &str| json!({"type":"sudoku","settings":{"password":password,"paddingMin":5,"paddingMax":25}});

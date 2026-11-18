@@ -77,42 +77,49 @@ async fn start_portal(
 }
 
 /// [`start_portal`], with `extra` changing the portal's configuration last.
+///
+/// The portal's public ports are picked by binding them and letting go, and
+/// a parallel test's socket can take one before Xray binds it; the portal
+/// then exits with "address already in use" and the start is repeated with
+/// fresh public ports.
 async fn start_portal_with(
     checkout: &Path,
     server: XrayVlessServerConfig,
     services: &Services,
     decryption: Option<&str>,
-    extra: impl FnOnce(&mut Value),
+    extra: impl Fn(&mut Value),
 ) -> (XrayServer, Public) {
-    let public = Public {
-        tcp: SocketAddr::from((Ipv4Addr::LOCALHOST, allocate_loopback_port())),
-        udp: SocketAddr::from((Ipv4Addr::LOCALHOST, allocate_loopback_udp_port())),
-    };
     let (tcp, udp) = (services.tcp, services.udp);
-    let portal = start_xray_vless_server_customized(checkout, server, |config| {
-        config["log"]["loglevel"] = "debug".into();
-        config["inbounds"][0]["tag"] = "vless-in".into();
-        config["inbounds"][0]["settings"]["clients"][0]["reverse"] = json!({"tag": "r-out"});
-        if let Some(decryption) = decryption {
-            config["inbounds"][0]["settings"]["decryption"] = decryption.into();
-        }
-        let inbounds = config["inbounds"].as_array_mut().unwrap();
-        inbounds.push(
-            json!({"tag": "public-tcp", "protocol": "tunnel", "listen": "127.0.0.1",
-            "port": public.tcp.port(), "settings": {"address": tcp.ip().to_string(),
-            "port": tcp.port(), "network": "tcp"}}),
-        );
-        inbounds.push(
-            json!({"tag": "public-udp", "protocol": "tunnel", "listen": "127.0.0.1",
-            "port": public.udp.port(), "settings": {"address": udp.ip().to_string(),
-            "port": udp.port(), "network": "udp"}}),
-        );
-        config["routing"] = json!({"rules": [{"inboundTag": ["public-tcp", "public-udp"],
-            "outboundTag": "r-out"}]});
-        extra(config);
+    start_on_fresh_ports!("the reverse portal", async {
+        let public = Public {
+            tcp: SocketAddr::from((Ipv4Addr::LOCALHOST, allocate_loopback_port())),
+            udp: SocketAddr::from((Ipv4Addr::LOCALHOST, allocate_loopback_udp_port())),
+        };
+        let portal = start_xray_vless_server_customized(checkout, server, |config| {
+            config["log"]["loglevel"] = "debug".into();
+            config["inbounds"][0]["tag"] = "vless-in".into();
+            config["inbounds"][0]["settings"]["clients"][0]["reverse"] = json!({"tag": "r-out"});
+            if let Some(decryption) = decryption {
+                config["inbounds"][0]["settings"]["decryption"] = decryption.into();
+            }
+            let inbounds = config["inbounds"].as_array_mut().unwrap();
+            inbounds.push(
+                json!({"tag": "public-tcp", "protocol": "tunnel", "listen": "127.0.0.1",
+                "port": public.tcp.port(), "settings": {"address": tcp.ip().to_string(),
+                "port": tcp.port(), "network": "tcp"}}),
+            );
+            inbounds.push(
+                json!({"tag": "public-udp", "protocol": "tunnel", "listen": "127.0.0.1",
+                "port": public.udp.port(), "settings": {"address": udp.ip().to_string(),
+                "port": udp.port(), "network": "udp"}}),
+            );
+            config["routing"] = json!({"rules": [{"inboundTag": ["public-tcp", "public-udp"],
+                "outboundTag": "r-out"}]});
+            extra(config);
+        })
+        .await;
+        Some((portal, public))
     })
-    .await;
-    (portal, public)
 }
 
 /// Our bridge for a portal at `portal`: `stream` and `flow` as the portal's

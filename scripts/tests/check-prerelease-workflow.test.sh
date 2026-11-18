@@ -138,8 +138,57 @@ grep -Fq 'cargo +nightly-2026-05-22 install cargo-fuzz --version 0.13.2 --locked
   die "RC fuzz gate does not pin cargo-fuzz"
 grep -Fq 'bash scripts/run-v05-host-hardening.sh fuzz' "$WORKFLOW" || \
   die "RC fuzz gate does not run the extended hardening campaign"
-grep -Fq 'cargo test --workspace --exclude segue-fuzz --all-targets --locked' "$WORKFLOW" || \
-  die "ordinary workspace tests can execute unbounded libFuzzer targets"
+# Shards replace `cargo test --workspace --exclude segue-fuzz --all-targets
+# --locked`. --all-targets on segue-fuzz would launch its libFuzzer mains, so
+# that package must not appear, and every other workspace member must be named
+# by exactly one shard.
+if {
+    job_body rust-test-engine
+    job_body rust-test-transport
+    job_body rust-test-config
+    job_body rust-test-support
+  } | grep 'cargo test' | grep -Fq 'segue-fuzz'; then
+  die "a Rust test shard names segue-fuzz; --all-targets would launch libFuzzer"
+fi
+shard_packages="$(
+  {
+    job_body rust-test-engine
+    job_body rust-test-transport
+    job_body rust-test-config
+    job_body rust-test-support
+  } | awk '
+    /cargo test --all-targets --locked/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "-p" && (i + 1) <= NF) print $(i + 1)
+      }
+    }
+  ' | LC_ALL=C sort
+)"
+workspace_packages="$(
+  awk '
+    /^members = \[/ { capture = 1; next }
+    capture && /^\]/ { exit }
+    capture {
+      line = $0
+      sub(/#.*/, "", line)
+      if (match(line, /"[^"]+"/)) print substr(line, RSTART + 1, RLENGTH - 2)
+    }
+  ' "$WORKSPACE_ROOT/Cargo.toml" | while IFS= read -r member; do
+    sed -n 's/^name = "\([^"]*\)"$/\1/p' "$WORKSPACE_ROOT/$member/Cargo.toml" | head -n 1
+  done | grep -vx 'segue-fuzz' | LC_ALL=C sort
+)"
+if [[ "$shard_packages" != "$workspace_packages" ]]; then
+  echo "Rust test shards do not partition the workspace exactly once" >&2
+  echo "shards:" >&2
+  printf '%s\n' "$shard_packages" >&2
+  echo "workspace minus segue-fuzz:" >&2
+  printf '%s\n' "$workspace_packages" >&2
+  exit 1
+fi
+for shard in rust-test-engine rust-test-transport rust-test-config rust-test-support; do
+  grep -Fq 'cargo test --all-targets --locked' <<<"$(job_body "$shard")" || \
+    die "$shard dropped --all-targets --locked"
+done
 
 if grep -Fq -- '--clobber' <<<"$publish_job"; then
   die "prerelease retries can overwrite an existing asset"
@@ -268,20 +317,132 @@ done
 # A stable tag skips exactly the gates its candidate run proved, and only
 # after its own history scan and evidence pass does it bind to that run.
 stable_tag_skip="    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')"
-for job in rust tproxy-linux go-oracles android supply-chain; do
+for job in rust-checks rust-test-engine rust-test-transport rust-test-config \
+  rust-test-support tproxy-linux android supply-chain \
+  go-oracles-protocols go-oracles-carriers go-oracles-wireguard go-oracles-tunnels; do
   grep -Fxq "$stable_tag_skip" <<<"$(job_body "$job")" || \
     die "$job does not run for every event except a stable tag push"
 done
-# The owner turned the macOS job off while no macOS runner is available
-# (2026-11-13). It keeps the stable-tag condition or is off outright; while
-# it is off, publish-prerelease, which needs it, cannot run either.
+# rust and go-oracles stay the required checks. Each uses the same stable-tag
+# predicate, but always() so a failed shard turns the check red instead of
+# skipping it.
+rust_gate="$(job_body rust)"
+grep -Fxq "    if: always() && cancelled() == false && (github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.'))" <<<"$rust_gate" || \
+  die "rust does not stay skipped on a stable tag and red when a shard fails"
+for shard in rust-checks rust-test-engine rust-test-transport rust-test-config rust-test-support; do
+  grep -Fxq "      - $shard" <<<"$rust_gate" || die "rust does not wait for $shard"
+done
+grep -Fxq '            if [[ "$result" != "success" ]]; then' <<<"$rust_gate" || \
+  die "rust does not fail when a shard is not successful"
+# go-oracles stays the required check. It uses the same stable-tag predicate,
+# but always() so a failed shard turns the check red instead of skipping it.
+go_oracles="$(job_body go-oracles)"
+grep -Fxq "    if: always() && cancelled() == false && (github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.'))" <<<"$go_oracles" || \
+  die "go-oracles does not stay skipped on a stable tag and red when a shard fails"
+for shard in go-oracles-protocols go-oracles-carriers go-oracles-wireguard go-oracles-tunnels; do
+  grep -Fxq "      - $shard" <<<"$go_oracles" || die "go-oracles does not wait for $shard"
+  shard_body="$(job_body "$shard")"
+  grep -Fxq '        uses: ./.github/actions/go-oracle-setup' <<<"$shard_body" || \
+    die "$shard does not prepare the pinned Go, Rust and Xray-core toolchain"
+  grep -Fxq '      CARGO_INCREMENTAL: "0"' <<<"$shard_body" || \
+    die "$shard dropped the incremental-compile disk guard"
+  grep -Fxq '      CARGO_PROFILE_DEV_DEBUG: line-tables-only' <<<"$shard_body" || \
+    die "$shard dropped the line-tables disk guard"
+  grep -Fxq '      - name: Report disk use' <<<"$shard_body" || \
+    die "$shard no longer reports disk use after its steps"
+done
+grep -Fxq '            if [[ "$result" != "success" ]]; then' <<<"$go_oracles" || \
+  die "go-oracles does not fail when a shard is not successful"
+# Every oracle command from the single go-oracles job still runs once.
+for command in \
+  "bash scripts/verify-oracle-fixtures.sh" \
+  "bash scripts/check-routing-oracle.sh" \
+  "bash scripts/check-vless-encryption-oracle.sh" \
+  "bash scripts/check-xhttp-download-oracle.sh" \
+  "bash scripts/check-v07-protocol-oracle.sh" \
+  "bash scripts/check-v08-protocol-oracle.sh" \
+  "bash scripts/check-trojan-interop.sh" \
+  "bash scripts/check-shadowsocks2022-interop.sh" \
+  "bash scripts/check-vmess-interop.sh" \
+  "bash scripts/check-socks-interop.sh" \
+  "bash scripts/check-http-interop.sh" \
+  "bash scripts/check-mux-interop.sh" \
+  "bash scripts/check-v08-independent-interop.sh" \
+  "bash scripts/check-v08-carrier-interop.sh" \
+  "bash scripts/check-hysteria-interop.sh" \
+  "bash scripts/check-kcp-interop.sh" \
+  "bash scripts/check-header-custom-interop.sh" \
+  "bash scripts/check-sudoku-interop.sh" \
+  "bash scripts/check-xmc-interop.sh" \
+  "bash scripts/check-xdns-interop.sh" \
+  "bash scripts/check-realm-interop.sh" \
+  "bash scripts/check-xicmp-interop.sh" \
+  "bash scripts/check-native-hysteria-interop.sh" \
+  "bash scripts/check-wireguard-runtime.sh" \
+  "bash scripts/check-native-wireguard-interop.sh" \
+  "bash scripts/check-wireguard-direct-fixture.sh" \
+  "bash scripts/check-bbr-interop.sh" \
+  "bash scripts/check-masque-interop.sh" \
+  "bash scripts/check-reverse-interop.sh" \
+  "bash scripts/check-xdrive-interop.sh" \
+  "bash scripts/check-xray-verdicts.sh" \
+  "bash scripts/check-xray-default-fingerprint.sh" \
+  "bash scripts/check-chrome-parrot-interop.sh" \
+  "python3 scripts/tests/verify-hysteria-reference.test.py" \
+  "python3 scripts/tests/verify-wireguard-reference.test.py"
+do
+  count="$(grep -Fc "$command" "$WORKFLOW" || true)"
+  [[ "$count" == "1" ]] || die "oracle command must run once, found $count: $command"
+done
+oracle_setup="$WORKSPACE_ROOT/.github/actions/go-oracle-setup/action.yml"
+[[ -f "$oracle_setup" ]] || die "go oracle shards have no shared setup action"
+grep -Fxq '        ref: 676eaf66f8f05d4d558ee7a74b4736623d3feeb9' "$oracle_setup" || \
+  die "go oracle setup does not pin the audited Xray-core commit"
+grep -Fxq '        go-version: "1.27.4"' "$oracle_setup" || \
+  die "go oracle setup does not pin the Go toolchain"
+grep -Fq 'rustup toolchain install 1.96.0 --profile minimal' "$oracle_setup" || \
+  die "go oracle setup does not install the pinned Rust toolchain"
+grep -Fq 'rustup default 1.96.0' "$oracle_setup" || \
+  die "go oracle setup does not select the pinned Rust toolchain"
+grep -Fq 'sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL' "$oracle_setup" || \
+  die "go oracle setup does not free disk space on the GitHub-hosted runner"
+grep -Fq '/usr/local/lib/android' "$oracle_setup" || \
+  die "go oracle setup does not drop the preinstalled Android SDK"
+grep -Fq 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0' "$oracle_setup" || \
+  die "go oracle setup does not cache the Rust build"
+# The Apple job stays on the owner's Mac mini: hosted macos-26 does not have
+# Xcode 27. It keeps the stable-tag condition (or is off outright) and must
+# skip fork pull requests so a self-hosted job cannot be queued by a fork.
 apple_job="$(job_body apple)"
-if ! grep -Fxq "$stable_tag_skip" <<<"$apple_job"; then
+fork_guard="github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
+stable_tag_predicate="github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')"
+if ! grep -Fq "$stable_tag_predicate" <<<"$apple_job"; then
   grep -Fxq '    if: false' <<<"$apple_job" || \
     die "apple does not run for every event except a stable tag push"
   grep -Fxq '      - apple' <<<"$(job_body publish-prerelease)" || \
     die "publish-prerelease no longer waits for the disabled apple job"
 fi
+if grep -Fq 'self-hosted' <<<"$apple_job"; then
+  grep -Fq "$fork_guard" <<<"$apple_job" || \
+    die "apple is self-hosted but can run for a fork pull request"
+fi
+while IFS= read -r self_hosted_job; do
+  [[ -n "$self_hosted_job" ]] || continue
+  body="$(job_body "$self_hosted_job")"
+  grep -Fq "$fork_guard" <<<"$body" || \
+    die "$self_hosted_job is self-hosted but can run for a fork pull request"
+done < <(
+  awk '
+    /^  [A-Za-z0-9_-]+:/ {
+      if (job != "" && hosted) print job
+      job = $1
+      sub(/:$/, "", job)
+      hosted = 0
+    }
+    /self-hosted/ { hosted = 1 }
+    END { if (job != "" && hosted) print job }
+  ' "$WORKFLOW"
+)
 candidate_job="$(job_body candidate-ci)"
 grep -Fxq "    if: needs.release-metadata.outputs.bind_candidate_ci == 'true'" <<<"$candidate_job" || \
   die "candidate binding is not restricted to stable tags"
@@ -296,5 +457,9 @@ secrets_job="$(job_body secrets)"
 grep -Fq -- '--log-opts="$log_opts"' <<<"$secrets_job" || die "secret scan scope is not selected per event"
 grep -Fxq '          log_opts=--all' <<<"$secrets_job" || die "branch secret scan does not cover all branches"
 grep -Fxq '            log_opts=HEAD' <<<"$secrets_job" || die "tag secret scan does not cover the tag ancestry"
+
+if grep -RFq 'instabox' "$WORKSPACE_ROOT/.github/workflows" "$WORKSPACE_ROOT/.github/actions"; then
+  die "a workflow still runs on Instabox"
+fi
 
 echo "verified idempotent source-only prerelease workflow policy and candidate isolation"

@@ -1,3 +1,6 @@
+#[path = "../../../tests/support/xray_startup.rs"]
+#[macro_use]
+mod xray_startup;
 #[path = "hysteria_runtime/support.rs"]
 mod hysteria_support;
 #[path = "trojan_runtime/support.rs"]

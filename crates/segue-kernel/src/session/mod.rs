@@ -10,7 +10,11 @@
 //! outbound and a relay. The exit choice is `Auto` (first exit in config
 //! order whose carrier is up or not recently failed) or one named exit; a
 //! session stays on the exit it was opened on (its state lives in that
-//! relay), so a change applies to new sessions.
+//! relay), so a change applies to new sessions. An AI-class session
+//! (`exit_class` [`EXIT_AI`]) does not follow that failover: under Auto it
+//! pins one exit and may move only to another exit in the same
+//! [`Exit::group`]. A named choice is the pin. If that exit (and its group)
+//! is down the dial is refused, not sent to a different egress.
 //!
 //! The app gets success only after the relay answered OPENED, which it does
 //! only once the site connect worked: a refused session (exit_denied,
@@ -18,11 +22,13 @@
 //! with an error and nothing is ever retried direct.
 //!
 //! Kill switch (KILLSWITCH.md L1): carrier outcomes drive one [`KillSwitch`]
-//! per exit. While a carrier cannot be established (`Reconnecting` /
-//! `Error`), new flows on strict (AI) routes are refused at once; overseas
-//! flows are tried (the session retries OPEN for a bounded time) and refused
-//! if that fails. A user disconnect (L5) refuses every proxied flow and ends
-//! the live sessions.
+//! per exit, and a new flow asks [`KillSwitch::verdict`]. While that exit is
+//! reconnecting or in error, a strict (AI) route is refused at once, except
+//! the pinned fresh OPEN after UNKNOWN_SESSION and a route whose retry window
+//! has elapsed with nothing backing off (that attempt is what brings the exit
+//! back). Overseas is [`crate::killswitch::Protection::Wait`]: the SOCKS/TUN
+//! front end holds TCP; a dial that is asked anyway still tries the OPEN.
+//! A user disconnect (L5) refuses every proxied flow and ends the live sessions.
 //!
 //! Channel health (SESSION_PROTOCOL §3, §5.1): each exit that has sessions
 //! keeps a control stream to its relay. A `STALL` from the relay (it sees
@@ -38,6 +44,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,7 +62,11 @@ use tokio::task::JoinHandle;
 use crate::dial::{Datagrams, DialError, Dialer};
 
 mod stream;
-use crate::killswitch::{Event, KillSwitch, Posture};
+use crate::killswitch::{
+    protection_for_exit_class, Event, FlowPosture, HoldGuard, KillSwitch, Posture, Protection,
+    Verdict, WAIT_CAP,
+};
+use crate::rules::Action;
 pub use stream::SessionStream;
 
 /// `exit_class` hints in OPEN (the relay classifies by itself).
@@ -95,6 +106,22 @@ pub struct Exit {
     pub relay: SocketAddr,
     /// Node id sent as `anchor_node_id`.
     pub node_id: u64,
+    /// Exits that share an egress identity. Empty means this exit is its
+    /// own group ([`Exit::group`]): an AI flow pinned here never moves to
+    /// another exit.
+    pub egress_group: String,
+}
+
+impl Exit {
+    /// The egress identity AI flows may move inside. Absent in config
+    /// (empty here) means the exit's own name.
+    pub fn group(&self) -> &str {
+        if self.egress_group.is_empty() {
+            &self.name
+        } else {
+            &self.egress_group
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -202,8 +229,13 @@ struct State {
     choice: Option<usize>,
     /// Bumped whenever the user changes `choice` (r11 R5): a fresh
     /// session pinned to the exit of an earlier attempt keeps the pin
-    /// only while this is unchanged.
+    /// only while this is unchanged. The AI pin is updated in the same
+    /// assignment: a named exit becomes the pin, Auto clears it so the
+    /// next AI flow pins whatever Auto selects then.
     choice_gen: u64,
+    /// Exit index the AI class is stuck to under Auto. `None` until the
+    /// first AI flow, and after the user switches back to Auto.
+    ai_pin: Option<usize>,
     health: Vec<Health>,
 }
 
@@ -226,6 +258,44 @@ impl State {
         (0..self.health.len())
             .min_by_key(|&i| self.health[i].last_fail)
             .unwrap_or(0)
+    }
+
+    /// Exit for an AI-class session.
+    ///
+    /// A named choice is that exit, even when it is down (the caller then
+    /// refuses; this does not shop for another). Under Auto the first call
+    /// pins [`Self::pick`]'s exit and later calls stay there. A down pin may
+    /// move only to an exit whose [`Exit::group`] is the same and that is
+    /// up. If none is, the pin is returned unchanged so the strict verdict
+    /// refuses on it instead of opening on a different egress.
+    fn pick_ai(&mut self, groups: &[String]) -> usize {
+        if let Some(i) = self.choice {
+            self.ai_pin = Some(i);
+            return i;
+        }
+        if let Some(i) = self.ai_pin {
+            if self.ai_up(i) {
+                return i;
+            }
+            let group = groups.get(i).map(String::as_str).unwrap_or("");
+            let moved = (0..self.health.len()).find(|&j| {
+                j != i && groups.get(j).map(String::as_str) == Some(group) && self.ai_up(j)
+            });
+            if let Some(j) = moved {
+                self.ai_pin = Some(j);
+                return j;
+            }
+            return i;
+        }
+        let i = self.pick();
+        self.ai_pin = Some(i);
+        i
+    }
+
+    /// Connected, and not waiting on a session answer that never came.
+    fn ai_up(&self, i: usize) -> bool {
+        let h = &self.health[i];
+        h.ks.posture() == Posture::Connected && !h.unproven
     }
 
     fn posture(&self) -> Posture {
@@ -299,6 +369,8 @@ pub struct KernelDialer {
     control: ControlTiming,
     /// Session timing and limits (validated: [`Self::with_session_config`]).
     session_cfg: segue_session::Config,
+    /// TCP flows currently held in [`crate::killswitch::Verdict::Wait`].
+    holds: Arc<AtomicUsize>,
 }
 
 impl Drop for KernelDialer {
@@ -329,6 +401,7 @@ impl KernelDialer {
                 revoked: None,
                 choice: None,
                 choice_gen: 0,
+                ai_pin: None,
                 health,
             })),
             off: watch::channel(false).0,
@@ -336,6 +409,7 @@ impl KernelDialer {
             channels: (0..exits_len).map(|_| Channel::default()).collect(),
             control: ControlTiming::default(),
             session_cfg: segue_session::Config::default(),
+            holds: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -492,7 +566,23 @@ impl KernelDialer {
         if st.choice != choice {
             st.choice = choice;
             st.choice_gen += 1;
+            // The user changed exit. Named: AI follows that exit now.
+            // Auto: drop the pin; the next AI flow pins the exit Auto
+            // is on at that moment, and sticks to its egress group.
+            st.ai_pin = choice;
         }
+        Ok(())
+    }
+
+    /// Lab / tests: put `name` in `group` (AI may move to other exits in it).
+    #[cfg(test)]
+    pub(crate) fn set_egress_group(&mut self, name: &str, group: &str) -> Result<(), DialError> {
+        let exit = self
+            .exits
+            .iter_mut()
+            .find(|e| e.name == name)
+            .ok_or_else(|| DialError(format!("unknown exit {name:?}")))?;
+        exit.egress_group = group.to_string();
         Ok(())
     }
 
@@ -651,8 +741,9 @@ impl KernelDialer {
         pin: Option<(usize, u64)>,
         exit: &mut Option<(usize, u64)>,
     ) -> Result<crate::dial::Stream, (DialError, Option<u8>)> {
+        let groups: Vec<String> = self.exits.iter().map(|e| e.group().to_string()).collect();
         let i = {
-            let st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap();
             if st.user_off {
                 return Err((DialError("refused: disconnected".into()), None));
             }
@@ -662,25 +753,51 @@ impl KernelDialer {
                     Some(c),
                 ));
             }
-            if self.exits.is_empty() {
+            if groups.is_empty() {
                 return Err((DialError("refused: no exits configured".into()), None));
             }
             // A pin from an UNKNOWN_SESSION answer (see `open`) is void
             // once the user picked another exit.
             let pinned = pin.filter(|&(_, g)| g == st.choice_gen).map(|(i, _)| i);
-            let i = pinned.unwrap_or_else(|| st.pick());
+            let i = if r.exit_class == EXIT_AI {
+                if let Some(i) = pinned {
+                    // The fresh OPEN stays on the exit that answered.
+                    // Re-picking would move an AI flow to another egress.
+                    st.ai_pin = Some(i);
+                    i
+                } else {
+                    st.pick_ai(&groups)
+                }
+            } else {
+                pinned.unwrap_or_else(|| st.pick())
+            };
             *exit = Some((i, st.choice_gen));
             let h = &st.health[i];
-            // Refused at once while the exit's carrier connects fail, or
-            // its sessions are backing off after failures (r9 F5). The
-            // one fresh attempt after UNKNOWN_SESSION is let through.
-            let down = matches!(h.ks.posture(), Posture::Reconnecting | Posture::Error)
-                && (h.recently_failed() || h.failing() > 0);
-            if r.exit_class == EXIT_AI && down && pinned.is_none() {
-                return Err((
-                    DialError("refused: tunnel reconnecting (strict route)".into()),
-                    None,
-                ));
+            // Posture decides. Protection comes from the route's exit class,
+            // not from a second AI check. A strict Refuse is immediate while
+            // the exit's carrier connects are failing or its sessions are
+            // backing off (r9 F5). Two attempts are still made, because they
+            // are what restores the exit: the pinned fresh OPEN after
+            // UNKNOWN_SESSION, and a route whose retry window has elapsed
+            // with nothing backing off. Wait is not an error here — the
+            // front end holds TCP; if a dial is asked anyway, the OPEN is tried.
+            let protection = protection_for_exit_class(r.exit_class);
+            let verdict = h.ks.verdict(&Action::Proxy(String::new()), protection);
+            match verdict {
+                Verdict::Release => {
+                    return Err((DialError("refused: disconnected".into()), None));
+                }
+                Verdict::Refuse
+                    if protection == Protection::Strict
+                        && pinned.is_none()
+                        && (h.recently_failed() || h.failing() > 0) =>
+                {
+                    return Err((
+                        DialError("refused: tunnel reconnecting (strict route)".into()),
+                        None,
+                    ));
+                }
+                _ => {}
             }
             i
         };
@@ -945,6 +1062,23 @@ impl Dialer for KernelDialer {
             }
         }
         self.engine.dial_udp(tag, addr, port).await
+    }
+}
+
+impl FlowPosture for KernelDialer {
+    fn posture(&self) -> Posture {
+        // The trait method would recurse; this is the aggregate posture.
+        KernelDialer::posture(self)
+    }
+
+    fn protection(&self, tag: &str) -> Option<Protection> {
+        self.routes
+            .get(tag)
+            .map(|r| protection_for_exit_class(r.exit_class))
+    }
+
+    fn try_hold(&self) -> Option<HoldGuard> {
+        HoldGuard::try_acquire(&self.holds, WAIT_CAP)
     }
 }
 

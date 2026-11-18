@@ -13,9 +13,11 @@ use segue_engine::{
     open_tcp_stream_with_resolver_and_dialer, OutboundRouter, OutboundUdpSession, TcpOutbound,
 };
 use segue_routing::{Network, Target, TargetAddr};
-use segue_transport::{BoxedTransportStream, SystemDnsResolver, TransportDialer};
+use segue_transport::{
+    BoxedTransportStream, ConnectorConfig, HappyEyeballsConfig, SystemDnsResolver, TransportDialer,
+};
 use serde_json::{json, Value};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 
 #[derive(Debug)]
 pub struct DialError(pub String);
@@ -80,12 +82,27 @@ pub struct EngineDialer {
     /// Kept for UDP: the UDP outbound is selected on first use, so a
     /// TCP-only outbound does not fail startup.
     routers: BTreeMap<String, OutboundRouter>,
-    transport: TransportDialer,
+    transport: Arc<TransportDialer>,
 }
 
 impl EngineDialer {
-    /// Build one engine outbound per tag from its Xray-style JSON object.
+    /// Build outbounds using an unprotected system transport, as the prototype
+    /// does. Embedded callers use [`Self::with_transport_dialer`] so the host's
+    /// socket protector covers every carrier and direct-flow socket.
     pub fn new(specs: &BTreeMap<String, Value>) -> Result<Self, DialError> {
+        let transport =
+            TransportDialer::system().map_err(|e| DialError(format!("transport: {e}")))?;
+        Self::with_transport_dialer(specs, Arc::new(transport))
+    }
+
+    /// Build one engine outbound per tag from its Xray-style JSON object.
+    ///
+    /// The same `TransportDialer` serves all outbounds and direct flows, so
+    /// they inherit its socket protection.
+    pub fn with_transport_dialer(
+        specs: &BTreeMap<String, Value>,
+        transport: Arc<TransportDialer>,
+    ) -> Result<Self, DialError> {
         let mut outbounds = BTreeMap::new();
         let mut routers = BTreeMap::new();
         for (tag, spec) in specs {
@@ -103,8 +120,6 @@ impl EngineDialer {
             outbounds.insert(tag.clone(), outbound);
             routers.insert(tag.clone(), router);
         }
-        let transport =
-            TransportDialer::system().map_err(|e| DialError(format!("transport: {e}")))?;
         Ok(Self {
             outbounds,
             routers,
@@ -122,13 +137,25 @@ impl Dialer for EngineDialer {
         port: u16,
     ) -> Result<Stream, DialError> {
         let Some(tag) = tag else {
-            let stream = match addr {
-                TargetAddr::Ip(ip) => TcpStream::connect((*ip, port)).await,
-                TargetAddr::Domain(name) => TcpStream::connect((name.as_str(), port)).await,
-            }
-            .map_err(|e| DialError(format!("direct: {e}")))?;
-            let _ = stream.set_nodelay(true);
-            return Ok(Box::new(stream));
+            let target = Target::new(addr.clone(), port, Network::Tcp);
+            let dests = match addr {
+                TargetAddr::Ip(ip) => vec![SocketAddr::new(*ip, port)],
+                TargetAddr::Domain(name) => tokio::net::lookup_host((name.as_str(), port))
+                    .await
+                    .map_err(|e| DialError(format!("direct: {e}")))?
+                    .collect::<Vec<_>>(),
+            };
+            let (stream, _) = self
+                .transport
+                .connect_raw_stream_with_peer(
+                    &ConnectorConfig::Tcp,
+                    &target,
+                    &dests,
+                    Some(&HappyEyeballsConfig::default()),
+                )
+                .await
+                .map_err(|e| DialError(format!("direct: {e}")))?;
+            return Ok(stream);
         };
         let outbound = self
             .outbounds
@@ -152,7 +179,9 @@ impl Dialer for EngineDialer {
         port: u16,
     ) -> Result<Datagrams, DialError> {
         let Some(tag) = tag else {
-            return Ok(Box::new(DirectUdp::connect(addr, port).await?));
+            return Ok(Box::new(
+                DirectUdp::connect(&self.transport, addr, port).await?,
+            ));
         };
         let router = self
             .routers
@@ -217,7 +246,11 @@ const MAX_UDP_PAYLOAD: usize = 65_507;
 struct DirectUdp(UdpSocket);
 
 impl DirectUdp {
-    async fn connect(addr: &TargetAddr, port: u16) -> Result<Self, DialError> {
+    async fn connect(
+        transport: &TransportDialer,
+        addr: &TargetAddr,
+        port: u16,
+    ) -> Result<Self, DialError> {
         let dests: Vec<SocketAddr> = match addr {
             TargetAddr::Ip(ip) => vec![SocketAddr::new(*ip, port)],
             TargetAddr::Domain(name) => tokio::net::lookup_host((name.as_str(), port))
@@ -236,6 +269,8 @@ impl DirectUdp {
             };
             let attempt = async {
                 let socket = UdpSocket::bind(local).await?;
+                segue_transport::protect_udp_socket(&socket, transport.socket_protector())
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 socket.connect(dest).await?;
                 Ok::<_, std::io::Error>(socket)
             };
@@ -281,5 +316,115 @@ impl UdpSession for DirectUdp {
             .peer_addr()
             .map_err(|e| DialError(format!("direct udp: {e}")))?;
         Ok((TargetAddr::Ip(peer.ip()), peer.port()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{Exit, KernelDialer};
+    use segue_transport::{SocketHandle, SocketProtector};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Default)]
+    struct RecordingProtector(Mutex<Vec<i64>>);
+
+    impl RecordingProtector {
+        fn sockets(&self) -> Vec<i64> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl SocketProtector for RecordingProtector {
+        fn protect(&self, socket: SocketHandle) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(socket.raw());
+            Ok(())
+        }
+    }
+
+    fn protected_dialer(protector: Arc<RecordingProtector>) -> Arc<TransportDialer> {
+        Arc::new(
+            TransportDialer::system_with_socket_protector(Some(protector))
+                .expect("protected transport"),
+        )
+    }
+
+    #[test]
+    fn kernel_dialer_accepts_protected_engine_dialer() {
+        let mut specs = BTreeMap::new();
+        specs.insert("carrier".to_owned(), json!({"protocol": "freedom"}));
+        let engine = EngineDialer::with_transport_dialer(
+            &specs,
+            protected_dialer(Arc::new(RecordingProtector::default())),
+        )
+        .unwrap();
+        let dialer: Arc<dyn crate::dial::Dialer> = Arc::new(KernelDialer::new(
+            Arc::new(engine),
+            vec![Exit {
+                name: "test".into(),
+                carrier: "carrier".into(),
+                relay: "127.0.0.1:9000".parse().unwrap(),
+                node_id: 1,
+                egress_group: String::new(),
+            }],
+            BTreeMap::new(),
+            Default::default(),
+        ));
+        drop(dialer);
+    }
+
+    #[tokio::test]
+    async fn shared_transport_protects_the_session_carrier_socket() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let protector = Arc::new(RecordingProtector::default());
+        let mut specs = BTreeMap::new();
+        specs.insert("carrier".to_owned(), json!({"protocol": "freedom"}));
+        let dialer =
+            EngineDialer::with_transport_dialer(&specs, protected_dialer(protector.clone()))
+                .unwrap();
+        let mut stream = dialer
+            .dial(Some("carrier"), &TargetAddr::Ip(addr.ip()), addr.port())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        stream.write_all(b"carrier").await.unwrap();
+        let mut got = [0u8; 7];
+        peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"carrier");
+        let sockets = protector.sockets();
+        assert_eq!(sockets.len(), 1);
+        assert!(sockets.iter().all(|fd| *fd >= 0));
+    }
+
+    #[tokio::test]
+    async fn shared_transport_protects_direct_tcp_and_udp_sockets() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let protector = Arc::new(RecordingProtector::default());
+        let dialer = EngineDialer::with_transport_dialer(
+            &BTreeMap::new(),
+            protected_dialer(protector.clone()),
+        )
+        .unwrap();
+        let target = TargetAddr::Ip(Ipv4Addr::LOCALHOST.into());
+        let stream = dialer
+            .dial(None, &target, listener.local_addr().unwrap().port())
+            .await
+            .unwrap();
+        let _ = listener.accept().await.unwrap();
+        drop(stream);
+        let port = udp.local_addr().unwrap().port();
+        let datagrams = dialer.dial_udp(None, &target, port).await.unwrap();
+        datagrams.send(&target, port, b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        udp.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        assert_eq!(protector.sockets().len(), 2);
     }
 }

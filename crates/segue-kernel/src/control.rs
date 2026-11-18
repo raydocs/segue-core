@@ -8,7 +8,7 @@
 //!
 //! | Request | Body | Answer |
 //! |---|---|---|
-//! | `GET /v1/status` | | `{"state", "posture", "exit_choice", "current_exit", "exits", "revoked", "control_refused", "policy"}` |
+//! | `GET /v1/status` | | `{"state", "posture", "exit_choice", "current_exit", "exits", "revoked", "control_refused", "policy", "tun"}` |
 //! | `POST /v1/connect` | | status |
 //! | `POST /v1/disconnect` | | status |
 //! | `POST /v1/exit` | `{"exit": "auto" \| "la" \| "ny" ...}` | status |
@@ -28,10 +28,14 @@
 //! Requests need `Authorization: Bearer <token>`. Requests carrying an
 //! `Origin` header (a web page) or a `Host` that is not a loopback name are
 //! refused, which closes the DNS-rebinding route into a loopback server.
+//!
+//! `tun.interface` is the utun name while one is open, otherwise `null`.
+//! `tun.routes` is `installed` after the split defaults are in, and `absent`
+//! otherwise (no tun mode, or not up yet).
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -51,6 +55,27 @@ pub struct Control {
     dialer: Arc<KernelDialer>,
     policy: Arc<PolicyStore>,
     token: String,
+    tun: Mutex<TunSnapshot>,
+}
+
+/// What `GET /v1/status` reports about the utun.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TunSnapshot {
+    pub interface: Option<String>,
+    /// `absent` or `installed`.
+    pub routes: &'static str,
+}
+
+impl TunSnapshot {
+    pub const ABSENT: &'static str = "absent";
+    pub const INSTALLED: &'static str = "installed";
+
+    pub fn absent() -> Self {
+        Self {
+            interface: None,
+            routes: Self::ABSENT,
+        }
+    }
 }
 
 /// A fresh random token: 32 bytes, hex.
@@ -65,7 +90,16 @@ impl Control {
             dialer,
             policy,
             token,
+            tun: Mutex::new(TunSnapshot::absent()),
         }
+    }
+
+    /// Publish the utun the process is holding. `routes` is
+    /// [`TunSnapshot::ABSENT`] or [`TunSnapshot::INSTALLED`].
+    pub fn set_tun(&self, interface: Option<String>, routes: &'static str) {
+        let mut tun = self.tun.lock().unwrap_or_else(|e| e.into_inner());
+        tun.interface = interface;
+        tun.routes = routes;
     }
 
     pub fn status(&self) -> Value {
@@ -82,6 +116,7 @@ impl Control {
             Posture::Error => "error",
             Posture::Disconnected => "disconnected",
         };
+        let tun = self.tun.lock().unwrap_or_else(|e| e.into_inner()).clone();
         json!({
             "state": state,
             "posture": posture,
@@ -95,6 +130,10 @@ impl Control {
                 .map(|(exit, code)| json!({"exit": exit, "code": code}))
                 .collect::<Vec<_>>(),
             "policy": self.policy.status(),
+            "tun": {
+                "interface": tun.interface,
+                "routes": tun.routes,
+            },
         })
     }
 
@@ -370,6 +409,7 @@ mod tests {
                 carrier: format!("c-{n}"),
                 relay: "127.0.0.1:7443".parse().unwrap(),
                 node_id: i as u64 + 1,
+                egress_group: String::new(),
             })
             .collect();
         let routes = [(
@@ -434,6 +474,8 @@ mod tests {
         assert_eq!(s["current_exit"], "la");
         assert_eq!(s["exits"], json!(["la", "ny"]));
         assert_eq!(s["policy"]["source"], "inline");
+        assert!(s["tun"]["interface"].is_null());
+        assert_eq!(s["tun"]["routes"], "absent");
 
         let (_, s) = authed(&api, "POST", "/v1/connect", "").await;
         assert_eq!(s["state"], "connected", "{s}");
@@ -511,6 +553,38 @@ mod tests {
             s["state"], "disconnected",
             "refused requests changed nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn tun_status_reports_the_interface() {
+        let api = start().await;
+        let (code, s) = authed(&api, "GET", "/v1/status", "").await;
+        assert_eq!(code, 200);
+        assert_eq!(s["tun"]["routes"], TunSnapshot::ABSENT);
+        // The HTTP test does not hold the Control. The setter is covered by
+        // building one the same way `start` does and reading `status` directly.
+        let dialer = Arc::new(crate::session::KernelDialer::new(
+            api.engine.clone(),
+            vec![crate::session::Exit {
+                name: "la".into(),
+                carrier: "c".into(),
+                relay: "127.0.0.1:1".parse().unwrap(),
+                node_id: 1,
+                egress_group: String::new(),
+            }],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeSet::new(),
+        ));
+        let policy = PolicyStore::inline(Policy::inline(
+            RuleSet::new(Vec::new(), Action::Reject),
+            CidrTable::default(),
+        ));
+        let ctl = Control::new(dialer, policy, "t".into());
+        assert_eq!(ctl.status()["tun"]["routes"], "absent");
+        ctl.set_tun(Some("utun3".into()), TunSnapshot::INSTALLED);
+        let s = ctl.status();
+        assert_eq!(s["tun"]["interface"], "utun3");
+        assert_eq!(s["tun"]["routes"], "installed");
     }
 
     #[test]

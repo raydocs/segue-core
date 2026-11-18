@@ -907,6 +907,7 @@ mod tests {
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: None,
+                ech_config_list: None,
             },
             fronting,
             keep_alive: None,

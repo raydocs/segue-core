@@ -5,6 +5,9 @@
 //! chaining and outbound probes. The ignored tests run against the pinned Go
 //! Xray-core HTTP inbound and compare the CONNECT request with the pinned Go
 //! client's; `scripts/check-http-interop.sh` builds Xray and runs them.
+#[path = "../../../tests/support/xray_startup.rs"]
+#[macro_use]
+mod xray_startup;
 #[path = "hysteria_runtime/support.rs"]
 mod hysteria_support;
 use hysteria_support::{tcp_echo, Bootstrap, Protector, Task};

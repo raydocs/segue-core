@@ -2,10 +2,10 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use segue_config::{
-    CoreConfig, DnsFakeIpConfig, InboundConfig, InboundProtocol, IpCidr, Network, OutboundConfig,
-    OutboundProxySettings, OutboundSettings, RoutingBalancer, RoutingBalancerStrategy,
-    RoutingConfig, StreamSecurity, StreamSettings, StreamTransport, TargetAddr,
-    VlessOutboundSettings, VlessUser,
+    default_fake_ip_exempt_domains, CoreConfig, DnsFakeIpConfig, InboundConfig, InboundProtocol,
+    IpCidr, Network, OutboundConfig, OutboundProxySettings, OutboundSettings, RoutingBalancer,
+    RoutingBalancerStrategy, RoutingConfig, StreamSecurity, StreamSettings, StreamTransport,
+    TargetAddr, VlessOutboundSettings, VlessUser,
 };
 use segue_engine::{
     Core, CoreError, CoreState, OutboundNodeKind, TunMtu, TunRuntimeOptions, TunRuntimeProfile,
@@ -196,6 +196,7 @@ fn core_rejects_programmatic_fake_ip_pool_with_only_reserved_addresses() {
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 30).unwrap(),
         pool_size: 1,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
 
     assert!(matches!(
@@ -212,6 +213,7 @@ fn core_rejects_programmatic_fake_ip_with_zero_ttl() {
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 19, 0, 0)), 16).unwrap(),
         pool_size: 1024,
         ttl: 0,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
 
     assert!(matches!(

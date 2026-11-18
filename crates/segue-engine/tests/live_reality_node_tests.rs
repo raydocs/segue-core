@@ -14,6 +14,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
+#[path = "../../../tests/support/xray_startup.rs"]
+#[macro_use]
+mod xray_startup;
+
 const LIVE_SOCKS_TAG: &str = "live_socks";
 const LIVE_TARGETS_ENV: &str = "XRAY_REALITY_LIVE_TARGETS";
 
@@ -641,7 +645,19 @@ fn selected_live_test_timeout_secs() -> u64 {
         .unwrap_or(240)
 }
 
+/// The live client, its SOCKS inbound on a fresh port. The port is picked
+/// by binding it and letting go, so the start is repeated on a new one when
+/// another socket takes it before Xray binds it.
 async fn start_xray_core_live_client(xray_checkout: &Path) -> LiveXrayProcess {
+    start_on_fresh_ports!(
+        "xray live client",
+        try_start_xray_core_live_client(xray_checkout)
+    )
+}
+
+/// One start of [`start_xray_core_live_client`] on a fresh port: `None` when
+/// another socket took the port first.
+async fn try_start_xray_core_live_client(xray_checkout: &Path) -> Option<LiveXrayProcess> {
     let temp_dir = create_temp_dir("xray-core-live-reality");
     let binary = temp_dir
         .path
@@ -682,37 +698,44 @@ async fn start_xray_core_live_client(xray_checkout: &Path) -> LiveXrayProcess {
         .expect("start xray live client process");
 
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    wait_for_tcp_listener(&mut child, addr, &stdout_path, &stderr_path).await;
+    if !wait_for_tcp_listener(&mut child, addr, &stdout_path, &stderr_path).await {
+        return None;
+    }
 
-    LiveXrayProcess {
+    Some(LiveXrayProcess {
         child,
         _temp_dir: temp_dir,
         addr,
         stdout_path,
         stderr_path,
-    }
+    })
 }
 
+/// Whether the live client listens on `addr` before `deadline`: `false` when
+/// it exited because another socket took the port.
 async fn wait_for_tcp_listener(
     child: &mut Child,
     addr: SocketAddr,
     stdout_path: &Path,
     stderr_path: &Path,
-) {
+) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.try_wait().expect("check xray live process status") {
             let stdout = fs::read_to_string(stdout_path).unwrap_or_default();
             let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
-            panic!(
-                "xray live client exited before listening on {addr}: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            let output = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+            assert!(
+                xray_startup::port_taken(&output),
+                "xray live client exited before listening on {addr}: {status}\n{output}"
             );
+            return false;
         }
 
         match TcpStream::connect(addr).await {
             Ok(stream) => {
                 drop(stream);
-                return;
+                return true;
             }
             Err(error) if Instant::now() < deadline => {
                 let _ = error;

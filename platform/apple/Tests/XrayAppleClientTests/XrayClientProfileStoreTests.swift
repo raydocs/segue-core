@@ -7,6 +7,14 @@ import XrayAppleShared
 import NetworkExtension
 #endif
 
+private struct KillSwitchFlags: Equatable {
+    var includeAllNetworks: Bool
+    var excludeLocalNetworks: Bool
+    var enforceRoutes: Bool
+    var excludeAPNs: Bool?
+    var excludeCellularServices: Bool?
+}
+
 final class XrayClientProfileStoreTests: XCTestCase {
     func testSavePersistsOnlyOpaqueReferenceInUserDefaults() throws {
         let defaults = try makeDefaults()
@@ -341,7 +349,89 @@ final class XrayClientProfileStoreTests: XCTestCase {
             options[XrayTunnelProviderMessage.configReferenceOptionKey] as? String,
             "opaque-reference"
         )
+        XCTAssertEqual(
+            (options[XrayTunnelProviderMessage.includeAllNetworksOptionKey] as? NSNumber)?.boolValue,
+            false
+        )
+        XCTAssertEqual(
+            (options[XrayTunnelProviderMessage.excludeLocalNetworksOptionKey] as? NSNumber)?.boolValue,
+            true
+        )
         XCTAssertFalse(options.values.contains { "\($0)".contains(Self.vlessUserID) })
+    }
+
+    @available(macOS 13.0, *)
+    @MainActor
+    func testKillSwitchOffLeavesTunnelProtocolUnchanged() {
+        let profile = makeProfile()
+        XCTAssertFalse(profile.includeAllNetworks)
+        XCTAssertTrue(profile.excludeLocalNetworks)
+
+        let tunnelProtocol = NETunnelProviderProtocol()
+        let before = killSwitchFlags(of: tunnelProtocol)
+        NetworkExtensionTunnelController.applyKillSwitch(to: tunnelProtocol, profile: profile)
+
+        XCTAssertEqual(killSwitchFlags(of: tunnelProtocol), before)
+        XCTAssertNil(tunnelProtocol.providerConfiguration)
+    }
+
+    @available(macOS 13.0, *)
+    @MainActor
+    func testKillSwitchOnSetsProtocolFlags() {
+        var profile = makeProfile()
+        profile.includeAllNetworks = true
+
+        let tunnelProtocol = NETunnelProviderProtocol()
+        NetworkExtensionTunnelController.applyKillSwitch(to: tunnelProtocol, profile: profile)
+
+        XCTAssertTrue(tunnelProtocol.includeAllNetworks)
+        XCTAssertTrue(tunnelProtocol.excludeLocalNetworks)
+        XCTAssertTrue(tunnelProtocol.enforceRoutes)
+        if #available(macOS 13.3, *) {
+            XCTAssertTrue(tunnelProtocol.excludeAPNs)
+            XCTAssertTrue(tunnelProtocol.excludeCellularServices)
+        }
+    }
+
+    @available(macOS 13.0, *)
+    @MainActor
+    func testKillSwitchOnHonorsExcludeLocalNetworks() {
+        var profile = makeProfile()
+        profile.includeAllNetworks = true
+        profile.excludeLocalNetworks = false
+
+        let tunnelProtocol = NETunnelProviderProtocol()
+        NetworkExtensionTunnelController.applyKillSwitch(to: tunnelProtocol, profile: profile)
+
+        XCTAssertTrue(tunnelProtocol.includeAllNetworks)
+        XCTAssertFalse(tunnelProtocol.excludeLocalNetworks)
+        XCTAssertTrue(tunnelProtocol.enforceRoutes)
+    }
+
+    @available(macOS 13.0, *)
+    @MainActor
+    func testProviderConfigurationCarriesKillSwitchSettings() {
+        var profile = makeProfile()
+        profile.includeAllNetworks = true
+        profile.excludeLocalNetworks = false
+
+        let configuration = NetworkExtensionTunnelController.providerConfiguration(
+            for: profile,
+            configReference: "opaque-reference"
+        )
+
+        XCTAssertEqual(
+            configuration[XrayTunnelProviderMessage.providerIncludeAllNetworksKey] as? Bool,
+            true
+        )
+        XCTAssertEqual(
+            configuration[XrayTunnelProviderMessage.providerExcludeLocalNetworksKey] as? Bool,
+            false
+        )
+        XCTAssertEqual(
+            configuration[XrayTunnelProviderMessage.providerConfigReferenceKey] as? String,
+            "opaque-reference"
+        )
     }
 
     @available(macOS 13.0, *)
@@ -538,6 +628,23 @@ final class XrayClientProfileStoreTests: XCTestCase {
             {"outbounds":[{"protocol":"vless","settings":{"vnext":[{"users":[{"id":"\(Self.vlessUserID)"}]}]}}]}
             """
         )
+    }
+
+    @available(macOS 13.0, *)
+    @MainActor
+    private func killSwitchFlags(
+        of tunnelProtocol: NETunnelProviderProtocol
+    ) -> KillSwitchFlags {
+        var flags = KillSwitchFlags(
+            includeAllNetworks: tunnelProtocol.includeAllNetworks,
+            excludeLocalNetworks: tunnelProtocol.excludeLocalNetworks,
+            enforceRoutes: tunnelProtocol.enforceRoutes
+        )
+        if #available(macOS 13.3, *) {
+            flags.excludeAPNs = tunnelProtocol.excludeAPNs
+            flags.excludeCellularServices = tunnelProtocol.excludeCellularServices
+        }
+        return flags
     }
 
     @available(macOS 13.0, *)

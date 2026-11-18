@@ -21,15 +21,15 @@ use hkdf::Hkdf;
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use segue_config::{
-    compile_dns_domain_matchers, compile_domain_matchers, parse_xray_json, CoreConfig, DnsConfig,
-    DnsFakeIpConfig, DnsHostTarget, DnsNameServerConfig, DnsOutboundRule, DnsOutboundRuleAction,
-    DnsOutboundSettings, DnsQTypeRange, DnsQueryStrategy, DnsServerConfig, DnsServerEndpoint,
-    DomainHostIndex, DomainMatcher, DomainMatcherSet, InboundConfig, InboundProtocol,
-    InboundSniffingConfig, IpCidr, IpMatcherSet, Network, OutboundConfig, OutboundSettings,
-    PolicyConfig, PolicyLevelConfig, RealitySettings, RealityShortId, RoutingConfig,
-    RoutingDomainStrategy, RoutingPortRange, RoutingRule, RoutingRuleTarget, SniffingDestination,
-    SocksInboundSettings, StreamSecurity, StreamSettings, StreamTransport, TargetAddr, TlsSettings,
-    VlessOutboundSettings, VlessUser,
+    compile_dns_domain_matchers, compile_domain_matchers, default_fake_ip_exempt_domains,
+    parse_xray_json, CoreConfig, DnsConfig, DnsFakeIpConfig, DnsHostTarget, DnsNameServerConfig,
+    DnsOutboundRule, DnsOutboundRuleAction, DnsOutboundSettings, DnsQTypeRange, DnsQueryStrategy,
+    DnsServerConfig, DnsServerEndpoint, DomainHostIndex, DomainMatcher, DomainMatcherSet,
+    InboundConfig, InboundProtocol, InboundSniffingConfig, IpCidr, IpMatcherSet, Network,
+    OutboundConfig, OutboundSettings, PolicyConfig, PolicyLevelConfig, RealitySettings,
+    RealityShortId, RoutingConfig, RoutingDomainStrategy, RoutingPortRange, RoutingRule,
+    RoutingRuleTarget, SniffingDestination, SocksInboundSettings, StreamSecurity, StreamSettings,
+    StreamTransport, TargetAddr, TlsSettings, VlessOutboundSettings, VlessUser,
 };
 use segue_engine::{
     ConnectionState, Core, CoreError, DnsBootstrapMode, OutboundAccounting, OutboundRouter,
@@ -70,6 +70,10 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout, Duration, Instant as TokioInstant};
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
+
+#[path = "../../../tests/support/xray_startup.rs"]
+#[macro_use]
+mod xray_startup;
 
 #[path = "runtime_data_path_tests/tun_admission.rs"]
 mod tun_admission;
@@ -143,6 +147,8 @@ fn compile_vless_tcp_outbound_one_shot(config: &CoreConfig) -> Result<VlessTcpOu
         | TcpOutbound::Hysteria(_)
         | TcpOutbound::Wireguard(_)
         | TcpOutbound::Masque(_)
+        | TcpOutbound::AnyTls(_)
+        | TcpOutbound::Tuic(_)
         | TcpOutbound::Chained { .. } => Err(CoreError::NoSupportedOutbound),
     }
 }
@@ -676,6 +682,7 @@ fn runtime_tun_config_with_fake_ip_route_only_http_sniffing(unused_proxy_port: u
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config.dns.hosts = DomainHostIndex::from_iter([(
         DomainMatcher::Full("routed.example".to_owned()),
@@ -703,6 +710,7 @@ fn runtime_tun_config_with_fake_ip_quic_sniffing_routed_to_dns_outbound() -> Cor
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config
 }
@@ -719,6 +727,7 @@ fn runtime_tun_config_with_fake_ip_domain_routed_freedom_outbound(
             ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
             pool_size: 32_768,
             ttl: 60,
+            exempt_domains: default_fake_ip_exempt_domains(),
         }),
         ..Default::default()
     };
@@ -734,6 +743,7 @@ fn runtime_tun_config_with_mobile_fake_dns_freedom(dns_server: SocketAddr) -> Co
             ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
             pool_size: 32_768,
             ttl: 60,
+            exempt_domains: default_fake_ip_exempt_domains(),
         }),
         ..Default::default()
     };
@@ -788,6 +798,7 @@ fn runtime_tun_config_with_fake_ip_ip_if_non_match_routed_freedom_outbound(
             ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
             pool_size: 32_768,
             ttl: 60,
+            exempt_domains: default_fake_ip_exempt_domains(),
         }),
         ..Default::default()
     };
@@ -867,6 +878,7 @@ fn runtime_tun_config_with_tls_vision_vless_domain_server(
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         TargetAddr::Domain(domain.to_owned()),
         port,
@@ -1237,6 +1249,7 @@ fn runtime_config_with_tls_vless_domain_server(
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
                 alpn: Vec::new(),
+                ech_config_list: None,
             }),
             TargetAddr::Domain(domain.to_owned()),
             port,
@@ -1827,6 +1840,7 @@ fn selects_tls_vless_outbound_without_fingerprint() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         TargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
         443,
@@ -1851,6 +1865,7 @@ fn selects_tls_explicit_server_name_over_domain_outbound() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         TargetAddr::Domain("vless.test".to_owned()),
         443,
@@ -1874,6 +1889,7 @@ fn selects_tls_server_name_from_domain_outbound_when_missing() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         TargetAddr::Domain("vless.test".to_owned()),
         443,
@@ -1897,6 +1913,7 @@ fn empty_tls_server_name_falls_back_to_domain_outbound() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         TargetAddr::Domain("vless.test".to_owned()),
         443,
@@ -1920,6 +1937,7 @@ fn missing_tls_server_name_falls_back_to_ip_outbound() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         TargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
         443,
@@ -1978,6 +1996,7 @@ fn selects_tls_vision_outbound_for_protected_stream_boundary() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
+            ech_config_list: None,
         }),
         TargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
         443,
@@ -4212,6 +4231,7 @@ fn runtime_config_with_password_socks_inbound() -> CoreConfig {
         )
         .unwrap()]),
         udp: true,
+        udp_address: None,
     });
     config
 }
@@ -6057,6 +6077,7 @@ async fn run_tun_fake_dns_static_only_vless_remote_resolution_scenario() {
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     let mut core = Core::with_tun_runtime_options(
         config,
@@ -6917,6 +6938,7 @@ async fn run_core_wide_fake_dns_socks_to_http_scenario() {
         ipv4_pool: fake_ip_pool,
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config.dns.hosts.insert(
         DomainMatcher::Full(domain.to_owned()),
@@ -7034,6 +7056,7 @@ async fn run_tun_dns_outbound_fake_ip_domain_scenario(strategy: RoutingDomainStr
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config.routing.domain_strategy = strategy;
     let mut core = Core::with_dns_resolver(
@@ -7114,6 +7137,7 @@ async fn run_tun_dns_outbound_tcp_fake_ip_domain_scenario(strategy: RoutingDomai
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config.routing.domain_strategy = strategy;
     let mut core = Core::with_dns_resolver(
@@ -9638,6 +9662,7 @@ async fn run_tun_fake_dns_tcp_scenario(dns_destination: Ipv4Addr) {
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     let mut core = Core::new(config).unwrap();
     core.start().await.unwrap();
@@ -10186,6 +10211,7 @@ async fn run_socks_mapped_fake_ip_http_sniffing_precedence_scenario() {
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     let resolver = StaticDnsResolver {
         domain: mapped_domain,
@@ -10237,6 +10263,7 @@ async fn run_socks_in_pool_unmapped_route_only_http_sniffing_scenario() {
         ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
         pool_size: 32_768,
         ttl: 60,
+        exempt_domains: default_fake_ip_exempt_domains(),
     });
     config.dns.hosts = DomainHostIndex::from_iter([(
         DomainMatcher::Full("routed.example".to_owned()),

@@ -59,6 +59,7 @@ async fn start_blackhole_core(tun_sniffing: bool) -> (Core, Arc<CountingSocketPr
             ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15).unwrap(),
             pool_size: 32_768,
             ttl: 60,
+            exempt_domains: default_fake_ip_exempt_domains(),
         });
     } else {
         config.inbounds[2].sniffing = None;

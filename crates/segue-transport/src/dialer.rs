@@ -391,6 +391,9 @@ impl TransportDialer {
             }),
             ConnectorConfig::Tcp => Err(TransportError::UnsupportedHttp3Security("TCP")),
             ConnectorConfig::Reality(_) => Err(TransportError::UnsupportedHttp3Security("REALITY")),
+            ConnectorConfig::ShadowTls(_) => {
+                Err(TransportError::UnsupportedHttp3Security("ShadowTLS"))
+            }
         }
     }
 
@@ -417,6 +420,12 @@ impl TransportDialer {
                 Some(reality) => reality.connect(reality_config, target).await,
                 None => Err(TransportError::UnsupportedConnectorConfig("reality")),
             },
+            ConnectorConfig::ShadowTls(config) => {
+                let prepared = self.tls.prepare_shadow_tls_stream(config)?;
+                let carrier = connect_tcp_target(target, self.socket_protector.as_deref()).await?;
+                let carrier = self.mask_tcp_carrier(Box::new(carrier));
+                crate::connect_shadow_tls_stream(carrier, prepared).await
+            }
         }
     }
 
@@ -441,6 +450,13 @@ impl TransportDialer {
     ) -> Result<BoxedTransportStream, TransportError> {
         match transport {
             TransportLayer::Raw => {
+                if let ConnectorConfig::ShadowTls(config) = config {
+                    let prepared = self.tls.prepare_shadow_tls_stream(config)?;
+                    let carrier = self
+                        .connect_tcp_carrier(original_target, candidates, happy_eyeballs)
+                        .await?;
+                    return crate::connect_shadow_tls_stream(carrier, prepared).await;
+                }
                 self.connect_resolved_with_alpn_policy(
                     config,
                     original_target,
@@ -510,9 +526,9 @@ impl TransportDialer {
         let prepared = match config {
             ConnectorConfig::Tcp => None,
             ConnectorConfig::Tls(tls) => Some(self.tls.prepare_stream(tls, TlsAlpnPolicy::Raw)?),
-            ConnectorConfig::Reality(_) => {
+            ConnectorConfig::Reality(_) | ConnectorConfig::ShadowTls(_) => {
                 return Err(TransportError::UnsupportedConnectorConfig(
-                    "reality over mKCP",
+                    "security over mKCP",
                 ))
             }
         };
@@ -526,6 +542,7 @@ impl TransportDialer {
                 self.socket_protector.clone(),
                 kcp,
                 realm.as_ref(),
+                Some(&self.network_changes),
             )
             .await?,
         );
@@ -582,9 +599,9 @@ impl TransportDialer {
         let prepared = match config {
             ConnectorConfig::Tcp => None,
             ConnectorConfig::Tls(tls) => Some(self.tls.prepare_stream(tls, TlsAlpnPolicy::Raw)?),
-            ConnectorConfig::Reality(_) => {
+            ConnectorConfig::Reality(_) | ConnectorConfig::ShadowTls(_) => {
                 return Err(TransportError::UnsupportedConnectorConfig(
-                    "UDP association REALITY",
+                    "UDP association security",
                 ));
             }
         };
@@ -679,6 +696,9 @@ impl TransportDialer {
                     }
                 }
             }
+            ConnectorConfig::ShadowTls(_) => Err(TransportError::ShadowTls(
+                "a ShadowTLS connector needs the raw TCP transport layer".to_owned(),
+            )),
             ConnectorConfig::Reality(reality_config) => {
                 if self.resolved_tcp_connector.is_some() {
                     return Err(TransportError::UnsupportedChainedTransport("REALITY"));

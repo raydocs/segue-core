@@ -737,6 +737,15 @@ fn ffi_reports_exact_current_capabilities() {
         | segue_ffi::XRAY_FFI_CAPABILITY_OUTBOUND_PROBE_CANCEL
         | segue_ffi::XRAY_FFI_CAPABILITY_TUN_MTU
         | segue_ffi::XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT;
+    // The proprietary-kernel build adds exactly the six kernel bits.
+    #[cfg(feature = "proprietary-kernel")]
+    let expected = expected
+        | segue_ffi::XRAY_FFI_CAPABILITY_KERNEL
+        | segue_ffi::XRAY_FFI_CAPABILITY_KERNEL_KILLSWITCH
+        | segue_ffi::XRAY_FFI_CAPABILITY_KERNEL_POLICY
+        | segue_ffi::XRAY_FFI_CAPABILITY_KERNEL_DNS
+        | segue_ffi::XRAY_FFI_CAPABILITY_KERNEL_STATS
+        | segue_ffi::XRAY_FFI_CAPABILITY_KERNEL_TUN_FD;
 
     assert_eq!(XRAY_FFI_CAPABILITIES, expected);
     assert_eq!(xray_ffi_capabilities(), expected);

@@ -115,6 +115,7 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 
 use crate::dial::{Dialer, UdpSession};
 use crate::dns::SmartDns;
+use crate::killswitch::HoldGuard;
 use crate::policy::Policy;
 use crate::quic::{looks_quic, looks_quic_first};
 use crate::rules::{Action, RuleSet};
@@ -1955,6 +1956,10 @@ impl Dial {
 #[derive(Clone, Debug)]
 pub enum TcpRoute {
     Dial(Dial),
+    /// Complete the handshake, but do not dial until the kill switch leaves
+    /// [`crate::killswitch::Verdict::Wait`]. Past the hold cap this is a
+    /// refusal instead (the SYN is reset, same as [`TcpRoute::Refuse`]).
+    Wait(Dial),
     /// Complete the handshake, peek at the first bytes for a TLS SNI / HTTP
     /// Host, then ask [`TunRouter::sniffed`] (§5.2a).
     Sniff(SniffSettings),
@@ -1990,6 +1995,34 @@ pub trait TunRouter: Send + Sync {
     fn route_udp(&self, _key: &FlowKey) -> UdpRoute {
         UdpRoute::Refuse
     }
+
+    /// A slot for [`TcpRoute::Wait`]. `None`: the cap is full, so the SYN
+    /// is refused.
+    fn take_wait_slot(&self) -> Option<HoldGuard> {
+        None
+    }
+
+    /// Verdict while a TCP flow is held. The default is "already allowed",
+    /// so a router with no kill switch never parks a flow.
+    fn flow_verdict(&self, action: &Action) -> crate::killswitch::Verdict {
+        match action {
+            Action::Proxy(tag) => crate::killswitch::Verdict::Proxy(tag.clone()),
+            Action::Direct => crate::killswitch::Verdict::Direct,
+            Action::Reject => crate::killswitch::Verdict::Refuse,
+        }
+    }
+
+    /// After the route is known (a plain dial, or once sniffing finished).
+    fn prepare_dial(&self, dial: &Dial) -> PrepareDial {
+        PrepareDial::Now(dial.clone())
+    }
+}
+
+/// What to do with a dial once the TCP flow exists.
+pub enum PrepareDial {
+    Now(Dial),
+    Hold(Dial, HoldGuard),
+    Refuse,
 }
 
 fn ip_route(rules: &RuleSet, key: &FlowKey) -> Option<Dial> {
@@ -2036,6 +2069,16 @@ impl TunKernel {
             Dial::from_action(&action, TargetAddr::Domain(e.domain))
         }))
     }
+
+    /// Kill switch for a route known at the SYN. Strict while reconnecting
+    /// resets the SYN; Wait accepts it and holds the dial.
+    fn gate_tcp(&self, dial: Dial) -> TcpRoute {
+        match self.kernel.preview(&action_of(&dial), false) {
+            crate::killswitch::Admission::Refuse => TcpRoute::Refuse,
+            crate::killswitch::Admission::Proceed => TcpRoute::Dial(dial),
+            crate::killswitch::Admission::Hold => TcpRoute::Wait(dial),
+        }
+    }
 }
 
 impl TunRouter for TunKernel {
@@ -2049,7 +2092,10 @@ impl TunRouter for TunKernel {
             return TcpRoute::Refuse;
         }
         if let Some(fake) = self.fake(&policy, key) {
-            return fake.map_or(TcpRoute::Refuse, TcpRoute::Dial);
+            return match fake {
+                Some(d) => self.gate_tcp(d),
+                None => TcpRoute::Refuse,
+            };
         }
         let rules = &policy.rules;
         if let Some(s) = self.kernel.sniff {
@@ -2059,7 +2105,7 @@ impl TunRouter for TunKernel {
             }
             return TcpRoute::Sniff(s);
         }
-        ip_route(rules, key).map_or(TcpRoute::Refuse, TcpRoute::Dial)
+        ip_route(rules, key).map_or(TcpRoute::Refuse, |d| self.gate_tcp(d))
     }
 
     fn sniffed(&self, key: &FlowKey, found: &Sniff) -> Option<Dial> {
@@ -2087,6 +2133,25 @@ impl TunRouter for TunKernel {
             None => UdpRoute::Refuse,
             Some(d) if crate::udp::plain(&self.kernel, ip) => UdpRoute::Plain(d),
             Some(d) => UdpRoute::Dial(d),
+        }
+    }
+
+    fn take_wait_slot(&self) -> Option<HoldGuard> {
+        self.kernel.try_hold()
+    }
+
+    fn flow_verdict(&self, action: &Action) -> crate::killswitch::Verdict {
+        self.kernel.verdict_of(action)
+    }
+
+    fn prepare_dial(&self, dial: &Dial) -> PrepareDial {
+        match self.kernel.preview(&action_of(dial), false) {
+            crate::killswitch::Admission::Proceed => PrepareDial::Now(dial.clone()),
+            crate::killswitch::Admission::Refuse => PrepareDial::Refuse,
+            crate::killswitch::Admission::Hold => match self.kernel.try_hold() {
+                Some(guard) => PrepareDial::Hold(dial.clone(), guard),
+                None => PrepareDial::Refuse,
+            },
         }
     }
 }
@@ -2143,6 +2208,9 @@ struct Pipe {
 
 enum TcpPlan {
     Dial(Dial),
+    /// Accepted while the kill switch said Wait. The guard counts against
+    /// the cap until the wait ends.
+    Hold(Dial, HoldGuard),
     Sniff(SniffSettings),
     Dns,
 }
@@ -2449,6 +2517,15 @@ fn policy(
                     let tag = d.tag.clone();
                     (TcpPlan::Dial(d), tag)
                 }
+                TcpRoute::Wait(d) => {
+                    // Over the hold cap: reset the SYN, same as a strict refusal.
+                    let Some(guard) = router.take_wait_slot() else {
+                        return Verdict::Refuse;
+                    };
+                    let tag = d.tag.clone();
+                    tcp_plans.insert(*key, TcpPlan::Hold(d, guard));
+                    return Verdict::Accept(tag);
+                }
             };
             tcp_plans.insert(*key, plan);
             Verdict::Accept(tag)
@@ -2709,9 +2786,38 @@ fn try_write<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, buf: &[u8]) -> Option<
     }
 }
 
+fn action_of(dial: &Dial) -> Action {
+    match &dial.tag {
+        Some(tag) => Action::Proxy(tag.clone()),
+        None => Action::Direct,
+    }
+}
+
+/// Hold `dial` until the kill switch allows it, or the flow is gone.
+/// `None`: refuse — the deadline passed, the posture left Wait for a
+/// refusal, or the application reset the flow. The guard is dropped either
+/// way, so the cap slot does not outlive the wait.
+async fn hold_dial(ctx: &Ctx, dial: Dial, guard: HoldGuard, up: &mpsc::Sender<Up>) -> Option<Dial> {
+    let action = action_of(&dial);
+    let verdict = tokio::select! {
+        verdict = crate::killswitch::wait_out(|| ctx.router.flow_verdict(&action)) => verdict,
+        _ = up.closed() => {
+            drop(guard);
+            return None;
+        }
+    };
+    drop(guard);
+    match verdict {
+        crate::killswitch::Verdict::Proxy(_) | crate::killswitch::Verdict::Direct => Some(dial),
+        _ => None,
+    }
+}
+
 /// Per-flow task: decide (sniff), dial, then relay both directions with
 /// half-close. A refusal or failed dial resets the flow; nothing is retried
-/// direct (§5.4).
+/// direct (§5.4). A [`TcpPlan::Hold`] keeps the accepted flow (no RST) until
+/// the posture allows the dial or the wait deadline passes, and then resets
+/// it the same way a failed dial does.
 async fn relay(
     ctx: Arc<Ctx>,
     plan: TcpPlan,
@@ -2723,6 +2829,13 @@ async fn relay(
     let dial = match plan {
         TcpPlan::Dns => return dns_tcp(&ctx, &link, down, up).await,
         TcpPlan::Dial(d) => d,
+        TcpPlan::Hold(d, guard) => {
+            let Some(d) = hold_dial(&ctx, d, guard, &up).await else {
+                send_up(&ctx, &up, Up::Abort).await;
+                return;
+            };
+            d
+        }
         TcpPlan::Sniff(s) => {
             let mut found = Sniff::NeedMore;
             let deadline = tokio::time::sleep(s.timeout);
@@ -2747,11 +2860,25 @@ async fn relay(
                 }
             }
             withdraw(&link, &mut down);
-            match ctx.router.sniffed(&key, &found) {
+            let dial = match ctx.router.sniffed(&key, &found) {
                 Some(d) => d,
                 None => {
                     send_up(&ctx, &up, Up::Abort).await;
                     return;
+                }
+            };
+            match ctx.router.prepare_dial(&dial) {
+                PrepareDial::Now(d) => d,
+                PrepareDial::Refuse => {
+                    send_up(&ctx, &up, Up::Abort).await;
+                    return;
+                }
+                PrepareDial::Hold(d, guard) => {
+                    let Some(d) = hold_dial(&ctx, d, guard, &up).await else {
+                        send_up(&ctx, &up, Up::Abort).await;
+                        return;
+                    };
+                    d
                 }
             }
         }

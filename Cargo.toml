@@ -69,12 +69,16 @@ prost = "0.14"
 rand = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 regex = "1"
-quinn = { version = "=0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# Pure-Rust zstd decoder. The `zstd` crate links libzstd, which iOS and Android
+# cross builds would have to compile as C; rule-set reads only need a decoder.
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 # Named only for congestion-controller callback types; quinn selects the features.
-quinn-proto = { version = "=0.11.16", default-features = false }
+quinn-proto = { version = "=0.11.19", default-features = false }
 rustls = { version = "0.23.40", default-features = false, features = ["aws_lc_rs", "brotli", "logging", "ring", "std", "tls12", "zlib"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "0.10"
 sha1 = "0.11"
 sha2 = "0.11"
 smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }

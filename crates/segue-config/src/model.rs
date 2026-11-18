@@ -98,8 +98,26 @@ pub enum RoutingBalancerStrategy {
     #[default]
     Random,
     RoundRobin,
-    LeastPing,
+    LeastPing(RoutingLeastPingSettings),
     LeastLoad(RoutingLeastLoadSettings),
+}
+
+/// Segue's hysteresis for Xray's `leastPing`, in sing-box's urltest style.
+///
+/// Xray has no `leastPing` settings. This separately named model field defaults
+/// to 50 ms, while leastLoad's fractional failure `tolerance` is unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoutingLeastPingSettings {
+    pub ping_tolerance: Option<Duration>,
+}
+
+impl RoutingLeastPingSettings {
+    /// sing-box urltest `tolerance` (`constant.DefaultURLTestTolerance`).
+    pub const DEFAULT_PING_TOLERANCE: Duration = Duration::from_millis(50);
+
+    pub fn effective_ping_tolerance(self) -> Duration {
+        self.ping_tolerance.unwrap_or(Self::DEFAULT_PING_TOLERANCE)
+    }
 }
 
 /// Bounded subset of Xray's `leastLoad` strategy settings.
@@ -113,8 +131,20 @@ pub struct RoutingLeastLoadSettings {
     pub expected: u8,
     pub max_rtt: Option<Duration>,
     pub tolerance_millionths: u32,
+    /// Segue's optional incumbent hysteresis, in sing-box urltest milliseconds.
+    /// `None` uses [`RoutingLeastPingSettings::DEFAULT_PING_TOLERANCE`]. It does
+    /// not replace Xray's fractional `tolerance`, and the spread across `expected`
+    /// candidates stays random.
+    pub ping_tolerance: Option<Duration>,
     pub baselines: Vec<Duration>,
     pub costs: Vec<RoutingLeastLoadCost>,
+}
+
+impl RoutingLeastLoadSettings {
+    pub fn effective_ping_tolerance(&self) -> Duration {
+        self.ping_tolerance
+            .unwrap_or(RoutingLeastPingSettings::DEFAULT_PING_TOLERANCE)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +365,45 @@ pub struct DnsFakeIpConfig {
     pub ipv4_pool: IpCidr,
     pub pool_size: u32,
     pub ttl: u32,
+    /// Names that keep real answers instead of a fake IP, as Xray domain
+    /// rules. Absent or `null` selects [`default_fake_ip_exempt_domains`]; an
+    /// empty list exempts nothing, which is the behaviour without this field.
+    pub exempt_domains: DomainMatcherSet,
+}
+
+/// Names that keep real answers under `dns.fakeIp` unless the configuration
+/// replaces the list: captive-portal probes, NTP and local-network names.
+///
+/// A fake IP breaks these: a captive-portal check must see the network's own
+/// answer, NTP must reach a real time source, and a `.lan` or `.local` name
+/// must resolve on the local network rather than be proxied. Xray-core has no
+/// such filter; this is a Segue extension, and `"exemptDomains": []` turns it
+/// off.
+pub const DEFAULT_FAKE_IP_EXEMPT_DOMAINS: &[&str] = &[
+    "full:captive.apple.com",
+    "full:connectivitycheck.gstatic.com",
+    "full:www.msftconnecttest.com",
+    "domain:ntp.org",
+    "full:time.apple.com",
+    "domain:lan",
+    "domain:local",
+];
+
+/// The compiled form of the built-in `DEFAULT_FAKE_IP_EXEMPT_DOMAINS` list.
+pub fn default_fake_ip_exempt_domains() -> DomainMatcherSet {
+    let matchers: Vec<DomainMatcher> = DEFAULT_FAKE_IP_EXEMPT_DOMAINS
+        .iter()
+        .map(|rule| match rule.strip_prefix("full:") {
+            Some(name) => DomainMatcher::Full(name.to_owned()),
+            None => DomainMatcher::Suffix(
+                rule.strip_prefix("domain:")
+                    .expect("a default exemption is a full: or domain: rule")
+                    .to_owned(),
+            ),
+        })
+        .collect();
+    DomainMatcherSet::compile(&matchers, DomainNameMode::Dns)
+        .expect("the built-in fake-IP exemptions are valid domain rules")
 }
 
 /// A routing rule. Each condition is `None` when the rule sets none and
@@ -920,6 +989,9 @@ pub struct SocksInboundSettings {
     /// `REP = 0x07`, as Xray-core does for `"udp": false`. The parser keeps an
     /// absent `udp` enabled, unlike Xray-core, which reads it as false.
     pub udp: bool,
+    /// `ip`: where the `UDP ASSOCIATE` relay binds and where its reply sends
+    /// the client. When unset, the local IP of the client's TCP connection.
+    pub udp_address: Option<std::net::IpAddr>,
 }
 
 impl Default for SocksInboundSettings {
@@ -929,6 +1001,7 @@ impl Default for SocksInboundSettings {
         Self {
             auth: segue_proxy::inbound::SocksInboundAuth::NoAuth,
             udp: true,
+            udp_address: None,
         }
     }
 }
@@ -1156,6 +1229,11 @@ pub enum OutboundProtocol {
     Socks,
     Http,
     Masque,
+    /// AnyTLS, which Xray-core does not have; the spelling follows sing-box's
+    /// `"type": "anytls"`.
+    AnyTls,
+    /// TUIC v5, which Xray-core does not have.
+    Tuic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1173,6 +1251,8 @@ pub enum OutboundSettings {
     Socks(SocksOutboundSettings),
     Http(HttpOutboundSettings),
     Masque(MasqueOutboundSettings),
+    AnyTls(AnyTlsOutboundSettings),
+    Tuic(TuicSettings),
 }
 
 impl OutboundSettings {
@@ -1191,7 +1271,53 @@ impl OutboundSettings {
             Self::Socks(_) => OutboundProtocol::Socks,
             Self::Http(_) => OutboundProtocol::Http,
             Self::Masque(_) => OutboundProtocol::Masque,
+            Self::AnyTls(_) => OutboundProtocol::AnyTls,
+            Self::Tuic(_) => OutboundProtocol::Tuic,
         }
+    }
+}
+
+/// A TUIC v5 QUIC client, using sing-box's outbound field names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TuicCongestionControl {
+    Cubic,
+    #[default]
+    NewReno,
+    Bbr,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TuicUdpRelayMode {
+    #[default]
+    Native,
+    Quic,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TuicSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    pub uuid: uuid::Uuid,
+    pub password: zeroize::Zeroizing<String>,
+    pub congestion_control: TuicCongestionControl,
+    pub udp_relay_mode: TuicUdpRelayMode,
+    pub zero_rtt_handshake: bool,
+    pub heartbeat: std::time::Duration,
+}
+
+impl fmt::Debug for TuicSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TuicSettings")
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("uuid", &"<redacted>")
+            .field("password", &"<redacted>")
+            .field("congestion_control", &self.congestion_control)
+            .field("udp_relay_mode", &self.udp_relay_mode)
+            .field("zero_rtt_handshake", &self.zero_rtt_handshake)
+            .field("heartbeat", &self.heartbeat)
+            .finish()
     }
 }
 
@@ -1713,6 +1839,54 @@ impl fmt::Debug for TrojanOutboundSettings {
             .field("server", &self.server)
             .field("port", &self.port)
             .field("password", &"<redacted>")
+            .field("level", &self.level)
+            .finish()
+    }
+}
+
+/// Sessions one AnyTLS outbound keeps at once, idle and busy. The engine's
+/// pool enforces the same bound; the parser refuses a `min_idle_session` it
+/// could never honour.
+pub const MAX_ANYTLS_IDLE_SESSIONS: usize = 8;
+
+/// AnyTLS outbound settings, named as sing-box and mihomo name them. AnyTLS
+/// has no Xray-core protocol, so the field names follow
+/// `option.AnyTLSOutboundOptions`: `password`,
+/// `idle_session_check_interval`, `idle_session_timeout`, `min_idle_session`
+/// and `client_metadata`, beside the server address and port every outbound
+/// here uses. The server is TLS-only, through the outbound's own
+/// `streamSettings`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AnyTlsOutboundSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    pub password: zeroize::Zeroizing<String>,
+    /// How often the pool retires idle sessions. Zero takes the reference's
+    /// thirty-second floor.
+    pub idle_session_check_interval: Duration,
+    /// How long a session with no stream stays reusable. Zero takes the
+    /// reference's thirty-second floor.
+    pub idle_session_timeout: Duration,
+    /// Idle sessions the cleanup always keeps.
+    pub min_idle_session: usize,
+    /// Replaces the client version string the settings frame reports.
+    pub client_metadata: Option<String>,
+    pub level: u32,
+}
+
+impl fmt::Debug for AnyTlsOutboundSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnyTlsOutboundSettings")
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("password", &"<redacted>")
+            .field(
+                "idle_session_check_interval",
+                &self.idle_session_check_interval,
+            )
+            .field("idle_session_timeout", &self.idle_session_timeout)
+            .field("min_idle_session", &self.min_idle_session)
+            .field("client_metadata", &self.client_metadata)
             .field("level", &self.level)
             .finish()
     }
@@ -2852,6 +3026,7 @@ pub enum StreamSecurity {
     None,
     Tls(TlsSettings),
     Reality(RealitySettings),
+    ShadowTls(ShadowTlsSettings),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2874,6 +3049,11 @@ pub struct TlsSettings {
     pub allow_insecure: bool,
     /// `tlsSettings.alpn`, verbatim.
     pub alpn: Vec<String>,
+    /// Decoded `tlsSettings.echConfigList`: a base64 ECHConfigList, as
+    /// Xray-core's `ECHConfigList` carries it. `None` means no ECH, which is
+    /// also what an empty string means in Xray. The DNS-resolver forms
+    /// (`udp://`, `https://`, `name+https://`) are refused by the parser.
+    pub ech_config_list: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2884,6 +3064,13 @@ pub struct RealitySettings {
     pub short_id: RealityShortId,
     pub spider_x: String,
     pub mldsa65_verify: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowTlsSettings {
+    pub password: zeroize::Zeroizing<String>,
+    /// The real TLS server's options. Raw TCP only, always version 3.
+    pub tls: TlsSettings,
 }
 
 #[derive(Clone, PartialEq, Eq)]

@@ -402,12 +402,14 @@ fn lab_full(
             carrier: "reality-la".into(),
             relay: "127.0.0.1:7443".parse().unwrap(),
             node_id: 1,
+            egress_group: String::new(),
         },
         Exit {
             name: "ny".into(),
             carrier: "hy2-ny".into(),
             relay: "127.0.0.1:7444".parse().unwrap(),
             node_id: 2,
+            egress_group: String::new(),
         },
     ];
     let route = |c| SegueRoute {
@@ -534,6 +536,104 @@ async fn connected_then_lost_is_reconnecting_and_refuses_ai() {
     assert!(l.d.probe().await.is_err());
     assert_eq!(l.d.posture(), Posture::Reconnecting);
     assert!(l.d.dial(Some("ai"), &site(), 443).await.is_err());
+}
+
+/// AI under Auto pins the exit it first uses. When that exit is down it
+/// is refused, not moved to an exit in another egress group. Overseas
+/// still fails over. Two exits in one group may take the AI flow.
+#[tokio::test]
+async fn ai_auto_does_not_leave_its_egress_group() {
+    let l = lab();
+    l.d.probe().await.unwrap();
+    roundtrip(l.d.dial(Some("ai"), &site(), 443).await.unwrap()).await;
+    assert_eq!(
+        l.ny_carriers.load(Ordering::SeqCst),
+        0,
+        "first pin was not la"
+    );
+    l.la_up.store(false, Ordering::SeqCst);
+    // Probe moves Auto's overseas pick to ny. The AI pin stays on la.
+    let _ = l.d.probe().await;
+    assert!(
+        l.ny_carriers.load(Ordering::SeqCst) >= 1,
+        "ny was not probed"
+    );
+    let ny_before = l.ny_carriers.load(Ordering::SeqCst);
+    let t = Instant::now();
+    let Err(e) = l.d.dial(Some("ai"), &site(), 443).await else {
+        panic!("the AI dial was not refused");
+    };
+    assert!(e.0.contains("strict"), "{e}");
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "not refused at once"
+    );
+    assert_eq!(
+        l.ny_carriers.load(Ordering::SeqCst),
+        ny_before,
+        "AI moved to ny"
+    );
+    // Overseas is not pinned: it uses the exit Auto is on now.
+    roundtrip(l.d.dial(Some("overseas"), &site(), 443).await.unwrap()).await;
+    assert!(l.ny_carriers.load(Ordering::SeqCst) > ny_before);
+
+    // Same egress group: the AI flow may move from la to ny.
+    let mut l = lab();
+    l.d.set_egress_group("la", "iad").unwrap();
+    l.d.set_egress_group("ny", "iad").unwrap();
+    l.d.probe().await.unwrap();
+    roundtrip(l.d.dial(Some("ai"), &site(), 443).await.unwrap()).await;
+    l.la_up.store(false, Ordering::SeqCst);
+    let _ = l.d.probe().await;
+    roundtrip(l.d.dial(Some("ai"), &site(), 443).await.unwrap()).await;
+    assert!(
+        l.ny_carriers.load(Ordering::SeqCst) >= 1,
+        "AI did not move inside the egress group"
+    );
+}
+
+/// The user naming an exit, or returning to Auto, replaces the AI pin.
+/// A fresh session after that follows the new choice.
+#[test]
+fn user_exit_change_resets_the_ai_pin() {
+    let mut st = State {
+        user_off: false,
+        revoked: None,
+        choice: None,
+        choice_gen: 0,
+        ai_pin: None,
+        health: vec![Health::new(), Health::new()],
+    };
+    st.health[0].ks.on_event(Event::ChannelUp);
+    let groups = vec!["la".to_string(), "ny".to_string()];
+    assert_eq!(st.pick_ai(&groups), 0, "first Auto pin");
+    assert_eq!(st.pick_ai(&groups), 0);
+    st.health[0].ks.on_event(Event::ChannelLost);
+    assert_eq!(st.pick_ai(&groups), 0, "down pin does not leave its group");
+    // User names ny.
+    st.choice = Some(1);
+    st.choice_gen += 1;
+    st.ai_pin = Some(1);
+    assert_eq!(st.pick_ai(&groups), 1);
+    // Back to Auto: the dialer clears the pin. Re-pin from scratch.
+    st.choice = None;
+    st.ai_pin = None;
+    st.health[1].ks.on_event(Event::ChannelUp);
+    assert_eq!(st.pick_ai(&groups), 1, "Auto re-pins the exit that is up");
+    // Same group, la down, ny up: the pin may move.
+    let mut st = State {
+        user_off: false,
+        revoked: None,
+        choice: None,
+        choice_gen: 0,
+        ai_pin: Some(0),
+        health: vec![Health::new(), Health::new()],
+    };
+    st.health[0].ks.on_event(Event::ChannelLost);
+    st.health[1].ks.on_event(Event::ChannelUp);
+    let same = vec!["iad".to_string(), "iad".to_string()];
+    assert_eq!(st.pick_ai(&same), 1);
+    assert_eq!(st.ai_pin, Some(1));
 }
 
 #[tokio::test]
@@ -1209,6 +1309,7 @@ mod exit_health {
             revoked: None,
             choice: None,
             choice_gen: 0,
+            ai_pin: None,
             health: vec![exit()],
         }));
         let a = HealthReporter::new(st.clone(), 0);
@@ -1606,8 +1707,10 @@ fn la_posture(l: &Lab) -> Posture {
     l.d.state.lock().unwrap().health[0].ks.posture()
 }
 
-/// A strict (AI) flow on la is refused at once by la's health (la is
-/// chosen manually: under Auto the flow would rightly move to ny).
+/// A strict (AI) flow on la is refused at once by la's health. The exit
+/// is named so the pin is la even if Auto would otherwise be on ny; an
+/// AI pin does not leave its egress group either
+/// ([`ai_auto_does_not_leave_its_egress_group`]).
 async fn ai_refused_fast(l: &Lab, what: &str) {
     l.d.set_exit("la").unwrap();
     let t = Instant::now();

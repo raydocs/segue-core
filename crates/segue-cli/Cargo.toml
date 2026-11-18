@@ -17,5 +17,5 @@ libc.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-segue-config = { path = "../segue-config" }
+segue-config = { path = "../segue-config", features = ["import"] }
 segue-engine = { path = "../segue-engine" }

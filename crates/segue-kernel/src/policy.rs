@@ -19,9 +19,15 @@
 //!  "chnroute": ["1.0.1.0/24"]}
 //! ```
 //!
-//! `ai_domains` become domain-suffix rules to the kernel's AI route (which
-//! must be a `home` role route), ahead of `rules`. `chnroute` is the
-//! domestic IP set the smart DNS uses to tell polluted answers apart.
+//! `ai_domains` and `ai_cidrs` are the bundle's AI list (the same fields the
+//! relay reads). The kernel merges them with the built-in list
+//! ([`crate::rules::builtin_ai_list`]) into a first-tier match that beats
+//! every user rule except an explicit reject. There is no separate `ai`
+//! object and no version gate: those two fields have been in the body since
+//! the signed format, and skipping the built-in list on an older `version`
+//! would leave that bundle able to send Claude or ChatGPT direct. A bundle
+//! that omits a built-in name still locks it. `chnroute` is the domestic IP
+//! set the smart DNS uses to tell polluted answers apart.
 //!
 //! A bundle is installed only if its signature verifies under a configured
 //! key, its `version` is above every version seen so far (no rollback; the
@@ -38,7 +44,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::rules::{Action, Cidr, CidrTable, Matcher, Rule, RuleSet, RuleSpec};
+use crate::rules::{Action, Cidr, CidrTable, RuleSet, RuleSpec};
 
 // Envelope format and signature check are shared with the relay, which
 // reads its AI set from the same signed bundle (KERNEL_SPEC §5.5 item 7).
@@ -281,27 +287,24 @@ impl Verifier {
 
     fn compile(&self, b: &Body) -> Result<Policy, PolicyError> {
         let bad = PolicyError::Incompatible;
-        let mut rules = Vec::with_capacity(b.ai_domains.len() + b.ai_cidrs.len() + b.rules.len());
-        // The AI set is accepted or refused by the same function the relay
-        // uses (review r5 N3), so one signed bundle means the same on both
-        // ends; the entries are then already canonical.
+        // The signed AI set is accepted or refused by the same function the
+        // relay uses (review r5 N3). The kernel then adds its built-in list,
+        // which the relay does not see: a name only the kernel locks is sent
+        // to the AI exit, and the relay's home whitelist may refuse it. That
+        // is a failed dial, not a direct connection.
         segue_policy::AiSet::parse(&b.ai_domains, &b.ai_cidrs).map_err(bad)?;
+        let (mut suffixes, mut ai_ips) = crate::rules::builtin_ai_list();
         for d in &b.ai_domains {
             let d = segue_policy::canonical_domain(d).expect("checked by AiSet::parse");
-            rules.push(Rule {
-                matcher: Matcher::DomainSuffix(d),
-                action: Action::Proxy(self.ai_route.clone()),
-            });
+            if !suffixes.iter().any(|s| s == &d) {
+                suffixes.push(d);
+            }
         }
-        let mut ai_ips = Vec::with_capacity(b.ai_cidrs.len());
         for (i, c) in b.ai_cidrs.iter().enumerate() {
             let cidr = Cidr::parse(c).map_err(|e| bad(format!("ai_cidrs[{i}]: {e}")))?;
             ai_ips.push(cidr);
-            rules.push(Rule {
-                matcher: Matcher::Cidr(cidr),
-                action: Action::Proxy(self.ai_route.clone()),
-            });
         }
+        let mut rules = Vec::with_capacity(b.rules.len());
         let ech_public_names = b
             .ech_public_names
             .iter()
@@ -321,7 +324,11 @@ impl Verifier {
             };
             rules.push(r.into_rule().map_err(|e| bad(format!("rules[{i}]: {e}")))?);
         }
-        let set = RuleSet::new(rules, b.default.clone());
+        let set = RuleSet::new(rules, b.default.clone()).with_ai(
+            suffixes,
+            &ai_ips,
+            Action::Proxy(self.ai_route.clone()),
+        );
         for tag in set.proxy_tags() {
             if !self.known.contains(tag) {
                 return Err(bad(format!("refers to unknown route {tag:?}")));
@@ -774,8 +781,44 @@ mod tests {
             &Action::Proxy("overseas".into())
         );
         assert!(p.chnroute.contains("36.1.1.1".parse().unwrap()));
+        // Built-in names are AI even though this bundle only lists openai.com.
+        assert_eq!(
+            p.rules.decide(&dom("api.anthropic.com")),
+            &Action::Proxy("ai".into())
+        );
         let st = s.status_at(NOW);
         assert_eq!((st.valid, st.version, st.high_water), (true, Some(3), 3));
+    }
+
+    /// A user Direct for an AI name loses. An explicit Reject still blocks.
+    #[test]
+    fn ai_tier_beats_a_direct_rule_and_loses_to_reject() {
+        let k = keys();
+        let v = verifier(&k);
+        let open = |rules: &str| {
+            let body = format!(
+                r#"{{"version":1,"expires_at":{},"ai_domains":[],"rules":{rules},
+                    "default":{{"type":"proxy","outbound":"overseas"}}}}"#,
+                NOW + 100
+            );
+            v.open(sign(&k.key, 1, body.as_bytes()).unwrap().as_bytes())
+                .unwrap()
+                .1
+        };
+        let direct = open(r#"[{"domain_suffix":"claude.ai","action":{"type":"direct"}}]"#);
+        assert_eq!(
+            direct.rules.decide(&dom("api.claude.ai")),
+            &Action::Proxy("ai".into())
+        );
+        let blocked = open(r#"[{"domain_suffix":"openai.com","action":{"type":"reject"}}]"#);
+        assert_eq!(
+            blocked.rules.decide(&dom("api.openai.com")),
+            &Action::Reject
+        );
+        assert_eq!(
+            blocked.rules.decide(&dom("claude.ai")),
+            &Action::Proxy("ai".into())
+        );
     }
 
     #[test]

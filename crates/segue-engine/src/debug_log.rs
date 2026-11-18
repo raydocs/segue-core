@@ -29,6 +29,8 @@ pub(crate) fn tcp_outbound_label(outbound: &TcpOutbound) -> &'static str {
         TcpOutbound::Hysteria(_) => "hysteria",
         TcpOutbound::Wireguard(_) => "wireguard",
         TcpOutbound::Masque(_) => "masque",
+        TcpOutbound::AnyTls(_) => "anytls",
+        TcpOutbound::Tuic(_) => "tuic",
         TcpOutbound::Chained { .. } => unreachable!("primary outbound is never a chain wrapper"),
     }
 }
@@ -44,6 +46,8 @@ pub(crate) fn udp_outbound_label(outbound: &UdpOutbound) -> &'static str {
         UdpOutbound::Hysteria(_) => "hysteria",
         UdpOutbound::Wireguard(_) => "wireguard",
         UdpOutbound::Masque(_) => "masque",
+        UdpOutbound::AnyTls(_) => "anytls",
+        UdpOutbound::Tuic(_) => "tuic",
     }
 }
 

@@ -332,6 +332,60 @@
       }
     },
     {
+      "name": "balancer-least-ping",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "protocol": "socks",
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            },
+            "tag": "socks-in"
+          }
+        ],
+        "outbounds": [
+          {
+            "protocol": "freedom",
+            "tag": "direct"
+          }
+        ],
+        "routing": {
+          "domainStrategy": "IPIfNonMatch",
+          "balancers": [
+            {
+              "tag": "select",
+              "selector": [
+                "direct"
+              ],
+              "fallbackTag": "direct",
+              "strategy": {
+                "type": "leastPing",
+                "settings": {
+                  "pingTolerance": "50ms"
+                }
+              }
+            }
+          ],
+          "rules": [
+            {
+              "type": "field",
+              "domain": [
+                "domain:example"
+              ],
+              "balancerTag": "select"
+            }
+          ]
+        }
+      },
+      "objects": {
+        "LEAST_PING": "/routing/balancers/0/strategy/settings"
+      }
+    },
+    {
       "name": "transport-chain",
       "config": {
         "inbounds": [
@@ -2416,6 +2470,159 @@
       },
       "objects": {
         "TROJAN": "/outbounds/0/settings"
+      }
+    },
+    {
+      "name": "anytls",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": {}
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "anytls",
+            "settings": {
+              "address": "anytls.example",
+              "port": 443,
+              "password": "synthetic-example-anytls-password",
+              "idle_session_check_interval": "30s",
+              "idle_session_timeout": "30s",
+              "min_idle_session": 1,
+              "client_metadata": "synthetic-client"
+            },
+            "streamSettings": {
+              "network": "raw",
+              "security": "tls",
+              "tlsSettings": {
+                "serverName": "anytls.example"
+              }
+            }
+          }
+        ],
+        "dns": {
+          "queryStrategy": "UseIPv4",
+          "fakeIp": {
+            "enabled": true,
+            "ipv4Pool": "198.19.0.0/16",
+            "poolSize": 32768,
+            "ttl": 60
+          }
+        },
+        "routing": {
+          "domainStrategy": "AsIs",
+          "rules": []
+        }
+      },
+      "objects": {
+        "ANYTLS": "/outbounds/0/settings"
+      }
+    },
+    {
+      "name": "tuic",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": {}
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "tuic",
+            "settings": {
+              "server": "tuic.example",
+              "port": 443,
+              "uuid": "00010203-0405-0607-0809-0a0b0c0d0e0f",
+              "password": "synthetic-tuic-example-password",
+              "congestion_control": "bbr",
+              "udp_relay_mode": "native",
+              "zero_rtt_handshake": true,
+              "heartbeat": "10s"
+            },
+            "streamSettings": {
+              "network": "udp",
+              "security": "tls",
+              "tlsSettings": {
+                "serverName": "tuic.example",
+                "alpn": [
+                  "h3"
+                ]
+              }
+            }
+          }
+        ],
+        "dns": {
+          "queryStrategy": "UseIPv4"
+        },
+        "routing": {
+          "domainStrategy": "AsIs",
+          "rules": []
+        }
+      },
+      "objects": {
+        "TUIC": "/outbounds/0/settings"
+      }
+    },
+    {
+      "name": "shadowtls",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": {}
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+              "vnext": [
+                {
+                  "address": "server.example",
+                  "port": 443,
+                  "users": [
+                    {
+                      "id": "00010203-0405-0607-0809-0a0b0c0d0e0f",
+                      "encryption": "none"
+                    }
+                  ]
+                }
+              ]
+            },
+            "streamSettings": {
+              "network": "raw",
+              "security": "shadowtls",
+              "shadowtlsSettings": {
+                "password": "synthetic-shadowtls-password",
+                "version": 3,
+                "serverName": "cover.example",
+                "fingerprint": "chrome"
+              }
+            }
+          }
+        ],
+        "dns": {
+          "queryStrategy": "UseIPv4"
+        },
+        "routing": {
+          "domainStrategy": "AsIs",
+          "rules": []
+        }
+      },
+      "objects": {
+        "SHADOWTLS": "/outbounds/0/streamSettings/shadowtlsSettings"
       }
     },
     {

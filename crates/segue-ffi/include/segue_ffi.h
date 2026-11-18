@@ -399,7 +399,10 @@ XrayStatus xray_core_rebind_wireguard(
  * Concurrent with data-path calls, but not lifecycle/free. Lazy clients stay lazy.
  * The same call moves every other live QUIC carrier (XHTTP, MASQUE and XDRIVE
  * storages over HTTP/3) to a fresh protected socket and counts them too; one
- * that fails to bind keeps its current socket. */
+ * that fails to bind keeps its current socket. An mKCP connection on its own
+ * UDP socket cannot move and is counted as well: it fails, its flows with it,
+ * at once if its source address changed and otherwise unless its peer is heard
+ * within seconds of the call. */
 XrayStatus xray_core_rebind_hysteria(
     XrayCoreHandle *handle,
     uint64_t *accepted,
@@ -587,6 +590,86 @@ XrayStatus xray_tun_stats(
     XrayCoreHandle *handle,
     XrayTunStats *stats,
     XrayError **error);
+
+/* Kernel declarations are present only when the embedding build opts into the
+ * proprietary-kernel feature. The default header's preprocessed text and the
+ * existing ABI remain unchanged. Stage 1 declares types; entry-point bodies
+ * arrive with their respective stages. */
+#ifdef XRAY_FFI_WITH_PROPRIETARY_KERNEL
+
+#define XRAY_FFI_CAPABILITY_KERNEL (UINT64_C(1) << 31)
+#define XRAY_FFI_CAPABILITY_KERNEL_KILLSWITCH (UINT64_C(1) << 32)
+#define XRAY_FFI_CAPABILITY_KERNEL_POLICY (UINT64_C(1) << 33)
+#define XRAY_FFI_CAPABILITY_KERNEL_DNS (UINT64_C(1) << 34)
+#define XRAY_FFI_CAPABILITY_KERNEL_STATS (UINT64_C(1) << 35)
+#define XRAY_FFI_CAPABILITY_KERNEL_TUN_FD (UINT64_C(1) << 36)
+
+typedef enum XrayKernelEventKind {
+  XRAY_KERNEL_EVENT_POSTURE_CHANGED = 0,
+  XRAY_KERNEL_EVENT_EXIT_CHANGED = 1,
+  XRAY_KERNEL_EVENT_POLICY_CHANGED = 2,
+  XRAY_KERNEL_EVENT_REVOKED = 3,
+  XRAY_KERNEL_EVENT_CONTROL_REFUSED = 4
+} XrayKernelEventKind;
+
+/* value uses connecting=0, connected=1, reconnecting=2, error=3 and
+ * disconnected=4 for a posture event. */
+typedef struct XrayKernelEvent {
+  /* in: caller allocation size; out: preserved */
+  size_t struct_size;
+  XrayKernelEventKind kind;
+  uint64_t value;
+  uint64_t timestamp_ms; /* monotonic milliseconds, for ordering only */
+} XrayKernelEvent;
+
+/* Append-only structure, with the same struct_size prefix contract as
+ * XrayTunStats. The implementation arrives with the kernel stats surface. */
+typedef struct XrayKernelStats {
+  size_t struct_size;
+  uint64_t tcp_accepted;
+  uint64_t tcp_refused_policy;
+  uint64_t udp_refused_policy;
+  uint64_t udp_refused_quic;
+  uint64_t fakeip_entries;
+  uint64_t fakeip_refusals;
+  uint64_t dns_cache_entries;
+  uint64_t dns_upstream_queries;
+  uint64_t session_opens;
+  uint64_t session_resumes;
+  uint64_t session_carrier_failures;
+  uint64_t policy_installs;
+  uint64_t policy_refusals;
+} XrayKernelStats;
+
+/* ABI 1.18 shape declarations. Link these only with a build that advertises
+ * the corresponding capability AND provides the staged function. Stage 1
+ * reserves the C surface but intentionally exports no xray_kernel_* symbol. */
+XrayStatus xray_kernel_load_config_json(
+    XrayCoreHandle *handle, const char *json, XrayError **error);
+XrayStatus xray_kernel_set_state_dir(
+    XrayCoreHandle *handle, const char *dir, XrayError **error);
+XrayStatus xray_kernel_config_warnings(
+    XrayCoreHandle *handle, char *buffer, size_t buffer_len,
+    size_t *written, XrayError **error);
+XrayStatus xray_kernel_set_user_enabled(
+    XrayCoreHandle *handle, int32_t enabled, XrayError **error);
+XrayStatus xray_kernel_set_exit(
+    XrayCoreHandle *handle, const char *name, XrayError **error);
+XrayStatus xray_kernel_probe(XrayCoreHandle *handle, XrayError **error);
+XrayStatus xray_kernel_poll_event(
+    XrayCoreHandle *handle, XrayKernelEvent *event,
+    char *detail_buffer, size_t detail_buffer_len, size_t *detail_written,
+    XrayError **error);
+XrayStatus xray_kernel_install_policy_bundle(
+    XrayCoreHandle *handle, const uint8_t *bytes, size_t len,
+    uint64_t *installed_version, XrayError **error);
+XrayStatus xray_kernel_status_snapshot_json(
+    XrayCoreHandle *handle, char *buffer, size_t buffer_len,
+    size_t *written, XrayError **error);
+XrayStatus xray_kernel_stats(
+    XrayCoreHandle *handle, XrayKernelStats *stats, XrayError **error);
+
+#endif /* XRAY_FFI_WITH_PROPRIETARY_KERNEL */
 
 #ifdef __cplusplus
 }

@@ -107,6 +107,7 @@ async fn tls_and_reality_start_after_the_handshake() {
             verify_peer_cert_by_name: vec![],
             alpn: vec![],
             fingerprint: None,
+            ech_config_list: None,
         }),
         ConnectorConfig::Reality(RealityClientConfig {
             server_name: "example.com".into(),

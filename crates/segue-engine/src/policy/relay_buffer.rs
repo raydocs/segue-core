@@ -111,6 +111,18 @@ impl Pool {
         }
     }
 
+    /// Drops every free buffer and returns how many there were, for the
+    /// memory watchdog. A buffer a direction still holds comes back here when
+    /// its read finds nothing, and the pool keeps it again if it has room.
+    fn release(&self) -> usize {
+        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+        let released = free.len();
+        free.clear();
+        // The thread spares are one buffer per thread and are not reachable
+        // from here; each is small next to the list.
+        released
+    }
+
     #[cfg(test)]
     fn free_buffers(&self) -> usize {
         self.free
@@ -118,6 +130,11 @@ impl Pool {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+}
+
+/// Drops the relay buffers the process keeps for reuse and returns how many.
+pub(crate) fn release_idle_relay_buffers() -> usize {
+    PROCESS_POOL.release()
 }
 
 /// Where reads past the small buffer go.

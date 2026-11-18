@@ -9,8 +9,14 @@ impl Parser<'_> {
         index: usize,
     ) -> Option<StreamSettings> {
         let stream = outbound.get("streamSettings");
-        let stream_network = self.parse_network(stream, index)?;
-        let mut security = self.parse_security(stream, index)?;
+        // TUIC is the only outbound whose carrier is spelled `udp`. Every other
+        // protocol keeps the unsupported-network error for that name.
+        let allow_udp = outbound
+            .get("protocol")
+            .and_then(Value::as_str)
+            .is_some_and(|protocol| protocol.eq_ignore_ascii_case("tuic"));
+        let stream_network = self.parse_network(stream, index, allow_udp)?;
+        let mut security = self.parse_security(stream, index, outbound)?;
         if stream_network == StreamNetwork::Hysteria {
             if let StreamSecurity::Tls(tls) = &mut security {
                 let explicit = stream
@@ -34,6 +40,14 @@ impl Parser<'_> {
         // Xray permits REALITY on raw, XHTTP and gRPC
         // (`infra/conf/transport_internet.go`). The alias `splithttp` is
         // normalized to the XHTTP variant by `parse_network` below.
+        if matches!(security, StreamSecurity::ShadowTls(_)) && stream_network != StreamNetwork::Raw
+        {
+            self.error(
+                format!("$.outbounds[{index}].streamSettings.security"),
+                "ShadowTLS v3 only supports raw/tcp as the inner stream transport",
+            );
+        }
+
         if matches!(security, StreamSecurity::Reality(_))
             && !matches!(
                 stream_network,
@@ -57,6 +71,35 @@ impl Parser<'_> {
             || xdrive_h3
             || stream_network == StreamNetwork::Xhttp
                 && matches!(&security, StreamSecurity::Tls(tls) if tls.alpn == ["h3"]);
+        // Real ECH is rustls' own extension, so it can only ride a hello
+        // rustls builds. A shaping fingerprint replaces that hello with a
+        // uTLS parrot whose ECH extension is GREASE, and a QUIC carrier never
+        // shapes but also never places rustls' ECH extension. Refuse both
+        // combinations here rather than send a hello that claims ECH and
+        // carries none.
+        let ech_tls = match &security {
+            StreamSecurity::Tls(tls) if tls.ech_config_list.is_some() => Some(tls),
+            _ => None,
+        };
+        if let Some(tls) = ech_tls {
+            let ech_path = format!("$.outbounds[{index}].streamSettings.tlsSettings.echConfigList");
+            let shaped = tls
+                .fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint != segue_utls::UNSAFE_TLS_FINGERPRINT);
+            if shaped {
+                self.error(
+                    ech_path.clone(),
+                    "echConfigList cannot be combined with a shaping fingerprint: the shaped hello carries only GREASE ECH; set fingerprint to unsafe",
+                );
+            }
+            if is_quic {
+                self.error(
+                    ech_path,
+                    "echConfigList is unsupported on a QUIC carrier: this client places ECH only in a rustls TCP hello",
+                );
+            }
+        }
         let mut quic_params = self.parse_quic_params(stream, stream_network, is_quic, index);
         if let Some(hop) = self.parse_udp_hop_mask(stream, is_quic, index) {
             if stream
@@ -337,9 +380,11 @@ impl Parser<'_> {
             salamander
         };
         Some(StreamSettings {
-            // Native Hysteria owns a UDP carrier; other transports retain
-            // their existing TCP classification (XHTTP selects H3 later).
-            network: if stream_network == StreamNetwork::Hysteria {
+            // Native Hysteria and TUIC's `network: "udp"` own a UDP carrier.
+            // Other transports retain their TCP classification (XHTTP selects
+            // H3 later). A TUIC outbound that names `tcp` stays TCP so
+            // `validate_tuic_stream` can reject it.
+            network: if matches!(stream_network, StreamNetwork::Hysteria | StreamNetwork::Udp) {
                 Network::Udp
             } else {
                 Network::Tcp
@@ -373,7 +418,8 @@ impl Parser<'_> {
             StreamNetwork::Hysteria => self
                 .parse_hysteria_transport(stream, index)
                 .map(StreamTransport::Hysteria),
-            StreamNetwork::Raw => Some(StreamTransport::Raw),
+            // TUIC carries QUIC itself; `udp` selects no layered transport.
+            StreamNetwork::Raw | StreamNetwork::Udp => Some(StreamTransport::Raw),
             StreamNetwork::WebSocket => self
                 .parse_websocket_settings(stream, index)
                 .map(StreamTransport::WebSocket),
@@ -427,6 +473,8 @@ impl Parser<'_> {
         let consumed: &[&str] = match network {
             StreamNetwork::Hysteria => &["hysteriaSettings"],
             StreamNetwork::Raw => &["tcpSettings", "rawSettings"],
+            // Security-only. A copied tcp/raw block is inert, same as on ws.
+            StreamNetwork::Udp => &[],
             StreamNetwork::WebSocket => &["wsSettings"],
             StreamNetwork::HttpUpgrade => &["httpupgradeSettings"],
             StreamNetwork::Grpc => &["grpcSettings"],
@@ -1447,6 +1495,7 @@ impl Parser<'_> {
         &mut self,
         stream: Option<&Value>,
         index: usize,
+        allow_udp: bool,
     ) -> Option<StreamNetwork> {
         let Some(stream_settings) = stream else {
             return Some(StreamNetwork::Raw);
@@ -1491,6 +1540,10 @@ impl Parser<'_> {
             "hysteria" => Some(StreamNetwork::Hysteria),
             // Xray renamed the `tcp` transport to `raw`; both names stay valid.
             "tcp" | "raw" => Some(StreamNetwork::Raw),
+            // Not an Xray transport. sing-box's TUIC outbound is a UDP QUIC
+            // carrier with no layered stream; `allow_udp` is set only then.
+            // Every other protocol still hits the unsupported-network arm.
+            "udp" if allow_udp => Some(StreamNetwork::Udp),
             "ws" | "websocket" => Some(StreamNetwork::WebSocket),
             "httpupgrade" => Some(StreamNetwork::HttpUpgrade),
             // No `gun` alias: v26.7.28's `TransportProtocol.Build` has only the
@@ -1528,6 +1581,7 @@ impl Parser<'_> {
         &mut self,
         stream: Option<&Value>,
         index: usize,
+        outbound: &Value,
     ) -> Option<StreamSecurity> {
         let security_path = format!("$.outbounds[{index}].streamSettings.security");
         // As with `network`, only an absent key defaults. A silent fallback
@@ -1549,10 +1603,15 @@ impl Parser<'_> {
             "tls" => {
                 let tls_settings = stream.and_then(|stream| stream.get("tlsSettings"));
                 let path = format!("$.outbounds[{index}].streamSettings.tlsSettings");
-                Some(StreamSecurity::Tls(
-                    self.parse_tls_object(tls_settings, &path),
-                ))
+                Some(StreamSecurity::Tls(self.parse_tls_object_for_protocol(
+                    tls_settings,
+                    &path,
+                    outbound,
+                )))
             }
+            "shadowtls" => self
+                .parse_shadow_tls_settings(stream, index)
+                .map(StreamSecurity::ShadowTls),
             "reality" => self
                 .parse_reality_settings(stream, index)
                 .map(StreamSecurity::Reality),
@@ -1575,6 +1634,19 @@ impl Parser<'_> {
         }
     }
 
+    fn parse_tls_object_for_protocol(
+        &mut self,
+        tls_settings: Option<&Value>,
+        path: &str,
+        outbound: &Value,
+    ) -> TlsSettings {
+        let tuic = outbound
+            .get("protocol")
+            .and_then(Value::as_str)
+            .is_some_and(|protocol| protocol.eq_ignore_ascii_case("tuic"));
+        self.parse_tls_object_inner(tls_settings, path, tuic)
+    }
+
     /// A TLS settings object at `path`, as Xray-core's `TLSConfig` reads it:
     /// `streamSettings.tlsSettings`, or a mask's `tlsConfig`.
     pub(super) fn parse_tls_object(
@@ -1582,9 +1654,30 @@ impl Parser<'_> {
         tls_settings: Option<&Value>,
         path: &str,
     ) -> TlsSettings {
+        self.parse_tls_object_inner(tls_settings, path, false)
+    }
+
+    fn parse_tls_object_inner(
+        &mut self,
+        tls_settings: Option<&Value>,
+        path: &str,
+        tuic: bool,
+    ) -> TlsSettings {
         self.validate_tls_settings(tls_settings, path);
+        self.parse_tls_fields(tls_settings, path, tuic)
+    }
+
+    fn parse_tls_fields(
+        &mut self,
+        tls_settings: Option<&Value>,
+        path: &str,
+        tuic: bool,
+    ) -> TlsSettings {
         let allow_insecure_path = format!("{path}.allowInsecure");
         let allow_insecure = match tls_settings.and_then(|settings| settings.get("allowInsecure")) {
+            // TUIC keeps sing-box's explicit skip-verification option. The
+            // other canonical Xray outbounds reject allowInsecure as above.
+            Some(Value::Bool(true)) if tuic => true,
             None | Some(Value::Null) | Some(Value::Bool(false)) => false,
             Some(Value::Bool(true)) => {
                 self.error(
@@ -1631,6 +1724,20 @@ impl Parser<'_> {
                     .collect()
             })
             .unwrap_or_default();
+        let ech_config_list = self.parse_tls_ech_config_list(tls_settings, path);
+        // Xray removed `echForceQuery` with its other deprecated TLS fields
+        // (none/half/full governed the DNS-fetch fallback). A config that still
+        // carries it gets Xray's own verdict — rejected — with a message that
+        // names the field instead of the generic unknown-key one.
+        if tls_settings
+            .and_then(|settings| settings.get("echForceQuery"))
+            .is_some_and(|value| !value.is_null())
+        {
+            self.error(
+                format!("{path}.echForceQuery"),
+                "field `echForceQuery` was removed by Xray; it governed the DNS-fetched ECH config, which this client does not fetch",
+            );
+        }
 
         TlsSettings {
             server_name: tls_settings
@@ -1641,7 +1748,76 @@ impl Parser<'_> {
             verify_peer_cert_by_name,
             allow_insecure,
             alpn,
+            ech_config_list,
         }
+    }
+
+    /// `tlsSettings.echConfigList`, as Xray-core's `TLSConfig.ECHConfigList`
+    /// reads it: a standard padded base64 ECHConfigList, or empty for none.
+    ///
+    /// Xray also accepts a DNS resolver form here — `udp://host[:port]`,
+    /// `https://host/dns-query`, or `name+scheme://…` — and fetches the
+    /// HTTPS RR's `ech` parameter at dial time. Segue's DNS client has no
+    /// HTTPS (type 65) query, so those forms are refused with a clear error
+    /// rather than silently sending an unencrypted hello.
+    ///
+    /// TODO: fetch the ECHConfigList from the HTTPS RR once the DNS client
+    /// can query type 65.
+    fn parse_tls_ech_config_list(
+        &mut self,
+        settings: Option<&Value>,
+        path: &str,
+    ) -> Option<Vec<u8>> {
+        use base64::Engine as _;
+
+        let path = format!("{path}.echConfigList");
+        let value = settings.and_then(|settings| settings.get("echConfigList"))?;
+        let encoded = match value {
+            // encoding/json unmarshals JSON null into the Go string zero value.
+            Value::Null => return None,
+            Value::String(encoded) => encoded,
+            _ => {
+                self.error(path, "field `echConfigList` must be a string or null");
+                return None;
+            }
+        };
+        // Xray's `len(c.EchConfigList) != 0` gate: an empty string is no ECH.
+        if encoded.is_empty() {
+            return None;
+        }
+        if encoded.contains("://") {
+            self.error(
+                path,
+                "echConfigList DNS resolver forms (udp://, https://, name+scheme://) are unsupported: this client cannot query the HTTPS RR; use the base64 ECHConfigList instead",
+            );
+            return None;
+        }
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            self.error(
+                path,
+                "echConfigList must be standard padded base64 of an ECHConfigList",
+            );
+            return None;
+        };
+        // ECHConfigList is `uint16 length; ECHConfig configs<length>`, so the
+        // prefix must account for every remaining byte. rustls would reject a
+        // malformed list at dial time; failing here names the field instead.
+        let Some((prefix, body)) = decoded.split_first_chunk::<2>() else {
+            self.error(path, "echConfigList decodes to fewer than 2 bytes");
+            return None;
+        };
+        if usize::from(u16::from_be_bytes(*prefix)) != body.len() {
+            self.error(
+                path,
+                "echConfigList length prefix does not match its contents",
+            );
+            return None;
+        }
+        if body.is_empty() {
+            self.error(path, "echConfigList carries no ECH config");
+            return None;
+        }
+        Some(decoded)
     }
 
     pub(super) fn validate_stream_settings_compatibility(&mut self, stream: &Value, index: usize) {
@@ -1866,6 +2042,60 @@ impl Parser<'_> {
                 );
             }
         }
+    }
+
+    fn parse_shadow_tls_settings(
+        &mut self,
+        stream: Option<&Value>,
+        index: usize,
+    ) -> Option<ShadowTlsSettings> {
+        let settings = stream.and_then(|stream| stream.get("shadowtlsSettings"));
+        let path = format!("$.outbounds[{index}].streamSettings.shadowtlsSettings");
+        let Some(settings) = settings.filter(|settings| settings.is_object()) else {
+            self.error(path, "ShadowTLS v3 settings must be an object");
+            return None;
+        };
+        self.reject_unknown_fields(settings, &path, &surface::SHADOWTLS);
+        let password_path = format!("{path}.password");
+        let Some(password) = self.optional_string_at(settings, "password", password_path.clone())
+        else {
+            if settings.get("password").is_none() {
+                self.error(password_path, "ShadowTLS v3 requires a password");
+            }
+            return None;
+        };
+        if password.is_empty() || password.len() > 4096 {
+            self.error(
+                password_path,
+                "ShadowTLS password must contain 1 to 4096 UTF-8 bytes",
+            );
+            return None;
+        }
+        let version_path = format!("{path}.version");
+        if self
+            .optional_u64_at(settings, "version", version_path.clone())
+            .unwrap_or(3)
+            != 3
+        {
+            self.error(version_path, "only ShadowTLS version 3 is supported");
+        }
+        let tls = self.parse_tls_fields(Some(settings), &path, false);
+        if tls.server_name.as_deref().is_none_or(str::is_empty) {
+            self.error(
+                format!("{path}.serverName"),
+                "ShadowTLS requires the real TLS server's name for SNI and certificate verification",
+            );
+        }
+        if tls.fingerprint.as_deref() == Some("unsafe") {
+            self.error(
+                format!("{path}.fingerprint"),
+                "ShadowTLS v3 requires a uTLS fingerprint, not `unsafe`",
+            );
+        }
+        Some(ShadowTlsSettings {
+            password: zeroize::Zeroizing::new(password.to_owned()),
+            tls,
+        })
     }
 
     pub(super) fn parse_reality_settings(

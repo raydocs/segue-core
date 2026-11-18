@@ -210,7 +210,7 @@ impl GeodataLoader {
         }
         let inverse = inverse ^ (apply_asset_reverse && geoip.reverse_match);
         for cidr in &geoip.cidr {
-            matchers.insert_cidr(cidr_to_ip_cidr(cidr, file_name, &code)?.cidr(), inverse);
+            matchers.insert_geoip_cidr(cidr_to_ip_cidr(cidr, file_name, &code)?.cidr(), inverse);
             #[cfg(test)]
             {
                 self.ip_matcher_builds += 1;
@@ -315,6 +315,13 @@ impl GeodataLoader {
             });
         }
         Ok(decoded)
+    }
+
+    /// Opens `file_name` under a configured geodata directory. The path must be
+    /// relative, with only normal components: the same rule as geodata files,
+    /// so a rule-set reference cannot escape the directory.
+    pub(crate) fn open_readable(&self, file_name: &str) -> Result<(File, PathBuf), GeodataError> {
+        self.open_file(file_name)
     }
 
     fn open_file(&self, file_name: &str) -> Result<(File, PathBuf), GeodataError> {

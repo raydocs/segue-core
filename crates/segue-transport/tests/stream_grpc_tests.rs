@@ -4738,6 +4738,7 @@ mod stream_grpc_pool_tests {
             verify_peer_cert_by_name: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
+            ech_config_list: None,
         });
         let target = Target::new(TargetAddr::Ip(addr.ip()), addr.port(), Network::Tcp);
         let dialer = dialer();

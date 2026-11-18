@@ -10,6 +10,590 @@ long-term supported release series.
 
 ## Unreleased
 
+**Security**
+
+- The vendored `quinn-proto` moves from 0.11.16 to 0.11.19 and `quinn` from
+  0.11.9 to 0.11.12, carrying the fixes for RUSTSEC-2026-0338, 0339, 0341,
+  0342, 0523 and 0524: a peer that answers a client's first Initial with a
+  Retry whose token leaves no room in the packet could make a release build
+  allocate more than 10 GiB and abort (0524), a peer could queue empty
+  DATAGRAM frames without bound (0342) or open 2^40 streams with one
+  MAX_STREAM_DATA frame (0523). The local patches (ChromeParrot handshake,
+  BBR and congestion callbacks, pacing, ready ACKs, stream receive window,
+  Hysteria DATAGRAM cap, the stopped/reset stream credit fix, quinn's
+  bounded transmit quantum, receive batch and rebind grace) are rebased onto
+  the new archives. (upstream `f35b091f`)
+- The stopped-stream flow-control fix is now half upstream's: 0.11.19's
+  `StreamsState::received_reset` credits a stopped stream only the bytes
+  past its end, as the vendored patch did; `Recv::stop` still double-credits
+  a stream reset before it is stopped, so that half stays ours.
+- A ChromeParrot client's lone Handshake ACK no longer counts as a packet in
+  flight awaiting an acknowledgement, and a lost MTU probe reaches the
+  congestion controller through its own callback. (upstream `44c48291`)
+- QUIC loss and congestion accounting for Hysteria and XHTTP H3: `reno`
+  starts at quic-go's 32-datagram window, Xray's BBR keys packets by their
+  place in the connection instead of the packet number (which repeats per
+  space), and a lost MTU probe no longer puts it into recovery.
+  (upstream `a67f9b24`)
+- Every uTLS fingerprint now advertises its profile's whole cipher suite
+  list, in uTLS's order with GREASE at its index, instead of only the suites
+  rustls implements: `chrome` sends 15 suites, `firefox` 17, `safari` 20 and
+  `ios` 26. BoringSSL padding is no longer grown to make up the missing
+  bytes, so padded hellos match uTLS's own byte for byte and carry the
+  JA3/JA4 a real browser does. The CBC and RSA key exchange suites among
+  them are advertised only; a server that selects one fails the handshake
+  with `SelectedUnofferedCipherSuite`. (upstream `405b8695`)
+- The vendored rustls (shaped-rustls, 0.23.40) carries the rustls
+  0.23.45/0.23.46 security fixes: strict brotli certificate decompression,
+  which refuses brotli's large-window extension and trailing input
+  (RUSTSEC-2026-0348); the key exchange hint is saved only after the server
+  is authenticated (0349); a TLS 1.3 handshake message may not share a
+  record with a key-changing message (0285); and `Debug` no longer prints
+  TLS session secrets (0346). No ClientHello byte changes.
+  (upstream `d38badbe`)
+- `scripts/check-vendored-advisories.sh` audits the upstream release behind
+  every vendored crate, and any git dependency, against RustSec, which
+  `cargo audit` matches only for registry packages. The supply-chain CI job
+  runs it after `cargo audit`. (upstream `ace50c52`)
+
+**Upstream 0.10.0/0.10.1 fixes**
+
+- `UDP ASSOCIATE` on a SOCKS inbound that listens on `::` with
+  `allowUnauthenticatedLan` now works for IPv4 clients. The relay was bound
+  to `::1` for them and the reply sent them there, where an IPv4 client
+  cannot reach it. Like Xray-core, the relay now binds the IP the client
+  connected to, in its IPv4 form for an IPv4 client, and a LAN client of a
+  `0.0.0.0` listener gets a relay on the LAN address instead of on
+  `127.0.0.1`. A link-local IPv6 control address keeps its scope id.
+  (upstream `bb0e8269`, `71e5142e`)
+- Another local process can no longer push a SOCKS client's UDP flows out of
+  its association. Without a password, any sender's datagrams opened flows
+  in it, and 128 targets were enough to evict the client's own. The
+  association is now pinned as in Xray-core: to the endpoint the client
+  declared, or to its TCP connection's IP and the port of its first
+  datagram, and datagrams from anyone else are dropped.
+  (upstream `053e7a04`)
+- The SOCKS inbound's `ip` setting takes effect: the `UDP ASSOCIATE` relay
+  binds that address and the reply names it, as in Xray-core. It was
+  accepted and ignored before. A domain is refused, since Xray-core fails on
+  it, and so is an address outside loopback unless `allowUnauthenticatedLan`
+  is set. (upstream `053e7a04`)
+- A Mux child keeps the data it received before the server's End. An End
+  carrying the error flag, or arriving while the child still had uplink data
+  to send, used to fail the child at once, dropping up to 64 KiB of the
+  response already queued and ending the read with an error. As in
+  Xray-core's client, which closes the session's output gracefully whatever
+  the flag, the reader now gets every queued byte and then EOF. Writes after
+  the End fail at once, so a caller that frames its response itself and
+  stops before EOF no longer hangs on its next write. (upstream `46857b63`,
+  `e29add47`)
+- A Mux open that fits on an existing parent no longer waits for another
+  open's cold connect to a new parent. A slow or unreachable server used to
+  hold every new flow of the outbound behind that dial, each spending its
+  own handshake timeout there. Xray-core dials a new Mux connection in the
+  background. (upstream `46857b63`)
+- Routing parity with Xray-core, three corrections:
+  - With sniffing `routeOnly`, rules see the original destination IP as well
+    as the sniffed domain, as Xray-core keeps `ob.Target` beside
+    `ob.RouteTarget`. An `ip` or `geoip` rule, such as `geoip:private` to
+    `direct`, used to miss such a flow because routing saw only the domain.
+    Under `IPOnDemand`, a failed lookup falls back to that IP. A fake IP
+    still routes and dials by its domain. This covers SOCKS, HTTP and
+    reverse sessions and TUN UDP; TUN TCP still routes a real IP by the IP
+    alone. A loopback outbound routes such a flow again by both the domain
+    and the IP; it used to see only the IP. (upstream `4886a7ec`,
+    `95907603`)
+  - A balancer whose strategy picks no member and that has no `fallbackTag`
+    sends the connection to the default outbound, as Xray-core's dispatcher
+    does, instead of failing it. A `fallbackTag` that names no outbound
+    still fails. `random` and `roundRobin` skip unhealthy members only when
+    the balancer has a `fallbackTag`, as in Xray-core; without one they keep
+    picking among all members and no longer fail when every member is
+    unhealthy. (upstream `4886a7ec`, `95907603`)
+  - In one `ip` list, negated CIDRs and negated GeoIP codes (including
+    `geoip:private`) are two matchers ORed together, as in Xray-core's
+    `buildOptimizedIPMatcher`. `["!10.0.0.0/8", "!geoip:cn"]` used to match
+    only an address outside both. (upstream `4886a7ec`)
+- A MASQUE HTTP/2 dial that is abandoned while it waits for the response, as
+  a Happy Eyeballs loser or a cancelled flow is, stops its connection driver
+  and keepalive at once instead of leaving the keepalive until its next PING
+  fails, up to 45 s later. (upstream `5d1173ad`)
+- A DNS query sent over a carrier that can lose a datagram (SOCKS's UDP
+  relay, Shadowsocks UDP outside Mux, Hysteria, WireGuard and MASQUE) goes
+  out again every second until its answer comes or the server's time is
+  over. One lost datagram used to fail the lookup after four seconds for
+  every lookup of the name that had joined it. The resolver inside a
+  WireGuard or MASQUE tunnel does the same; a stream carrier is sent the
+  query once, as before. (upstream `8558001d`)
+- A DNS exchange past the managed resolver's operation cap now waits for a
+  place, for as long as its lookup's deadline allows, in a queue of four
+  waiters per place, instead of being refused at once and answered with
+  SERVFAIL. Past that queue it is still refused. (upstream `4759382a`)
+- A Hysteria connect attempt to the last of the server's addresses, the only
+  one for a server with one address, gets what is left of the dial's ten
+  seconds, at most eight, where every attempt had three. Quinn's first probe
+  timeout is a second against quic-go's 300 ms, so three seconds carried two
+  Initials where Xray-core's client sends four or five, and a slow or lossy
+  mobile path failed to connect where Xray-core connected. Attempts with
+  further addresses waiting keep three seconds each. (upstream `3d0864d0`)
+- An mKCP connection on its own UDP socket, plain or introduced by `realm`,
+  is put to the test when the host reports that the OS network changed,
+  through the same request (`xray_core_rebind_hysteria`, `Core::rebind_quic`)
+  that moves the QUIC carriers. Xray-core's mKCP server tells sessions apart
+  by the client's address, port and conversation, so the session cannot
+  move: the connection fails with `NetworkDown` at once if its datagrams now
+  leave from another address than at the dial, and otherwise unless its
+  server is heard within three seconds when segments are unacknowledged,
+  fourteen when it is idle. Its flows end and the next flow dials a new
+  connection; until now it sat out the 30-second dead-link timeout first. A
+  connection that keeps its address and whose server still answers stays.
+  The request's count includes these connections. mKCP over `xdns` or
+  `xicmp` is left alone. Xray-core has no counterpart. (upstream `3eb92e35`,
+  `579b752f`, `5cfcbffc`, `a0cbfbc3`)
+- The `xicmp` mask works inside an Apple Network Extension. The client
+  connected its ICMP sockets to the server, and XNU leaves a connected ICMP
+  socket's local address empty, where connecting a UDP socket fills it in.
+  Inside the extension such a flow matches the tunnel's policy, and NECP
+  defuncts a connected socket with that result: on an iPhone each socket
+  dialed while the tunnel came up, the first connection's among them, failed
+  every send after its first echo request with `EPIPE` and read nothing, so
+  mKCP over xicmp failed at its first exchange, while the macOS CLI and
+  Android worked against the same server. On Apple systems the client's
+  sockets are now bound to the wildcard and left unconnected, as Xray-core's
+  are, and keep the replies from their server's address; where the bind is
+  refused they are connected as before. Each also takes the interface the
+  system scopes a UDP socket of the process to on its way to the same
+  address, and asks again at most once a second while it sends, so it moves
+  between Wi-Fi and cellular; Xray-core's server knows the client by its id
+  and answers its latest address. Outside a Network Extension the system
+  scopes no UDP socket and the socket stays unbound, and `sockopt.interface`
+  still binds it. Android and Linux behave as before. (upstream `9870b64e`,
+  `35681380`)
+- After `Endpoint::rebind`, Quinn keeps reading the socket a connection
+  moved away from for three seconds after the first packet on the new one,
+  and comes back to it when the work limiter ended its poll with datagrams
+  left. A peer's datagrams for the old path arrive after its first one for
+  the new path whenever the old path is the slower one, and QUIC sends a
+  DATAGRAM frame once: a MASQUE tunnel lost the answers that were in flight
+  at the change, and a DNS lookup among them failed. Hysteria's UDP goes
+  through the same sockets; XHTTP H3 retransmits its streams and lost only
+  time. (upstream `07c8d874`)
+- A system DNS lookup no longer holds `xray_core_free`. The lookup ran
+  `getaddrinfo`, which cannot be cancelled, on the runtime's blocking pool,
+  and freeing a handle waits for the handle's runtime, so a host stopping or
+  restarting its tunnel on a network that had gone away could hang until the
+  lookup gave up. The lookup now runs on a thread of its own, at most 64 at
+  once: one still in flight finishes by itself after the call returns and
+  calls no host callback. `xray_core_free` goes on waiting for the runtime's
+  threads without a limit, so none of them is inside the socket-protect
+  callback once it returns. Only a core that asks the system resolver was
+  affected, as under the default `XRAY_DNS_BOOTSTRAP_MODE_SYSTEM`.
+  (upstream `3079cddf`, `fad2f562`)
+- A TCP flow through a MASQUE or WireGuard outbound no longer stops for good
+  while it uploads. The userspace stack went to sleep when its queue of
+  outgoing packets was full and only WireGuard's engine told it when the
+  queue had drained; over MASQUE it slept on with the queue empty and
+  packets waiting to be read. The loop now waits for a transmit slot
+  itself. A fast retransmit that met a full queue is no longer forgotten: it
+  stays owed until the segment leaves, so a flow is not left with
+  unacknowledged data and no timer. (upstream `06cbfecc`)
+- A flight that loses several segments is repaired without the
+  retransmission timer. The vendored smoltcp follows NewReno (RFC 6582): an
+  ACK of new data short of what had been sent when a loss was found resends
+  the next missing segment at once, a FIN included, and Reno halves its
+  window once for the loss event. SACK blocks that report more than two
+  segments beyond the cumulative ACK start a fast retransmit like a third
+  duplicate ACK (RFC 6675), which finds the hole in what was sent during a
+  recovery and a retransmission that was lost in its turn. After a timeout
+  neither sign starts one until an ACK passes what had been sent before it.
+  `Socket::set_retransmission_timeout_floor` replaces the one-second bound
+  on request; the MASQUE stack asks for 200 ms past the round trip.
+  (upstream `054ba5fd`)
+- Loss recovery is a socket's choice: it lives behind
+  `Socket::set_loss_recovery` and is off by default, so the sockets that
+  terminate the TUN link keep treating a loss as before (a test pins that).
+  The retransmission floor is a setting of the packet type a stack carries:
+  200 ms for a CONNECT-IP (MASQUE) tunnel, none for WireGuard, which keeps
+  the second of RFC 6298. `reset` still clears a pending fast retransmit on
+  every socket. (upstream `acd64f02`)
+- TUN TCP and UDP flow lifecycle: a UDP flow's task permit is held by the
+  flow in the table and handed to the flow that evicts it, so an eviction
+  never waits for the runtime to drop the old task; a bridge that returns
+  without sending a close still ends its flow; a TCP flow whose remote side
+  is closed is reset after 30 s in FIN-WAIT-2 if the app keeps its side
+  open, instead of holding its buffers and its place under the flow limit
+  for as long as the app lives. (upstream `76f1a0e0`)
+- TUN flow limits: one permit pool shared by DNS queries and UDP flows,
+  sized for a full flow table plus every DNS query, so a full table no
+  longer starves DNS. A closed TCP flow whose app stops taking data or never
+  acknowledges the FIN is given `tcpGiveUpTicks` (four minutes) since its
+  last progress. A UDP bridge that panics still ends its flow before the
+  panic reaches its `JoinError`. (upstream `43ff4e67`)
+- iOS and macOS: the packet tunnel provider cancels the tunnel with
+  `XrayPacketTunnelProviderError.tunFileDescriptorStopped` when the core's
+  read or write loop gives up on the borrowed utun descriptor, instead of
+  the system going on showing a connected VPN that moves no packets. A start
+  that arrives while an earlier DNS bootstrap lookup still holds the
+  bootstrap worker now runs as soon as that lookup returns, within its own
+  deadline, instead of waiting the deadline out and failing with
+  `dnsBootstrapTimedOut`. (upstream `00cfb9b6`)
+- Android: `startXrayTunnel()` while a session is stopping (after
+  `stopXrayTunnel()` or a packet-pump or descriptor failure) is queued and
+  runs once the stop finishes, rather than being dropped without a callback;
+  a later call replaces it and the replaced one reports
+  `onXrayTunnelStartCancelled`. `stopXrayTunnel()` waits for an
+  `onXrayTunnelStarted` already in flight, and no `onXrayTunnelStarted`
+  comes after it returns. (upstream `c9fe6baa`)
+- Android and Apple: profiles whose VLESS outbound is in the simplified form
+  start again; the DNS bootstrap reads the address and port from it as from
+  the `vnext` form. (upstream `8fa287b9`)
+- CLI: `segue run` stops gracefully on SIGTERM as on SIGINT, so `systemctl
+  stop`, `docker stop` and launchd let the core shut down and tell a QUIC
+  carrier's server the flow ended. (upstream `c1a69b7b`)
+
+**New protocols and formats**
+
+- A new `anytls` outbound protocol, client only, over the existing
+  TLS/REALITY carrier. It speaks the `sing-anytls` wire format: the SHA-256
+  password hello, the 7-byte command frames, the reference padding scheme
+  (including server-sent scheme updates), and UDP over sing's UDP-over-TCP
+  framing. TCP flows multiplex over a bounded session pool with
+  `idle_session_check_interval`, `idle_session_timeout` and
+  `min_idle_session`, named as sing-box and mihomo name them. Xray-core has
+  no AnyTLS, so the config shape is Segue's own; see
+  [the outbound design](docs/design/anytls-outbound.md).
+- Client-only ShadowTLS v3 raw-TCP stream security, including uTLS-shaped
+  authenticated ClientHello session IDs, the genuine TLS relay handshake,
+  chained-HMAC application framing, fixed reference vectors and a
+  real-local-TLS loopback test, following SagerNet/sing-shadowtls and
+  mihomo's `transport/shadowtls`.
+- A TUIC v5 client outbound over the shared protected QUIC transport, with
+  UUID/password TLS-exporter authentication, CONNECT bidirectional stream
+  TCP, native datagram and QUIC-stream UDP relay, bounded
+  fragmentation/reassembly, Dissociate, heartbeat, socket rebinds, and
+  configurable CUBIC/NewReno/BBR congestion control and 0-RTT capability.
+  The protocol follows tuic-protocol/tuic's dev SPEC and mihomo's
+  `transport/tuic/v5`; this is a new protocol, not an upstream Xray commit.
+  TUIC uses sing-box's snake_case settings and TLS 1.3 configuration,
+  including optional ALPN/sni and explicit allowInsecure support. Its
+  credential-bearing settings redact UUID/password diagnostics, and loopback
+  tests independently verify the exporter token for TCP/UDP relay in both
+  UDP modes.
+- Real ECH on the TLS outbound path, as Xray-core v26.11.9 reads it:
+  `tlsSettings.echConfigList` takes a standard padded base64 ECHConfigList
+  and switches the handshake to rustls' ECH mode (`ClientConfigBuilder::
+  with_ech` in the vendored shaped-rustls), so the inner SNI travels
+  encrypted and only the config's public name is visible. The config is
+  built for TLS 1.3 alone, on aws-lc-rs' HPKE suites, and the ECHConfigList
+  joins the TLS config cache key.
+- `tlsSettings.echForceQuery` is rejected: Xray-core removed it with its
+  other deprecated TLS fields. (upstream `55956f8d`)
+- Real ECH is refused at config time with a shaping `fingerprint` (the uTLS
+  parrot hello carries only GREASE ECH) and on QUIC carriers, which never
+  place rustls' ECH extension; the transport builders refuse both again. The
+  GREASE ECH path, REALITY and uTLS-shaped hellos are unchanged.
+- The DNS resolver forms of `echConfigList` (`udp://`, `https://`,
+  `name+scheme://`) are refused with a clear config error: the bundled DNS
+  client cannot query HTTPS (type 65) resource records yet, so the ECH
+  config cannot be fetched at dial time.
+- Routing rules can name a local sing-box binary rule-set with
+  `ext-srs:<path>` in `domain` or `ip` (not both). The path is resolved like
+  `ext:` geodata: relative to a configured geodata directory, with no
+  absolute path, `..` or symbolic link. Versions 1–5 are read. There is no
+  remote download.
+- A headless rule's destination domains (`domain`, `domain_suffix`,
+  `domain_keyword`, `domain_regex`) and `ip_cidr` become the existing domain
+  and IP matchers. `network` (`tcp`/`udp`), port, `port_range`,
+  `source_port`, `source_port_range` and `source_ip_cidr` are applied too.
+  Rules in the file are OR'd; the routing rule's other conditions are AND'd.
+  A suffix written with a leading dot (`.com.cn`) matches names that end in
+  it and not the apex, which `domain:` would also match.
+- Items Segue cannot represent — process, package, wifi, AdGuard domain,
+  network type, interface address, query type, invert, and a logical `and`
+  of two domain or IP lists — are reported and that rule matches nothing. An
+  empty rule, which sing-box would treat as matching every connection,
+  matches nothing as well. The file is zlib-decoded as it is read, and both
+  the file and the decompressed stream are capped at 128 MiB.
+- Routing rules can also name a local mihomo binary rule-set with
+  `ext-mrs:<path>` in `domain` or `ip` (not both, and not together with
+  `ext-srs:` on the other field). The path is resolved like `ext:` geodata,
+  with no absolute path, `..` or symbolic link, and there is no remote
+  download. Version 1 is read. Behaviour `domain` lowers the succinct domain
+  set into the same matchers as a sing-box rule-set: an exact name, a `+.`
+  name (the name and its subdomains), a leading-dot suffix (subdomains but
+  not the apex) and `*` as one label. Behaviour `ipcidr` lowers the sorted
+  address ranges, IPv4 stored IPv4-mapped, into CIDRs. `classical` is
+  rejected; mihomo does not store it in `.mrs`. The file is one zstd frame,
+  decoded with the pure-Rust `ruzstd` crate so iOS and Android builds do not
+  link libzstd for this path. The file and the inflated bytes are capped at
+  128 MiB. A set that lowers to nothing matches nothing, rather than every
+  connection.
+- `segue import <file> [--format clash|singbox] [-o out.json]` converts
+  Clash/mihomo YAML and sing-box JSON profiles into Segue's Xray-style JSON,
+  also exposed as `segue_config::import::import_profile`. Proxies and
+  outbounds (VLESS incl. REALITY and Vision, VMess, Trojan, Shadowsocks 2022
+  and AEAD, Hysteria 2, WireGuard, AnyTLS, SOCKS, HTTP), transports (raw,
+  ws, grpc, httpupgrade, xhttp), TLS/REALITY/ALPN/fingerprint, proxy groups
+  (select/url-test/fallback/load-balance) as balancers plus an observatory,
+  rules (DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-REGEX, IP-CIDR(6),
+  GEOIP, GEOSITE, MATCH, port rules) and DNS (servers, fake-IP range and
+  filters) are carried. Every field that cannot be expressed — TUIC,
+  Shadowsocks plugins, process rules, remote or non-`.srs` rule-sets,
+  `skip-cert-verify` — is reported as a warning naming its source path. The
+  converted output is run through the parser before it is returned, so a
+  profile Segue would refuse fails at import time.
+
+**TUN and memory**
+
+- Apple: packets are read from the utun descriptor in batches with
+  `recvmsg_x`, instead of one `read(2)` per packet. The batch size is
+  adaptive — it starts at 4, doubles while batches come back full and halves
+  while they come back under half full — up to 32 packets on iOS and 64 on
+  macOS; the batch arena is bounded at 272 KiB (94 KiB at a 1500-byte MTU).
+  Packets are still carved out of one shared allocation, so a batch costs no
+  per-packet allocation, and each packet is split off without a copy exactly
+  as before. `SEGUE_TUN_BATCH=0` (also `false`, `off` or the empty value)
+  turns batching off for the process and leaves the single-packet read path
+  exactly as it was. `recvmsg_x` and `struct msghdr_x` are private Darwin
+  API and are declared by hand. Raw-IP descriptors and every non-Apple
+  platform keep reading one packet per call.
+- Apple: a utun socket is now given `UTUN_OPT_MAX_PENDING_PACKETS`, derived
+  from its receive buffer as sing-tun does (raised towards 8 MiB, then
+  `SO_RCVBUF/8*7/(mtu+4)`, clamped to 64). When the limit is reached the
+  interface pauses instead of letting the control socket drop packets with
+  `ENOBUFS`. It is best effort: a kernel that does not know the option (or
+  any other failure) is ignored. Based on sing-box 1.15 / sing-tun.
+- Apple: packets written to a utun descriptor go out in `sendmsg_x` batches
+  of up to 64, instead of one `write`/`writev` per packet, when every frame
+  still fits a 4 KiB mbuf cluster (4092 bytes of IP payload, plus the
+  4-byte utun header). A larger frame stays on the per-frame `writev`. A
+  short `sendmsg_x` (fewer messages accepted than submitted) commits only
+  that prefix; `EAGAIN` and `ENOBUFS` commit nothing, and a multi-message
+  `ENOBUFS` or `EMSGSIZE` is retried as a smaller batch, so none of those
+  paths drops or resends a packet. `SEGUE_TUN_BATCH=0` (`false`, `off` or
+  empty) turns the batch off and leaves the single-packet write path exactly
+  as it was. Raw-IP descriptors and every non-Apple platform never batch.
+  `sendmsg_x` is private Darwin API and is declared next to `recvmsg_x`.
+- Apple: batched and single utun writes are gated on the estimated utun
+  input-chain depth, the way sing-tun does it. Past
+  `net.utun.max_pending_input` (512) the kernel leaks one mbuf cluster per
+  refused write until reboot, so the gate stops at 384 and, when the
+  interface counter has not moved for 16 samples, lets at most 8 packets
+  through as a probe that stays under the limit. A closed gate submits
+  nothing — it does not fall through to `writev`. The gate arms only when
+  the socket is in netif mode and its input counter can be read; otherwise
+  there is nothing to estimate and writes are not held. An `ENOSPC` refusal
+  realigns the estimate to just over the limit and is not retried. Based on
+  sing-box 1.15 / sing-tun.
+- A TUN TCP flow's receive window is now a runtime-profile value instead of
+  a fixed 32 KiB. The `Desktop` and `Throughput` profiles give each flow a
+  256 KiB receive ring, which smoltcp scales by 3, so one flow is no longer
+  capped at `32 KiB / RTT` (2.6 Mbit/s at 100 ms) but at 21 Mbit/s.
+  `Mobile`, `MobilePlus` and `LowMemory` keep 32 KiB: the engine allocates
+  the ring eagerly when the socket is created, so a larger maximum would
+  cost every idle flow on a jetsam-limited extension. `Default` follows the
+  target, as before. The MTU floor (`4 × MSS`) still applies on top of the
+  profile value, and the ring is allocated per live flow, so the profile's
+  flow limit bounds the total.
+- The vendored smoltcp holds 16 disjoint reassembly ranges instead of 4
+  (`ASSEMBLER_MAX_SEGMENT_COUNT`), so a lossy mobile path that delivers
+  several segments out of order no longer exhausts the assembler and forces
+  retransmission of data the peer already sent. The assembler is a fixed
+  array, so a socket's reassembly state grows from 64 to 256 bytes and
+  nothing is allocated. SACK still reports at most three blocks, as RFC 2018
+  allows.
+- A host can now give the core the memory budget its platform kills the
+  process for exceeding, in bytes, through `TunRuntimeOptions::memory_limit`
+  (50 MiB on iOS). When it is set, a watchdog samples the process footprint
+  about once a second — Darwin's `task_info(TASK_VM_INFO)` physical
+  footprint, which is what jetsam counts, and `/proc/self/statm` resident
+  size on Linux — and, at `limit - 5 MiB` or when the growth rate projects
+  the limit within the next second, asks the connection registry to close
+  the oldest idle connections and drops the relay buffers the process keeps
+  for reuse, logging what it did. Connections that are still moving data are
+  closed only above the hard limit. Without a limit no task is started and
+  nothing is sampled. The thresholds and the growth-rate projection follow
+  sing-box's OOM killer.
+
+**DNS and routing**
+
+- The destination DNS cache now scales with the runtime memory profile:
+  1 024 entries inside a phone or Network Extension and 4 096 on desktop,
+  following mihomo's 4 096-entry default and sing-box's
+  `max(CacheCapacity, 1024)`. A cached answer keeps at most 16 addresses, so
+  one large upstream response cannot make a single entry's cost follow the
+  response size; eviction is still least-recently-used over live entries.
+- `dns.fakeIp` gains a Segue-only `exemptDomains` list of Xray domain rules.
+  Names it matches keep real answers instead of a fake IP, so
+  captive-portal checks, NTP and `.lan`/`.local` names work under fake-IP.
+  The built-in default exempts `captive.apple.com`,
+  `connectivitycheck.gstatic.com`, `www.msftconnecttest.com`, `*.ntp.org`,
+  `time.apple.com`, `*.lan` and `*.local`; `"exemptDomains": []` exempts
+  nothing, which is the behaviour without this field.
+- On the mobile, mobile-plus and low-memory profiles the observatory no
+  longer probes from the moment the core starts. Probing begins on the
+  first connection through a `leastPing` or `leastLoad` balancer and pauses
+  after 30 minutes without one — sing-box urltest's `idle_timeout` — then
+  resumes on the next such connection. Delays already measured stay in place
+  across the pause. Desktop and throughput profiles keep the previous eager
+  schedule, and `TunRuntimeOptions::eager_observatory` forces that schedule
+  on every profile. `observatory_idle_timeout` overrides the 30 minutes.
+  Xray's observatory JSON fields are unchanged.
+- `leastPing` keeps its current outbound until another healthy one is faster
+  by more than `pingTolerance` (default 50 ms, sing-box urltest
+  `tolerance`). With no incumbent it still picks the lowest delay,
+  tie-broken by tag order. `leastLoad`'s Xray `tolerance`, `expected` and
+  `baselines` are unchanged; the same `pingTolerance` applies only when that
+  ranking selects a single outbound, so a top-N spread does not stick to one
+  member.
+
+**Kernel**
+
+- The kernel kill switch is the decision on the data path.
+  `protection_for_exit_class` maps an AI exit to Strict and an overseas exit
+  to Wait; any other class fails closed. The session dialer and the
+  SOCKS/TUN admission ask `KillSwitch::verdict` instead of a second AI-only
+  check. A TCP flow that gets `Verdict::Wait` is accepted and held, not
+  reset, until the posture is connected or the wait deadline (12 s) passes,
+  and is then refused the same way a failed dial is refused. At most 64
+  flows are held; a SYN past that cap is reset. UDP is refused rather than
+  held: a datagram flow has no handshake to keep the application waiting,
+  and buffering it would pin memory for a flow the app has usually already
+  abandoned. A strict (AI) flow is still refused at once while its exit is
+  reconnecting.
+- Apple: the reference client has an opt-in kill switch, off by default.
+  `includeAllNetworks` and `excludeLocalNetworks` (default true) travel in
+  the provider configuration and start options with the other tunnel
+  settings. While the setting is off, the saved `NETunnelProviderProtocol`
+  does not have `includeAllNetworks`, `excludeLocalNetworks`,
+  `excludeAPNs`, `excludeCellularServices` or `enforceRoutes` assigned.
+  While it is on, the client sets those flags on the protocol it saves: all
+  networks into the tunnel, LAN excluded unless the second option is turned
+  off, APNs and cellular services excluded on iOS 16.4+ and macOS 13.3+,
+  and `enforceRoutes` on iOS and macOS. tvOS cannot apply the flags. This is
+  not a lockdown across quit or reboot.
+- Android: `XrayVpnService.onRevoke()` stops the core with the same
+  `stopXrayTunnel()` path an explicit stop uses, then reports `revoked`
+  through `onXrayTunnelStopped` and `XrayVpnRuntimeSnapshot.stopReason`. The
+  snapshot also exposes `isAlwaysOn` and `isLockdownEnabled` on API 29+, and
+  null on older releases. The library does not install its own firewall;
+  always-on and lockdown remain the system VPN toggles.
+- AI traffic is pinned to the connected IDC exit. A built-in first-tier
+  suffix list (`crates/segue-kernel/data/ai-lock.txt`) carries
+  anthropic.com, claude.ai, claude.com, openai.com, chatgpt.com,
+  oaistatic.com and oaiusercontent.com, the account-bearing names vendor
+  docs and the Codex and Gemini CLI trees showed besides them (Claude's
+  user-content hosts, Cursor, Copilot's own hosts, Gemini's own hosts,
+  xAI/Grok and Codex's Sentry org host, checked against
+  `docs/research/ai-destinations.md`), and Anthropic's published inbound
+  prefixes `160.79.104.0/23`, `153.61.224.0/22` and `2607:6bc0::/48` —
+  Anthropic allocations, not a CDN. OpenAI's published ranges are egress,
+  and OpenAI, Cursor, Copilot, Gemini and xAI terminate on shared edges, so
+  they have no client-facing CIDR; shared telemetry and login front doors
+  (Sentry, Datadog, Statsig SaaS, `github.com`, `accounts.google.com`,
+  Cloudflare) stay off the list. It is merged with the signed bundle's
+  `ai_domains`/`ai_cidrs` into a first-tier match that beats every user
+  rule, including direct and GEOIP, except an explicit reject.
+- A connection to an AI CIDR, or whose sniffed TLS SNI is an AI name, is
+  AI-class. A non-AI SNI cannot steer an AI address onto another proxy.
+- DNS for an AI name is fake-IP (A) or an empty NOERROR (AAAA; the pool has
+  no v6 range). It is not forwarded to a domestic upstream.
+- QUIC and any other UDP to the AI (home) route is refused, so clients fall
+  back to TCP.
+- Under Auto an AI session pins one exit and may move only inside that
+  exit's `egress_group` (optional per exit; absent means the exit alone).
+  If that group is down the dial is refused, not failed over. `set_exit`
+  replaces the pin. Overseas failover is unchanged.
+- The lock covers what the kernel sees: it releases to the OS on
+  `Disconnected`, cannot see packets while it is not running, and desktop
+  and iOS would need platform help beyond the kernel (an AI-only PF/WFP
+  layer on desktop; iOS offers only `includeAllNetworks`). See
+  [the design notes](docs/design/ai-lock.md).
+- `segue-kernel` process mode takes `SIGTERM` and `SIGINT`, flushes the
+  fake-IP journal, deletes the control token and exits 0. `--state-dir` is
+  the runtime directory for the token, the fake-IP journal and
+  `policy.installed`; `--log` appends the same lines as stderr (mode 0600).
+  Exit codes are 0 clean, 1 runtime, 2 usage, 3 config or state path, 4 TUN
+  setup.
+- On macOS, `segue-kernel run` with a `tun` object opens a utun
+  (`com.apple.net.utun_control`), sets its address and MTU, and installs
+  split default routes (`0.0.0.0/1`, `128.0.0.0/1`, `::/1`, `8000::/1`)
+  through a `PF_ROUTE` socket, with the exit addresses as host routes via
+  the physical gateway (`RTF_IFSCOPE`), installed first. Direct dials and
+  domestic DNS sockets use `IP_BOUND_IF` on the physical interface. The
+  utun descriptor is the existing Darwin packet pump, and routes are removed
+  on every exit, including a setup failure. `GET /v1/status` reports
+  `tun.interface` and `tun.routes`.
+- Kernel outbounds and direct flows can share the host's protected
+  transport through the new `EngineDialer::with_transport_dialer`.
+- The opt-in `proprietary-kernel` FFI skeleton is in place (ABI 1.18:
+  guarded kernel declarations and six capability bits). Existing platform
+  builds and the feature-off ABI are unchanged; kernel config loading,
+  symbol implementations and host integration are staged separately.
+
+**Tests and CI**
+
+- CI Linux jobs run on GitHub-hosted `ubuntu-24.04` instead of Instabox.
+  The root-disk bind mount is a free-disk step that drops preinstalled
+  SDKs; the Android job keeps `/usr/local/lib/android`. Rust jobs cache
+  builds with Swatinem/rust-cache v2.9.3, keyed per job. `tproxy-linux`
+  enables KVM instead of TCG. The release-evidence workflows move with them.
+- The `rust` required check is an aggregate of `rust-checks` (fmt, clippy,
+  docs and the script checks) and four test shards: `rust-test-engine`,
+  `rust-test-transport`, `rust-test-config`, and `rust-test-support` for
+  every other workspace member. Each shard uses `--all-targets --locked`.
+  `segue-fuzz` is still excluded, so `--all-targets` cannot launch its
+  libFuzzer mains. The aggregate fails unless every shard succeeded.
+  Stable tag pushes still skip the gate.
+- The Apple job stays on the self-hosted Mac mini. Hosted macos-26 has
+  Xcode 26.x, not the Xcode 27 the adapter build needs. Fork pull requests
+  skip that job. `quick-check` uses the same Ubuntu runner and Rust cache.
+
+- CI's `go-oracles` gate is four parallel shards (`go-oracles-protocols`,
+  `go-oracles-carriers`, `go-oracles-wireguard`, `go-oracles-tunnels`) plus
+  the same `go-oracles` job, which now fails unless every shard succeeded
+  (the single job took 31.9 minutes on the 2026-11-16 main run; the slowest
+  shard about ten of those). Every oracle command is unchanged and still
+  runs once. Checkout, the root-disk target, Go 1.27.4, Rust 1.96.0 and
+  pinned Xray-core are shared through `.github/actions/go-oracle-setup`.
+  Each shard reports its own disk use, because the runners no longer share
+  one build directory. Stable tag pushes still skip the gate.
+- The interop suites that start Xray-core, or a Go stand-in binding a port,
+  pick the port by binding `127.0.0.1:0` and releasing it, and now retry the
+  start on a fresh port when the child exits early with `bind: address
+  already in use` — TCP or UDP — up to five times, re-rendering the config
+  for each attempt; any other early exit still fails at once with the full
+  output. The shared helper in `tests/support/xray_startup.rs` generalizes
+  upstream's `f33a50b0` (first ported as `b68f0254` for the
+  mux/Shadowsocks/Trojan/VMess reference alone) to every suite that binds a
+  port. The mKCP header-custom prefix case answers with a random token
+  rather than the client's, so a stream's crossing datagrams no longer drop
+  nearly every reply, and the xdns carrier and WireGuard timed-lifecycle
+  cases allow more room on a slow runner. (upstream `f33a50b0`, `b68f0254`,
+  `1efb1e47`, `3b257e07`; fixture option `--vless-encryption` from
+  `e1e1c5a3`)
+- The sudoku REALITY interop case repeats at most twice on an early EOF from
+  the public REALITY dest probe, and a gRPC dial inside REALITY waits 15
+  seconds instead of 5 (`REALITY_COLD_DIAL_TIMEOUT` in
+  `crates/segue-transport/src/stream/grpc/pool.rs`): grpc-go's
+  `MinConnectTimeout` is 5 seconds but the client retries out to a 19-second
+  `MaxDelay`, and one 5-second attempt dropped in the middle of that sleep
+  took the next dial down with it. Other gRPC dials stay at 5 seconds.
+- `scripts/tests/check-mobile-toolchains.test.sh` and
+  `scripts/tests/check-mobile-device-evidence.test.sh` pass on macOS (the
+  self-hosted Mac mini runner) as well as Linux. The Android build test now
+  stubs `cargo` on `PATH` instead of assuming the host running the test
+  suite has a Rust toolchain installed — `build-android-libs.sh` probes for
+  `cargo` before it rejects a mismatched `ANDROID_API_LEVEL`, so on a
+  machine without cargo the expected diagnostic never fired. The
+  device-evidence validator (`scripts/check-mobile-device-evidence.py`) now
+  normalizes RFC 3339 fractional seconds to six digits before
+  `datetime.fromisoformat`: Python releases before 3.11 (macOS ships 3.9
+  with the Xcode CLT) only accept 3- or 6-digit fractions, so a timestamp
+  like `06:00:00.5Z` was rejected as unparseable instead of reaching the
+  `durationSeconds` cross-check. The accepted timestamp format and every
+  verdict are unchanged on Python 3.11+.
+
 - Linux: the download of a connection from a SOCKS, HTTP or transparent
   inbound is moved in the kernel with `splice(2)` once the outbound reads a
   bare TCP socket: a freedom outbound from its first byte, and VLESS Vision
@@ -190,8 +774,9 @@ long-term supported release series.
   before the next flow dialed again. `xray_core_rebind_hysteria` carries the
   request, so hosts need no change: the mobile wrappers already call it on
   every network change. `Core::rebind_quic` is the Rust entry. Connections
-  behind a `realm`, `xdns` or `xicmp` mask, and mKCP, do not move. Xray-core
-  has no counterpart.
+  behind a `realm`, `xdns` or `xicmp` mask do not move, and mKCP connections
+  are not moved either: they are put to the test on the same request
+  instead. Xray-core has no counterpart.
 - Hysteria, XHTTP over HTTP/3 and XDRIVE's storages over HTTP/3 shape their
   QUIC handshake like Chrome's, as Xray-core v26.10.31's default ChromeParrot
   does, unless
@@ -631,7 +1216,12 @@ long-term supported release series.
     `REP = 0x07` before the address is read.
   - The request's version and reserved bytes, and the login's version byte,
     are not checked. A failed login gets status `0xFF`.
-  - The whole handshake shares one `handshake` timeout.
+  - The whole handshake shares one `handshake` timeout, given once from the
+    moment the client connects. A client that sent its first byte just
+    before it used to get a second full timeout for the rest of the
+    handshake; SOCKS 4 and HTTP on the SOCKS port had the same gap.
+    Xray-core waits for the first byte without a limit. (upstream
+    `bb0e8269`)
   - UDP datagrams without a payload are dropped, and their reserved bytes
     are not checked.
 - The SOCKS inbound reads `users` as another name for `accounts`, keeps the
@@ -668,14 +1258,20 @@ long-term supported release series.
   certificate still aborts the handshake. A `spiderX` that is neither empty
   nor starts with `/` is now a configuration error, as in Xray-core, and
   share links with such an `spx` are refused at import.
-- VLESS (with or without Vision) and Trojan outbounds no longer send the
-  request header on its own. As in Xray-core, the header waits for the first
-  payload and leaves in the same write, so over TLS or REALITY the first
-  record is no longer a header-only record of a predictable size. When the
-  app sends nothing first, the header goes out after the same wait as
-  Xray-core: 500 ms for VLESS, 100 ms for Trojan. With Vision, the empty
-  padding frame is now sent only in that case, behind the header, instead of
-  on every connection.
+- VLESS (with or without Vision), Trojan, VMess and Shadowsocks outbounds no
+  longer send the request header on its own. As in Xray-core, the header
+  waits for the first payload and leaves in the same write, so over TLS or
+  REALITY the first record is no longer a header-only record of a
+  predictable size. When the app sends nothing first, the header goes out
+  after the same wait as Xray-core: 500 ms for VLESS, 100 ms for Trojan. A
+  VLESS UDP flow and a VLESS Mux connection leave with their first XUDP or
+  Mux frame, with the same 500 ms wait; VMess and Shadowsocks follow the
+  same rule, VMess waiting 100 ms on TCP, UDP and Mux/XUDP alike and for the
+  classic AEAD methods, and Shadowsocks 2022 not waiting at all. A VMess
+  `chacha20-poly1305` flow over plain TCP still sends its header eagerly.
+  With Vision, the empty padding frame is now sent only in that case, behind
+  the header, instead of on every connection. (upstream `d130f49c`,
+  `71e5142e`, `32ff57aa`)
 - Outbound URL probes no longer announce themselves. The observatory, startup
   and on-demand probes used to send `User-Agent: xray-rust-…-probe`; they now
   send Xray-core's Chrome navigation headers in Go's order. As in Xray-core,
@@ -998,11 +1594,13 @@ long-term supported release series.
   so an override's own `setMtu` is replaced by the `tunMtu` of
   `startXrayTunnel` (1500 by default). A host that lowered the MTU in
   `buildTunnel()`, for example to 1400, passes that value as `tunMtu` instead.
-- TUN: each TCP socket's receive buffer is `max(32 KiB, 4 × MSS)`, so kernel
-  senders, which only send whole segments into the window, do not stall on a
-  jumbo MTU. Unchanged up to MTU 8232; at 9000 it adds at most 768 KiB on
-  `Mobile`. The TUN packet queues also hold at most `depth × 1500` bytes, so
-  a jumbo MTU does not multiply their memory.
+- TUN: each TCP socket's receive buffer is its profile's receive window or
+  `4 × MSS`, whichever is larger — 32 KiB on the mobile profiles, 256 KiB on
+  `Desktop` and `Throughput` — so kernel senders, which only send whole
+  segments into the window, do not stall on a jumbo MTU. The mobile
+  profiles are unchanged up to MTU 8232; at 9000 the floor adds at most
+  768 KiB on `Mobile`. The TUN packet queues also hold at most
+  `depth × 1500` bytes, so a jumbo MTU does not multiply their memory.
 - UDP: a datagram larger than its outbound path carries (VLESS UDP, Mux/XUDP
   and Trojan 8192 bytes, native VMess 8094, WireGuard its tunnel MTU less
   28/48, so 1392 at the default 1420) no longer ends the whole flow or, over

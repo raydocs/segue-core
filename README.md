@@ -32,8 +32,9 @@ target/release/segue run -config client.json
 
 `config check` validates a profile without touching the network. A
 credential-free smoke run: `cargo run --locked -p segue-cli -- run -config examples/freedom.json`
-(SOCKS5 on `127.0.0.1:1080`, direct out). Never commit live UUIDs, keys,
-short IDs or endpoints.
+(SOCKS5 on `127.0.0.1:1080`, direct out); it runs until `Ctrl-C`, and on unix
+`segue` stops as gracefully on SIGTERM, as in Xray-core. Never commit live
+UUIDs, keys, short IDs or endpoints.
 
 Mobile builds: `scripts/build-apple-xcframework.sh` and
 `scripts/build-android-libs.sh`; the C ABI is in

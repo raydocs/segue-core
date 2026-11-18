@@ -25,7 +25,7 @@ env:
 jobs:
   release-metadata:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       artifact_name: ${{ steps.release.outputs.artifact_name }}
@@ -130,7 +130,7 @@ jobs:
   release-evidence:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: release-metadata
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       actions: read
@@ -181,7 +181,7 @@ jobs:
             "$archive" "$CANDIDATE_COMMIT" "$CANDIDATE_TREE"
 
   secrets:
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Check out complete history
@@ -240,7 +240,7 @@ jobs:
       - release-metadata
       - release-evidence
       - secrets
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       actions: read
@@ -266,12 +266,58 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  # Required-check name. fmt, clippy, docs and script checks stay in
+  # rust-checks. Workspace tests run on the four shards below, one -p group
+  # each, so every member except segue-fuzz is tested once with
+  # --all-targets --locked. segue-engine, segue-transport and segue-config are
+  # each their own shard; the fourth holds the remaining crates. This job
+  # fails unless every shard succeeded. always() keeps a shard failure red
+  # instead of skipped; cancelled() == false still skips the gate when the
+  # run is cancelled, and the event clause still skips a stable tag push.
   rust:
+    needs:
+      - rust-checks
+      - rust-test-engine
+      - rust-test-transport
+      - rust-test-config
+      - rust-test-support
+    if: always() && cancelled() == false && (github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Require every Rust shard
+        env:
+          CHECKS: ${{ needs.rust-checks.result }}
+          ENGINE: ${{ needs.rust-test-engine.result }}
+          TRANSPORT: ${{ needs.rust-test-transport.result }}
+          CONFIG: ${{ needs.rust-test-config.result }}
+          SUPPORT: ${{ needs.rust-test-support.result }}
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local name="$1"
+            local result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "rust-$name did not succeed: ${result:-missing}" >&2
+              fail=1
+            else
+              echo "rust-$name succeeded"
+            fi
+          }
+          check checks "$CHECKS"
+          check test-engine "$ENGINE"
+          check test-transport "$TRANSPORT"
+          check test-config "$CONFIG"
+          check test-support "$SUPPORT"
+          exit "$fail"
+
+  rust-checks:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
-    # Full debug info for the workspace tests and the fuzz replay filled the
-    # Instabox root disk (about 44 GiB free); line tables keep panic locations.
+    # Full debug info for clippy, docs and the fuzz replay fills the
+    # GitHub-hosted disk; line tables keep panic locations.
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -283,14 +329,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Instabox runs the workspace on a 20 GiB /data disk, which a full
-      # workspace test build fills. The root disk has the room, so build there.
-      - name: Keep build outputs on the root disk
+      # GitHub-hosted runners ship a small root disk full of preinstalled
+      # SDKs. Drop the ones this job does not use before the workspace build.
+      - name: Free disk space
         run: |
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
-          mkdir -p target
-          sudo mount --bind /opt/segue-target target
-          df -h / target
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
 
       - name: Check repository scripts
         run: |
@@ -327,16 +372,19 @@ jobs:
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
 
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::perf -W clippy::suspicious
 
-      - name: Test
-        # `--all-targets` overrides the fuzz bins' `test = false` metadata and
-        # would otherwise launch their libFuzzer mains without a run bound.
-        run: cargo test --workspace --exclude segue-fuzz --all-targets --locked
+      - name: Test proprietary-kernel FFI skeleton
+        run: cargo test -p segue-ffi --features proprietary-kernel
 
       - name: Replay fuzz seed corpora
         run: bash scripts/replay-fuzz-corpus.sh
@@ -359,24 +407,25 @@ jobs:
       - name: Test mobile build-script guards
         run: bash scripts/tests/check-mobile-toolchains.test.sh
 
-  tproxy-linux:
-    # The Instabox kernel (6.18.60-instabox) is built without TPROXY
-    # (CONFIG_NETFILTER_XT_TARGET_TPROXY and CONFIG_NFT_TPROXY are unset and it
-    # loads no modules), and CI runs on Instabox only (owner 2026-11-15). The
-    # check therefore boots Ubuntu's generic kernel, which ships TPROXY as
-    # modules, in QEMU with virtme-ng. Instabox exposes no /dev/kvm, so QEMU
-    # runs under TCG; the guest boots in about 15 s and shares the runner's
-    # root file system, so the test binary built here runs unchanged. The guest
-    # has only a loopback interface, which is the isolated network the script
-    # asks for. Stable promotion still requires this job.
+  rust-test-engine:
+    # Largest crate, so it does not share a runner with another package's tests.
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
@@ -384,28 +433,236 @@ jobs:
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
 
-      - name: Install QEMU, virtme-ng and a kernel with TPROXY
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
+      - name: Test
+        # --all-targets on segue-fuzz would launch its libFuzzer mains. This
+        # shard names segue-engine only, with the same locked all-targets flags
+        # the single workspace test used.
+        run: cargo test --all-targets --locked -p segue-engine
+
+  rust-test-transport:
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
         run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
+      - name: Test
+        run: cargo test --all-targets --locked -p segue-transport
+
+  rust-test-config:
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
+      - name: Test
+        run: cargo test --all-targets --locked -p segue-config
+
+  rust-test-support:
+    # Every remaining workspace member except segue-fuzz. Kept together so the
+    # three large crates above each get their own runner.
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
+      - name: Test
+        run: cargo test --all-targets --locked -p segue-bench -p segue-cli -p segue-ffi -p segue-kernel -p segue-policy -p segue-proxy -p segue-relay -p segue-routing -p segue-runtime -p segue-session -p segue-tun -p segue-utls -p segue-vless-encryption -p segue-wireguard
+
+  tproxy-linux:
+    # The GitHub-hosted kernel does not ship the TPROXY modules this check
+    # loads (CONFIG_NETFILTER_XT_TARGET_TPROXY / CONFIG_NFT_TPROXY). Boot
+    # Ubuntu's generic kernel, which ships them, in QEMU with virtme-ng.
+    # /dev/kvm is root-only until the udev rule below; with KVM the guest
+    # boots in a few seconds and shares the runner's root file system, so the
+    # test binary built here runs unchanged. The guest has only a loopback
+    # interface, which is the isolated network the script asks for. Stable
+    # promotion still requires this job.
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
+      - name: Install QEMU, virtme-ng and a kernel with TPROXY
+        # A stalled Ubuntu mirror once held `apt-get update` silent for 28 min
+        # until the job timeout; bound each try and retry instead.
+        timeout-minutes: 15
+        run: |
+          apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          for try in 1 2 3; do
+            if sudo timeout 180 apt-get "${apt_opts[@]}" update -q; then break; fi
+            echo "apt-get update attempt $try failed or stalled; retrying" >&2
+            [[ $try == 3 ]] && exit 1
+            sleep 10
+          done
+          sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get "${apt_opts[@]}" install -y -qq --no-install-recommends \
             qemu-system-x86 virtme-ng linux-image-generic iptables iproute2 busybox-static
           kernel="$(ls /boot/vmlinuz-*-generic | sort -V | tail -n 1)"
           test -n "$kernel"
           echo "TPROXY_KERNEL=$kernel" >> "$GITHUB_ENV"
 
+      - name: Allow the runner user to use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          # The node may already exist with the old mode; udev does not restamp it.
+          if [[ -e /dev/kvm ]]; then
+            sudo chmod 0666 /dev/kvm
+          fi
+          test -r /dev/kvm && test -w /dev/kvm
+
       - name: Verify Linux transparent TCP and UDP interception
         run: |
           test_binary="$(cargo test --locked -p segue-engine --test tproxy_tests --no-run --message-format=json | python3 -c 'import json,sys; print(next(v["executable"] for v in map(json.loads,sys.stdin) if v.get("reason")=="compiler-artifact" and v.get("executable")))')"
           log="$RUNNER_TEMP/tproxy-vm.log"
-          sudo vng --run "$TPROXY_KERNEL" --disable-kvm --cpus 4 --memory 4G --user root --rwdir "$RUNNER_TEMP" \
+          sudo vng --run "$TPROXY_KERNEL" --cpus 4 --memory 4G --user root --rwdir "$RUNNER_TEMP" \
             --exec "set -e; modprobe xt_TPROXY; modprobe nft_tproxy; cd '$PWD'; XRAY_TPROXY_ISOLATED_NETWORK=1 XRAY_TPROXY_TEST_BINARY='$test_binary' bash scripts/check-tproxy-linux.sh; echo TPROXY_VM_OK" 2>&1 | tee "$log"
           grep -Fxq TPROXY_VM_OK "$log"
 
+  # Required-check name. Oracle steps run on the four shards below (balanced
+  # from run 43811109067, where this job took 31.9 minutes). This job fails
+  # unless every shard succeeded. always() keeps a shard failure red instead
+  # of skipped; cancelled() == false still skips the gate when the run is
+  # cancelled, and the event clause still skips a stable tag push.
   go-oracles:
+    needs:
+      - go-oracles-protocols
+      - go-oracles-carriers
+      - go-oracles-wireguard
+      - go-oracles-tunnels
+    if: always() && cancelled() == false && (github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Require every Go oracle shard
+        env:
+          PROTOCOLS: ${{ needs.go-oracles-protocols.result }}
+          CARRIERS: ${{ needs.go-oracles-carriers.result }}
+          WIREGUARD: ${{ needs.go-oracles-wireguard.result }}
+          TUNNELS: ${{ needs.go-oracles-tunnels.result }}
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local name="$1"
+            local result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "go-oracles-$name did not succeed: ${result:-missing}" >&2
+              fail=1
+            else
+              echo "go-oracles-$name succeeded"
+            fi
+          }
+          check protocols "$PROTOCOLS"
+          check carriers "$CARRIERS"
+          check wireguard "$WIREGUARD"
+          check tunnels "$TUNNELS"
+          exit "$fail"
+
+  # ~7.3 min of steps on run 43811109067: fixtures through v0.8 chains.
+  go-oracles-protocols:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
-    # The pinned-interop steps run about 31 minutes (29 on main dbf1360f, 23-27
-    # on the v26.11.9 stack before it); leave room for a slow runner.
+    runs-on: ubuntu-24.04
+    # Slowest shard was about 10 minutes on run 43811109067; keep the single
+    # job's budget so a cold toolchain or a slow runner is not a new failure.
     timeout-minutes: 45
     # Every step builds its test binaries into one target directory, once per
     # run. Incremental caches and full debug info only cost disk here, and the
@@ -419,50 +676,14 @@ jobs:
         with:
           persist-credentials: false
 
-      # Instabox runs the workspace on a 20 GiB /data disk, which a full
-      # workspace test build fills. The root disk has the room, so build there.
-      - name: Keep build outputs on the root disk
-        run: |
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
-          mkdir -p target
-          sudo mount --bind /opt/segue-target target
-          df -h / target
-
-      # The pinned Xray-core v26.11.9 source requires Go 1.27.
-      # Use one exact toolchain for all oracle and interoperability checks.
-      #
-      # Every locally committed module's `go.sum` is listed: the cache key uses these
-      # paths alone, so a module missing from the list has its dependencies
-      # re-downloaded on every run.
-      - name: Install pinned Go toolchain
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.27.4"
-          cache-dependency-path: |
-            go.sum
-            tools/reality-oracle/masquerade/go.sum
-            tools/reality-oracle/grpc/go.sum
-            tools/wireguard-reference/go.sum
+      - name: Prepare pinned Go, Rust and Xray-core
+        uses: ./.github/actions/go-oracle-setup
 
       - name: Verify Go-oracle fixtures
         run: bash scripts/verify-oracle-fixtures.sh
 
-      - name: Check out pinned routing and encryption oracle
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: XTLS/Xray-core
-          ref: 676eaf66f8f05d4d558ee7a74b4736623d3feeb9
-          path: Xray-core
-          persist-credentials: false
-
       - name: Verify routing domain strategies against pinned Xray-core
         run: bash scripts/check-routing-oracle.sh
-
-      - name: Install pinned Rust toolchain for encryption interop
-        run: rustup toolchain install 1.96.0 --profile minimal
-
-      - name: Select pinned Rust toolchain
-        run: rustup default 1.96.0
 
       - name: Verify VLESS encryption primitives and live pinned interop
         run: bash scripts/check-vless-encryption-oracle.sh
@@ -484,32 +705,66 @@ jobs:
 
       - name: Check VMess AEAD pinned Xray interoperability
         run: bash scripts/check-vmess-interop.sh
+
       - name: Check SOCKS5 TCP/TLS, IPv6, chains, probes, UDP and TUN against pinned Xray-core
         run: bash scripts/check-socks-interop.sh
+
       - name: Check HTTP outbound against the pinned Xray HTTP server
         run: bash scripts/check-http-interop.sh
+
       - name: Check shared Mux and XUDP interoperability
         run: bash scripts/check-mux-interop.sh
+
       - name: Check v0.8 clients against pinned independent sing-box
         run: bash scripts/check-v08-independent-interop.sh
+
       - name: Check v0.8 REALITY, split-XHTTP and cross-protocol chains
         run: bash scripts/check-v08-carrier-interop.sh
+
+      # Keep this step last: it shows how much room the steps above leave.
+      - name: Report disk use
+        if: always()
+        run: |
+          df -h /
+          du -sh target ~/.cache/go-build ~/go/pkg/mod 2>/dev/null || true
+
+  # ~8.3 min of steps on run 43811109067: live Hysteria, mKCP, header-custom,
+  # sudoku, xmc, and the native Hysteria server.
+  go-oracles-carriers:
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    # Slowest shard was about 10 minutes on run 43811109067; keep the single
+    # job's budget so a cold toolchain or a slow runner is not a new failure.
+    timeout-minutes: 45
+    # Every step builds its test binaries into one target directory, once per
+    # run. Incremental caches and full debug info only cost disk here, and the
+    # runner ran out of it after the xdns step; line tables keep panic locations.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare pinned Go, Rust and Xray-core
+        uses: ./.github/actions/go-oracle-setup
+
       - name: Verify live Hysteria TCP and UDP against pinned Xray-core
         run: bash scripts/check-hysteria-interop.sh
+
       - name: Verify mKCP masks and live mKCP carriers against pinned Xray-core
         run: bash scripts/check-kcp-interop.sh
+
       - name: Verify header-custom TCP and UDP against pinned Xray-core
         run: bash scripts/check-header-custom-interop.sh
+
       - name: Verify the sudoku mask against pinned Xray-core
         run: bash scripts/check-sudoku-interop.sh
+
       - name: Verify the xmc mask against pinned Xray-core
         run: bash scripts/check-xmc-interop.sh
-      - name: Verify the xdns mask against pinned Xray-core
-        run: bash scripts/check-xdns-interop.sh
-      - name: Verify the realm mask against pinned Xray-core
-        run: bash scripts/check-realm-interop.sh
-      - name: Verify the xicmp mask against pinned Xray-core
-        run: bash scripts/check-xicmp-interop.sh
 
       - name: Check out independent native Hysteria reference
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -523,6 +778,36 @@ jobs:
         run: |
           python3 scripts/tests/verify-hysteria-reference.test.py
           bash scripts/check-native-hysteria-interop.sh
+
+      # Keep this step last: it shows how much room the steps above leave.
+      - name: Report disk use
+        if: always()
+        run: |
+          df -h /
+          du -sh target ~/.cache/go-build ~/go/pkg/mod 2>/dev/null || true
+
+  # ~6.9 min of steps on run 43811109067: WireGuard against Xray, the native
+  # roaming/replay/recovery suite, the direct fixture, and BBR.
+  go-oracles-wireguard:
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    # Slowest shard was about 10 minutes on run 43811109067; keep the single
+    # job's budget so a cold toolchain or a slow runner is not a new failure.
+    timeout-minutes: 45
+    # Every step builds its test binaries into one target directory, once per
+    # run. Incremental caches and full debug info only cost disk here, and the
+    # runner ran out of it after the xdns step; line tables keep panic locations.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare pinned Go, Rust and Xray-core
+        uses: ./.github/actions/go-oracle-setup
 
       - name: Verify bounded WireGuard engine and TCP UDP core runtime against pinned Xray-core
         run: bash scripts/check-wireguard-runtime.sh
@@ -538,11 +823,51 @@ jobs:
       - name: Verify the BBR profiles against pinned Xray-core's sender and servers
         run: bash scripts/check-bbr-interop.sh
 
+      # Keep this step last: it shows how much room the steps above leave.
+      - name: Report disk use
+        if: always()
+        run: |
+          df -h /
+          du -sh target ~/.cache/go-build ~/go/pkg/mod 2>/dev/null || true
+
+  # ~8.0 min of steps on run 43811109067: xdns, realm, xicmp, MASQUE, reverse,
+  # XDRIVE, and the pinned-Xray verdict, fingerprint and ChromeParrot checks.
+  go-oracles-tunnels:
+    if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
+    runs-on: ubuntu-24.04
+    # Slowest shard was about 10 minutes on run 43811109067; keep the single
+    # job's budget so a cold toolchain or a slow runner is not a new failure.
+    timeout-minutes: 45
+    # Every step builds its test binaries into one target directory, once per
+    # run. Incremental caches and full debug info only cost disk here, and the
+    # runner ran out of it after the xdns step; line tables keep panic locations.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare pinned Go, Rust and Xray-core
+        uses: ./.github/actions/go-oracle-setup
+
+      - name: Verify the xdns mask against pinned Xray-core
+        run: bash scripts/check-xdns-interop.sh
+
+      - name: Verify the realm mask against pinned Xray-core
+        run: bash scripts/check-realm-interop.sh
+
+      - name: Verify the xicmp mask against pinned Xray-core
+        run: bash scripts/check-xicmp-interop.sh
+
       - name: Verify the MASQUE client against pinned Xray-core
         run: bash scripts/check-masque-interop.sh
 
       - name: Verify the VLESS reverse proxy bridge against pinned Xray-core
         run: bash scripts/check-reverse-interop.sh
+
       - name: Verify the XDRIVE client against pinned Xray-core
         run: bash scripts/check-xdrive-interop.sh
 
@@ -565,13 +890,19 @@ jobs:
   rc-interop:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Check out release candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
 
       - name: Check out pinned Xray-core oracle
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -592,6 +923,11 @@ jobs:
 
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
 
       - name: Run release-candidate interoperability gate
         env:
@@ -600,13 +936,19 @@ jobs:
 
   scheduled-pinned-interop:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Check out scheduled xray-rust revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
 
       - name: Check out pinned Xray-core oracle
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -628,6 +970,11 @@ jobs:
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
 
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
       - name: Run broad pinned interoperability and resource gate
         env:
           XRAY_CORE_CHECKOUT: ${{ github.workspace }}/Xray-core
@@ -635,7 +982,7 @@ jobs:
 
   xray-core-main-smoke:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     continue-on-error: true
     steps:
@@ -643,6 +990,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
 
       - name: Check out Xray-core main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -675,6 +1028,11 @@ jobs:
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
 
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
       - name: Run focused Xray-core main compatibility smoke
         env:
           XRAY_CORE_CHECKOUT: ${{ github.workspace }}/Xray-core
@@ -688,13 +1046,19 @@ jobs:
   host-hardening:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Check out release candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
 
       - name: Install pinned Rust toolchains
         run: |
@@ -703,6 +1067,15 @@ jobs:
           rustup toolchain install nightly-2026-05-22 \
             --profile minimal \
             --component miri,rust-src
+
+      # Registry only. Miri and AddressSanitizer rebuild with a nightly
+      # toolchain and sanitizer flags; caching target/ would restore a 1.96
+      # tree this job does not reuse and can crowd out the other caches.
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+          cache-targets: "false"
 
       - name: Exhaustively model routing-policy publication
         run: bash scripts/run-v05-host-hardening.sh model
@@ -716,7 +1089,7 @@ jobs:
   fuzz-smoke:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Check out release candidate
@@ -724,8 +1097,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
       - name: Install pinned fuzz toolchain
         run: rustup toolchain install nightly-2026-05-22 --profile minimal --component rust-src
+
+      # Registry and cargo bins only. The campaign builds with nightly
+      # AddressSanitizer; a cached target/ from another toolchain is unused.
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+          cache-targets: "false"
 
       - name: Install pinned cargo-fuzz
         run: cargo +nightly-2026-05-22 install cargo-fuzz --version 0.13.2 --locked
@@ -748,13 +1135,19 @@ jobs:
   controlled-network:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Check out release candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
 
       - name: Check out pinned Xray-core oracle
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -775,6 +1168,11 @@ jobs:
 
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
 
       - name: Ensure tc netem is available
         run: |
@@ -797,21 +1195,34 @@ jobs:
           retention-days: 14
 
   apple:
-    # disabled: no macOS runner, owner 2026-11-13. GitHub-hosted macos-15 is
-    # blocked on billing and Instabox has no macOS runs-on label. Restore
-    # this condition to re-enable:
-    # github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    # publish-prerelease still needs this job, so RC prereleases wait for it.
-    if: false
-    runs-on: macos-15
+    # Runs on the owner's Mac mini (self-hosted runner `segue-macos`, owner
+    # 2026-11-17). GitHub-hosted macos-26 has Xcode 26.x, not the Xcode 27 the
+    # Apple adapter's lipo check needs, so this job stays here. Fork pull
+    # requests are skipped: a self-hosted job from a fork would wait until
+    # timeout. Its work directory, CARGO_HOME, RUSTUP_HOME and TMPDIR are
+    # on the external disk (/Volumes/dev/ci; see the runner's .env), because
+    # the internal disk is small. It is not ephemeral: every step must clean
+    # up after itself and never rely on state left by a previous run, except
+    # the build caches below: cargo, SwiftPM and Xcode check their own inputs.
+    if: (github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, macOS, ARM64, segue-macos]
     timeout-minutes: 90
     env:
-      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Install rustup on the self-hosted runner if missing
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            : "${CARGO_HOME:?the runner .env must set CARGO_HOME on the external disk}"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          fi
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
 
       - name: Install pinned Rust toolchains
         run: |
@@ -827,6 +1238,43 @@ jobs:
             --profile minimal \
             --component rust-src
 
+      # The checkout wipes target/ (git clean -ffdx), so without this every
+      # run would rebuild seven Rust targets from scratch. SEGUE_CI_CACHE comes
+      # from the runner's .env; its name ends in .noindex so Spotlight leaves
+      # it alone. Pull requests build without LTO and with 16 codegen units:
+      # they check that everything compiles, links and passes the Swift tests.
+      # Pushes to main and tags build with the shipping release profile.
+      - name: Use the runner's persistent build cache
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          cache="${SEGUE_CI_CACHE:-$RUNNER_TEMP/segue-ci-cache}"
+          flavour=release
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            flavour=pr
+            {
+              echo "CARGO_PROFILE_RELEASE_LTO=false"
+              echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
+              # Without LTO the release profile's strip = "symbols" also
+              # strips proc-macro dylibs, and rustc then reports E0463
+              # "can't find crate for `zeroize_derive`". Host code only.
+              echo "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP=none"
+            } >> "$GITHUB_ENV"
+          fi
+          mkdir -p "$cache"
+          # Keep the external disk from filling up: past 150 GiB, start over.
+          if [[ "$(du -sg "$cache" | cut -f1)" -gt 150 ]]; then
+            echo "build cache over 150 GiB; clearing it"
+            rm -rf "${cache:?}"/*
+          fi
+          {
+            echo "APPLE_CARGO_TARGET_DIR=$cache/apple-cargo-$flavour"
+            echo "SEGUE_SWIFTPM_SCRATCH=$cache/swiftpm-$flavour"
+            echo "SEGUE_SWIFTPM_HOME=$cache/swiftpm-home"
+            echo "SEGUE_CLANG_MODULE_CACHE=$cache/clang-module-cache"
+            echo "SEGUE_XCODE_DERIVED_DATA=$cache/xcode-derived-$flavour"
+          } >> "$GITHUB_ENV"
+
       - name: Build Apple XCFramework
         run: bash scripts/build-apple-xcframework.sh
 
@@ -837,12 +1285,12 @@ jobs:
         run: bash scripts/fetch-geodata.sh
 
       - name: Test Swift package
-        env:
-          CLANG_MODULE_CACHE_PATH: ${{ github.workspace }}/target/mobile/apple-clang-module-cache
-          HOME: ${{ github.workspace }}/target/mobile/apple-swiftpm-test-home
         run: |
+          export CLANG_MODULE_CACHE_PATH="$SEGUE_CLANG_MODULE_CACHE"
+          export HOME="$SEGUE_SWIFTPM_HOME"
           mkdir -p "$CLANG_MODULE_CACHE_PATH" "$HOME"
-          swift test --disable-sandbox --package-path platform/apple
+          swift test --disable-sandbox --package-path platform/apple \
+            --scratch-path "$SEGUE_SWIFTPM_SCRATCH"
 
       - name: Check Apple adapter links
         env:
@@ -852,7 +1300,7 @@ jobs:
       - name: Build unsigned Apple sample apps
         run: |
           project="platform/apple/XrayClient/XrayClient.xcodeproj"
-          derived_data="$RUNNER_TEMP/xray-apple-sample"
+          derived_data="$SEGUE_XCODE_DERIVED_DATA"
 
           xcodebuild \
             -project "$project" \
@@ -892,7 +1340,7 @@ jobs:
 
   android:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
       - name: Check out repository
@@ -900,14 +1348,13 @@ jobs:
         with:
           persist-credentials: false
 
-      # Instabox runs the workspace on a 20 GiB /data disk, which a full
-      # workspace test build fills. The root disk has the room, so build there.
-      - name: Keep build outputs on the root disk
+      # Keep /usr/local/lib/android: this job installs and builds with the
+      # image SDK (ANDROID_HOME). Drop the other preinstalled SDKs.
+      - name: Free disk space
         run: |
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
-          mkdir -p target
-          sudo mount --bind /opt/segue-target target
-          df -h / target
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
 
       - name: Select JDK 17
         run: |
@@ -936,6 +1383,11 @@ jobs:
             i686-linux-android \
             x86_64-linux-android
 
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
       - name: Build and verify Android AAR
         run: bash scripts/build-android-adapter.sh
 
@@ -963,7 +1415,7 @@ jobs:
 
   supply-chain:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Check out repository
@@ -971,11 +1423,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
 
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
 
       - name: Install pinned dependency scanners
         run: |
@@ -1004,6 +1467,9 @@ jobs:
       - name: Audit RustSec advisories
         run: cargo audit
 
+      - name: Audit vendored and git dependencies against RustSec advisories
+        run: bash scripts/check-vendored-advisories.sh
+
       - name: Enforce dependency policy
         run: cargo deny --locked check advisories bans licenses sources
 
@@ -1027,7 +1493,7 @@ jobs:
       - apple
       - android
       - supply-chain
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write

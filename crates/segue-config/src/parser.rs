@@ -1,3 +1,4 @@
+mod anytls;
 mod blackhole;
 mod dns;
 mod filter;
@@ -21,6 +22,7 @@ mod stream;
 mod sudoku;
 mod tproxy;
 mod trojan;
+mod tuic;
 mod vless;
 mod vmess;
 mod wireguard;
@@ -33,9 +35,10 @@ mod xray_lists;
 use xray_lists::PlainDomain;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::surface;
@@ -44,6 +47,7 @@ use serde_json::Value;
 
 use crate::model::build_domain_matcher_set;
 use crate::{
+    default_fake_ip_exempt_domains,
     geodata::{default_geodata_dirs, GeodataLoader},
     AddressPortStrategy, CoreConfig, CustomSocketOption, Diagnostic, DnsConfig, DnsFakeIpConfig,
     DnsHostTarget, DnsIpFilter, DnsNameServerConfig, DnsOutboundRule, DnsOutboundRuleAction,
@@ -54,11 +58,12 @@ use crate::{
     ObservatoryConfig, OutboundConfig, OutboundProtocol, OutboundProxySettings, OutboundSettings,
     PolicyConfig, PolicyLevelConfig, PolicySystemConfig, QuicBbrProfile, QuicCongestion,
     QuicIntervalRange, QuicParamsSettings, QuicUdpHopSettings, RealitySettings, RealityShortId,
-    SniffingDestination, SocketOptions, StreamSecurity, StreamSettings, StreamTransport,
-    TargetAddr, TlsSettings, TproxyMode, WebSocketSettings, XhttpMode, XhttpPaddingMethod,
-    XhttpPaddingPlacement, XhttpPlacement, XhttpRange, XhttpSettings, XhttpUplinkDataPlacement,
-    XhttpXmuxSettings, DEFAULT_OBSERVATORY_PROBE_INTERVAL, DEFAULT_OBSERVATORY_PROBE_URL,
-    MAX_DNS_SERVER_TIMEOUT_MS, MAX_DNS_SERVE_EXPIRED_TTL_SECONDS, OBSERVATORY_PROBE_TIMEOUT,
+    ShadowTlsSettings, SniffingDestination, SocketOptions, StreamSecurity, StreamSettings,
+    StreamTransport, TargetAddr, TlsSettings, TproxyMode, WebSocketSettings, XhttpMode,
+    XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement, XhttpRange, XhttpSettings,
+    XhttpUplinkDataPlacement, XhttpXmuxSettings, DEFAULT_OBSERVATORY_PROBE_INTERVAL,
+    DEFAULT_OBSERVATORY_PROBE_URL, MAX_DNS_SERVER_TIMEOUT_MS, MAX_DNS_SERVE_EXPIRED_TTL_SECONDS,
+    OBSERVATORY_PROBE_TIMEOUT,
 };
 
 const MAX_ROUTING_RULES: usize = 4_096;
@@ -80,11 +85,14 @@ const TUN_DNS_ANCHOR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 const TUN_CLIENT_IPV4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 
 /// The transport `streamSettings.network` names, before their settings block
-/// has been read. All of them dial TCP; the variant only says what gets
-/// layered on top.
+/// has been read. Most dial TCP; `Hysteria` and `Udp` dial UDP. The variant
+/// says what gets layered on top. `Udp` is TUIC's security-only carrier and
+/// becomes a raw transport classified as UDP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamNetwork {
     Raw,
+    /// `network: "udp"`, accepted only for a TUIC outbound.
+    Udp,
     Hysteria,
     WebSocket,
     HttpUpgrade,
@@ -344,6 +352,8 @@ fn parse_xray_json_with_loader_and_limits(
         matcher_budget: MatcherBudget::new(matcher_budget_limits),
         selector_budget: SelectorBudget::default(),
         parsing_xhttp_download: false,
+        srs_cache: HashMap::new(),
+        mrs_cache: HashMap::new(),
     };
     let config = parser.parse_config();
 
@@ -370,6 +380,11 @@ struct Parser<'a> {
     matcher_budget: MatcherBudget,
     selector_budget: SelectorBudget,
     parsing_xhttp_download: bool,
+    /// Decoded `ext-srs:` files, keyed by the reference path, so one file is
+    /// inflated once per parse.
+    srs_cache: HashMap<String, Arc<segue_routing::srs::SrsRuleSet>>,
+    /// Decoded `ext-mrs:` files, keyed by the reference path.
+    mrs_cache: HashMap<String, Arc<segue_routing::mrs::MrsRuleSet>>,
 }
 
 impl Parser<'_> {
@@ -742,6 +757,18 @@ impl Parser<'_> {
                 );
             }
         }
+        if let InboundProtocol::Socks(crate::SocksInboundSettings {
+            udp_address: Some(address),
+            ..
+        }) = &protocol
+        {
+            if !address.is_loopback() && !allow_unauthenticated_lan {
+                self.error(
+                    format!("$.inbounds[{index}].settings.ip"),
+                    "a SOCKS UDP relay outside loopback needs settings.allowUnauthenticatedLan=true, as the listen address does",
+                );
+            }
+        }
         if matches!(listen.as_str(), "0.0.0.0" | "::") {
             self.warning(
                 format!("$.inbounds[{index}].listen"),
@@ -1093,6 +1120,9 @@ impl Parser<'_> {
             Some("socks") => OutboundProtocol::Socks,
             Some("http") => OutboundProtocol::Http,
             Some("masque") => OutboundProtocol::Masque,
+            // Not an Xray-core protocol; the name is sing-box's and mihomo's.
+            Some("anytls") => OutboundProtocol::AnyTls,
+            Some("tuic") => OutboundProtocol::Tuic,
             Some(protocol) => {
                 self.error(
                     protocol_path,
@@ -1146,6 +1176,12 @@ impl Parser<'_> {
             }
             OutboundProtocol::Masque => {
                 OutboundSettings::Masque(self.parse_masque_settings(outbound, index)?)
+            }
+            OutboundProtocol::AnyTls => {
+                OutboundSettings::AnyTls(self.parse_anytls_settings(outbound, index)?)
+            }
+            OutboundProtocol::Tuic => {
+                OutboundSettings::Tuic(self.parse_tuic_settings(outbound, index)?)
             }
         };
         let target_strategy = self.domain_strategy_at(
@@ -1228,6 +1264,8 @@ impl Parser<'_> {
         self.validate_hysteria_pair(&settings, &stream, proxy_settings.is_some(), index);
         self.validate_masque_pair(&settings, &stream, proxy_settings.is_some(), index);
         self.validate_trojan_stream(&settings, &stream, index);
+        self.validate_anytls_stream(&settings, &stream, index);
+        self.validate_tuic_stream(&settings, &mut stream, proxy_settings.is_some(), index);
 
         // Xray v26.7.28 applies this policy only to its simplified top-level
         // VLESS settings. Its legacy `vnext` path bypasses that validation.
@@ -1258,7 +1296,10 @@ impl Parser<'_> {
             | OutboundSettings::Socks(_)
             | OutboundSettings::Http(_)
             // MASQUE requires TLS.
-            | OutboundSettings::Masque(_) => false,
+            | OutboundSettings::Masque(_)
+            // AnyTLS requires TLS; `validate_anytls_stream` refuses plaintext.
+            | OutboundSettings::AnyTls(_)
+            | OutboundSettings::Tuic(_) => false,
         };
         if rejects_plaintext_server {
             self.error(
@@ -2771,6 +2812,7 @@ fn hex_value(byte: u8) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         fs,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
@@ -3125,6 +3167,8 @@ mod tests {
             matcher_budget: MatcherBudget::new(DEFAULT_MATCHER_BUDGET_LIMITS),
             selector_budget: SelectorBudget::default(),
             parsing_xhttp_download: false,
+            srs_cache: HashMap::new(),
+            mrs_cache: HashMap::new(),
         };
         let spec = format!("test{}", "@AdS".repeat(MAX_CONFIG_GEODATA_ATTR_FILTERS + 1));
 
@@ -3146,6 +3190,8 @@ mod tests {
             matcher_budget: MatcherBudget::new(DEFAULT_MATCHER_BUDGET_LIMITS),
             selector_budget: SelectorBudget::default(),
             parsing_xhttp_download: false,
+            srs_cache: HashMap::new(),
+            mrs_cache: HashMap::new(),
         };
         let attrs = (0..=MAX_CONFIG_GEODATA_ATTR_FILTERS)
             .map(|index| format!("attr{index}"))
@@ -3242,5 +3288,322 @@ mod tests {
         Regex = 1,
         Domain = 2,
         Full = 3,
+    }
+
+    #[test]
+    fn ext_srs_rules_match_domains_and_ips_and_skip_unsupported_items() {
+        let asset_dir = unique_temp_dir("ext-srs");
+        fs::write(
+            asset_dir.join("domain-v2.srs"),
+            include_bytes!("../../segue-routing/fixtures/domain-v2.srs"),
+        )
+        .unwrap();
+        fs::write(
+            asset_dir.join("ip-v2.srs"),
+            include_bytes!("../../segue-routing/fixtures/ip-v2.srs"),
+        )
+        .unwrap();
+        fs::write(
+            asset_dir.join("process-v2.srs"),
+            include_bytes!("../../segue-routing/fixtures/process-v2.srs"),
+        )
+        .unwrap();
+        fs::write(
+            asset_dir.join("mixed-v2.srs"),
+            include_bytes!("../../segue-routing/fixtures/mixed-v2.srs"),
+        )
+        .unwrap();
+        let raw = r#"{
+          "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+          "routing": { "rules": [
+            { "domain": ["ext-srs:domain-v2.srs"], "outboundTag": "domain" },
+            { "ip": ["ext-srs:ip-v2.srs"], "port": "443", "outboundTag": "ip" },
+            { "domain": ["ext-srs:process-v2.srs", "keyword:google"], "outboundTag": "process" },
+            { "domain": ["ext-srs:mixed-v2.srs"], "port": "443", "network": "tcp", "outboundTag": "mixed" }
+          ]}
+        }"#;
+
+        let parsed =
+            super::parse_xray_json_with_geodata_dirs(raw, std::slice::from_ref(&asset_dir))
+                .expect("ext-srs config");
+        let rules = &parsed.config.routing.rules;
+        let tagged = |tag: &str| {
+            rules
+                .iter()
+                .filter(|rule| rule.target.tag() == tag)
+                .collect::<Vec<_>>()
+        };
+
+        let domain = tagged("domain");
+        assert_eq!(domain.len(), 1);
+        assert!(domain[0].matches(None, Some("example.com"), None));
+        assert!(domain[0].matches(None, Some("sing-box.sagernet.org"), None));
+        assert!(domain[0].matches(None, Some("example.com.cn"), None));
+        assert!(!domain[0].matches(None, Some("com.cn"), None));
+        assert!(domain[0].matches(None, Some("ads.tracker.test"), None));
+        assert!(!domain[0].matches(None, Some("tracker.test"), None));
+
+        let ip_rules = tagged("ip");
+        assert_eq!(ip_rules.len(), 1);
+        let ten = "10.1.2.3".parse().unwrap();
+        let eleven = "11.0.0.1".parse().unwrap();
+        let mut route = crate::RouteContext::inbound(None);
+        route.source = Some(std::net::SocketAddr::from(([192, 0, 2, 1], 9)));
+        assert!(ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&ten),
+            Some(crate::Network::Tcp),
+            Some(443)
+        ));
+        assert!(!ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&ten),
+            Some(crate::Network::Tcp),
+            Some(80)
+        ));
+        assert!(!ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&eleven),
+            Some(crate::Network::Tcp),
+            Some(443)
+        ));
+        route.source = Some(std::net::SocketAddr::from(([192, 0, 2, 2], 9)));
+        assert!(!ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&ten),
+            Some(crate::Network::Tcp),
+            Some(443)
+        ));
+
+        let process = tagged("process");
+        assert!(process
+            .iter()
+            .any(|rule| rule.matches(None, Some("keep.example"), None)));
+        assert!(process
+            .iter()
+            .any(|rule| rule.matches(None, Some("www.google.com"), None)));
+        assert!(!process
+            .iter()
+            .any(|rule| rule.matches(None, Some("drop.example"), None)));
+        assert!(parsed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("process_name")));
+
+        let mixed = tagged("mixed");
+        assert_eq!(mixed.len(), 2);
+        let inside = "192.0.2.10".parse().unwrap();
+        // The file also requires source port 53.
+        let mut mixed_route = crate::RouteContext::inbound(None);
+        mixed_route.source = Some(std::net::SocketAddr::from(([203, 0, 113, 8], 53)));
+        assert!(mixed.iter().any(|rule| {
+            rule.matches_route(
+                &mixed_route,
+                Some("example.com"),
+                None,
+                Some(crate::Network::Tcp),
+                Some(443),
+            )
+        }));
+        assert!(mixed.iter().all(|rule| {
+            !rule.matches_route(
+                &mixed_route,
+                Some("example.com"),
+                None,
+                Some(crate::Network::Tcp),
+                Some(80),
+            )
+        }));
+        assert!(mixed.iter().any(|rule| {
+            rule.matches_route(
+                &mixed_route,
+                None,
+                Some(&inside),
+                Some(crate::Network::Tcp),
+                Some(443),
+            )
+        }));
+        assert!(mixed.iter().all(|rule| {
+            !rule.matches_route(
+                &mixed_route,
+                Some("example.com"),
+                None,
+                Some(crate::Network::Udp),
+                Some(443),
+            )
+        }));
+        mixed_route.source = Some(std::net::SocketAddr::from(([203, 0, 113, 8], 9)));
+        assert!(mixed.iter().all(|rule| {
+            !rule.matches_route(
+                &mixed_route,
+                Some("example.com"),
+                None,
+                Some(crate::Network::Tcp),
+                Some(443),
+            )
+        }));
+
+        let missing = super::parse_xray_json_with_geodata_dirs(
+            r#"{
+              "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+              "routing": { "rules": [{ "domain": ["ext-srs:missing.srs"], "outboundTag": "direct" }] }
+            }"#,
+            std::slice::from_ref(&asset_dir),
+        );
+        assert!(missing.is_err());
+
+        let escaped = super::parse_xray_json_with_geodata_dirs(
+            r#"{
+              "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+              "routing": { "rules": [{ "domain": ["ext-srs:../secret.srs"], "outboundTag": "direct" }] }
+            }"#,
+            std::slice::from_ref(&asset_dir),
+        )
+        .unwrap_err();
+        assert!(escaped.diagnostics[0].message.contains("normal components"));
+
+        let both = super::parse_xray_json_with_geodata_dirs(
+            r#"{
+              "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+              "routing": { "rules": [{
+                "domain": ["ext-srs:domain-v2.srs"],
+                "ip": ["ext-srs:ip-v2.srs"],
+                "outboundTag": "direct"
+              }] }
+            }"#,
+            std::slice::from_ref(&asset_dir),
+        )
+        .unwrap_err();
+        assert!(both
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("not both")));
+
+        fs::remove_dir_all(asset_dir).unwrap();
+    }
+
+    #[test]
+    fn ext_mrs_rules_match_domains_and_ips() {
+        let asset_dir = unique_temp_dir("ext-mrs");
+        fs::write(
+            asset_dir.join("domain.mrs"),
+            include_bytes!("../../segue-routing/fixtures/domain.mrs"),
+        )
+        .unwrap();
+        fs::write(
+            asset_dir.join("ipcidr.mrs"),
+            include_bytes!("../../segue-routing/fixtures/ipcidr.mrs"),
+        )
+        .unwrap();
+        let raw = r#"{
+          "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+          "routing": { "rules": [
+            { "domain": ["ext-mrs:domain.mrs", "keyword:google"], "outboundTag": "domain" },
+            { "ip": ["ext-mrs:ipcidr.mrs"], "port": "443", "outboundTag": "ip" }
+          ]}
+        }"#;
+
+        let parsed =
+            super::parse_xray_json_with_geodata_dirs(raw, std::slice::from_ref(&asset_dir))
+                .expect("ext-mrs config");
+        let rules = &parsed.config.routing.rules;
+        let tagged = |tag: &str| {
+            rules
+                .iter()
+                .filter(|rule| rule.target.tag() == tag)
+                .collect::<Vec<_>>()
+        };
+
+        let domain = tagged("domain");
+        assert_eq!(domain.len(), 2);
+        assert!(domain
+            .iter()
+            .any(|rule| rule.matches(None, Some("example.com"), None)));
+        assert!(domain
+            .iter()
+            .any(|rule| rule.matches(None, Some("a.b.com.cn"), None)));
+        assert!(domain
+            .iter()
+            .all(|rule| !rule.matches(None, Some("com.cn"), None)));
+        assert!(domain
+            .iter()
+            .any(|rule| rule.matches(None, Some("www.google.com"), None)));
+        assert!(domain
+            .iter()
+            .any(|rule| rule.matches(None, Some("www.qq.com"), None)));
+        assert!(domain
+            .iter()
+            .any(|rule| rule.matches(None, Some("sagernet.org"), None)));
+        assert!(domain
+            .iter()
+            .all(|rule| !rule.matches(None, Some("www.example.com"), None)));
+
+        let ip_rules = tagged("ip");
+        assert_eq!(ip_rules.len(), 1);
+        let ten = "10.1.2.3".parse().unwrap();
+        let doc = "192.0.2.10".parse().unwrap();
+        let outside = "11.0.0.1".parse().unwrap();
+        let route = crate::RouteContext::inbound(None);
+        assert!(ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&ten),
+            Some(crate::Network::Tcp),
+            Some(443)
+        ));
+        assert!(ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&doc),
+            Some(crate::Network::Udp),
+            Some(443)
+        ));
+        assert!(!ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&ten),
+            Some(crate::Network::Tcp),
+            Some(80)
+        ));
+        assert!(!ip_rules[0].matches_route(
+            &route,
+            None,
+            Some(&outside),
+            Some(crate::Network::Tcp),
+            Some(443)
+        ));
+
+        let both = super::parse_xray_json_with_geodata_dirs(
+            r#"{
+              "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+              "routing": { "rules": [{
+                "domain": ["ext-mrs:domain.mrs"],
+                "ip": ["ext-srs:ipcidr.mrs"],
+                "outboundTag": "direct"
+              }] }
+            }"#,
+            std::slice::from_ref(&asset_dir),
+        )
+        .unwrap_err();
+        assert!(both
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("not both")));
+
+        let escaped = super::parse_xray_json_with_geodata_dirs(
+            r#"{
+              "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+              "routing": { "rules": [{ "domain": ["ext-mrs:../secret.mrs"], "outboundTag": "direct" }] }
+            }"#,
+            std::slice::from_ref(&asset_dir),
+        )
+        .unwrap_err();
+        assert!(escaped.diagnostics[0].message.contains("normal components"));
+
+        fs::remove_dir_all(asset_dir).unwrap();
     }
 }

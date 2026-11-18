@@ -173,6 +173,7 @@ async fn xicmp_carries_xhttp_h3() {
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: vec!["h3".to_owned()],
+            ech_config_list: None,
         }),
         XhttpMode::StreamOne,
     );

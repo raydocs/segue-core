@@ -252,7 +252,13 @@ starts once the earlier one's cleanup has finished, so wrappers need not wait.
 Only the latest queued replacement runs; an older one also reports
 cancellation. A call with the same arguments as the start in flight, such as a
 redelivered intent, is ignored like before, as is a call while a session is
-running or stopping. A replacement whose worker cannot be scheduled reports
+running. A call while a session is stopping, after `stopXrayTunnel()` or a
+packet-pump or descriptor failure, starts once that stop has finished; a later
+such call replaces it, and the replaced one reports `onXrayTunnelStartCancelled`.
+`stopXrayTunnel()` blocks until the core has stopped, and once it returns the
+stopped session calls no `onXrayTunnelStarted`: it waits for one already
+running, so that callback must not wait for a thread that stops the tunnel. A
+replacement whose worker cannot be scheduled reports
 `onXrayTunnelStartFailed`, or `onXrayTunnelStartCancelled` if it was stopped
 meanwhile, instead of throwing. The callbacks carry no attempt identity, and
 those of different attempts can arrive on different threads and interleave.
@@ -329,6 +335,10 @@ is unchanged.
 request fresh protected carrier sockets while retaining live inner flows and
 current endpoints. Each returns accepted/coalesced requests, not completed
 path validation or handshakes. Idle outbounds return zero without connecting.
+`rebindHysteria()` also reaches mKCP on its own UDP socket, which cannot move:
+such a connection is counted and fails, its inner flows with it, at once if
+its source address changed and otherwise unless its server is heard within
+seconds, so the count is not of connections that survive.
 
 Apps owning the TUN fd can opt into `XrayNetworkChangeCoordinator`. Add
 `android.permission.ACCESS_NETWORK_STATE` to the host manifest and supply the
@@ -708,6 +718,22 @@ bash scripts/tests/check-mobile-toolchains.test.sh
 
 See [mobile testing](../../docs/mobile-testing.md) for the full native artifact
 matrix and on-device checklist.
+
+## Kill switch
+
+Android's kill switch is the system always-on VPN toggle plus "Block connections
+without VPN" (lockdown). This library does not install its own firewall.
+`XrayVpnService.onRevoke()` runs when the user or the system withdraws VPN
+consent: the interface is already gone, so the service stops the core with the
+same `stopXrayTunnel()` path an explicit stop uses, then calls
+`onXrayTunnelStopped("revoked")`. An explicit `stopXrayTunnel()` does not emit
+that callback. The reason is also on `XrayVpnRuntimeSnapshot.stopReason` until
+the next session is published.
+
+`XrayVpnRuntimeSnapshot.isAlwaysOn` and `isLockdownEnabled` mirror
+`VpnService.isAlwaysOn()` and `isLockdownEnabled()`. Both exist only on API 29
+and later; on older releases the snapshot fields are null, not false. The host
+still has to send the user to the system VPN settings to turn the toggles on.
 
 ## Current limits
 

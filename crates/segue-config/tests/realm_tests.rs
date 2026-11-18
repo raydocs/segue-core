@@ -201,7 +201,8 @@ fn tls_config_reads_as_tls_settings_do() {
         json!({"fingerprint":"nope"}),
         json!({"allowInsecure":true}),
         json!({"pinnedPeerCertSha256":"zz"}),
-        json!({"echConfigList":"x"}),
+        json!({"echConfigList":"not base64!"}),
+        json!({"echForceQuery":"full"}),
     ] {
         assert!(parse_realm(json!({
             "url":"realm://t@rendezvous.example/name","stunServers":["stun.example.net:3478"],

@@ -4,7 +4,11 @@ use segue_wireguard::UdpSession;
 use std::{net::SocketAddr, time::Duration};
 use tokio::{net::UdpSocket, time::timeout};
 
-pub const WAIT: Duration = Duration::from_secs(5);
+/// How long an exchange waits for the round trip through the real reference.
+/// The relays run on loopback, but each packet passes the reference process,
+/// and a starved runner can delay that well past a quiet host's few
+/// milliseconds; ten seconds still fails fast when a flow is truly stuck.
+pub const WAIT: Duration = Duration::from_secs(10);
 
 pub enum Event {
     Client { front: usize, packet: Vec<u8> },

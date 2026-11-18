@@ -1,0 +1,85 @@
+name: Quick check
+
+# Fast compile feedback for branches written without a local toolchain.
+# Push a commit to any `quick/**` branch: this formats the tree, lints and
+# builds every target (no tests run), and uploads the formatting patch and the
+# compiler output as artifacts (the patch is also printed base64 in the log). It never pushes and never runs the full gate.
+on:
+  push:
+    branches: ["quick/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quick-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
+
+      - name: Format
+        run: |
+          mkdir -p out
+          # Bees cannot run cargo: add lock entries for new dependencies
+          # (workspace members only, nothing else is upgraded).
+          cargo update --workspace || true
+          cargo fmt --all || true
+          git diff > out/fmt.patch
+          git diff --stat
+          # The artifact quota can be full, so the patch is also printed
+          # between markers for `gh run view --log` to recover.
+          echo '=====FMT-PATCH-BEGIN====='
+          base64 -w 3000 out/fmt.patch
+          echo '=====FMT-PATCH-END====='
+
+      - name: Lint and build every target
+        run: |
+          set -o pipefail
+          cargo clippy --keep-going --workspace --all-targets --all-features --message-format=short \
+            -- -D warnings -W clippy::perf -W clippy::suspicious 2>&1 | tee out/clippy.txt
+
+      - name: Regenerate checked-in generated files (patch includes fmt and lock)
+        if: always()
+        run: |
+          if cargo run -q -p segue-config --example config_contract > out/contract.json; then mv out/contract.json docs/config-contract.json; fi
+          git diff --stat
+          git diff > out/gen.patch
+          echo '=====GEN-PATCH-BEGIN====='
+          base64 -w 3000 out/gen.patch
+          echo '=====GEN-PATCH-END====='
+
+      - name: Upload results
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: quick-check
+          path: out/
