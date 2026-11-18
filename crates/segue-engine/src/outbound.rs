@@ -5211,13 +5211,15 @@ async fn open_vless_tcp_stream_with_resolved_server_and_dialer(
         }
     }
 
-    let stream = open_encrypted_carrier(
+    // Boxed: the retry loop would otherwise grow every TCP open future past
+    // the legacy task budget (future_layout_tests).
+    let stream = Box::pin(open_encrypted_carrier(
         outbound,
         resolved_server,
         resolved_download,
         transport_dialer,
         flow.uses_vision(),
-    )
+    ))
     .await?;
     held_request_stream(outbound, flow, stream, VlessCommand::Tcp, target)
 }
@@ -5649,13 +5651,15 @@ async fn open_vless_command_stream(
     resolved_download: &[SocketAddr],
     transport_dialer: &TransportDialer,
 ) -> Result<BoxedTransportStream, CoreError> {
-    let stream = open_encrypted_carrier(
+    // Boxed: the retry loop would otherwise grow every TCP open future past
+    // the legacy task budget (future_layout_tests).
+    let stream = Box::pin(open_encrypted_carrier(
         outbound,
         resolved_server,
         resolved_download,
         transport_dialer,
         flow.uses_vision(),
-    )
+    ))
     .await?;
     held_request_stream(outbound, flow, stream, command, target)
 }
