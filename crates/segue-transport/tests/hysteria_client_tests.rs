@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::Response;
-use segue_proxy::hysteria::{decode_tcp_request, decode_udp_message};
+use segue_proxy::hysteria::{decode_tcp_request, decode_udp_message, WireError};
 use segue_routing::{Network, Target, TargetAddr};
 use segue_transport::hysteria::{HysteriaClient, HysteriaConfig, HysteriaError};
 use segue_transport::{SocketHandle, SocketProtector, TlsConnector};
@@ -111,18 +111,26 @@ impl Mock {
             ) {
                 let (mut send, mut recv) = connection.accept_bi().await.unwrap();
                 let mut wire = Vec::new();
-                while decode_tcp_request(&wire).is_err() {
+                let consumed = loop {
+                    match decode_tcp_request(&wire) {
+                        Ok((_, consumed)) => break consumed,
+                        Err(WireError::Incomplete) => {}
+                        Err(error) => panic!("tcp request: {error}"),
+                    }
                     let mut bytes = [0; 1024];
                     let n = recv.read(&mut bytes).await.unwrap().unwrap();
                     wire.extend_from_slice(&bytes[..n]);
-                }
+                };
+                // The client may pipeline the first payload behind the request.
+                let mut leftover = wire.split_off(consumed);
                 if matches!(mode, Mode::TcpStall) {
                     let _ = send.stopped().await;
                     cancelled.store(true, Ordering::Release);
                 } else if matches!(mode, Mode::HalfClose) {
                     send.write_all(b"\x00\x00\x00").await.unwrap();
                     let data = recv.read_to_end(4096).await.unwrap();
-                    send.write_all(&data).await.unwrap();
+                    leftover.extend_from_slice(&data);
+                    send.write_all(&leftover).await.unwrap();
                     send.finish().unwrap();
                 } else if matches!(mode, Mode::TcpRejected) {
                     send.write_all(b"\x07\x06secret\x00").await.unwrap();
@@ -280,16 +288,22 @@ async fn empty_udp_datagram_is_skipped_and_the_session_keeps_sending() {
 }
 
 #[tokio::test]
-async fn tcp_response_deadline_resets_stream_and_releases_slot() {
+async fn tcp_response_is_not_required_to_open_and_drop_resets_the_stream() {
     let (server, tls) = Mock::start(Mode::TcpStall);
     let mut config = server.config();
-    config.limits.operation_timeout = Duration::from_millis(150);
     config.limits.max_tcp_streams = 1;
     let client = HysteriaClient::connect(config, &tls).await.unwrap();
-    assert!(matches!(
-        client.open_tcp(&target()).await,
-        Err(HysteriaError::Timeout)
-    ));
+    // The open itself must not wait out the server's silence: the request
+    // goes out with the first write, and dropping the stream resets it.
+    let mut stream = client.open_tcp(&target()).await.unwrap();
+    stream.write_all(b"x").await.unwrap();
+    assert!(timeout(Duration::from_millis(200), async {
+        let mut buf = [0u8; 8];
+        let _ = stream.read(&mut buf).await;
+    })
+    .await
+    .is_err());
+    drop(stream);
     timeout(DEADLINE, async {
         while !server.tcp_cancelled.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
@@ -297,12 +311,10 @@ async fn tcp_response_deadline_resets_stream_and_releases_slot() {
     })
     .await
     .unwrap();
-    // A second attempt reaches the peer (then times out), rather than leaking
-    // the only local slot from the cancelled request.
-    assert!(matches!(
-        client.open_tcp(&target()).await,
-        Err(HysteriaError::Timeout)
-    ));
+    // The only local slot is free again, so a second open reaches the peer.
+    let mut stream = client.open_tcp(&target()).await.unwrap();
+    stream.write_all(b"y").await.unwrap();
+    drop(stream);
     client.close();
 }
 
@@ -348,8 +360,13 @@ async fn tcp_failure_status_and_malformed_headers_fail_without_server_text() {
         let client = HysteriaClient::connect(server.config(), &tls)
             .await
             .unwrap();
-        let error = client.open_tcp(&target()).await.err().unwrap();
-        assert_eq!(error, expected);
+        let mut stream = client.open_tcp(&target()).await.unwrap();
+        let error = stream.read(&mut [0u8; 16]).await.unwrap_err();
+        let parsed = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<HysteriaError>())
+            .copied();
+        assert_eq!(parsed, Some(expected));
         assert!(!format!("{error} {error:?}").contains("secret"));
     }
 }

@@ -152,11 +152,17 @@ async fn pinned_reference_rejects_wrong_auth_and_closes_failed_tcp_destination()
     drop(reservation);
     let target = Target::new(TargetAddr::Ip(address.ip()), address.port(), Network::Tcp);
     if server.is_native() {
-        // Native Hysteria dials before acknowledging the request.
-        assert!(matches!(
-            client.open_tcp(&target).await,
-            Err(HysteriaError::TcpRejected)
-        ));
+        // Native Hysteria dials before acknowledging. The request leaves with
+        // the first read or write, and the rejection arrives on the stream.
+        let mut tcp = client.open_tcp(&target).await.unwrap();
+        let mut byte = [0];
+        let result = timeout(DEADLINE, tcp.read(&mut byte)).await.unwrap();
+        let error = result.expect_err("native server rejects a closed port");
+        let rejected = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<HysteriaError>())
+            .copied();
+        assert_eq!(rejected, Some(HysteriaError::TcpRejected));
     } else {
         // Xray acknowledges before DispatchLink dials; failure arrives on the stream.
         let mut tcp = client.open_tcp(&target).await.unwrap();
