@@ -301,173 +301,183 @@ impl OwnerCache {
     }
 }
 
+#[cfg(target_os = "macos")]
 const CACHE_TTL: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
 const CACHE_CAP: usize = 4096;
 
-/// `xinpgen` is 24 bytes on the current export. The header's own `xig_len`
-/// is trusted when it looks like a size.
-const XINPGEN_FALLBACK: usize = 24;
-/// `so_last_pid` inside `xsocket_n` (pack-4 layout).
-const PID_IN_XSOCKET: usize = 68;
-const VFLAG_OFF: usize = 44;
-const LPORT_OFF: usize = 18;
-const LADDR_OFF: usize = 64;
-/// IPv4 sits 12 bytes into `in_addr_4in6` (three pad words, then the address).
-const IPV4_IN_4IN6: usize = 12;
-const INP_IPV4: u8 = 0x1;
-const INP_IPV6: u8 = 0x2;
-/// `xtcpcb_n` rounded up to 8, added to the socket record for TCP.
-const TCP_CB_BYTES: usize = 208;
+/// PCB list parser. Compiled into the macOS resolver and into tests (the
+/// layout checks run on every OS). A non-macOS library build has no caller.
+#[cfg(any(test, target_os = "macos"))]
+mod pcb {
+    use super::*;
 
-fn roundup8(n: usize) -> usize {
-    n.saturating_add(7) & !7
-}
+    /// `xinpgen` is 24 bytes on the current export. The header's own `xig_len`
+    /// is trusted when it looks like a size.
+    const XINPGEN_FALLBACK: usize = 24;
+    /// `so_last_pid` inside `xsocket_n` (pack-4 layout).
+    pub(super) const PID_IN_XSOCKET: usize = 68;
+    pub(super) const VFLAG_OFF: usize = 44;
+    pub(super) const LPORT_OFF: usize = 18;
+    pub(super) const LADDR_OFF: usize = 64;
+    /// IPv4 sits 12 bytes into `in_addr_4in6` (three pad words, then the address).
+    pub(super) const IPV4_IN_4IN6: usize = 12;
+    pub(super) const INP_IPV4: u8 = 0x1;
+    pub(super) const INP_IPV6: u8 = 0x2;
+    /// `xtcpcb_n` rounded up to 8, added to the socket record for TCP.
+    pub(super) const TCP_CB_BYTES: usize = 208;
 
-fn read_u32(buf: &[u8], off: usize) -> Option<u32> {
-    let b = buf.get(off..off + 4)?;
-    Some(u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
-}
+    fn roundup8(n: usize) -> usize {
+        n.saturating_add(7) & !7
+    }
 
-fn read_port(buf: &[u8]) -> Option<u16> {
-    let b = buf.get(LPORT_OFF..LPORT_OFF + 2)?;
-    Some(u16::from_be_bytes([b[0], b[1]]))
-}
+    fn read_u32(buf: &[u8], off: usize) -> Option<u32> {
+        let b = buf.get(off..off + 4)?;
+        Some(u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+    }
 
-fn read_v6(buf: &[u8], off: usize) -> Option<Ipv6Addr> {
-    let b = buf.get(off..off + 16)?;
-    let mut octets = [0u8; 16];
-    octets.copy_from_slice(b);
-    Some(Ipv6Addr::from(octets))
-}
+    fn read_port(buf: &[u8]) -> Option<u16> {
+        let b = buf.get(LPORT_OFF..LPORT_OFF + 2)?;
+        Some(u16::from_be_bytes([b[0], b[1]]))
+    }
 
-/// Socket-table bytes before the TCP control block: 408 since Darwin 22
-/// (`xinpcb_n` + `xsocket_n` + two `xsockbuf_n` + `xsockstat_n`, each
-/// rounded to 8), 384 before that.
-fn socket_table_len() -> usize {
-    #[cfg(target_os = "macos")]
-    {
-        if osrelease_major().unwrap_or(22) >= 22 {
+    fn read_v6(buf: &[u8], off: usize) -> Option<Ipv6Addr> {
+        let b = buf.get(off..off + 16)?;
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(b);
+        Some(Ipv6Addr::from(octets))
+    }
+
+    /// Socket-table bytes before the TCP control block: 408 since Darwin 22
+    /// (`xinpcb_n` + `xsocket_n` + two `xsockbuf_n` + `xsockstat_n`, each
+    /// rounded to 8), 384 before that.
+    fn socket_table_len() -> usize {
+        #[cfg(target_os = "macos")]
+        {
+            if super::darwin::osrelease_major().unwrap_or(22) >= 22 {
+                408
+            } else {
+                384
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
             408
+        }
+    }
+
+    fn fallback_stride(tcp: bool) -> usize {
+        let base = socket_table_len();
+        if tcp {
+            base + TCP_CB_BYTES
         } else {
-            384
+            base
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        408
-    }
-}
 
-fn fallback_stride(tcp: bool) -> usize {
-    let base = socket_table_len();
-    if tcp {
-        base + TCP_CB_BYTES
-    } else {
-        base
-    }
-}
-
-/// Pid of the socket bound to `local`, from a `pcblist_n` buffer. `None`
-/// when the buffer is not that table or nothing matches. UDP may fall
-/// back to an unspecified local address on the same port (a wildcard
-/// bind); TCP does not, so a listener is not blamed for a connection.
-pub(crate) fn find_owner_pid(buf: &[u8], local: SocketAddr, tcp: bool) -> Option<u32> {
-    let header = match read_u32(buf, 0) {
-        Some(n) if (16..=128).contains(&n) && n as usize <= buf.len() => n as usize,
-        _ => XINPGEN_FALLBACK,
-    };
-    if buf.len() < header + 4 {
-        return None;
-    }
-    let count = read_u32(buf, 4)? as usize;
-    if count == 0 {
-        return None;
-    }
-    let stride = detect_stride(buf, header, count, tcp)?;
-    let want = normalize_ip(local.ip());
-    let mut wildcard: Option<u32> = None;
-    let mut off = header;
-    let mut seen = 0usize;
-    while seen < count && off + stride <= buf.len() {
-        let rec = &buf[off..off + stride];
-        off += stride;
-        seen += 1;
-        let Some(pid) = record_pid(rec) else {
-            continue;
+    /// Pid of the socket bound to `local`, from a `pcblist_n` buffer. `None`
+    /// when the buffer is not that table or nothing matches. UDP may fall
+    /// back to an unspecified local address on the same port (a wildcard
+    /// bind); TCP does not, so a listener is not blamed for a connection.
+    pub(super) fn find_owner_pid(buf: &[u8], local: SocketAddr, tcp: bool) -> Option<u32> {
+        let header = match read_u32(buf, 0) {
+            Some(n) if (16..=128).contains(&n) && n as usize <= buf.len() => n as usize,
+            _ => XINPGEN_FALLBACK,
         };
-        if read_port(rec) != Some(local.port()) {
-            continue;
+        if buf.len() < header + 4 {
+            return None;
         }
-        let Some(addr) = record_local(rec, want) else {
-            continue;
-        };
-        if addr == want {
-            return Some(pid);
+        let count = read_u32(buf, 4)? as usize;
+        if count == 0 {
+            return None;
         }
-        if !tcp && wildcard.is_none() && addr.is_unspecified() {
-            wildcard = Some(pid);
+        let stride = detect_stride(buf, header, count, tcp)?;
+        let want = normalize_ip(local.ip());
+        let mut wildcard: Option<u32> = None;
+        let mut off = header;
+        let mut seen = 0usize;
+        while seen < count && off + stride <= buf.len() {
+            let rec = &buf[off..off + stride];
+            off += stride;
+            seen += 1;
+            let Some(pid) = record_pid(rec) else {
+                continue;
+            };
+            if read_port(rec) != Some(local.port()) {
+                continue;
+            }
+            let Some(addr) = record_local(rec, want) else {
+                continue;
+            };
+            if addr == want {
+                return Some(pid);
+            }
+            if !tcp && wildcard.is_none() && addr.is_unspecified() {
+                wildcard = Some(pid);
+            }
         }
+        wildcard
     }
-    wildcard
-}
 
-fn detect_stride(buf: &[u8], header: usize, count: usize, tcp: bool) -> Option<usize> {
-    let body = buf.len().saturating_sub(header);
-    if count > 0 && body.is_multiple_of(count) {
-        let stride = body / count;
-        if stride >= PID_IN_XSOCKET + 8 && plausible_xi(buf, header) {
+    fn detect_stride(buf: &[u8], header: usize, count: usize, tcp: bool) -> Option<usize> {
+        let body = buf.len().saturating_sub(header);
+        if count > 0 && body.is_multiple_of(count) {
+            let stride = body / count;
+            if stride >= PID_IN_XSOCKET + 8 && plausible_xi(buf, header) {
+                return Some(stride);
+            }
+        }
+        let stride = fallback_stride(tcp);
+        if stride >= PID_IN_XSOCKET + 8 && header + stride <= buf.len() && plausible_xi(buf, header)
+        {
             return Some(stride);
         }
-    }
-    let stride = fallback_stride(tcp);
-    if stride >= PID_IN_XSOCKET + 8 && header + stride <= buf.len() && plausible_xi(buf, header) {
-        return Some(stride);
-    }
-    None
-}
-
-fn plausible_xi(buf: &[u8], off: usize) -> bool {
-    matches!(read_u32(buf, off), Some(n) if (80..=512).contains(&n))
-}
-
-fn record_pid(rec: &[u8]) -> Option<u32> {
-    let xi_len = read_u32(rec, 0)? as usize;
-    if !(80..=512).contains(&xi_len) {
-        return None;
-    }
-    let so = roundup8(xi_len);
-    let xso_len = read_u32(rec, so)?;
-    if !(64..=256).contains(&xso_len) {
-        return None;
-    }
-    let pid = read_u32(rec, so + PID_IN_XSOCKET)?;
-    if pid == 0 {
         None
-    } else {
-        Some(pid)
     }
-}
 
-fn record_local(rec: &[u8], want: IpAddr) -> Option<IpAddr> {
-    let flag = *rec.get(VFLAG_OFF)?;
-    match want {
-        IpAddr::V4(_) => {
-            if flag & INP_IPV4 != 0 {
-                let off = LADDR_OFF + IPV4_IN_4IN6;
-                let b = rec.get(off..off + 4)?;
-                return Some(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])));
-            }
-            if flag & INP_IPV6 != 0 {
-                let mapped = read_v6(rec, LADDR_OFF)?.to_ipv4_mapped()?;
-                return Some(IpAddr::V4(mapped));
-            }
-            None
+    fn plausible_xi(buf: &[u8], off: usize) -> bool {
+        matches!(read_u32(buf, off), Some(n) if (80..=512).contains(&n))
+    }
+
+    fn record_pid(rec: &[u8]) -> Option<u32> {
+        let xi_len = read_u32(rec, 0)? as usize;
+        if !(80..=512).contains(&xi_len) {
+            return None;
         }
-        IpAddr::V6(_) => {
-            if flag & INP_IPV6 == 0 {
-                return None;
+        let so = roundup8(xi_len);
+        let xso_len = read_u32(rec, so)?;
+        if !(64..=256).contains(&xso_len) {
+            return None;
+        }
+        let pid = read_u32(rec, so + PID_IN_XSOCKET)?;
+        if pid == 0 {
+            None
+        } else {
+            Some(pid)
+        }
+    }
+
+    fn record_local(rec: &[u8], want: IpAddr) -> Option<IpAddr> {
+        let flag = *rec.get(VFLAG_OFF)?;
+        match want {
+            IpAddr::V4(_) => {
+                if flag & INP_IPV4 != 0 {
+                    let off = LADDR_OFF + IPV4_IN_4IN6;
+                    let b = rec.get(off..off + 4)?;
+                    return Some(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])));
+                }
+                if flag & INP_IPV6 != 0 {
+                    let mapped = read_v6(rec, LADDR_OFF)?.to_ipv4_mapped()?;
+                    return Some(IpAddr::V4(mapped));
+                }
+                None
             }
-            Some(IpAddr::V6(read_v6(rec, LADDR_OFF)?))
+            IpAddr::V6(_) => {
+                if flag & INP_IPV6 == 0 {
+                    return None;
+                }
+                Some(IpAddr::V6(read_v6(rec, LADDR_OFF)?))
+            }
         }
     }
 }
@@ -477,9 +487,9 @@ mod darwin {
     use std::ffi::CStr;
     use std::sync::{Mutex, OnceLock};
 
+    use super::pcb::find_owner_pid;
     use super::{
-        file_name, find_owner_pid, OwnerCache, OwnerKey, OwnerResolver, ProcessInfo, Proto,
-        CACHE_CAP, CACHE_TTL,
+        file_name, OwnerCache, OwnerKey, OwnerResolver, ProcessInfo, Proto, CACHE_CAP, CACHE_TTL,
     };
 
     extern "C" {
@@ -627,19 +637,19 @@ mod darwin {
     }
 }
 
-#[cfg(target_os = "macos")]
-use darwin::osrelease_major;
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    use super::pcb::{
+        find_owner_pid, INP_IPV4, INP_IPV6, IPV4_IN_4IN6, LADDR_OFF, LPORT_OFF, PID_IN_XSOCKET,
+        TCP_CB_BYTES, VFLAG_OFF,
+    };
     use super::{
-        builtin_ai_processes, find_owner_pid, AiProcessSet, CacheGet, OwnerCache, OwnerKey,
-        OwnerResolver, ProcessInfo, Proto, UnknownOwner, INP_IPV4, INP_IPV6, IPV4_IN_4IN6,
-        LADDR_OFF, LPORT_OFF, PID_IN_XSOCKET, TCP_CB_BYTES, VFLAG_OFF,
+        builtin_ai_processes, AiProcessSet, CacheGet, OwnerCache, OwnerKey, OwnerResolver,
+        ProcessInfo, Proto, UnknownOwner,
     };
 
     fn addr(ip: IpAddr, port: u16) -> SocketAddr {
