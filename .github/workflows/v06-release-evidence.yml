@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   validate:
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Check out exact evidence candidate

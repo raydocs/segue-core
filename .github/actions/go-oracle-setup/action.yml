@@ -1,21 +1,20 @@
 name: Prepare a Go oracle shard
 description: >-
-  Bind the build directory to the root disk, install the pinned Go and Rust
-  toolchains, and check out pinned Xray-core. The caller checks out this
-  repository first; a local action is not on disk until then.
+  Free disk space on the GitHub-hosted runner, install the pinned Go and Rust
+  toolchains, cache the Rust build, and check out pinned Xray-core. The caller
+  checks out this repository first; a local action is not on disk until then.
 
 runs:
   using: composite
   steps:
-    # Instabox runs the workspace on a 20 GiB /data disk, which a full
-    # workspace test build fills. The root disk has the room, so build there.
-    - name: Keep build outputs on the root disk
+    # GitHub-hosted runners ship a small root disk full of preinstalled SDKs.
+    # Drop the ones an oracle shard does not use before the build.
+    - name: Free disk space
       shell: bash
       run: |
-        sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
-        mkdir -p target
-        sudo mount --bind /opt/segue-target target
-        df -h / target
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune -af
+        df -h
 
     # The pinned Xray-core v26.11.9 source requires Go 1.27.
     # Use one exact toolchain for all oracle and interoperability checks.
@@ -48,3 +47,8 @@ runs:
     - name: Select pinned Rust toolchain
       shell: bash
       run: rustup default 1.96.0
+
+    - name: Cache Rust build outputs
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        key: ${{ github.job }}

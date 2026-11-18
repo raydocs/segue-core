@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   check:
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
       CARGO_INCREMENTAL: "0"
@@ -29,16 +29,21 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Keep build outputs on the root disk
+      - name: Free disk space
         run: |
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
-          mkdir -p target
-          sudo mount --bind /opt/segue-target target
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
 
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
           rustup default 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ github.job }}
 
       - name: Format
         run: |
