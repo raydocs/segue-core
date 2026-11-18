@@ -1,6 +1,6 @@
 diff -ruN a/src/chrome_parrot.rs b/src/chrome_parrot.rs
 --- a/src/chrome_parrot.rs	1969-12-31 16:00:00
-+++ b/src/chrome_parrot.rs	2026-11-18 07:38:58
++++ b/src/chrome_parrot.rs	2026-11-18 10:06:57
 @@ -0,0 +1,655 @@
 +//! Xray-core's ChromeParrot client handshake
 +//!
@@ -658,8 +658,8 @@ diff -ruN a/src/chrome_parrot.rs b/src/chrome_parrot.rs
 +    }
 +}
 diff -ruN a/src/config/transport.rs b/src/config/transport.rs
---- a/src/config/transport.rs	2006-07-23 18:21:28
-+++ b/src/config/transport.rs	2026-11-18 07:38:58
+--- a/src/config/transport.rs	2026-11-18 11:17:04
++++ b/src/config/transport.rs	2026-11-18 10:06:57
 @@ -47,7 +47,10 @@
      pub(crate) crypto_buffer_size: usize,
      pub(crate) allow_spin: bool,
@@ -764,8 +764,8 @@ diff -ruN a/src/config/transport.rs b/src/config/transport.rs
              .field("enable_segmentation_offload", enable_segmentation_offload);
          if cfg!(feature = "qlog") {
 diff -ruN a/src/congestion/bbr/bw_estimation.rs b/src/congestion/bbr/bw_estimation.rs
---- a/src/congestion/bbr/bw_estimation.rs	2006-07-23 18:21:28
-+++ b/src/congestion/bbr/bw_estimation.rs	2026-11-18 07:38:58
+--- a/src/congestion/bbr/bw_estimation.rs	2026-11-18 11:17:04
++++ b/src/congestion/bbr/bw_estimation.rs	2026-11-18 10:06:57
 @@ -1,78 +1,191 @@
 +use std::collections::BTreeMap;
  use std::fmt::{Debug, Display, Formatter};
@@ -1250,8 +1250,8 @@ diff -ruN a/src/congestion/bbr/bw_estimation.rs b/src/congestion/bbr/bw_estimati
      }
  }
 diff -ruN a/src/congestion/bbr/mod.rs b/src/congestion/bbr/mod.rs
---- a/src/congestion/bbr/mod.rs	2006-07-23 18:21:28
-+++ b/src/congestion/bbr/mod.rs	2026-11-18 07:38:58
+--- a/src/congestion/bbr/mod.rs	2026-11-18 11:17:04
++++ b/src/congestion/bbr/mod.rs	2026-11-18 10:06:57
 @@ -5,13 +5,13 @@
  use rand::{RngExt, SeedableRng};
  use rand_pcg::Pcg32;
@@ -1827,8 +1827,8 @@ diff -ruN a/src/congestion/bbr/mod.rs b/src/congestion/bbr/mod.rs
 +    }
 +}
 diff -ruN a/src/congestion.rs b/src/congestion.rs
---- a/src/congestion.rs	2006-07-23 18:21:28
-+++ b/src/congestion.rs	2026-11-18 07:38:58
+--- a/src/congestion.rs	2026-11-18 11:17:04
++++ b/src/congestion.rs	2026-11-18 10:06:57
 @@ -1,7 +1,7 @@
  //! Logic for controlling the rate at which data is sent
  
@@ -1975,8 +1975,8 @@ diff -ruN a/src/congestion.rs b/src/congestion.rs
      /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
      fn metrics(&self) -> ControllerMetrics {
 diff -ruN a/src/connection/mod.rs b/src/connection/mod.rs
---- a/src/connection/mod.rs	2006-07-23 18:21:28
-+++ b/src/connection/mod.rs	2026-11-18 08:26:56
+--- a/src/connection/mod.rs	2026-11-18 11:17:04
++++ b/src/connection/mod.rs	2026-11-18 10:07:11
 @@ -10,14 +10,12 @@
  use bytes::{Bytes, BytesMut};
  use frame::StreamMetaVec;
@@ -2758,8 +2758,8 @@ diff -ruN a/src/connection/mod.rs b/src/connection/mod.rs
  
  impl SentFrames {
 diff -ruN a/src/connection/pacing.rs b/src/connection/pacing.rs
---- a/src/connection/pacing.rs	2006-07-23 18:21:28
-+++ b/src/connection/pacing.rs	2026-11-18 07:38:58
+--- a/src/connection/pacing.rs	2026-11-18 11:17:04
++++ b/src/connection/pacing.rs	2026-11-18 10:06:57
 @@ -15,6 +15,7 @@
  pub(super) struct Pacer {
      capacity: u64,
@@ -3016,8 +3016,8 @@ diff -ruN a/src/connection/pacing.rs b/src/connection/pacing.rs
      }
  }
 diff -ruN a/src/connection/packet_builder.rs b/src/connection/packet_builder.rs
---- a/src/connection/packet_builder.rs	2006-07-23 18:21:28
-+++ b/src/connection/packet_builder.rs	2026-11-18 07:38:58
+--- a/src/connection/packet_builder.rs	2026-11-18 11:17:04
++++ b/src/connection/packet_builder.rs	2026-11-18 10:06:57
 @@ -2,12 +2,12 @@
  use rand::RngExt;
  use tracing::{debug, trace, trace_span};
@@ -3164,8 +3164,8 @@ diff -ruN a/src/connection/packet_builder.rs b/src/connection/packet_builder.rs
  
      /// Encrypt packet, returning the length of the packet and whether padding was added
 diff -ruN a/src/connection/paths.rs b/src/connection/paths.rs
---- a/src/connection/paths.rs	2006-07-23 18:21:28
-+++ b/src/connection/paths.rs	2026-11-18 08:16:40
+--- a/src/connection/paths.rs	2026-11-18 11:17:04
++++ b/src/connection/paths.rs	2026-11-18 10:07:11
 @@ -7,7 +7,7 @@
      pacing::Pacer,
      spaces::{PacketSpace, SentPacket},
@@ -3209,8 +3209,8 @@ diff -ruN a/src/connection/paths.rs b/src/connection/paths.rs
  
      pub(crate) fn update(&mut self, ack_delay: Duration, rtt: Duration) {
 diff -ruN a/src/connection/spaces.rs b/src/connection/spaces.rs
---- a/src/connection/spaces.rs	2006-07-23 18:21:28
-+++ b/src/connection/spaces.rs	2026-11-18 07:38:58
+--- a/src/connection/spaces.rs	2026-11-18 11:17:04
++++ b/src/connection/spaces.rs	2026-11-18 10:06:57
 @@ -11,9 +11,9 @@
  
  use super::assembler::Assembler;
@@ -3234,8 +3234,8 @@ diff -ruN a/src/connection/spaces.rs b/src/connection/spaces.rs
      pub(super) path_generation: u64,
      /// The time the packet was sent.
 diff -ruN a/src/connection/streams/mod.rs b/src/connection/streams/mod.rs
---- a/src/connection/streams/mod.rs	2006-07-23 18:21:28
-+++ b/src/connection/streams/mod.rs	2026-11-18 07:38:58
+--- a/src/connection/streams/mod.rs	2026-11-18 11:17:04
++++ b/src/connection/streams/mod.rs	2026-11-18 10:06:57
 @@ -138,7 +138,7 @@
              hash_map::Entry::Occupied(s) => s,
              hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
@@ -3246,8 +3246,8 @@ diff -ruN a/src/connection/streams/mod.rs b/src/connection/streams/mod.rs
          let (read_credits, stop_sending) = stream.stop()?;
          if stop_sending.should_transmit() {
 diff -ruN a/src/connection/streams/recv.rs b/src/connection/streams/recv.rs
---- a/src/connection/streams/recv.rs	2006-07-23 18:21:28
-+++ b/src/connection/streams/recv.rs	2026-11-18 07:38:58
+--- a/src/connection/streams/recv.rs	2026-11-18 11:17:04
++++ b/src/connection/streams/recv.rs	2026-11-18 10:06:57
 @@ -93,8 +93,12 @@
  
          self.stopped = true;
@@ -3288,8 +3288,8 @@ diff -ruN a/src/connection/streams/recv.rs b/src/connection/streams/recv.rs
                  false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
              };
 diff -ruN a/src/connection/streams/state.rs b/src/connection/streams/state.rs
---- a/src/connection/streams/state.rs	2006-07-23 18:21:28
-+++ b/src/connection/streams/state.rs	2026-11-18 07:38:58
+--- a/src/connection/streams/state.rs	2026-11-18 11:17:04
++++ b/src/connection/streams/state.rs	2026-11-18 10:06:57
 @@ -129,6 +129,9 @@
      pub(super) send_window: u64,
      /// Configured upper bound for how much unacked data the peer can send us per stream
@@ -3551,8 +3551,8 @@ diff -ruN a/src/connection/streams/state.rs b/src/connection/streams/state.rs
  
      #[test]
 diff -ruN a/src/lib.rs b/src/lib.rs
---- a/src/lib.rs	2006-07-23 18:21:28
-+++ b/src/lib.rs	2026-11-18 07:38:58
+--- a/src/lib.rs	2026-11-18 11:17:04
++++ b/src/lib.rs	2026-11-18 10:06:57
 @@ -26,6 +26,9 @@
      ops,
  };
@@ -3564,8 +3564,8 @@ diff -ruN a/src/lib.rs b/src/lib.rs
  pub mod coding;
  mod constant_time;
 diff -ruN a/src/packet.rs b/src/packet.rs
---- a/src/packet.rs	2006-07-23 18:21:28
-+++ b/src/packet.rs	2026-11-18 07:38:58
+--- a/src/packet.rs	2026-11-18 11:17:04
++++ b/src/packet.rs	2026-11-18 10:06:57
 @@ -702,6 +702,17 @@
          }
      }
@@ -3586,7 +3586,7 @@ diff -ruN a/src/packet.rs b/src/packet.rs
          match self {
 diff -ruN a/src/tests/congestion_sent.rs b/src/tests/congestion_sent.rs
 --- a/src/tests/congestion_sent.rs	1969-12-31 16:00:00
-+++ b/src/tests/congestion_sent.rs	2026-11-18 07:38:58
++++ b/src/tests/congestion_sent.rs	2026-11-18 10:06:57
 @@ -0,0 +1,697 @@
 +use super::*;
 +use crate::congestion::{Controller, ControllerFactory, CubicConfig};
@@ -4286,8 +4286,8 @@ diff -ruN a/src/tests/congestion_sent.rs b/src/tests/congestion_sent.rs
 +    );
 +}
 diff -ruN a/src/tests/mod.rs b/src/tests/mod.rs
---- a/src/tests/mod.rs	2006-07-23 18:21:28
-+++ b/src/tests/mod.rs	2026-11-18 07:38:58
+--- a/src/tests/mod.rs	2026-11-18 11:17:04
++++ b/src/tests/mod.rs	2026-11-18 11:16:39
 @@ -18,19 +18,19 @@
  #[cfg(feature = "rustls-ring")]
  use rustls::crypto::ring::default_provider;
@@ -4330,7 +4330,68 @@ diff -ruN a/src/tests/mod.rs b/src/tests/mod.rs
      let mut active_cid_num = CidQueue::LEN as u64;
      active_cid_num = active_cid_num.min(LOC_CID_COUNT);
  
-@@ -4386,3 +4386,138 @@
+@@ -3011,7 +3011,35 @@
+     assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), 1452);
+ }
+ 
++/// Segue: with a round trip longer than the 10 ms PTO probe gap, both probes
++/// still leave before either is acknowledged, and black-hole detection works
++/// exactly as upstream asserts in its zero-latency version of this test.
+ #[test]
++fn blackhole_after_mtu_change_is_detected_with_latency() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    pair.latency = Duration::from_millis(40);
++    pair.mtu = 1500;
++    let (client_ch, server_ch) = pair.connect();
++    pair.drive();
++    assert_eq!(pair.client_conn_mut(client_ch).path_mtu(), 1452);
++    assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), 1452);
++
++    pair.mtu = 1200;
++    let payload = vec![42; 1300];
++    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
++    pair.client_send(client_ch, s).write(&payload).unwrap();
++    assert!(!pair.drive_bounded(), "Connections never reached an idle state");
++
++    let recv = pair.server_recv(server_ch, s);
++    assert_eq!(stream_chunks(recv).len(), 1300);
++    let client_stats = pair.client_conn_mut(client_ch).stats();
++    assert!(client_stats.path.lost_packets >= 3);
++    assert!(client_stats.path.congestion_events >= 3);
++    assert_eq!(client_stats.path.black_holes_detected, 1);
++}
++
++#[test]
+ fn blackhole_after_mtu_change_repairs_itself() {
+     let _guard = subscribe();
+     let mut pair = Pair::default();
+@@ -3043,11 +3071,20 @@
+     // The whole packet arrived in the end
+     assert_eq!(buf.len(), 1300);
+ 
+-    // Sanity checks (black hole detected after 3 lost packets)
++    // The oversized datagram was lost and the bytes still arrived.
++    //
++    // Upstream requires `lost_packets >= 3`, `congestion_events >= 3` and one
++    // black-hole detection. Those counts describe both PTO datagrams leaving in
++    // one turn, before either is acknowledged: every retransmission is then a
++    // full-MTU packet, dropped again, until four suspicious bursts lower the
++    // path MTU. The probes are now 10 ms apart. This harness has no latency, so
++    // the first probe's ACK is handled before the second probe is sent, the loss
++    // is declared, and that probe carries the data clamped to the minimum MTU.
++    // One loss repairs the send. A round trip longer than the gap still emits
++    // both probes first, and black-hole detection there is unchanged.
+     let client_stats = pair.client_conn_mut(client_ch).stats();
+-    assert!(client_stats.path.lost_packets >= 3);
+-    assert!(client_stats.path.congestion_events >= 3);
+-    assert_eq!(client_stats.path.black_holes_detected, 1);
++    assert!(client_stats.path.lost_packets >= 1);
++    assert!(client_stats.path.congestion_events >= 1);
+ }
+ 
+ #[test]
+@@ -4386,3 +4423,138 @@
      let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
      pair.connect();
  }
@@ -4470,8 +4531,8 @@ diff -ruN a/src/tests/mod.rs b/src/tests/mod.rs
 +
 +mod congestion_sent;
 diff -ruN a/src/tests/util.rs b/src/tests/util.rs
---- a/src/tests/util.rs	2006-07-23 18:21:28
-+++ b/src/tests/util.rs	2026-11-18 07:38:58
+--- a/src/tests/util.rs	2026-11-18 11:17:04
++++ b/src/tests/util.rs	2026-11-18 10:06:57
 @@ -42,6 +42,8 @@
      /// Number of spin bit flips
      pub(super) spins: u64,
@@ -4498,8 +4559,8 @@ diff -ruN a/src/tests/util.rs b/src/tests/util.rs
              if packet_size > self.mtu {
                  info!(packet_size, "dropping packet (max size exceeded)");
 diff -ruN a/src/transport_parameters.rs b/src/transport_parameters.rs
---- a/src/transport_parameters.rs	2006-07-23 18:21:28
-+++ b/src/transport_parameters.rs	2026-11-18 07:38:58
+--- a/src/transport_parameters.rs	2026-11-18 11:17:04
++++ b/src/transport_parameters.rs	2026-11-18 10:06:57
 @@ -110,6 +110,11 @@
              /// This field is initialized only for outgoing `TransportParameters` instances and
              /// is set to `None` for `TransportParameters` received from a peer.

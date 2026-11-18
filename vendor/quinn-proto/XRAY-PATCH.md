@@ -334,3 +334,16 @@ second datagram is now held for 10 ms (`LOSS_PROBE_SPACING`), long enough to
 clear that burst and far shorter than a round trip. The driver's transmit loop
 reuses one timestamp, so `poll_transmit` returns nothing until that deadline
 instead of emitting the second datagram immediately.
+
+`blackhole_after_mtu_change_repairs_itself` no longer requires three losses or a
+black-hole event. Upstream's count assumed both probes left in one turn, before
+either ACK, so each retransmission was another full-MTU packet and four
+suspicious bursts lowered the path MTU. With the probes 10 ms apart and the
+harness's zero latency, the first probe's ACK declares the loss before the
+second probe is sent. That probe carries the data clamped to the minimum MTU,
+the shrunken link delivers it, and one loss repairs the send. Black-hole
+detection itself is unchanged: a round trip longer than the gap still sends both
+probes first, and the same four bursts still lower the MTU. The test still
+requires the bytes to arrive and at least one loss.
+
+- 2026-11-18: `blackhole_after_mtu_change_is_detected_with_latency` (40 ms latency) keeps upstream's black-hole assertions (>=3 losses, >=3 congestion events, 1 black hole) for the spaced-probe patch; the zero-latency upstream test now accepts the one-loss repair.

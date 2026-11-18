@@ -3011,6 +3011,34 @@ fn connect_runs_mtud_again_after_600_seconds() {
     assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), 1452);
 }
 
+/// Segue: with a round trip longer than the 10 ms PTO probe gap, both probes
+/// still leave before either is acknowledged, and black-hole detection works
+/// exactly as upstream asserts in its zero-latency version of this test.
+#[test]
+fn blackhole_after_mtu_change_is_detected_with_latency() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.latency = Duration::from_millis(40);
+    pair.mtu = 1500;
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+    assert_eq!(pair.client_conn_mut(client_ch).path_mtu(), 1452);
+    assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), 1452);
+
+    pair.mtu = 1200;
+    let payload = vec![42; 1300];
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(&payload).unwrap();
+    assert!(!pair.drive_bounded(), "Connections never reached an idle state");
+
+    let recv = pair.server_recv(server_ch, s);
+    assert_eq!(stream_chunks(recv).len(), 1300);
+    let client_stats = pair.client_conn_mut(client_ch).stats();
+    assert!(client_stats.path.lost_packets >= 3);
+    assert!(client_stats.path.congestion_events >= 3);
+    assert_eq!(client_stats.path.black_holes_detected, 1);
+}
+
 #[test]
 fn blackhole_after_mtu_change_repairs_itself() {
     let _guard = subscribe();
@@ -3043,11 +3071,20 @@ fn blackhole_after_mtu_change_repairs_itself() {
     // The whole packet arrived in the end
     assert_eq!(buf.len(), 1300);
 
-    // Sanity checks (black hole detected after 3 lost packets)
+    // The oversized datagram was lost and the bytes still arrived.
+    //
+    // Upstream requires `lost_packets >= 3`, `congestion_events >= 3` and one
+    // black-hole detection. Those counts describe both PTO datagrams leaving in
+    // one turn, before either is acknowledged: every retransmission is then a
+    // full-MTU packet, dropped again, until four suspicious bursts lower the
+    // path MTU. The probes are now 10 ms apart. This harness has no latency, so
+    // the first probe's ACK is handled before the second probe is sent, the loss
+    // is declared, and that probe carries the data clamped to the minimum MTU.
+    // One loss repairs the send. A round trip longer than the gap still emits
+    // both probes first, and black-hole detection there is unchanged.
     let client_stats = pair.client_conn_mut(client_ch).stats();
-    assert!(client_stats.path.lost_packets >= 3);
-    assert!(client_stats.path.congestion_events >= 3);
-    assert_eq!(client_stats.path.black_holes_detected, 1);
+    assert!(client_stats.path.lost_packets >= 1);
+    assert!(client_stats.path.congestion_events >= 1);
 }
 
 #[test]
