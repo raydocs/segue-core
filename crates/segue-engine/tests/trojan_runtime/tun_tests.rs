@@ -219,13 +219,16 @@ async fn vmess_runtime_tun_dns_wire_and_managed_destination_lookup() {
 #[tokio::test]
 #[ignore = "requires pinned Xray; use check-mux-interop.sh"]
 async fn mux_runtime_tun_tcp_udp_and_host_close() {
-    for protocol in ["vless", "vless-vision", "trojan", "shadowsocks", "vmess"] {
-        for carrier in ["raw", "grpc", "xhttp"] {
-            if protocol == "vless-vision" && carrier != "raw" {
-                continue;
+    for round in 0..30 {
+        eprintln!("Mux TUN tcp_udp round {round}");
+        for protocol in ["vless", "vless-vision", "trojan", "shadowsocks", "vmess"] {
+            for carrier in ["raw", "grpc", "xhttp"] {
+                if protocol == "vless-vision" && carrier != "raw" {
+                    continue;
+                }
+                eprintln!("Mux TUN {protocol}/{carrier}: tcp_udp_and_host_close");
+                tun_tcp_udp_and_host_close(reference(protocol, carrier).await, true).await;
             }
-            eprintln!("Mux TUN {protocol}/{carrier}: tcp_udp_and_host_close");
-            tun_tcp_udp_and_host_close(reference(protocol, carrier).await, true).await;
         }
     }
 }
