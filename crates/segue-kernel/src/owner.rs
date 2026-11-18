@@ -121,14 +121,16 @@ impl AiProcessSet {
             other => return Err(format!("unknown kind {other:?}")),
         };
         let value = match field {
-            ProcField::Name | ProcField::Bundle => {
+            // macOS process names carry spaces ("Claude Helper (GPU)"), so a
+            // name is the rest of the line like a path. A bundle id never does.
+            ProcField::Bundle => {
                 let value = parts.next().ok_or("missing value")?;
                 if parts.next().is_some() {
                     return Err("extra token".into());
                 }
                 value.to_owned()
             }
-            ProcField::Path | ProcField::Cmd => {
+            ProcField::Name | ProcField::Path | ProcField::Cmd => {
                 let rest = line[kind.len()..].trim();
                 if rest.is_empty() {
                     return Err("missing value".into());
@@ -659,6 +661,15 @@ mod tests {
     }
 
     #[test]
+    fn names_with_spaces_and_the_built_in_list_parse() {
+        let set = AiProcessSet::parse("name Claude Helper (GPU)  # electron helper\nname claude\n")
+            .unwrap();
+        assert_eq!(set.entries.len(), 2);
+        assert_eq!(set.entries[0].value, "Claude Helper (GPU)");
+        AiProcessSet::parse(include_str!("../data/ai-processes.txt")).unwrap();
+    }
+
+    #[test]
     fn parser_accepts_the_four_kinds_and_rejects_a_bad_line() {
         let set = AiProcessSet::parse(
             "# comment\n\nname claude\nname codex\npath /usr/local/bin/claude\nbundle com.anthropic.claude\ncmd claude --model opus\nname claude # twice\n",
@@ -695,7 +706,11 @@ mod tests {
         assert!(!stored.matchable());
         assert!(stored.matched_label(&claude).is_none());
         assert!(AiProcessSet::parse("name\n").is_err());
-        assert!(AiProcessSet::parse("name claude extra\n").is_err());
+        // Names may contain spaces (Electron helpers), so this is one name.
+        assert_eq!(
+            AiProcessSet::parse("name claude extra\n").unwrap().entries[0].value,
+            "claude extra"
+        );
         assert!(AiProcessSet::parse("nope claude\n").is_err());
         assert!(AiProcessSet::parse("bundle\n").is_err());
         assert!(AiProcessSet::parse("bundle a b\n").is_err());
