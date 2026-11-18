@@ -410,16 +410,39 @@ grep -Fq '/usr/local/lib/android' "$oracle_setup" || \
   die "go oracle setup does not drop the preinstalled Android SDK"
 grep -Fq 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0' "$oracle_setup" || \
   die "go oracle setup does not cache the Rust build"
-# The owner turned the macOS job off while no macOS runner is available
-# (2026-11-13). It keeps the stable-tag condition or is off outright; while
-# it is off, publish-prerelease, which needs it, cannot run either.
+# The Apple job stays on the owner's Mac mini: hosted macos-26 does not have
+# Xcode 27. It keeps the stable-tag condition (or is off outright) and must
+# skip fork pull requests so a self-hosted job cannot be queued by a fork.
 apple_job="$(job_body apple)"
-if ! grep -Fxq "$stable_tag_skip" <<<"$apple_job"; then
+fork_guard="github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
+stable_tag_predicate="github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')"
+if ! grep -Fq "$stable_tag_predicate" <<<"$apple_job"; then
   grep -Fxq '    if: false' <<<"$apple_job" || \
     die "apple does not run for every event except a stable tag push"
   grep -Fxq '      - apple' <<<"$(job_body publish-prerelease)" || \
     die "publish-prerelease no longer waits for the disabled apple job"
 fi
+if grep -Fq 'self-hosted' <<<"$apple_job"; then
+  grep -Fq "$fork_guard" <<<"$apple_job" || \
+    die "apple is self-hosted but can run for a fork pull request"
+fi
+while IFS= read -r self_hosted_job; do
+  [[ -n "$self_hosted_job" ]] || continue
+  body="$(job_body "$self_hosted_job")"
+  grep -Fq "$fork_guard" <<<"$body" || \
+    die "$self_hosted_job is self-hosted but can run for a fork pull request"
+done < <(
+  awk '
+    /^  [A-Za-z0-9_-]+:/ {
+      if (job != "" && hosted) print job
+      job = $1
+      sub(/:$/, "", job)
+      hosted = 0
+    }
+    /self-hosted/ { hosted = 1 }
+    END { if (job != "" && hosted) print job }
+  ' "$WORKFLOW"
+)
 candidate_job="$(job_body candidate-ci)"
 grep -Fxq "    if: needs.release-metadata.outputs.bind_candidate_ci == 'true'" <<<"$candidate_job" || \
   die "candidate binding is not restricted to stable tags"
