@@ -4523,12 +4523,17 @@ mod stream_grpc_pool_tests {
         /// has drained, so this is the one shape in which a pooled connection
         /// is live and unusable at once.
         GoAwayUnderAnOpenCall,
+        /// `RST_STREAM` on the first call as soon as its headers arrive, with
+        /// the connection left up. The client's driver keeps running, so a
+        /// pool that only watches the driver hands the dead connection out
+        /// again.
+        ResetTheOpenStream,
     }
 
     impl AfterFirstCall {
         fn reason(self) -> Option<Reason> {
             match self {
-                Self::KeepServing => None,
+                Self::KeepServing | Self::ResetTheOpenStream => None,
                 Self::GoAwayGracefully | Self::GoAwayUnderAnOpenCall => Some(Reason::NO_ERROR),
                 Self::GoAwayWithAnError => Some(Reason::INTERNAL_ERROR),
             }
@@ -4583,7 +4588,12 @@ mod stream_grpc_pool_tests {
         let mut connection = server::handshake(socket).await.expect("server handshake");
         let mut served_one = false;
         while let Some(accepted) = connection.accept().await {
-            let (request, respond) = accepted.expect("a well-formed request");
+            let (request, mut respond) = accepted.expect("a well-formed request");
+            if after_first_call == AfterFirstCall::ResetTheOpenStream && !served_one {
+                served_one = true;
+                respond.send_reset(Reason::CANCEL);
+                continue;
+            }
             let call = tokio::spawn(echo_call(request.into_body(), respond));
 
             let shutdown = if served_one {
@@ -5017,6 +5027,48 @@ mod stream_grpc_pool_tests {
         .await;
 
         assert_eq!(peer.accepted(), 2, "the unusable connection was replaced");
+    }
+
+    /// A reset that arrives after `open_grpc_call` returned still has to retire
+    /// the pool slot. The driver has not finished — the connection itself is
+    /// fine — so watching only the driver would dial the next flow onto the
+    /// stream the peer already closed.
+    #[tokio::test]
+    async fn an_uplink_reset_before_the_body_retires_the_pooled_connection() {
+        let peer = GrpcPeer::spawn(AfterFirstCall::ResetTheOpenStream).await;
+        let dialer = dialer();
+        let transport = TransportLayer::Grpc(GrpcTransport::new(config()));
+        let TransportLayer::Grpc(grpc) = &transport else {
+            panic!("the transport under test is gRPC");
+        };
+
+        within_deadline(async {
+            let mut first = open_flow(&dialer, &transport, peer.addr).await;
+            // Larger than the initial stream window, so the write has to wait
+            // for capacity and therefore observes the reset.
+            let body = vec![0u8; 70_000];
+            let error = first
+                .write_all(&body)
+                .await
+                .expect_err("the reset stream takes no body");
+            assert!(
+                error.to_string().contains("the gRPC uplink is closed"),
+                "{error}"
+            );
+            drop(first);
+
+            assert!(
+                !grpc.holds_a_live_connection().await,
+                "the failed write must condemn the connection before its driver ends"
+            );
+
+            let mut second = open_flow(&dialer, &transport, peer.addr).await;
+            round_trip(&mut second, b"second").await;
+            end_flow(second).await;
+        })
+        .await;
+
+        assert_eq!(peer.accepted(), 2, "the reset connection was replaced");
     }
 
     // There is no test here for a request that cannot be built, and its

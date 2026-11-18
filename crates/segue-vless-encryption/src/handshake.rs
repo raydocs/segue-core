@@ -67,7 +67,7 @@ impl ClientConfig {
         cache: Option<&Cache>,
     ) -> io::Result<EncryptedStream<S>> {
         let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-        tokio::time::timeout_at(deadline, self.handshake(stream, suite, cache, deadline))
+        tokio::time::timeout_at(deadline, self.handshake(stream, suite, cache))
             .await
             .map_err(|_| {
                 io::Error::new(
@@ -82,7 +82,6 @@ impl ClientConfig {
         mut stream: S,
         suite: CipherSuite,
         cache: Option<&Cache>,
-        deadline: Instant,
     ) -> io::Result<EncryptedStream<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -157,7 +156,7 @@ impl ClientConfig {
                     write_mask,
                     prefix,
                     resume.lease,
-                    deadline.min(resume.expires),
+                    resume.expires,
                 ));
             }
             Some(Prepared::Fresh(epoch)) => Some(epoch),

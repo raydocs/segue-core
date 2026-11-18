@@ -5211,10 +5211,16 @@ async fn open_vless_tcp_stream_with_resolved_server_and_dialer(
         }
     }
 
-    let stream = outbound
-        .open_carrier(resolved_server, resolved_download, transport_dialer)
-        .await?;
-    let stream = encryption::wrap(stream, outbound.encryption(), flow.uses_vision()).await?;
+    // Boxed: the retry loop would otherwise grow every TCP open future past
+    // the legacy task budget (future_layout_tests).
+    let stream = Box::pin(open_encrypted_carrier(
+        outbound,
+        resolved_server,
+        resolved_download,
+        transport_dialer,
+        flow.uses_vision(),
+    ))
+    .await?;
     held_request_stream(outbound, flow, stream, VlessCommand::Tcp, target)
 }
 
@@ -5633,6 +5639,31 @@ async fn open_reverse_carrier(
     vless.open_carrier(&server, &download, &proxy_dialer).await
 }
 
+/// Dials the carrier and wraps VLESS encryption, once more if the pooled gRPC
+/// uplink was already closed. The first attempt marks that connection failed;
+/// the second therefore dials a new one. A second failure is returned.
+async fn open_encrypted_carrier(
+    outbound: &VlessTcpOutbound,
+    resolved_server: &[SocketAddr],
+    resolved_download: &[SocketAddr],
+    transport_dialer: &TransportDialer,
+    vision: bool,
+) -> Result<BoxedTransportStream, CoreError> {
+    let mut retried = false;
+    loop {
+        let stream = outbound
+            .open_carrier(resolved_server, resolved_download, transport_dialer)
+            .await?;
+        match encryption::wrap(stream, outbound.encryption(), vision).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) if !retried && encryption::grpc_uplink_closed(&error) => {
+                retried = true;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// The request for a UDP or Mux command, its header held until the first
 /// XUDP or Mux frame as for a TCP request: Xray-core's `postRequest` sends
 /// every command's header with the first payload.
@@ -5645,10 +5676,16 @@ async fn open_vless_command_stream(
     resolved_download: &[SocketAddr],
     transport_dialer: &TransportDialer,
 ) -> Result<BoxedTransportStream, CoreError> {
-    let stream = outbound
-        .open_carrier(resolved_server, resolved_download, transport_dialer)
-        .await?;
-    let stream = encryption::wrap(stream, outbound.encryption(), flow.uses_vision()).await?;
+    // Boxed: the retry loop would otherwise grow every TCP open future past
+    // the legacy task budget (future_layout_tests).
+    let stream = Box::pin(open_encrypted_carrier(
+        outbound,
+        resolved_server,
+        resolved_download,
+        transport_dialer,
+        flow.uses_vision(),
+    ))
+    .await?;
     held_request_stream(outbound, flow, stream, command, target)
 }
 
