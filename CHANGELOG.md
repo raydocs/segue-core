@@ -506,6 +506,17 @@ long-term supported release series.
   Cloudflare) stay off the list. It is merged with the signed bundle's
   `ai_domains`/`ai_cidrs` into a first-tier match that beats every user
   rule, including direct and GEOIP, except an explicit reject.
+- AI tools are also matched by the owning process. `data/ai-processes.txt`
+  (`name` / `path`, with `bundle` / `cmd` stored) merges with the signed
+  bundle's `ai_processes` lines. When a flow's destination is not already
+  an AI domain or CIDR, the kernel asks macOS who owns the local socket
+  (`net.inet.tcp.pcblist_n` / `net.inet.udp.pcblist_n` and `proc_pidpath`,
+  no root) and, on a `name` or `path` hit, sends it to the AI exit. An
+  explicit user reject still blocks; a user direct or proxy rule does not
+  pull the flow off the AI exit. A miss or a lookup failure leaves the
+  flow on the destination decision. The per-flow reason is `domain`,
+  `cidr`, or `process:<name>`. Other operating systems do not resolve an
+  owner yet.
 - A connection to an AI CIDR, or whose sniffed TLS SNI is an AI name, is
   AI-class. A non-AI SNI cannot steer an AI address onto another proxy.
 - DNS for an AI name is fake-IP (A) or an empty NOERROR (AAAA; the pool has

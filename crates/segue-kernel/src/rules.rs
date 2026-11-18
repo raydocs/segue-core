@@ -9,11 +9,16 @@
 //! A destination it matches is the AI action, except when a user rule that
 //! matches is an explicit [`Action::Reject`]: a block still blocks. A user
 //! Direct or Proxy rule cannot pull an AI destination off the AI exit.
+//! The same precedence applies to a process match ([`RuleSet::with_processes`]):
+//! it is consulted only when the destination tier missed and the tier lists
+//! a `name` or `path`.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use segue_routing::TargetAddr;
 use serde::Deserialize;
+
+use crate::owner::{AiProcessSet, OwnerResolver};
 
 /// What to do with a flow.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -48,27 +53,52 @@ pub struct Rule {
 /// rule rejected the target. Not an index into the user rules.
 pub const AI_TIER_INDEX: usize = usize::MAX;
 
-/// Destinations that must use the AI exit. Built from the file in
-/// `data/ai-lock.txt` plus the signed bundle's `ai_domains` / `ai_cidrs`.
+/// Why the AI tier claimed a flow. [`AiReason::label`] is the per-flow
+/// diagnostic: `domain`, `cidr`, or `process:<name>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AiReason {
+    Domain,
+    Cidr,
+    /// The matched `name` pattern, or the executable name on a path hit.
+    Process(String),
+}
+
+impl AiReason {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Domain => "domain".to_owned(),
+            Self::Cidr => "cidr".to_owned(),
+            Self::Process(name) => format!("process:{name}"),
+        }
+    }
+}
+
+/// What [`RuleSet::explain`] decided. `matched` is None only for the default.
+pub struct Decision<'a> {
+    pub action: &'a Action,
+    pub matched: Option<usize>,
+    pub ai_reason: Option<AiReason>,
+}
+
+/// Local end of a flow, plus who can name its owner. Passed only when the
+/// caller has a socket to ask about.
+#[derive(Clone, Copy)]
+pub struct FlowQuery<'a> {
+    pub proto: crate::owner::Proto,
+    pub local: SocketAddr,
+    pub resolver: &'a dyn OwnerResolver,
+}
+
+/// Destinations, and optionally processes, that must use the AI exit.
+/// Destinations come from `data/ai-lock.txt` plus the bundle's `ai_domains`
+/// / `ai_cidrs`. Processes come from `data/ai-processes.txt` plus
+/// `ai_processes`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiTier {
     suffixes: Vec<String>,
     cidrs: CidrTable,
+    processes: AiProcessSet,
     action: Action,
-}
-
-impl AiTier {
-    fn matches(&self, target: &TargetAddr) -> bool {
-        match target {
-            TargetAddr::Domain(name) => {
-                let n = normalize(name);
-                self.suffixes
-                    .iter()
-                    .any(|s| segue_policy::suffix_match(&n, s))
-            }
-            TargetAddr::Ip(ip) => self.cidrs.contains(*ip),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,15 +124,27 @@ impl RuleSet {
         self.ai = Some(AiTier {
             suffixes,
             cidrs: CidrTable::new(cidrs),
+            processes: AiProcessSet::default(),
             action,
         });
         self
     }
 
-    /// The AI tier matched `target` (a block rule may still win in
-    /// [`Self::lookup`]).
+    /// Install process patterns on the AI tier. No effect without
+    /// [`Self::with_ai`]: the tier owns the action a process match returns.
+    /// An empty or bundle-only set never calls the resolver.
+    pub fn with_processes(mut self, processes: AiProcessSet) -> Self {
+        if let Some(ai) = self.ai.as_mut() {
+            ai.processes = processes;
+        }
+        self
+    }
+
+    /// The AI tier matched `target` by destination (a block rule may still
+    /// win in [`Self::lookup`]). Process matches are not a property of the
+    /// destination; see [`Self::explain`].
     pub fn is_ai(&self, target: &TargetAddr) -> bool {
-        self.ai.as_ref().is_some_and(|ai| ai.matches(target))
+        self.destination_reason(target).is_some()
     }
 
     /// The action the AI tier routes to, when one is installed.
@@ -111,7 +153,7 @@ impl RuleSet {
     }
 
     pub fn decide(&self, target: &TargetAddr) -> &Action {
-        self.lookup(target).map(|(_, a)| a).unwrap_or(&self.default)
+        self.explain(target, None).action
     }
 
     /// The first rule that matches `target`, with its index, or None when
@@ -121,19 +163,106 @@ impl RuleSet {
     ///
     /// When the AI tier matches, an explicit [`Action::Reject`] user rule
     /// still wins (a block is a block). Every other user rule loses: the
-    /// tier's action is returned with [`AI_TIER_INDEX`].
+    /// tier's action is returned with [`AI_TIER_INDEX`]. This is the
+    /// destination-only view: a process match needs [`Self::explain`].
     pub fn lookup(&self, target: &TargetAddr) -> Option<(usize, &Action)> {
-        if self.is_ai(target) {
+        let decided = self.explain(target, None);
+        decided.matched.map(|i| (i, decided.action))
+    }
+
+    /// Destination rules, then — only when those missed and the AI tier
+    /// lists a process `name` or `path` — the owner of `flow`'s local
+    /// socket. The resolver is not called when the process list cannot
+    /// match, when the destination tier already matched, or when `flow` is
+    /// None. A resolver `None` falls through to the user rules. A user
+    /// [`Action::Reject`] still wins over a process match; a user Direct
+    /// or Proxy does not.
+    pub fn explain(&self, target: &TargetAddr, flow: Option<FlowQuery<'_>>) -> Decision<'_> {
+        if let Some(reason) = self.destination_reason(target) {
             if let Some(i) = self.reject_index(target) {
-                return Some((i, &self.rules[i].action));
+                return Decision {
+                    action: &self.rules[i].action,
+                    matched: Some(i),
+                    ai_reason: None,
+                };
             }
-            Some((
-                AI_TIER_INDEX,
-                &self.ai.as_ref().expect("is_ai implies a tier").action,
-            ))
-        } else {
-            self.user_index(target).map(|i| (i, &self.rules[i].action))
+            return Decision {
+                action: &self
+                    .ai
+                    .as_ref()
+                    .expect("destination reason implies a tier")
+                    .action,
+                matched: Some(AI_TIER_INDEX),
+                ai_reason: Some(reason),
+            };
         }
+        if let Some(reason) = self.process_reason(flow) {
+            if let Some(i) = self.reject_index(target) {
+                return Decision {
+                    action: &self.rules[i].action,
+                    matched: Some(i),
+                    ai_reason: None,
+                };
+            }
+            return Decision {
+                action: &self
+                    .ai
+                    .as_ref()
+                    .expect("process reason implies a tier")
+                    .action,
+                matched: Some(AI_TIER_INDEX),
+                ai_reason: Some(reason),
+            };
+        }
+        if let Some(i) = self.user_index(target) {
+            return Decision {
+                action: &self.rules[i].action,
+                matched: Some(i),
+                ai_reason: None,
+            };
+        }
+        Decision {
+            action: &self.default,
+            matched: None,
+            ai_reason: None,
+        }
+    }
+
+    fn destination_reason(&self, target: &TargetAddr) -> Option<AiReason> {
+        let ai = self.ai.as_ref()?;
+        match target {
+            TargetAddr::Domain(name) => {
+                let n = normalize(name);
+                if ai
+                    .suffixes
+                    .iter()
+                    .any(|s| segue_policy::suffix_match(&n, s))
+                {
+                    Some(AiReason::Domain)
+                } else {
+                    None
+                }
+            }
+            TargetAddr::Ip(ip) => {
+                if ai.cidrs.contains(*ip) {
+                    Some(AiReason::Cidr)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Process hit, ignoring the destination. Does not call the resolver
+    /// unless a `name` or `path` is listed.
+    pub(crate) fn process_reason(&self, flow: Option<FlowQuery<'_>>) -> Option<AiReason> {
+        let ai = self.ai.as_ref()?;
+        if !ai.processes.matchable() {
+            return None;
+        }
+        let flow = flow?;
+        let info = flow.resolver.owner(flow.proto, flow.local)?;
+        ai.processes.matched_label(&info).map(AiReason::Process)
     }
 
     fn user_index(&self, target: &TargetAddr) -> Option<usize> {
@@ -712,5 +841,139 @@ mod tests {
         assert!(parse_ai_list("suffix .claude.ai\n").is_err());
         assert!(parse_ai_list("nope claude.ai\n").is_err());
         assert!(parse_ai_list("suffix\n").is_err());
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::owner::{AiProcessSet, OwnerResolver, ProcessInfo, Proto};
+
+    struct Scripted {
+        calls: AtomicUsize,
+        info: Option<ProcessInfo>,
+    }
+
+    impl OwnerResolver for Scripted {
+        fn owner(&self, _proto: Proto, _local: std::net::SocketAddr) -> Option<ProcessInfo> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.info.clone()
+        }
+    }
+
+    fn claude() -> ProcessInfo {
+        ProcessInfo {
+            pid: 7,
+            name: "claude".into(),
+            path: "/usr/local/bin/claude".into(),
+        }
+    }
+
+    fn flow<'a>(resolver: &'a Scripted) -> FlowQuery<'a> {
+        FlowQuery {
+            proto: Proto::Tcp,
+            local: "127.0.0.1:9".parse().unwrap(),
+            resolver,
+        }
+    }
+
+    #[test]
+    fn destination_reason_is_domain_or_cidr() {
+        let cidr = Cidr::parse("203.0.113.0/24").unwrap();
+        let rules = RuleSet::new(Vec::new(), Action::Direct).with_ai(
+            vec!["claude.ai".into()],
+            &[cidr],
+            Action::Proxy("ai".into()),
+        );
+        let domain = rules.explain(&d("a.claude.ai"), None);
+        assert_eq!(domain.ai_reason.unwrap().label(), "domain");
+        assert_eq!(domain.action, &Action::Proxy("ai".into()));
+        let ip = rules.explain(&ip("203.0.113.9"), None);
+        assert_eq!(ip.ai_reason.unwrap().label(), "cidr");
+    }
+
+    #[test]
+    fn no_process_entries_never_calls_the_resolver() {
+        let resolver = Scripted {
+            calls: AtomicUsize::new(0),
+            info: Some(claude()),
+        };
+        let rules = RuleSet::new(Vec::new(), Action::Direct).with_ai(
+            vec!["claude.ai".into()],
+            &[],
+            Action::Proxy("ai".into()),
+        );
+        let missed = rules.explain(&d("example.com"), Some(flow(&resolver)));
+        assert_eq!(missed.action, &Action::Direct);
+        assert!(missed.ai_reason.is_none());
+        let hit = rules.explain(&d("claude.ai"), Some(flow(&resolver)));
+        assert_eq!(hit.ai_reason.unwrap().label(), "domain");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+
+        let bundle_only = rules.with_processes(
+            AiProcessSet::parse("bundle com.anthropic.claude\ncmd claude\n").unwrap(),
+        );
+        let _ = bundle_only.explain(&d("example.com"), Some(flow(&resolver)));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn process_match_beats_user_direct_and_proxy_but_not_reject() {
+        let resolver = Scripted {
+            calls: AtomicUsize::new(0),
+            info: Some(claude()),
+        };
+        let rules = RuleSet::new(
+            vec![
+                Rule {
+                    matcher: Matcher::DomainSuffix("example.com".into()),
+                    action: Action::Direct,
+                },
+                Rule {
+                    matcher: Matcher::Cidr(Cidr::parse("198.51.100.0/24").unwrap()),
+                    action: Action::Proxy("overseas".into()),
+                },
+                Rule {
+                    matcher: Matcher::DomainExact("blocked.example".into()),
+                    action: Action::Reject,
+                },
+            ],
+            Action::Proxy("overseas".into()),
+        )
+        .with_ai(Vec::new(), &[], Action::Proxy("ai".into()))
+        .with_processes(AiProcessSet::parse("name claude\n").unwrap());
+
+        let direct = rules.explain(&d("www.example.com"), Some(flow(&resolver)));
+        assert_eq!(direct.action, &Action::Proxy("ai".into()));
+        assert_eq!(direct.matched, Some(AI_TIER_INDEX));
+        assert_eq!(direct.ai_reason.unwrap().label(), "process:claude");
+
+        let proxy = rules.explain(&ip("198.51.100.8"), Some(flow(&resolver)));
+        assert_eq!(proxy.action, &Action::Proxy("ai".into()));
+        assert_eq!(proxy.ai_reason.unwrap().label(), "process:claude");
+
+        let blocked = rules.explain(&d("blocked.example"), Some(flow(&resolver)));
+        assert_eq!(blocked.action, &Action::Reject);
+        assert!(blocked.ai_reason.is_none());
+        assert_ne!(blocked.matched, Some(AI_TIER_INDEX));
+
+        let quiet = Scripted {
+            calls: AtomicUsize::new(0),
+            info: None,
+        };
+        let missed = rules.explain(&d("www.example.com"), Some(flow(&quiet)));
+        assert_eq!(missed.action, &Action::Direct);
+        assert!(missed.ai_reason.is_none());
+        assert_eq!(quiet.calls.load(Ordering::SeqCst), 1);
+
+        let other = Scripted {
+            calls: AtomicUsize::new(0),
+            info: Some(ProcessInfo {
+                pid: 3,
+                name: "curl".into(),
+                path: "/usr/bin/curl".into(),
+            }),
+        };
+        let curl = rules.explain(&d("www.example.com"), Some(flow(&other)));
+        assert_eq!(curl.action, &Action::Direct);
+        assert!(curl.ai_reason.is_none());
     }
 }

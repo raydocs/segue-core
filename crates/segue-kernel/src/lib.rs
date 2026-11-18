@@ -12,6 +12,7 @@ pub mod dial;
 pub mod dns;
 pub mod fakeip;
 pub mod killswitch;
+pub mod owner;
 pub mod policy;
 pub mod process;
 pub mod quic;
