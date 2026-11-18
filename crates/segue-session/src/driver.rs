@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use crate::client::{ClientSession, CloseReason, Health, State, Tx};
 use crate::codec::{code, ty, CtrlHello, Frame, FrameDecoder, Kind, SessionId, Target};
 use crate::pool::{Grant as PoolGrant, Pool, Ticket, Tier, FRAME_MAX};
+use crate::quality::QualityEvent;
 use crate::relay::{Grant, RelayEvent, RelayTable};
 use crate::ProtoError;
 
@@ -925,10 +926,16 @@ pub struct ClientCtl {
     /// Session-level health reports (r9 F5, see [`Health`]): called
     /// from the driver task whenever the session's health changes.
     pub health: Option<HealthHook>,
+    /// Path-quality evidence (see [`QualityEvent`]): called from the
+    /// driver task when the session loses a carrier or replays bytes.
+    pub quality: Option<QualityHook>,
 }
 
 /// Receives a session's [`Health`] reports.
 pub type HealthHook = Arc<dyn Fn(Health) + Send + Sync>;
+
+/// Receives a session's [`QualityEvent`]s.
+pub type QualityHook = Arc<dyn Fn(QualityEvent) + Send + Sync>;
 
 /// [`run_client`] with hooks.
 pub async fn run_client_ctl<A>(
@@ -947,11 +954,17 @@ where
         mut opened,
         mut cancel,
         health,
+        quality,
     } = ctl;
     let report = |s: &mut ClientSession| {
         if let Some(h) = s.take_health() {
             if let Some(f) = &health {
                 f(h);
+            }
+        }
+        if let Some(q) = s.take_quality() {
+            if let Some(f) = &quality {
+                f(q);
             }
         }
     };
@@ -1826,6 +1839,9 @@ pub enum ControlHint {
     /// task has stopped; reconnecting would get the same answer. Never
     /// followed by [`ControlHint::Dead`]: the channel was never up.
     Rejected(u8),
+    /// A control PING was answered: the round trip, for the exit's path
+    /// quality (see [`crate::quality`]).
+    Rtt(std::time::Duration),
 }
 
 /// A `REJECT` of `CTRL_HELLO` that a reconnect cannot change: another
@@ -1879,6 +1895,8 @@ pub async fn run_control(
         let mut dec = FrameDecoder::new();
         let mut buf = vec![0u8; 4096];
         let mut last_rx = Instant::now();
+        // PINGs in flight, by nonce: a PONG measures the round trip.
+        let mut pings: HashMap<u64, Instant> = HashMap::new();
         let mut ping = tokio::time::interval(timing.ping_every);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Set by the relay's CTRL_HELLO reply only: until then the stream
@@ -1923,6 +1941,11 @@ pub async fn run_control(
                                     let _ = hints.send(ControlHint::Stall { session_id, attach_gen });
                                 }
                             }
+                            Ok(Some(Frame::Pong { nonce, .. })) => {
+                                if let Some(sent) = pings.remove(&nonce) {
+                                    let _ = hints.send(ControlHint::Rtt(sent.elapsed()));
+                                }
+                            }
                             Ok(Some(_)) => {}
                             Ok(None) => break,
                             Err(_) => break 'stream,
@@ -1937,6 +1960,12 @@ pub async fn run_control(
                     if !write_within(&mut w, Frame::Ping { nonce }, timing.dead_after).await {
                         break 'stream;
                     }
+                    // Bound the in-flight table: a PONG that never comes
+                    // (a lossy path) must not grow it without limit.
+                    if pings.len() >= 8 {
+                        pings.clear();
+                    }
+                    pings.insert(nonce, Instant::now());
                 }
                 _ = sleep_until_dead(last_rx, timing.dead_after) => break 'stream,
                 _ = hints.closed() => return,
