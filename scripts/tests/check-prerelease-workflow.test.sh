@@ -458,4 +458,8 @@ grep -Fq -- '--log-opts="$log_opts"' <<<"$secrets_job" || die "secret scan scope
 grep -Fxq '          log_opts=--all' <<<"$secrets_job" || die "branch secret scan does not cover all branches"
 grep -Fxq '            log_opts=HEAD' <<<"$secrets_job" || die "tag secret scan does not cover the tag ancestry"
 
+if grep -RFq 'instabox' "$WORKSPACE_ROOT/.github/workflows" "$WORKSPACE_ROOT/.github/actions"; then
+  die "a workflow still runs on Instabox"
+fi
+
 echo "verified idempotent source-only prerelease workflow policy and candidate isolation"
