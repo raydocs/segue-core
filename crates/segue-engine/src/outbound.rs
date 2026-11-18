@@ -4,7 +4,8 @@ mod first_payload;
 mod protocol_stream;
 use first_payload::{
     flush_header_alone, FirstPayloadDeadline, HeldHeader, SHADOWSOCKS_2022_FIRST_PAYLOAD_WAIT,
-    SHADOWSOCKS_FIRST_PAYLOAD_WAIT, TROJAN_FIRST_PAYLOAD_WAIT, VMESS_FIRST_PAYLOAD_WAIT,
+    SHADOWSOCKS_FIRST_PAYLOAD_WAIT, TROJAN_FIRST_PAYLOAD_WAIT, VLESS_REVERSE_FIRST_PAYLOAD_WAIT,
+    VMESS_FIRST_PAYLOAD_WAIT,
 };
 mod shadowsocks;
 pub use shadowsocks::Shadowsocks2022Outbound;
@@ -5239,11 +5240,15 @@ fn held_request_stream(
     // as that timeout path.
     let mut stream: BoxedTransportStream = Box::new(HeldHeader::new(stream, &header));
 
+    // The reverse tunnel request keeps Xray-core's 500 ms wait: it is set up
+    // once per tunnel, and reverse_bridge_tests pin that timing.
+    let xray_wait = matches!(command, VlessCommand::Reverse);
     if flow.uses_vision() {
         return Ok(vision_stream(
             stream,
             *outbound.user().id.as_bytes(),
             outbound.user().vision_seed,
+            xray_wait,
         ));
     }
 
@@ -5251,10 +5256,16 @@ fn held_request_stream(
     // record-aligned reads.
     stream.release_record_alignment();
     let stream = VlessResponseStream::new(stream);
-    Ok(Box::new(FirstPayloadDeadline::for_vless(
-        VlessOutboundStream::new(stream),
-        flush_header_alone,
-    )))
+    let stream = VlessOutboundStream::new(stream);
+    Ok(if xray_wait {
+        Box::new(FirstPayloadDeadline::new(
+            stream,
+            VLESS_REVERSE_FIRST_PAYLOAD_WAIT,
+            flush_header_alone,
+        ))
+    } else {
+        Box::new(FirstPayloadDeadline::for_vless(stream, flush_header_alone))
+    })
 }
 
 /// A held request under Vision, as a TCP relay reads and writes it.
@@ -5262,15 +5273,24 @@ fn vision_stream(
     stream: BoxedTransportStream,
     user_id: [u8; 16],
     seed: [u32; 4],
+    xray_wait: bool,
 ) -> BoxedTransportStream {
     let stream = VlessResponseStream::new(VisionTransportStream::new(stream));
-    let stream = VisionStream::new(stream, user_id, seed);
+    let stream = VisionOutboundStream::new(VisionStream::new(stream, user_id, seed));
     // No payload: the empty padding frame Xray-core inserts when its 500 ms
-    // wait expires, sent on the relay's next read rather than after it.
-    Box::new(FirstPayloadDeadline::for_vless(
-        VisionOutboundStream::new(stream),
-        |stream| stream.inner.queue_empty_padding_frame(),
-    ))
+    // wait expires, sent on the relay's next read rather than after it
+    // (after the full wait for a reverse tunnel request).
+    if xray_wait {
+        Box::new(FirstPayloadDeadline::new(
+            stream,
+            VLESS_REVERSE_FIRST_PAYLOAD_WAIT,
+            |stream| stream.inner.queue_empty_padding_frame(),
+        ))
+    } else {
+        Box::new(FirstPayloadDeadline::for_vless(stream, |stream| {
+            stream.inner.queue_empty_padding_frame()
+        }))
+    }
 }
 
 /// The stream a Vision request gets over `carrier`, with no request header.
@@ -5279,7 +5299,12 @@ pub(crate) fn vision_stream_for_tests(
     carrier: BoxedTransportStream,
     user_id: [u8; 16],
 ) -> BoxedTransportStream {
-    vision_stream(Box::new(HeldHeader::new(carrier, &[])), user_id, [0; 4])
+    vision_stream(
+        Box::new(HeldHeader::new(carrier, &[])),
+        user_id,
+        [0; 4],
+        false,
+    )
 }
 
 pub async fn open_vless_udp_stream_with_resolver_and_dialer(

@@ -21,6 +21,10 @@ use std::task::ready;
 use tokio::time::Sleep;
 
 /// Xray-core's Trojan wait (`buf.CopyOnceTimeout(..., time.Millisecond*100)`).
+/// Xray-core's VLESS `ReadMultiBufferTimeout`. Kept only for the reverse
+/// tunnel request, where setup latency does not matter and the bridge stays
+/// byte- and timing-identical to Xray-core's.
+pub(super) const VLESS_REVERSE_FIRST_PAYLOAD_WAIT: Duration = Duration::from_millis(500);
 pub(super) const TROJAN_FIRST_PAYLOAD_WAIT: Duration = Duration::from_millis(100);
 /// Xray-core's VMess wait, the same for every command
 /// (`buf.CopyOnceTimeout(input, bodyWriter, time.Millisecond*100)`).
