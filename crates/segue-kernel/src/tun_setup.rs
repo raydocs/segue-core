@@ -1727,12 +1727,13 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn prepare_rejects_tun_off_macos() {
-        let err = TunSession::prepare(
+        let Err(err) = TunSession::prepare(
             Some(&TunAddress::default()),
             &std::collections::BTreeMap::new(),
             &[],
-        )
-        .unwrap_err();
+        ) else {
+            panic!("a TUN session was prepared off macOS");
+        };
         assert!(err.contains("macOS"), "{err}");
     }
 }
