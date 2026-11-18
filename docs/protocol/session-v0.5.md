@@ -248,3 +248,181 @@ target example.com:443, exit_class 1, no t_stall_ms, no first_data):
   03 0B 65 78 61 6D 70 6C 65 2E 63 6F 6D 01 BB   # atyp 3, len 11, port 443
   01                                   # exit_class
 ```
+
+## 3. Auth material and the control stream (spec §3)
+
+Two things the code attributes to §3:
+
+- **`resume_secret` comparison is constant-time.** A re-attach (OPEN retry or
+  RESUME) must prove knowledge of the 32-byte secret chosen by the client in
+  its first OPEN; the relay compares in constant time (`crates/segue-session/src/lib.rs:170-180`,
+  used at `relay.rs:496` and `relay.rs:578`). The secret and ticket are never
+  printed by any `Debug` impl (`codec.rs:162-201`, `client.rs:225-243`,
+  `relay.rs:159-171`).
+- **The control stream.** A carrier whose first frame is CTRL_HELLO belongs to
+  a device, not a session (`crates/segue-session/src/relay.rs:10-14`,
+  `relay.rs:421-474`). Relay behaviour:
+  - CTRL_HELLO is ticket-checked (`Authorizer::resume`, `relay.rs:433-438`);
+    a wrong wire version is answered `REJECT(version)` (`relay.rs:424-426`,
+    spec §10), other malformed closes the carrier (`relay.rs:427`).
+  - The reply is the `CtrlHelloReply` (node/instance ids, ticket state,
+    `relay.rs:459-468`).
+  - PING is answered by PONG while the outbound control queue is under 64
+    frames (`CTRL_QUEUE`, `relay.rs:216-218`, `relay.rs:365-378`).
+  - `STALL{session_id, attach_gen}` frames are queued on **every** control
+    stream of the device when one of its sessions goes DETACHED (B1,
+    `relay.rs:476-489`, `relay.rs:1085-1096`), batched ≤ 512 entries per frame
+    (`STALL_BATCH`, `relay.rs:220`).
+  - `REVOKED[code]` is queued and the stream closed on a device reset
+    (`reset_device`, `relay.rs:978-1005`).
+  - Bounds: ≤ 32 live control streams per device (`MAX_CTRL_PER_DEVICE`,
+    `relay.rs:206`); at the cap only streams quiet for `t_ctrl_idle / 3` are
+    replaced, never a live one (`ctrl_quiet`, `relay.rs:211-213`,
+    `relay.rs:439-457`). A control stream is closed after `t_ctrl_idle`
+    without a frame or `max_lifetime` after its CTRL_HELLO (`relay.rs:14-16`,
+    `relay.rs:1039-1050`).
+
+Client side, `run_control` (`crates/segue-session/src/driver.rs:1853-1949`):
+send CTRL_HELLO, then PING every `ping_every` (5 s); a stream is *accepted*
+only once the reply arrived; silence for `dead_after` (12 s) or a break on an
+accepted stream is reported as `ControlHint::Dead` — "the channel is dead,
+move every session" (`driver.rs:1825-1831`, `driver.rs:1885-1890`); a REJECT
+with `version|auth|expired|revoked` is terminal (`ControlHint::Rejected`,
+`control_reject_is_terminal` `driver.rs:1835-1845`); every reconnect waits
+`retry` (2 s) first (`ControlTiming`, `driver.rs:1792-1809`). The kernel keeps
+one control stream per configured exit that has sessions
+(`crates/segue-kernel/src/session/mod.rs:32-37`, `ensure_channel`
+`mod.rs:445`).
+
+## 4. Flow control and replay (spec §4)
+
+Source: `crates/segue-session/src/flow.rs` (module doc `flow.rs:1-14`),
+`pool.rs`. Each session has two independent half-flows, one per direction:
+client→relay ("uplink", the relay's `RecvHalf`) and relay→client ("downlink").
+
+### 4.1 Offsets and sequencing
+
+- Every byte of application data has a **u64 offset** starting at 0; DATA
+  frames carry `offset` and may be re-sent with the same offsets on any
+  carrier. Only contiguous data is accepted: an offset beyond `recv_offset`
+  is the fatal `gap in data`; a frame ending beyond the advertised
+  `max_offset` is the fatal `data beyond max_offset`; duplicates (end ≤
+  `recv_offset`) are trimmed and counted as zero new bytes (`RecvHalf::on_data`,
+  `flow.rs:631-657`).
+- **FIN occupies one offset** (rule 7) and is *not* counted against the
+  window — "requiring window for it could deadlock a peer whose app has
+  stopped reading" (`flow.rs:13-15`, `on_fin` `flow.rs:660-678`). FIN must sit
+  exactly at `recv_offset`; a second FIN at a different offset is fatal
+  (`fin moved`, `flow.rs:663-667`). A session direction is done when
+  `acked > fin` (`SendHalf::done`, `flow.rs:345-347`).
+- **ACK** carries the receiver's `recv_offset` (all bytes before it are
+  received) and `max_offset` (the window edge: the receiver commits to buffer
+  up to here). Processing rules (rule 2): an ACK for bytes never sent
+  (`recv > sent_hw`) is fatal; `max_offset` never shrinks the peer's window
+  (`peer_max` only grows); a duplicate or old ACK is ignored
+  (`SendHalf::on_ack`, `flow.rs:228-247`).
+- Delayed ACKs (rule 8 mechanism): an ACK is due immediately once a quarter of
+  the outstanding credit (or a 16 KiB window step) has arrived, or the peer's
+  FIN; otherwise after `ack_delay` (20 ms default; the spec says
+  `jitter × SRTT/2`, floor 20 ms, `lib.rs:63-64`) (`ack_deadline`,
+  `flow.rs:797-816`). ACKs piggyback ahead of new data when something is
+  sendable (`client.rs:873-876`, `relay.rs:841-844`).
+
+### 4.2 The sending side: replay buffer
+
+`SendHalf` keeps `[acked_offset, written)` plus a FIN marker, and **two send
+positions** (`flow.rs:4-8`): `cursor` — the next offset to put on the *current*
+carrier, rewound on re-attach — and `sent_hw` — the highest offset ever sent,
+used for the fatal checks of rules 2 and 6. Sending is bounded by the peer's
+advertised `max_offset` (`peer_max`): `poll_next` stops at
+  `min(data_end, peer_max)` (`flow.rs:260-288`). New application bytes are
+accepted only while the replay buffer (capped by `replay_cap`, default 2 MiB,
+`lib.rs:139-156`) and the pool grant cover them — backpressure, never loss
+(`write`/`write_capacity`, `flow.rs:127-205`).
+
+### 4.3 The receiving side: credit and window growth
+
+`RecvHalf` keeps `consumed_offset` (bytes handed to the app), `recv_offset`
+and the advertised `adv_max` ("`max_offset` never decreases", `flow.rs:10-11`).
+The **receive credit** is `max_offset − consumed_offset`; the pool grant always
+covers it, so "the bytes a peer can make us buffer are bounded by the grant"
+(rule 1, `flow.rs:9-12`).
+
+Window growth (rule 8): the receiver estimates SRTT from its own window
+advertisements — when data first ends beyond an advertised edge, at least one
+round trip has passed since the next advertisement went out (`RateRtt`,
+`flow.rs:363-405`, samples windowed over `RTT_WINDOW` = 2 s, `flow.rs:398`,
+clamped to 2 s, new measurement after each carrier change `flow.rs:473-481`,
+`new_path` `flow.rs:857-861`) — and a delivery rate per SRTT epoch. The target
+window is `clamp(2 × delivery_rate × SRTT, initial_credit, window_cap)`;
+"a window-limited sender delivers about `win` per RTT, so the target is about
+`2 × win` and the window doubles each round trip until the link, the reader or
+the cap limits it" (`flow.rs:519-535`). Growth is **not** taken back when the
+app reads slowly (like TCP receive autotuning); the window falls back to the
+initial credit only after `idle_after` (1 s) with no data (`update_credit`,
+`flow.rs:709-775`). Under pool pressure the target is capped at the pool's fair
+share (`flow.rs:742-744`).
+
+### 4.4 Attach generations and what is retransmitted
+
+- **Generations (A1):** each successful attach to a carrier increments
+  `attach_gen`; at most one attach is in flight; a superseded carrier is
+  frozen — no DATA, no ACK — and every non-DATA event from it is ignored,
+  while its DATA is still deduplicated by offset (`client.rs:3-6`,
+  `attach` `client.rs:358-415`, `on_frame_at` `client.rs:661-691`).
+- **On re-attach** the client sends RESUME with its snapshot
+  (`recv_offset`, `max_offset`), and the sender **replays from
+  `max(peer.recv_offset, own.acked_offset)`**: the relay's RESUMED (or the
+  client's own RESUME ACK state) rewinds the cursor (`SendHalf::rewind`,
+  `flow.rs:249-258`). Bytes the peer already had are skipped by offset;
+  duplicates that still arrive are dropped in `on_data` (`flow.rs:645-647`).
+  "An old snapshot is not an error; one beyond anything ever sent is"
+  (`resume offset beyond sent`, rule 6, `flow.rs:247-258`).
+- **Relay side (atomic attach, §5.2):** `switch` snapshots the client's
+  offsets, rewinds its downlink replay buffer, closes the old carrier, binds
+  the new one and restarts RTT measurement — all before any frame goes out
+  (`relay.rs:629-670`).
+- **Optimistic data:** only the first OPEN of generation 0 may carry
+  `first_data` before any answer (`client.rs:860-864`); an OPEN retry carries
+  none, and a retry OPEN that reaches a relay which knows the session is
+  treated as a resume with the client snapshot `(0, initial credit)`
+  (R2-2b, `relay.rs:517-527`, `client.rs:736-748`).
+
+### 4.5 The global pool (rule 8) and admission floors
+
+All session memory comes from one process-wide pool counted in 4 KB blocks
+(`BLOCK`, `pool.rs:51`); a session holds a `Grant` that grows and shrinks, the
+sum of grants never exceeds the pool, and `try_resize` fails instead of
+overcommitting (`pool.rs:1-10`). "Grants are charged for the memory a buffer
+actually holds, not for the bytes in it" (`pool.rs:12-15`). The kernel uses one
+8 MiB pool for session buffers, driver queues and the TUN stack's TCP buffers
+(`crates/segue-kernel/src/session/mod.rs:76-86`).
+
+**Admission floors (rule 8 arithmetic):** a session is admitted only if the
+pool can cover its floors — the 16 KiB initial credit (`INITIAL_CREDIT`,
+`lib.rs:151-153`), one replay block (`SEND_FLOOR` = one 4 KB block,
+`flow.rs:65-70`) and one pipe block each way (`pipe.rs:1-13`) —
+"`1000 × 4 KB floor = 4 MB of an 8 MB pool`" (`pool.rs:693-696`,
+`tests/driver.rs:853-899`). If the pool cannot cover the initial credit the
+side refuses: the client session is not created (`client.rs:245-252`), the
+relay answers `REJECT(capacity)` (`relay.rs:540-549`).
+
+**Tiers (deadlock-freedom).** *Elastic* grants (receive windows, replay
+buffers, pipe and TUN ring growth, admission floors) stop at the Elastic tier
+limit; *draining* buffers (a frame queued to or just read from a carrier, a
+chunk on its way to the app/TUN) may use the higher Relay and Transport tiers.
+"A tier's holders only ever wait for stages of a higher tier …, so the waits
+form no cycle and a pool full of elastic grants still moves bytes"
+(`pool.rs:17-32`, `Tier` `pool.rs:62-72`). The transport region is disjoint and
+handed out in arrival order to tickets; a frame may hold it at most
+`TRANSPORT_HOLD` = 2 s without a byte moving (30 s overall cap), after which
+the carrier is dropped and its data replayed (`pool.rs:77-90`,
+`pool.rs:33-43`).
+
+**Growth budget.** Credit above the initial credit ("window growth") is taken
+only while the elastic tier is less than half in use (`GROWTH_SHARE_DIV` = 2):
+"credit once advertised cannot be revoked, so sessions that grew and then went
+quiet without closing must not pin what admission needs" (`flow.rs:508-516`,
+`update_credit` `flow.rs:747-766`). Under pressure (`under_pressure`,
+`pool.rs:222`) a receiver's desired credit is capped at the pool's fair share
+(`pool.rs:229`, `flow.rs:742-744`).
