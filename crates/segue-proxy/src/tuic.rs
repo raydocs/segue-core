@@ -392,7 +392,9 @@ pub fn fragment_datagrams(
 }
 
 struct PartialPacket {
-    target: Address,
+    /// Adopted from the first address-bearing fragment (fragment 0); `None`
+    /// until it arrives, since fragments can be delivered in any order.
+    target: Option<Address>,
     created: Instant,
     fragments: Vec<Option<Vec<u8>>>,
     received: usize,
@@ -429,55 +431,69 @@ impl Reassembler {
 
     pub fn feed(&mut self, packet: &Packet, now: Instant) -> Result<Option<Packet>, WireError> {
         self.expire(now);
-        let check = Command::Packet(packet.clone());
-        encode(&check)?;
-        if packet.payload.len() > self.max_payload {
-            return Err(WireError::ReassemblyLimit);
-        }
+        // Structural validation, including `None` only on non-first fragments.
+        encode(&Command::Packet(packet.clone()))?;
         if packet.fragment_total == 1 {
+            if packet.payload.len() > self.max_payload {
+                return Err(WireError::ReassemblyLimit);
+            }
             return Ok(Some(packet.clone()));
         }
         let key = (packet.association_id, packet.packet_id);
-        if let Some(partial) = self.pending.get(&key) {
-            if partial.fragments.len() != usize::from(packet.fragment_total) {
-                return Err(WireError::Fragmentation);
+        match self.pending.get(&key) {
+            Some(partial) => {
+                if partial.fragments.len() != usize::from(packet.fragment_total) {
+                    return Err(WireError::Fragmentation);
+                }
             }
-            if let Some(existing) = &partial.fragments[usize::from(packet.fragment_id)] {
-                return if existing == &packet.payload {
-                    Ok(None)
-                } else {
-                    Err(WireError::Fragmentation)
-                };
+            None => {
+                if self.pending.len() >= MAX_PENDING_PACKETS
+                    || self.bytes.saturating_add(packet.payload.len()) > MAX_PENDING_BYTES
+                {
+                    return Err(WireError::ReassemblyLimit);
+                }
+                // Only fragment 0 carries the address, but fragments may be
+                // delivered in any order, so the bag starts without a target:
+                // like sing-quic and mihomo's defraggers, it is adopted from
+                // the first fragment that still carries one.
+                self.pending.insert(
+                    key,
+                    PartialPacket {
+                        target: packet.address.clone(),
+                        created: now,
+                        fragments: vec![None; usize::from(packet.fragment_total)],
+                        received: 0,
+                        bytes: 0,
+                    },
+                );
             }
-        } else {
-            if self.pending.len() >= MAX_PENDING_PACKETS {
-                return Err(WireError::ReassemblyLimit);
-            }
-            self.pending.insert(
-                key,
-                PartialPacket {
-                    target: packet.address.clone().ok_or(WireError::Fragmentation)?,
-                    created: now,
-                    fragments: vec![None; usize::from(packet.fragment_total)],
-                    received: 0,
-                    bytes: 0,
-                },
-            );
         }
         let partial = self.pending.get_mut(&key).expect("partial inserted");
-        if partial.bytes.saturating_add(packet.payload.len()) > self.max_payload
+        if let Some(existing) = partial.fragments[usize::from(packet.fragment_id)].as_ref() {
+            // A duplicate is an idempotent retransmission only when its bytes
+            // agree. It also never changes the original deadline.
+            return if existing == &packet.payload {
+                Ok(None)
+            } else {
+                Err(WireError::Fragmentation)
+            };
+        }
+        // Every fragment stored after the first keeps the reassembled payload
+        // within max_payload; a bag holding only its first fragment can never
+        // complete over budget, since each later fragment re-checks the sum.
+        if (partial.received != 0
+            && partial.bytes.saturating_add(packet.payload.len()) > self.max_payload)
             || self.bytes.saturating_add(packet.payload.len()) > MAX_PENDING_BYTES
         {
             return Err(WireError::ReassemblyLimit);
         }
-        if packet.fragment_id == 0 {
-            if packet.address.clone() != Some(partial.target.clone()) {
-                return Err(WireError::Fragmentation);
-            }
-        } else if packet.address.is_some() {
-            // None is optional on later fragments in mihomo, but if present it
-            // must not silently switch the destination halfway through a packet.
-            if packet.address.clone() != Some(partial.target.clone()) {
+        if let Some(address) = &packet.address {
+            if partial.target.is_none() {
+                partial.target = Some(address.clone());
+            } else if partial.target.as_ref() != Some(address) {
+                // `None` is the norm on later fragments, but an address that
+                // is present must not silently switch the destination halfway
+                // through a packet.
                 return Err(WireError::Fragmentation);
             }
         }
@@ -490,6 +506,9 @@ impl Reassembler {
         }
         let complete = self.pending.remove(&key).expect("complete fragment bag");
         self.bytes -= complete.bytes;
+        let address = complete
+            .target
+            .expect("completion includes fragment 0, which carries the address");
         let mut payload = Vec::with_capacity(complete.bytes);
         for fragment in complete.fragments {
             payload.extend_from_slice(&fragment.expect("every fragment received"));
@@ -499,7 +518,7 @@ impl Reassembler {
             packet_id: packet.packet_id,
             fragment_total: 1,
             fragment_id: 0,
-            address: Some(complete.target),
+            address: Some(address),
             payload,
         }))
     }
