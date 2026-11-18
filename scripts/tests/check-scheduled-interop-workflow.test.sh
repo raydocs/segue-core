@@ -247,13 +247,18 @@ expected_rc_interop="$(cat <<'EXPECTED'
   rc-interop:
     if: needs.release-metadata.outputs.run_release_gates == 'true'
     needs: release-metadata
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Check out release candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
       - name: Check out pinned Xray-core oracle
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -270,6 +275,10 @@ expected_rc_interop="$(cat <<'EXPECTED'
         run: rustup toolchain install 1.96.0 --profile minimal
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ${{ github.job }}
       - name: Run release-candidate interoperability gate
         env:
           XRAY_CORE_CHECKOUT: ${{ github.workspace }}/Xray-core
@@ -280,13 +289,18 @@ EXPECTED
 expected_scheduled_pinned="$(cat <<'EXPECTED'
   scheduled-pinned-interop:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Check out scheduled xray-rust revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
       - name: Check out pinned Xray-core oracle
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -303,6 +317,10 @@ expected_scheduled_pinned="$(cat <<'EXPECTED'
         run: rustup toolchain install 1.96.0 --profile minimal
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ${{ github.job }}
       - name: Run broad pinned interoperability and resource gate
         env:
           XRAY_CORE_CHECKOUT: ${{ github.workspace }}/Xray-core
@@ -313,7 +331,7 @@ EXPECTED
 expected_main_smoke="$(cat <<'EXPECTED'
   xray-core-main-smoke:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     continue-on-error: true
     steps:
@@ -321,6 +339,11 @@ expected_main_smoke="$(cat <<'EXPECTED'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
       - name: Check out Xray-core main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -347,6 +370,10 @@ expected_main_smoke="$(cat <<'EXPECTED'
         run: rustup toolchain install 1.96.0 --profile minimal
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ${{ github.job }}
       - name: Run focused Xray-core main compatibility smoke
         env:
           XRAY_CORE_CHECKOUT: ${{ github.workspace }}/Xray-core
@@ -361,7 +388,7 @@ EXPECTED
 expected_rust="$(cat <<'EXPECTED'
   rust:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
@@ -372,12 +399,11 @@ expected_rust="$(cat <<'EXPECTED'
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Keep build outputs on the root disk
+      - name: Free disk space
         run: |
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/segue-target
-          mkdir -p target
-          sudo mount --bind /opt/segue-target target
-          df -h / target
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
       - name: Check repository scripts
         run: |
           for script in scripts/*.sh scripts/tests/*.sh; do
@@ -410,6 +436,10 @@ expected_rust="$(cat <<'EXPECTED'
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
       - name: Select pinned Rust toolchain
         run: rustup default 1.96.0
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ${{ github.job }}
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
@@ -459,7 +489,7 @@ EXPECTED
 expected_publish_fields="$(cat <<'EXPECTED'
     if: needs.release-metadata.outputs.is_rc == 'true'
     needs:
-    runs-on: instabox-medium
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
     steps:

@@ -343,8 +343,12 @@ grep -Fq 'rustup toolchain install 1.96.0 --profile minimal' "$oracle_setup" || 
   die "go oracle setup does not install the pinned Rust toolchain"
 grep -Fq 'rustup default 1.96.0' "$oracle_setup" || \
   die "go oracle setup does not select the pinned Rust toolchain"
-grep -Fq 'sudo mount --bind /opt/segue-target target' "$oracle_setup" || \
-  die "go oracle setup does not keep build outputs on the root disk"
+grep -Fq 'sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL' "$oracle_setup" || \
+  die "go oracle setup does not free disk space on the GitHub-hosted runner"
+grep -Fq '/usr/local/lib/android' "$oracle_setup" || \
+  die "go oracle setup does not drop the preinstalled Android SDK"
+grep -Fq 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0' "$oracle_setup" || \
+  die "go oracle setup does not cache the Rust build"
 # The owner turned the macOS job off while no macOS runner is available
 # (2026-11-13). It keeps the stable-tag condition or is off outright; while
 # it is off, publish-prerelease, which needs it, cannot run either.
