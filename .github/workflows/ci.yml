@@ -1406,6 +1406,17 @@ jobs:
         with:
           key: ${{ github.job }}
 
+      # Maven Central / Gradle plugin portal returned errors twice on 2026-11-18
+      # ("Could not resolve org.jetbrains.kotlin:kotlin-gradle-plugin"); keep
+      # the resolved dependency cache between runs (keyed by the Gradle files).
+      - name: Cache Gradle dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            target/mobile/android-gradle-home/caches/modules-2
+            target/mobile/android-gradle-home/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('platform/android/**/*.gradle*', 'platform/android/**/gradle-wrapper.properties', 'platform/android/gradle/libs.versions.toml', 'platform/android/gradle/verification-metadata.xml') }}
+
       - name: Build and verify Android AAR
         run: bash scripts/build-android-adapter.sh
 
