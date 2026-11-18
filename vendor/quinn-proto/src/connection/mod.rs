@@ -223,6 +223,12 @@ pub struct Connection {
     //
     /// The number of times a PTO has been sent without receiving an ack.
     pto_count: u32,
+    /// Do not send the second loss-probe datagram before this instant.
+    ///
+    /// A PTO sends two datagrams. Emitted together, a burst of a few packets
+    /// erases both and the next probe waits out a doubled timeout. Holding the
+    /// second one across a short gap lets it survive that burst.
+    next_loss_probe: Option<Instant>,
 
     //
     // Congestion Control
@@ -350,6 +356,7 @@ impl Connection {
             next_bundled_ack_time: None,
 
             pto_count: 0,
+            next_loss_probe: None,
 
             app_limited: false,
             receiving_ecn: false,
@@ -475,6 +482,15 @@ impl Connection {
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
         assert!(max_datagrams != 0);
+        // The second PTO datagram waits out a short burst. Returning here keeps
+        // the driver's transmit loop from emitting it in the same turn.
+        if let Some(at) = self.next_loss_probe {
+            if now < at && SpaceId::iter().any(|space| self.spaces[space].loss_probes > 0) {
+                self.timers.set(Timer::Pacing, at);
+                return None;
+            }
+            self.next_loss_probe = None;
+        }
         let max_datagrams = match self.config.enable_segmentation_offload {
             false => 1,
             true => max_datagrams,
@@ -769,7 +785,15 @@ impl Connection {
                     }
                 }
 
-                // Allocate space for another datagram
+                // Allocate space for another datagram.
+                // One probe per transmit. The next one is armed on the pacing
+                // timer so a 2–4 packet burst cannot erase both copies.
+                if num_datagrams >= 1 && self.spaces[space_id].loss_probes > 0 {
+                    let at = now + LOSS_PROBE_SPACING;
+                    self.next_loss_probe = Some(at);
+                    self.timers.set(Timer::Pacing, at);
+                    break;
+                }
                 probe_datagram = self.spaces[space_id].loss_probes != 0;
                 let next_datagram_size_limit = match self.spaces[space_id].loss_probes {
                     0 => segment_size,
@@ -1078,6 +1102,16 @@ impl Connection {
             num_datagrams = 1;
 
             trace!(?probe_size, "writing MTUD probe");
+        }
+
+        // A probe datagram already left in this transmit, or the batch stopped
+        // before the second one (a short first probe shrinks the GSO segment
+        // and the loop bails). Hold the rest for the next wakeup; the driver's
+        // transmit loop would otherwise send it in this same turn.
+        if SpaceId::iter().any(|space| self.spaces[space].loss_probes > 0) {
+            let at = now + LOSS_PROBE_SPACING;
+            self.next_loss_probe = Some(at);
+            self.timers.set(Timer::Pacing, at);
         }
 
         if buf.is_empty() {
@@ -4324,6 +4358,11 @@ fn get_max_ack_delay(params: &TransportParameters) -> Duration {
 
 // Prevents overflow and improves behavior in extreme circumstances
 const MAX_BACKOFF_EXPONENT: u32 = 16;
+
+/// Gap between the two datagrams of one PTO. Wider than a few-packet burst,
+/// far shorter than a round trip, so the second copy is not lost with the first
+/// and does not wait for the doubled timeout.
+const LOSS_PROBE_SPACING: Duration = Duration::from_millis(10);
 
 /// Minimal remaining size to allow packet coalescing, excluding cryptographic tag
 ///
