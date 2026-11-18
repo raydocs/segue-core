@@ -338,7 +338,8 @@ async fn connect_header_leaves_alone_when_no_payload_follows() {
     .unwrap();
     let mut stream = coalesced(Box::new(recorder), &header);
     let mut byte = [0_u8; 1];
-    let read = tokio::time::timeout(TUIC_FIRST_PAYLOAD_WAIT * 4, stream.read(&mut byte)).await;
+    let read =
+        tokio::time::timeout(std::time::Duration::from_millis(50), stream.read(&mut byte)).await;
     assert!(read.is_err(), "the recorder never yields read data");
     let writes = writes.lock().unwrap();
     assert_eq!(writes.len(), 1, "the header left on its own");
