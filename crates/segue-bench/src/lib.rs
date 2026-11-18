@@ -188,6 +188,7 @@ pub enum EngineKind {
     XrayRust,
     XrayCore,
     SingBox,
+    Mihomo,
 }
 
 impl EngineKind {
@@ -196,6 +197,7 @@ impl EngineKind {
             Self::XrayRust => "xray-rust",
             Self::XrayCore => "xray-core",
             Self::SingBox => "sing-box",
+            Self::Mihomo => "mihomo",
         }
     }
 
@@ -204,6 +206,7 @@ impl EngineKind {
             "xray-rust" => Ok(Self::XrayRust),
             "xray-core" => Ok(Self::XrayCore),
             "sing-box" => Ok(Self::SingBox),
+            "mihomo" => Ok(Self::Mihomo),
             other => Err(BenchError::InvalidArguments(format!(
                 "unsupported engine `{other}`"
             ))),
@@ -425,6 +428,7 @@ pub struct BenchOptions {
     pub xray_core_dir: Option<PathBuf>,
     pub sing_box_bin: Option<PathBuf>,
     pub sing_box_dir: Option<PathBuf>,
+    pub mihomo_bin: Option<PathBuf>,
     pub tun_profile: Option<String>,
     pub skip_sing_box: bool,
     pub no_auto_build: bool,
@@ -1254,6 +1258,7 @@ impl Default for BenchOptions {
             xray_core_dir: None,
             sing_box_bin: None,
             sing_box_dir: None,
+            mihomo_bin: None,
             tun_profile: None,
             skip_sing_box: false,
             no_auto_build: false,
@@ -1640,6 +1645,9 @@ where
                 options.sing_box_bin =
                     Some(PathBuf::from(required_value(&rest, &mut index, flag)?));
             }
+            "--mihomo-bin" => {
+                options.mihomo_bin = Some(PathBuf::from(required_value(&rest, &mut index, flag)?));
+            }
             "--tun-profile" => {
                 options.tun_profile = Some(required_value(&rest, &mut index, flag)?.to_owned());
             }
@@ -1675,7 +1683,7 @@ where
             }
             if options.engine.is_none() {
                 return Err(BenchError::InvalidArguments(
-                    "run requires --engine xray-rust|xray-core|sing-box".to_owned(),
+                    "run requires --engine xray-rust|xray-core|sing-box|mihomo".to_owned(),
                 ));
             }
             Ok(CliArgs::Run(options))
@@ -6631,8 +6639,8 @@ fn engine_config_with_dns_upstream(
                         })?;
                     Ok(vision_xudp_config(port, vless_addr, cert_sha256))
                 }
-                EngineKind::SingBox => Err(BenchError::InvalidArguments(
-                    "vision-xudp workload is not supported by sing-box process engine".to_owned(),
+                EngineKind::SingBox | EngineKind::Mihomo => Err(BenchError::InvalidArguments(
+                    "vision-xudp workload is not supported by sing-box or mihomo".to_owned(),
                 )),
             }
         }
@@ -6662,10 +6670,12 @@ fn engine_config_with_dns_upstream(
         }
         WorkloadKind::TunFakeDns | WorkloadKind::TunFakeDnsTcp => match engine {
             EngineKind::XrayRust => Ok(tun_fake_dns_config()),
-            EngineKind::XrayCore | EngineKind::SingBox => Err(BenchError::InvalidArguments(
-                "fake-DNS TUN workloads currently support only --engine xray-rust because dns.fakeIp is an xray-rust config extension"
-                    .to_owned(),
-            )),
+            EngineKind::XrayCore | EngineKind::SingBox | EngineKind::Mihomo => {
+                Err(BenchError::InvalidArguments(
+                    "fake-DNS TUN workloads currently support only --engine xray-rust because dns.fakeIp is an xray-rust config extension"
+                        .to_owned(),
+                ))
+            }
         },
         WorkloadKind::TunDnsProxy => match engine {
             EngineKind::XrayRust => {
@@ -6676,9 +6686,11 @@ fn engine_config_with_dns_upstream(
                 })?;
                 Ok(tun_dns_proxy_config(upstream, dns_upstream_transport))
             }
-            EngineKind::XrayCore | EngineKind::SingBox => Err(BenchError::InvalidArguments(
-                "tun-dns-proxy currently supports only --engine xray-rust".to_owned(),
-            )),
+            EngineKind::XrayCore | EngineKind::SingBox | EngineKind::Mihomo => {
+                Err(BenchError::InvalidArguments(
+                    "tun-dns-proxy currently supports only --engine xray-rust".to_owned(),
+                ))
+            }
         },
         WorkloadKind::TunUdpFreedom
         | WorkloadKind::TunTcpFreedom
@@ -6806,6 +6818,114 @@ fn sing_box_reality_vision_xudp_config(port: u16, vless_addr: SocketAddr) -> Str
         vless_addr.ip(),
         vless_addr.port()
     )
+}
+
+/// Mihomo (Clash Meta) YAML. `mixed-port` is the SOCKS5 inbound the harness
+/// dials; `find-process-mode: off` keeps process lookup out of the sample.
+fn mihomo_config(
+    port: u16,
+    workload: WorkloadKind,
+    fixture: &WorkloadFixture,
+) -> Result<String, BenchError> {
+    match workload {
+        WorkloadKind::RealityVisionXudp | WorkloadKind::RealityVisionBulkThroughput => {
+            let vless_addr = fixture.vless_addr.ok_or_else(|| {
+                BenchError::InvalidArguments(format!(
+                    "{} workload requires a VLESS Reality server fixture",
+                    workload.as_str()
+                ))
+            })?;
+            Ok(mihomo_reality_config(port, vless_addr))
+        }
+        WorkloadKind::GrpcBulkThroughput => {
+            let vless_addr = grpc_fixture_vless_addr(workload, fixture)?;
+            Ok(mihomo_vless_grpc_config(port, vless_addr))
+        }
+        WorkloadKind::StreamTransport => Err(BenchError::InvalidArguments(
+            "mihomo does not support stream-transport in this harness".to_owned(),
+        )),
+        _ if workload.supports_sing_box_process_engine() => Ok(mihomo_direct_config(port)),
+        _ => Err(BenchError::InvalidArguments(format!(
+            "unsupported mihomo workload `{}`",
+            workload.as_str()
+        ))),
+    }
+}
+
+fn mihomo_listener_header(port: u16, mode: &str) -> String {
+    format!(
+        "\
+mixed-port: {port}
+allow-lan: false
+bind-address: 127.0.0.1
+mode: {mode}
+log-level: error
+find-process-mode: off
+ipv6: false
+geo-auto-update: false
+"
+    )
+}
+
+fn mihomo_direct_config(port: u16) -> String {
+    mihomo_listener_header(port, "direct")
+}
+
+fn mihomo_vless_grpc_config(port: u16, vless_addr: SocketAddr) -> String {
+    format!(
+        "{header}\
+proxies:
+  - name: proxy
+    type: vless
+    server: {ip}
+    port: {server_port}
+    uuid: {TEST_VLESS_UUID_STRING}
+    network: grpc
+    udp: false
+    tls: false
+    grpc-opts:
+      grpc-service-name: {GRPC_BENCH_SERVICE_NAME}
+rules:
+  - MATCH,proxy
+",
+        header = mihomo_listener_header(port, "rule"),
+        ip = vless_addr.ip(),
+        server_port = vless_addr.port(),
+    )
+}
+
+fn mihomo_reality_config(port: u16, vless_addr: SocketAddr) -> String {
+    format!(
+        "{header}\
+proxies:
+  - name: proxy
+    type: vless
+    server: {ip}
+    port: {server_port}
+    uuid: {TEST_VLESS_UUID_STRING}
+    network: tcp
+    udp: true
+    flow: xtls-rprx-vision
+    tls: true
+    servername: {REALITY_SERVER_NAME}
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: {REALITY_PUBLIC_KEY}
+      short-id: {REALITY_SHORT_ID_HEX}
+      support-x25519mlkem768: true
+rules:
+  - MATCH,proxy
+",
+        header = mihomo_listener_header(port, "rule"),
+        ip = vless_addr.ip(),
+        server_port = vless_addr.port(),
+    )
+}
+
+fn ensure_mihomo_binary(options: &BenchOptions) -> Result<PathBuf, BenchError> {
+    options.mihomo_bin.clone().ok_or_else(|| {
+        BenchError::InvalidArguments("mihomo requires --mihomo-bin <path>".to_owned())
+    })
 }
 
 fn tun_freedom_config() -> String {
@@ -8161,9 +8281,14 @@ async fn start_engine(
                 options.dns_upstream_transport,
             )?,
             EngineKind::SingBox => sing_box_config(port, options.workload, fixture)?,
+            EngineKind::Mihomo => mihomo_config(port, options.workload, fixture)?,
         }
     };
-    let config_path = run_dir.join("config.json");
+    let config_name = match kind {
+        EngineKind::Mihomo => "config.yaml",
+        EngineKind::XrayRust | EngineKind::XrayCore | EngineKind::SingBox => "config.json",
+    };
+    let config_path = run_dir.join(config_name);
     fs::write(&config_path, config).map_err(|source| BenchError::Io {
         action: format!("writing config `{}`", config_path.display()),
         source,
@@ -8177,6 +8302,7 @@ async fn start_engine(
         EngineKind::XrayRust => ensure_xray_rust_binary(options)?,
         EngineKind::XrayCore => ensure_xray_core_binary(options, binary_dir)?,
         EngineKind::SingBox => ensure_sing_box_binary(options, binary_dir)?,
+        EngineKind::Mihomo => ensure_mihomo_binary(options)?,
     };
     let stdout = fs::File::create(&stdout_path).map_err(|source| BenchError::Io {
         action: format!("creating stdout log `{}`", stdout_path.display()),
@@ -8187,13 +8313,15 @@ async fn start_engine(
         source,
     })?;
     let mut command = Command::new(&binary);
-    command.arg("run");
     match kind {
         EngineKind::XrayRust | EngineKind::XrayCore => {
-            command.arg("-config");
+            command.arg("run").arg("-config");
         }
         EngineKind::SingBox => {
-            command.arg("-c");
+            command.arg("run").arg("-c");
+        }
+        EngineKind::Mihomo => {
+            command.arg("-f");
         }
     };
     command
@@ -8302,7 +8430,7 @@ where
         CliArgs::Run(options) => {
             let engine = options.engine.ok_or_else(|| {
                 BenchError::InvalidArguments(
-                    "run requires --engine xray-rust|xray-core|sing-box".to_owned(),
+                    "run requires --engine xray-rust|xray-core|sing-box|mihomo".to_owned(),
                 )
             })?;
             let run_id = new_run_id();
@@ -10902,10 +11030,13 @@ fn engine_source_git_provenance(
                 .then(default_sing_box_dir)
                 .flatten()
         }),
+        EngineKind::Mihomo => None,
     }?;
     match kind {
         EngineKind::XrayCore => xray_core_git_provenance_at(&source_dir),
-        EngineKind::XrayRust | EngineKind::SingBox => git_provenance_at(&source_dir),
+        EngineKind::XrayRust | EngineKind::SingBox | EngineKind::Mihomo => {
+            git_provenance_at(&source_dir)
+        }
     }
 }
 
@@ -11025,6 +11156,12 @@ fn canonical_run_invocation_args(
         if let Some(path) = sing_box_bin {
             push_invocation_path(&mut args, "--sing-box-bin", path);
         }
+    }
+    let mihomo_bin = (kind == EngineKind::Mihomo)
+        .then_some(engine_binary_path)
+        .or(options.mihomo_bin.as_deref());
+    if let Some(path) = mihomo_bin {
+        push_invocation_path(&mut args, "--mihomo-bin", path);
     }
     if let Some(path) = options.xray_core_dir.as_deref() {
         push_invocation_path(&mut args, "--xray-core-dir", path);
@@ -12278,6 +12415,7 @@ mod tests {
                 xray_core_dir: None,
                 sing_box_bin: None,
                 sing_box_dir: None,
+                mihomo_bin: None,
                 tun_profile: None,
                 skip_sing_box: false,
                 no_auto_build: false,
@@ -13943,6 +14081,47 @@ mod tests {
         assert!(config.contains(r#""protocol": "socks""#));
         assert!(config.contains(r#""udp": true"#));
         assert!(config.contains(r#""protocol": "freedom""#));
+    }
+
+    #[test]
+    fn mihomo_yaml_uses_mixed_port_and_the_same_outbound() {
+        let direct = mihomo_config(
+            18080,
+            WorkloadKind::TcpBulkThroughput,
+            &WorkloadFixture::default(),
+        )
+        .unwrap();
+        assert!(direct.contains("mixed-port: 18080\n"));
+        assert!(direct.contains("bind-address: 127.0.0.1\n"));
+        assert!(direct.contains("mode: direct\n"));
+        assert!(direct.contains("find-process-mode: off\n"));
+        assert!(!direct.contains("proxies:"));
+
+        let mut fixture = WorkloadFixture::default();
+        fixture.vless_addr = Some("127.0.0.1:2443".parse().unwrap());
+        let grpc = mihomo_config(18081, WorkloadKind::GrpcBulkThroughput, &fixture).unwrap();
+        assert!(grpc.contains("mixed-port: 18081\n"));
+        assert!(grpc.contains("mode: rule\n"));
+        assert!(grpc.contains("type: vless\n"));
+        assert!(grpc.contains("server: 127.0.0.1\n"));
+        assert!(grpc.contains("port: 2443\n"));
+        assert!(grpc.contains(&format!("uuid: {TEST_VLESS_UUID_STRING}\n")));
+        assert!(grpc.contains("network: grpc\n"));
+        assert!(grpc.contains("tls: false\n"));
+        assert!(grpc.contains(&format!("grpc-service-name: {GRPC_BENCH_SERVICE_NAME}\n")));
+        assert!(grpc.contains("rules:\n  - MATCH,proxy\n"));
+
+        let reality =
+            mihomo_config(18082, WorkloadKind::RealityVisionBulkThroughput, &fixture).unwrap();
+        assert!(reality.contains("flow: xtls-rprx-vision\n"));
+        assert!(reality.contains(&format!("servername: {REALITY_SERVER_NAME}\n")));
+        assert!(reality.contains(&format!("public-key: {REALITY_PUBLIC_KEY}\n")));
+        assert!(reality.contains(&format!("short-id: {REALITY_SHORT_ID_HEX}\n")));
+        assert!(reality.contains("support-x25519mlkem768: true\n"));
+        assert!(reality.contains("client-fingerprint: chrome\n"));
+
+        let error = mihomo_config(1, WorkloadKind::TunTcpFreedom, &fixture).unwrap_err();
+        assert!(error.to_string().contains("unsupported mihomo workload"));
     }
 
     #[test]
