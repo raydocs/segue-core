@@ -639,6 +639,7 @@ regexTarget = "secret"
 regexes = ['''^aGSYystUbf59_9_6LKRxD27rmSW_-2_nyd9YG_Gwbks$''']
 paths = [
   '''^scripts/run-v07-performance\.py$''',
+  '''^scripts/bench/tun/configs\.py$''',
   '''^docs/benchmarks/results/2026\-10\-02\-v08\-adaptive\-relay/measurements\.tar\.gz!investigation/scripts/run\-v07\-performance\.py$''',
   '''^docs/benchmarks/results/2026-09-19-v07/benchmark-source\.patch$''',
   '''^docs/benchmarks/results/2026-09-20-v07-parity/selected-source\.patch$''',
@@ -1024,3 +1025,11 @@ condition = "AND"
 regexTarget = "match"
 regexes = ['''^libcrux-secrets",\s*"libcrux-sha3"$''']
 paths = ['''^vendor/shaped-rustls/Cargo\.lock$''']
+
+[[allowlists]]
+description = "TLS named-group constant quoted from Go source in a research note (not a credential)"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^X25519MLKEM768$''']
+paths = ['''^docs/notes/reality-third-party-auth\.md$''']
