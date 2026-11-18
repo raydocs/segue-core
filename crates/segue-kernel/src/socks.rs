@@ -29,7 +29,7 @@ use crate::dial::{Dialer, Stream};
 use crate::fakeip::FakeIpPool;
 use crate::killswitch::{self, Admission, FlowPosture, HoldGuard};
 use crate::policy::{Policy, PolicyStore};
-use crate::rules::{Action, CidrTable, RuleSet};
+use crate::rules::{Action, CidrTable, FlowQuery, RuleSet};
 use crate::sniff::{sniff, Sniff};
 use crate::udp::{associate, Udp};
 
@@ -179,6 +179,14 @@ async fn handle(mut conn: TcpStream, kernel: &Kernel) -> Result<(), Fail> {
         reply(&mut conn, REP_NOT_ALLOWED).await?;
         return Ok(());
     }
+    // The client's socket, not the destination. Absent on a peer that has
+    // already gone: process matching is skipped and the destination rules
+    // stand.
+    let flow = conn.peer_addr().ok().map(|local| FlowQuery {
+        proto: crate::owner::Proto::Tcp,
+        local,
+        resolver: crate::owner::system_owner(),
+    });
     if cmd == CMD_UDP_ASSOCIATE {
         let Some(udp) = kernel.udp.as_ref() else {
             reply(&mut conn, REP_CMD_UNSUPPORTED).await?;
@@ -198,23 +206,27 @@ async fn handle(mut conn: TcpStream, kernel: &Kernel) -> Result<(), Fail> {
                 reply(&mut conn, REP_NOT_ALLOWED).await?;
                 return Ok(());
             };
-            let action = policy.decide_fake(&entry.domain).clone();
-            return connect_then_reply(
-                conn,
-                kernel,
-                &action,
-                TargetAddr::Domain(entry.domain),
-                port,
-            )
-            .await;
+            let domain = TargetAddr::Domain(entry.domain);
+            let decided = policy.rules.explain(&domain, flow);
+            // Unmatched fake-IP names use the foreign route, not the
+            // default: that is the only reason the pool handed one out.
+            let action = if decided.matched.is_none() {
+                policy.foreign.clone()
+            } else {
+                decided.action.clone()
+            };
+            let ai_reason = decided.ai_reason.as_ref().map(|r| r.label());
+            return connect_then_reply(conn, kernel, &action, domain, port, ai_reason).await;
         }
         if let Some(settings) = kernel.sniff {
-            return sniffed(conn, kernel, &policy, ip, port, settings).await;
+            return sniffed(conn, kernel, &policy, ip, port, settings, flow).await;
         }
     }
-    let action = policy.rules.decide(&addr).clone();
+    let decided = policy.rules.explain(&addr, flow);
+    let action = decided.action.clone();
+    let ai_reason = decided.ai_reason.as_ref().map(|r| r.label());
     drop(policy);
-    connect_then_reply(conn, kernel, &action, addr, port).await
+    connect_then_reply(conn, kernel, &action, addr, port, ai_reason).await
 }
 
 /// Dial first, then tell the client how it went.
@@ -224,6 +236,7 @@ async fn connect_then_reply(
     action: &Action,
     addr: TargetAddr,
     port: u16,
+    ai_reason: Option<String>,
 ) -> Result<(), Fail> {
     let tag = match action {
         Action::Reject => {
@@ -239,7 +252,7 @@ async fn connect_then_reply(
         reply(&mut conn, REP_HOST_UNREACHABLE).await?;
         return Ok(());
     }
-    let upstream = match dial(kernel, tag, &addr, port).await {
+    let upstream = match dial(kernel, tag, &addr, port, ai_reason.as_deref()).await {
         Some(stream) => stream,
         None => {
             reply(&mut conn, REP_HOST_UNREACHABLE).await?;
@@ -285,21 +298,34 @@ async fn kill_switch_allows(kernel: &Kernel, action: &Action) -> bool {
     }
 }
 
-async fn dial(kernel: &Kernel, tag: Option<&str>, addr: &TargetAddr, port: u16) -> Option<Stream> {
+fn dial_via(tag: Option<&str>, ai_reason: Option<&str>) -> String {
+    match ai_reason {
+        Some(reason) => format!("{} (ai_reason: {reason})", tag.unwrap_or("direct")),
+        None => tag.unwrap_or("direct").to_owned(),
+    }
+}
+
+async fn dial(
+    kernel: &Kernel,
+    tag: Option<&str>,
+    addr: &TargetAddr,
+    port: u16,
+    ai_reason: Option<&str>,
+) -> Option<Stream> {
     // A proxy route that fails is refused, never retried as direct.
     match tokio::time::timeout(DIAL_TIMEOUT, kernel.dialer.dial(tag, addr, port)).await {
         Ok(Ok(stream)) => Some(stream),
         Ok(Err(e)) => {
             eprintln!(
                 "segue-kernel: dial via {} failed: {e}",
-                tag.unwrap_or("direct")
+                dial_via(tag, ai_reason)
             );
             None
         }
         Err(_) => {
             eprintln!(
                 "segue-kernel: dial via {} timed out",
-                tag.unwrap_or("direct")
+                dial_via(tag, ai_reason)
             );
             None
         }
@@ -314,6 +340,7 @@ async fn sniffed(
     ip: IpAddr,
     port: u16,
     s: SniffSettings,
+    flow: Option<FlowQuery<'_>>,
 ) -> Result<(), Fail> {
     if let Some((_, Action::Reject)) = policy.rules.lookup(&TargetAddr::Ip(ip)) {
         // Nothing a sniffed name could do changes this; refuse before the
@@ -324,10 +351,10 @@ async fn sniffed(
     reply(&mut conn, REP_OK).await?;
     let (first, found) = peek_host(&mut conn, s).await?;
     let dst = SocketAddr::new(ip, port);
-    let Some((tag, target)) = sniffed_route(policy, dst, &found, &kernel.hidden) else {
+    let Some(choice) = sniffed_choice(policy, dst, &found, &kernel.hidden, flow) else {
         return reset(conn);
     };
-    let action = match &tag {
+    let action = match &choice.tag {
         Some(t) => Action::Proxy(t.clone()),
         None => Action::Direct,
     };
@@ -337,8 +364,16 @@ async fn sniffed(
     if !kill_switch_allows(kernel, &action).await {
         return reset(conn);
     }
-    let tag = tag.as_deref();
-    let Some(mut upstream) = dial(kernel, tag, &target, port).await else {
+    let tag = choice.tag.as_deref();
+    let Some(mut upstream) = dial(
+        kernel,
+        tag,
+        &choice.target,
+        port,
+        choice.ai_reason.as_deref(),
+    )
+    .await
+    else {
         return reset(conn);
     };
     if !first.is_empty() && upstream.write_all(&first).await.is_err() {
@@ -393,12 +428,30 @@ const AI_BLOCKED: Action = Action::Reject;
 ///   refused here, counted in `hidden` ([`HiddenRefusals`]), never sent to
 ///   the relay. The outer SNI is never looked up: it names the
 ///   client-facing server, which fronts AI and non-AI names alike.
+pub(crate) struct SniffChoice {
+    pub tag: Option<String>,
+    pub target: TargetAddr,
+    /// `domain`, `cidr`, or `process:<name>` when the AI tier chose this.
+    pub ai_reason: Option<String>,
+}
+
+#[cfg(test)]
 pub(crate) fn sniffed_route(
     policy: &Policy,
     dst: SocketAddr,
     found: &Sniff,
     hidden: &HiddenRefusals,
 ) -> Option<(Option<String>, TargetAddr)> {
+    sniffed_choice(policy, dst, found, hidden, None).map(|c| (c.tag, c.target))
+}
+
+pub(crate) fn sniffed_choice(
+    policy: &Policy,
+    dst: SocketAddr,
+    found: &Sniff,
+    hidden: &HiddenRefusals,
+    owner: Option<FlowQuery<'_>>,
+) -> Option<SniffChoice> {
     let ip = dst.ip();
     let rules = &policy.rules;
     let by_ip = rules.lookup(&TargetAddr::Ip(ip));
@@ -407,47 +460,91 @@ pub(crate) fn sniffed_route(
         Sniff::Ech { outer: Some(d) } if !policy.is_ech_public_name(d) => Some(d),
         _ => None,
     };
-    let (action, name) = match (found, named) {
+    let (action, name, ai_reason) = match (found, named) {
         (_, Some(d)) => {
             let by_domain = rules.lookup(&TargetAddr::Domain(d.clone()));
             // An AI address or an AI SNI is the AI exit. A non-AI SNI must
             // not steer an AI CIDR onto another proxy (stricter would take
             // the domain when both sides are Proxy). An explicit Reject on
             // either side still blocks.
-            let ai =
-                rules.is_ai(&TargetAddr::Ip(ip)) || rules.is_ai(&TargetAddr::Domain(d.clone()));
+            let dest_domain = rules.is_ai(&TargetAddr::Domain(d.clone()));
+            let dest_ip = rules.is_ai(&TargetAddr::Ip(ip));
+            let ai = dest_domain || dest_ip;
             let blocked = matches!(by_ip, Some((_, Action::Reject)))
                 || matches!(by_domain, Some((_, Action::Reject)));
-            let a = if ai && !blocked {
-                rules.ai_action().unwrap_or(&AI_BLOCKED)
+            let (a, reason) = if ai && !blocked {
+                let why = if dest_domain { "domain" } else { "cidr" };
+                (
+                    rules.ai_action().unwrap_or(&AI_BLOCKED),
+                    Some(why.to_owned()),
+                )
             } else if ai {
-                &AI_BLOCKED
+                (&AI_BLOCKED, None)
+            } else if !blocked {
+                if let Some(why) = rules.process_reason(owner) {
+                    (rules.ai_action().unwrap_or(&AI_BLOCKED), Some(why.label()))
+                } else {
+                    (
+                        stricter(by_ip, by_domain).unwrap_or_else(|| rules.default_action()),
+                        None,
+                    )
+                }
             } else {
-                stricter(by_ip, by_domain).unwrap_or_else(|| rules.default_action())
+                (
+                    stricter(by_ip, by_domain).unwrap_or_else(|| rules.default_action()),
+                    None,
+                )
             };
-            (a, Some(d))
+            (a, Some(d), reason)
         }
         (Sniff::Ech { .. }, None) => match by_ip {
-            Some((_, Action::Reject)) => (&Action::Reject, None),
-            _ if policy.ai_ips.contains(ip) => (&policy.hidden_name, None),
+            Some((_, Action::Reject)) => (&Action::Reject, None, None),
+            _ if policy.ai_ips.contains(ip) => (&policy.hidden_name, None, None),
             _ => {
                 hidden.refuse(dst, Instant::now());
-                (&Action::Reject, None)
+                (&Action::Reject, None, None)
             }
         },
-        _ => (by_ip.map_or(rules.default_action(), |(_, a)| a), None),
+        _ => {
+            let dest_ip = rules.is_ai(&TargetAddr::Ip(ip));
+            let blocked = matches!(by_ip, Some((_, Action::Reject)));
+            if dest_ip && !blocked {
+                (
+                    rules.ai_action().unwrap_or(&AI_BLOCKED),
+                    None,
+                    Some("cidr".to_owned()),
+                )
+            } else if !dest_ip && !blocked {
+                if let Some(why) = rules.process_reason(owner) {
+                    (
+                        rules.ai_action().unwrap_or(&AI_BLOCKED),
+                        None,
+                        Some(why.label()),
+                    )
+                } else {
+                    (by_ip.map_or(rules.default_action(), |(_, a)| a), None, None)
+                }
+            } else {
+                (by_ip.map_or(rules.default_action(), |(_, a)| a), None, None)
+            }
+        }
     };
     match action {
         Action::Reject => None,
         // Direct goes to the address the client asked for, never to a
         // locally resolved sniffed name (that lookup would leak the name).
-        Action::Direct => Some((None, TargetAddr::Ip(ip))),
+        Action::Direct => Some(SniffChoice {
+            tag: None,
+            target: TargetAddr::Ip(ip),
+            ai_reason,
+        }),
         // The relay connects by name when there is one, which sidesteps a
         // polluted or stale IP.
-        Action::Proxy(tag) => Some((
-            Some(tag.clone()),
-            name.map_or(TargetAddr::Ip(ip), |d| TargetAddr::Domain(d.clone())),
-        )),
+        Action::Proxy(tag) => Some(SniffChoice {
+            tag: Some(tag.clone()),
+            target: name.map_or(TargetAddr::Ip(ip), |d| TargetAddr::Domain(d.clone())),
+            ai_reason,
+        }),
     }
 }
 
