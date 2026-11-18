@@ -10,6 +10,18 @@ long-term supported release series.
 
 ## Unreleased
 
+**Performance**
+
+- A VLESS request is no longer held for 500 ms when the client sends nothing.
+  Xray-core waits that long (`ReadMultiBufferTimeout`) so the header and the
+  first payload can share one write; on a server-first download nothing ever
+  arrives, and the server cannot speak until the request does. A payload that
+  is already buffered still shares the header's write. With nothing buffered,
+  the next read sends the header, and Vision still pads an empty frame, the
+  same bytes Xray-core sends when its wait expires. On the VLESS+gRPC 1 GiB
+  download (3 release runs) the median run fell from 1072 ms to 450 ms, and
+  the median gap before the transfer window from 513 ms to 10 ms.
+
 **Security**
 
 - The vendored `quinn-proto` moves from 0.11.16 to 0.11.19 and `quinn` from

@@ -4,8 +4,7 @@ mod first_payload;
 mod protocol_stream;
 use first_payload::{
     flush_header_alone, FirstPayloadDeadline, HeldHeader, SHADOWSOCKS_2022_FIRST_PAYLOAD_WAIT,
-    SHADOWSOCKS_FIRST_PAYLOAD_WAIT, TROJAN_FIRST_PAYLOAD_WAIT, VLESS_FIRST_PAYLOAD_WAIT,
-    VMESS_FIRST_PAYLOAD_WAIT,
+    SHADOWSOCKS_FIRST_PAYLOAD_WAIT, TROJAN_FIRST_PAYLOAD_WAIT, VMESS_FIRST_PAYLOAD_WAIT,
 };
 mod shadowsocks;
 pub use shadowsocks::Shadowsocks2022Outbound;
@@ -5234,8 +5233,10 @@ fn held_request_stream(
         flow: flow.request_flow(),
     };
     let header = Zeroizing::new(encode_request_header(&request)?);
-    // Like Xray-core, hold the header until the first payload so both share
-    // one write; the deadline sends it alone when no payload arrives.
+    // A payload already buffered shares this write. A server-first download
+    // never writes; the relay's next read sends the header instead of waiting
+    // out Xray-core's 500 ms `ReadMultiBufferTimeout`. The bytes are the same
+    // as that timeout path.
     let mut stream: BoxedTransportStream = Box::new(HeldHeader::new(stream, &header));
 
     if flow.uses_vision() {
@@ -5250,9 +5251,8 @@ fn held_request_stream(
     // record-aligned reads.
     stream.release_record_alignment();
     let stream = VlessResponseStream::new(stream);
-    Ok(Box::new(FirstPayloadDeadline::new(
+    Ok(Box::new(FirstPayloadDeadline::for_vless(
         VlessOutboundStream::new(stream),
-        VLESS_FIRST_PAYLOAD_WAIT,
         flush_header_alone,
     )))
 }
@@ -5265,10 +5265,10 @@ fn vision_stream(
 ) -> BoxedTransportStream {
     let stream = VlessResponseStream::new(VisionTransportStream::new(stream));
     let stream = VisionStream::new(stream, user_id, seed);
-    // On timeout Xray-core pads an empty frame to hide the bare header.
-    Box::new(FirstPayloadDeadline::new(
+    // No payload: the empty padding frame Xray-core inserts when its 500 ms
+    // wait expires, sent on the relay's next read rather than after it.
+    Box::new(FirstPayloadDeadline::for_vless(
         VisionOutboundStream::new(stream),
-        VLESS_FIRST_PAYLOAD_WAIT,
         |stream| stream.inner.queue_empty_padding_frame(),
     ))
 }
@@ -5415,8 +5415,8 @@ const REVERSE_DIAL_BACKOFF: Duration = Duration::from_millis(200);
 /// command, which names no address, over the outbound's whole carrier, a
 /// `dialerProxy` chain included, and Mux.Cool after it. The header waits for
 /// a first payload, as any VLESS request's does; none comes before the
-/// portal speaks, so it goes alone after 500 ms, Vision padding an empty
-/// frame. The carrier is dialed as often as Xray-core dials it.
+/// portal speaks, so the relay's read sends it alone, Vision padding an
+/// empty frame. The carrier is dialed as often as Xray-core dials it.
 ///
 /// The dial carries the bridge's reverse context there, so a freedom the
 /// chain ends on refuses the tunnel unless its final rules allow the
@@ -12440,6 +12440,44 @@ mod testpre_tests {
         )
     }
 
+    /// A server-first download writes nothing. The request has to leave as
+    /// soon as the relay reads, not after Xray-core's 500 ms payload wait:
+    /// the server cannot send the first byte until it has the request.
+    #[tokio::test]
+    async fn vless_server_first_download_sends_the_request_without_waiting() {
+        let (port, mut connections) = server().await;
+        let outbound = vless(port, 0);
+        let dialer = TransportDialer::system().unwrap();
+        let mut stream = open_vless_tcp_stream_with_resolver_and_dialer(
+            &outbound,
+            &target(),
+            &SystemDnsResolver,
+            &dialer,
+        )
+        .await
+        .unwrap();
+        let mut connection = tokio::time::timeout(Duration::from_secs(5), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let mut header = [0; 17];
+        let mut byte = [0; 1];
+        tokio::select! {
+            read = stream.read(&mut byte) => panic!("the fake server spoke: {read:?}"),
+            received = tokio::time::timeout(Duration::from_secs(2), connection.read_exact(&mut header)) => {
+                received.expect("the request never arrived").unwrap();
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "server-first request held for {elapsed:?}"
+        );
+        assert_eq!(header[0], 0);
+        assert_eq!(&header[1..], uuid::Uuid::parse_str(ID).unwrap().as_bytes());
+    }
+
     /// A UDP or Mux request header waits for the first frame and leaves with
     /// it, as Xray-core's `postRequest` sends the header of every command.
     #[tokio::test]
@@ -12483,9 +12521,8 @@ mod testpre_tests {
             assert_eq!(header[0], 0);
             assert_eq!(&header[1..], uuid::Uuid::parse_str(ID).unwrap().as_bytes());
 
-            // Without a frame the header leaves alone once Xray-core's wait
-            // is over, driven by the relay's read. The wait starts when the
-            // stream is built, so it is measured from before the open.
+            // Without a frame the relay's read sends the header alone. It must
+            // not sit out Xray-core's 500 ms payload wait.
             let opened = tokio::time::Instant::now();
             let open = open_vless_command_stream(
                 &outbound,
@@ -12507,7 +12544,11 @@ mod testpre_tests {
                     received.expect("the header leaves alone").unwrap();
                 }
             }
-            assert!(opened.elapsed() >= VLESS_FIRST_PAYLOAD_WAIT, "{command:?}");
+            let elapsed = opened.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(200),
+                "{command:?} held for {elapsed:?}"
+            );
             assert_eq!(header[0], 0);
         }
     }
