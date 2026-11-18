@@ -46,8 +46,14 @@
 //! "exits": [{"name": "la", "carrier": "reality-la", "relay": "10.0.0.1:7443", "node_id": 1},
 //!           {"name": "ny", "carrier": "hy2-ny", "relay": "10.0.0.2:7443", "node_id": 2}],
 //! "segue": {"ai": {"ticket_file": "device.ticket", "exit_class": "ai"}},
-//! "control": {"listen": "127.0.0.1:0", "token_file": "control.json"}
+//! "control": {"listen": "127.0.0.1:0", "token_file": "control.json"},
+//! "tun": { "mtu": 1500, "ipv4": "172.19.0.1/30", "ipv4_peer": "172.19.0.2" }
 //! ```
+//!
+//! `tun` absent: SOCKS and DNS only. `tun` present (macOS): open a utun,
+//! install split default routes and exclude exit addresses. An empty `tun`
+//! object uses the defaults above, plus `fd00:5e9e::1/64` via `fd00:5e9e::2`
+//! unless `"ipv6": false`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -63,6 +69,7 @@ use crate::policy::{Policy, PolicyStore, Verifier};
 use crate::rules::{Action, Cidr, CidrTable, RuleSet, RuleSpec};
 use crate::session::{Exit, SegueRoute};
 use crate::socks::SniffSettings;
+use crate::tun_setup::TunAddress;
 use crate::udp::UdpSettings;
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +97,40 @@ struct RawConfig {
     /// Session-layer routes: tag → relay reached through an engine outbound.
     #[serde(default)]
     segue: BTreeMap<String, RawSegue>,
+    /// macOS utun. Absent: do not open one.
+    #[serde(default)]
+    tun: Option<RawTun>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTun {
+    #[serde(default = "default_tun_mtu")]
+    mtu: u32,
+    #[serde(default = "default_tun_ipv4")]
+    ipv4: String,
+    #[serde(default = "default_tun_peer")]
+    ipv4_peer: String,
+    /// `false` skips the v6 address and the `::/1` + `8000::/1` routes.
+    #[serde(default = "default_tun_v6")]
+    ipv6: bool,
+    #[serde(default)]
+    ipv6_address: Option<String>,
+    #[serde(default)]
+    ipv6_peer: Option<String>,
+}
+
+fn default_tun_mtu() -> u32 {
+    crate::tun_setup::DEFAULT_MTU
+}
+fn default_tun_ipv4() -> String {
+    crate::tun_setup::DEFAULT_IPV4.into()
+}
+fn default_tun_peer() -> String {
+    crate::tun_setup::DEFAULT_IPV4_PEER.into()
+}
+fn default_tun_v6() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,6 +339,8 @@ pub struct KernelConfig {
     /// Home-role tags (outbounds and session routes): never carry UDP.
     pub home: BTreeSet<String>,
     pub control: Option<ControlConfig>,
+    /// macOS utun address. `None`: SOCKS and DNS only.
+    pub tun: Option<TunAddress>,
 }
 
 /// Remove and check the `role` key of an outbound object. True: home.
@@ -323,8 +366,18 @@ impl KernelConfig {
         Self::parse_in(text, Path::new("."))
     }
 
-    /// Parse; relative `chnroute_file` paths resolve against `base`.
+    /// Parse; relative paths resolve against `base` (the config file's
+    /// directory).
     pub fn parse_in(text: &str, base: &Path) -> Result<Self, String> {
+        Self::parse_with(text, base, None)
+    }
+
+    /// Parse. Relative runtime paths (`control.token_file`,
+    /// `dns.fake_ip_state`, `policy.installed`) resolve against `state_dir`
+    /// when it is set, and against `base` otherwise. The delivered bundle,
+    /// tickets and `chnroute_file` always stay next to the config.
+    pub fn parse_with(text: &str, base: &Path, state_dir: Option<&Path>) -> Result<Self, String> {
+        let state = state_dir.unwrap_or(base);
         let raw: RawConfig = serde_json::from_str(text).map_err(|e| format!("config: {e}"))?;
         if !raw.listen.ip().is_loopback() {
             // The SOCKS entry point has no authentication; exposing it beyond
@@ -477,13 +530,14 @@ impl KernelConfig {
                             .into(),
                     );
                 }
-                let (c, cidrs) = dns_config(d, &known, base)?;
+                let (c, cidrs) = dns_config(d, &known, base, state)?;
                 (Some(c), cidrs)
             }
             None => (None, Vec::new()),
         };
         let udp = raw.udp.map(|u| udp_config(u, &known, &home)).transpose()?;
-        let resolve = |p: PathBuf| if p.is_absolute() { p } else { base.join(p) };
+        let in_config = |p: PathBuf| if p.is_absolute() { p } else { base.join(p) };
+        let in_state = |p: PathBuf| if p.is_absolute() { p } else { state.join(p) };
         let (policy, policy_log) = match raw.policy {
             Some(p) => {
                 if raw.rules.is_some() || raw.default.is_some() {
@@ -504,8 +558,8 @@ impl KernelConfig {
                     known.keys().cloned().collect(),
                     home.clone(),
                 )?;
-                let store = PolicyStore::signed(verifier, p.installed.map(resolve));
-                let log = store.load_startup(p.bundle.map(resolve).as_deref());
+                let store = PolicyStore::signed(verifier, p.installed.map(in_state));
+                let log = store.load_startup(p.bundle.map(in_config).as_deref());
                 (Arc::new(store), log)
             }
             None => {
@@ -543,8 +597,30 @@ impl KernelConfig {
                 }
                 Some(ControlConfig {
                     listen: c.listen,
-                    token_file: resolve(c.token_file),
+                    token_file: in_state(c.token_file),
                 })
+            }
+        };
+        let tun = match raw.tun {
+            None => None,
+            Some(t) => {
+                let addr = TunAddress::from_parts(
+                    t.mtu,
+                    &t.ipv4,
+                    &t.ipv4_peer,
+                    t.ipv6,
+                    t.ipv6_address.as_deref(),
+                    t.ipv6_peer.as_deref(),
+                )?;
+                if let Some(d) = &dns {
+                    if addr.overlaps_fake(d.fake_ip_base, d.fake_ip_prefix) {
+                        return Err(
+                            "tun.ipv4 overlaps dns.fake_ip_range; the pool could hand out the utun address"
+                                .into(),
+                        );
+                    }
+                }
+                Some(addr)
             }
         };
         Ok(Self {
@@ -559,6 +635,7 @@ impl KernelConfig {
             exits,
             home,
             control,
+            tun,
         })
     }
 }
@@ -608,7 +685,8 @@ fn udp_config(
 fn dns_config(
     d: RawDns,
     outbounds: &BTreeMap<String, Value>,
-    base: &Path,
+    config_base: &Path,
+    state_base: &Path,
 ) -> Result<(DnsConfig, Vec<Cidr>), String> {
     if !d.listen.ip().is_loopback() {
         // An open resolver on the LAN would answer anyone and hand out
@@ -645,7 +723,7 @@ fn dns_config(
         let path = if file.is_absolute() {
             file.clone()
         } else {
-            base.join(file)
+            config_base.join(file)
         };
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("dns.chnroute_file {}: {e}", path.display()))?;
@@ -692,9 +770,13 @@ fn dns_config(
         fake_ip_ttl: Duration::from_secs(d.fake_ip_ttl_secs),
         fake_ip_grace: Duration::from_secs(d.fake_ip_grace_secs),
         fake_ip_max_entries: d.fake_ip_max_entries,
-        fake_ip_state: d
-            .fake_ip_state
-            .map(|f| if f.is_absolute() { f } else { base.join(f) }),
+        fake_ip_state: d.fake_ip_state.map(|f| {
+            if f.is_absolute() {
+                f
+            } else {
+                state_base.join(f)
+            }
+        }),
         foreign: d.foreign,
     };
     Ok((cfg, cidrs))
@@ -1015,5 +1097,71 @@ mod tests {
         .err()
         .unwrap();
         assert!(err.contains("loopback"), "{err}");
+    }
+
+    #[test]
+    fn state_dir_keeps_runtime_files_off_the_config_directory() {
+        let dir = std::env::temp_dir().join(format!("segue-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        let text = r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+            "control":{"listen":"127.0.0.1:0","token_file":"control.json"},
+            "dns":{"listen":"127.0.0.1:5353","domestic":["1.1.1.1:53"],"fake_ip_state":"fakeip.state"}}"#;
+        let state = dir.join("state");
+        let c = KernelConfig::parse_with(text, &dir, Some(&state)).unwrap();
+        assert_eq!(
+            c.control.as_ref().unwrap().token_file,
+            state.join("control.json")
+        );
+        assert_eq!(
+            c.dns.as_ref().unwrap().fake_ip_state.as_ref().unwrap(),
+            &state.join("fakeip.state")
+        );
+        let abs = r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+            "control":{"listen":"127.0.0.1:0","token_file":"/tmp/keep.json"}}"#;
+        let c = KernelConfig::parse_with(abs, &dir, Some(&state)).unwrap();
+        assert_eq!(
+            c.control.unwrap().token_file,
+            PathBuf::from("/tmp/keep.json")
+        );
+        let c = KernelConfig::parse_in(text, &dir).unwrap();
+        assert_eq!(c.control.unwrap().token_file, dir.join("control.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tun_section_uses_defaults_and_rejects_the_fake_ip_range() {
+        let off = KernelConfig::parse(r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"}}"#)
+            .unwrap();
+        assert!(off.tun.is_none());
+        let on = KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},"tun":{}}"#,
+        )
+        .unwrap();
+        let tun = on.tun.unwrap();
+        assert_eq!(tun.mtu, 1500);
+        assert_eq!(tun.v4, std::net::Ipv4Addr::new(172, 19, 0, 1));
+        assert!(tun.v6.is_some());
+        let no_v6 = KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},"tun":{"ipv6":false}}"#,
+        )
+        .unwrap();
+        assert!(no_v6.tun.unwrap().v6.is_none());
+        let err = match KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},"tun":{"mtu":100}}"#,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("mtu 100 was accepted"),
+        };
+        assert!(err.contains("mtu"), "{err}");
+        let err = match KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+                "dns":{"listen":"127.0.0.1:5353","domestic":["1.1.1.1:53"],"fake_ip_range":"172.19.0.0/16"},
+                "tun":{}}"#,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("utun address inside the fake-ip range was accepted"),
+        };
+        assert!(err.contains("fake_ip"), "{err}");
     }
 }
