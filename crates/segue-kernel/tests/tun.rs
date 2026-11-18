@@ -3286,6 +3286,25 @@ fn sha(b: &[u8]) -> [u8; 32] {
 /// the run took ~85% of a core here; now ~15%.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_tcp_carriers_full_pool_and_a_healthy_tun_flow_over_loopback() {
+    // The CPU and wakeup budgets below are process-wide (getrusage), so the
+    // sibling tests of this binary running in parallel would be billed to this
+    // one: 5% of a core alone became 77% on a 4-core CI runner. Re-run this
+    // test alone in a child process of the same binary and judge that run.
+    const ISOLATED: &str = "SEGUE_KERNEL_ISOLATED_BUDGET_TEST";
+    if std::env::var_os(ISOLATED).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "slow_tcp_carriers_full_pool_and_a_healthy_tun_flow_over_loopback",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ISOLATED, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated budget run failed: {status}");
+        return;
+    }
     use segue_kernel::session::{Exit, KernelDialer, SegueRoute};
     use segue_session::client::{ClientSession, CloseReason, OpenParams};
     use segue_session::codec::{Kind, Target};
