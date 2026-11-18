@@ -383,7 +383,7 @@ share (`flow.rs:742-744`).
   the new one and restarts RTT measurement — all before any frame goes out
   (`relay.rs:629-670`).
 - **Optimistic data:** only the first OPEN of generation 0 may carry
-  `first_data` before any answer (`client.rs:860-864`); an OPEN retry carries
+  `first_data` before any answer (`client.rs:449-451`); an OPEN retry carries
   none, and a retry OPEN that reaches a relay which knows the session is
   treated as a resume with the client snapshot `(0, initial credit)`
   (R2-2b, `relay.rs:517-527`, `client.rs:736-748`).
@@ -601,7 +601,8 @@ matching rule** only (`crates/segue-session/src/park.rs:1-6`):
 - anything else — late, stale, unsolicited, or after a re-attach — is
   `Ignored` (no effect) (`park.rs:12-21`);
 - new data to send or a re-attach cancels the pending request without waiting
-  for the ACK (`cancel`, `park.rs:34-36`; wired at `client.rs:1134-1140`).
+  for the ACK (`cancel`, `park.rs:34-36`; wired at `client.rs:1101` and, on
+  every attach, `client.rs:376`).
 
 The client may request a PARK only while `Active`, with nothing pending
 uplink and nothing buffered downlink (`request_park`, `client.rs:1153-1167`).
