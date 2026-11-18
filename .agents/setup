@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Prepare a fresh Amp orb to build, test, and lint segue-core.
+#
+# The repository's default validation is pure Rust (see CONTRIBUTING.md and the
+# `rust` CI job): cargo fmt / clippy / test on the workspace with the toolchain
+# pinned in rust-toolchain.toml. Go 1.27.4 is additionally installed because the
+# committed oracle and interop scripts (scripts/check-*-oracle.sh, go.mod) use it.
+#
+# This script is idempotent: a warm re-run on a restored snapshot reinstalls
+# nothing and only re-verifies cheaply. Keep it non-interactive and fast; never
+# start a long-lived process here (define services in .amp/services.yaml).
+set -euo pipefail
+
+RUST_VERSION="1.96.0"   # keep in sync with rust-toolchain.toml
+GO_VERSION="1.27.4"     # keep in sync with CI (actions/setup-go) and go.mod
+GO_ROOT="/usr/local/go"
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$repo_root"
+
+step() { printf '\n=== %s ===\n' "$1"; }
+timed() { local label="$1"; shift; local t0; t0=$(date +%s); "$@"; printf '    (%s took %ss)\n' "$label" "$(( $(date +%s) - t0 ))"; }
+
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export PATH="$CARGO_HOME/bin:$GO_ROOT/bin:$PATH"
+
+# --- Rust toolchain -----------------------------------------------------------
+install_rust() {
+  if ! command -v rustup >/dev/null 2>&1; then
+    step "Installing rustup + Rust $RUST_VERSION"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+    sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+      --default-toolchain "$RUST_VERSION" --component clippy,rustfmt
+    rm -f /tmp/rustup-init.sh
+  else
+    step "Ensuring Rust $RUST_VERSION with clippy + rustfmt"
+    # rust-toolchain.toml pins the channel; make sure it (and components) exist.
+    rustup toolchain install "$RUST_VERSION" --profile minimal \
+      --component clippy,rustfmt --no-self-update
+  fi
+  rustc --version
+  cargo --version
+}
+timed "rust toolchain" install_rust
+
+# --- Go toolchain -------------------------------------------------------------
+install_go() {
+  if [ -x "$GO_ROOT/bin/go" ] && "$GO_ROOT/bin/go" version | grep -q "go${GO_VERSION} "; then
+    step "Go $GO_VERSION already installed"
+  else
+    step "Installing Go $GO_VERSION"
+    curl --proto '=https' --tlsv1.2 -sSfL \
+      "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+    sudo rm -rf "$GO_ROOT"
+    sudo tar -C "$(dirname "$GO_ROOT")" -xzf /tmp/go.tar.gz
+    rm -f /tmp/go.tar.gz
+  fi
+  "$GO_ROOT/bin/go" version
+}
+timed "go toolchain" install_go
+
+# --- Persist toolchains on PATH for Amp and supervised services ---------------
+# Amp and orb services start in separate non-interactive login shells, so the
+# toolchain paths must be exported from ~/.bash_profile, not just this process.
+step "Persisting toolchain PATH in ~/.bash_profile"
+profile_marker="# segue-core orb toolchains"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<EOF
+
+$profile_marker
+export RUSTUP_HOME="\$HOME/.rustup"
+export CARGO_HOME="\$HOME/.cargo"
+case ":\$PATH:" in
+  *":\$CARGO_HOME/bin:"*) ;;
+  *) export PATH="\$CARGO_HOME/bin:$GO_ROOT/bin:\$PATH" ;;
+esac
+EOF
+fi
+
+# --- Dependencies -------------------------------------------------------------
+# Vendored crates live in vendor/; fetch pulls the remaining registry deps.
+step "Fetching Cargo dependencies (locked)"
+timed "cargo fetch" cargo fetch --locked
+
+# Warm the default validation build so the first clippy/test run is fast. cargo
+# skips already-compiled crates, so a warm snapshot re-run finishes quickly.
+# CARGO_INCREMENTAL=0 matches CI and keeps the target dir smaller.
+step "Warming the workspace build"
+CARGO_INCREMENTAL=0 timed "cargo build" \
+  cargo build --workspace --exclude segue-fuzz --locked
+
+# --- Orb agent guidance -------------------------------------------------------
+step "Writing orb agent guidance"
+mkdir -p "$HOME/.config/amp"
+guidance="$HOME/.config/amp/AGENTS.md"
+guidance_marker="<!-- segue-core orb notes -->"
+if ! grep -Fq "$guidance_marker" "$guidance" 2>/dev/null; then
+  cat >> "$guidance" <<EOF
+
+$guidance_marker
+## segue-core toolchain notes
+- Rust is pinned to $RUST_VERSION (rust-toolchain.toml); cargo/clippy/rustfmt are on PATH.
+- Go $GO_VERSION is at $GO_ROOT/bin for the oracle/interop scripts under scripts/.
+- Run all cargo commands from the repository root; dependency builds target the root disk.
+- Default validation (see CONTRIBUTING.md):
+    cargo fmt --all -- --check
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::perf -W clippy::suspicious
+    cargo test --workspace --exclude segue-fuzz --all-targets --locked
+EOF
+fi
+
+step "Setup complete"

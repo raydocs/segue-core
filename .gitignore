@@ -55,7 +55,12 @@ __pycache__/
 *.pfx
 
 # Local agent tooling and working context.
-.agents/
+.agents/*
+# Orb lifecycle scripts are committed so fresh Amp orbs run them.
+!.agents/setup
+!.agents/resume
+# Orb portal descriptors written at runtime.
+.amp/portals/*
 .codex/
 skills-lock.json
 AGENT_CONTEXT.md

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Runs after initial activation and each time a paused orb wakes, before Amp
+# continues. Keep it fast (<10s) and idempotent: no installs, no long-lived
+# processes. segue-core has no tunnels or databases to reconnect, so this only
+# confirms the pinned toolchains are reachable on PATH for Amp and services.
+set -euo pipefail
+
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export PATH="$CARGO_HOME/bin:/usr/local/go/bin:$PATH"
+
+command -v cargo >/dev/null 2>&1 || { echo "resume: cargo not on PATH; rerun .agents/setup" >&2; exit 1; }
+command -v go    >/dev/null 2>&1 || { echo "resume: go not on PATH; rerun .agents/setup" >&2; exit 1; }
