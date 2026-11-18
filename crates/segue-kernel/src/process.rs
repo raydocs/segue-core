@@ -185,6 +185,14 @@ impl Log {
 
     pub fn line(&self, msg: impl std::fmt::Display) {
         eprintln!("segue-kernel: {msg}");
+        self.record(msg);
+    }
+
+    /// Append one line to the `--log` file and do not touch stderr.
+    ///
+    /// Fatal startup errors are printed by `main` and must also land in the
+    /// file. `line` would print them a second time.
+    pub fn record(&self, msg: impl std::fmt::Display) {
         let Some(file) = &self.file else {
             return;
         };
@@ -226,6 +234,20 @@ mod tests {
         assert_eq!(RunFailure::runtime("a").code(), ExitCode::Runtime);
         assert_eq!(RunFailure::tun("a").code(), ExitCode::Tun);
         assert_eq!(RunFailure::tun("utun: denied").to_string(), "utun: denied");
+    }
+
+    #[test]
+    fn record_appends_a_fatal_line_without_a_second_stderr_path() {
+        let path =
+            std::env::temp_dir().join(format!("segue-kernel-log-{}-record", std::process::id()));
+        let log = Log::open(Some(&path)).unwrap();
+        log.record("tun mtu: ioctl SIOCSIFMTU: Operation not permitted (os error 1) (errno 1)");
+        drop(log);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("ioctl SIOCSIFMTU"), "{text}");
+        assert!(text.contains("errno 1"), "{text}");
+        Log::stderr().record("not stored");
     }
 
     #[test]

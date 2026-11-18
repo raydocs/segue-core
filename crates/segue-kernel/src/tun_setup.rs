@@ -12,7 +12,11 @@
 //! the utun peer, which is more specific than the system's default and leaves
 //! that default in place. Exit addresses are host routes via the physical
 //! gateway, scoped to that interface (`RTF_IFSCOPE`), installed *before* the
-//! split defaults so the carrier is never captured. Direct and domestic
+//! split defaults so the carrier is never captured. Loopback, and an address
+//! assigned to a local interface, are not given that route: they are reached
+//! without the default route, and adding one fails (`EEXIST`) for an alias
+//! on the physical NIC. `RTM_ADD` reporting that the route is already
+//! installed is success; the route is left as it is. Direct and domestic
 //! sockets are also bound with `IP_BOUND_IF` / `IPV6_BOUND_IF`, except a dial
 //! whose next hop is loopback: the physical NIC cannot reach `127.0.0.0/8`
 //! or `::1`.
@@ -318,9 +322,43 @@ pub fn split_defaults(tun: &TunAddress, utun_index: u32) -> Vec<RouteSpec> {
     routes
 }
 
+/// Whether `ip` is in `local`, including an IPv4-mapped form of the same address.
+pub fn assigned_locally(ip: IpAddr, local: &BTreeSet<IpAddr>) -> bool {
+    if local.contains(&ip) {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(v4) => local.contains(&IpAddr::V6(v4.to_ipv6_mapped())),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .is_some_and(|v4| local.contains(&IpAddr::V4(v4))),
+    }
+}
+
+/// Whether `ip` needs a host route that keeps the exit off the utun.
+///
+/// Loopback and an address assigned to a local interface are reached without
+/// the default route. A host route for either is unnecessary, and on macOS
+/// adding one for a local alias fails with `EEXIST` (the interface route is
+/// already there) and takes the whole tun setup down.
+pub fn exit_needs_exclusion(ip: IpAddr, tun: &TunAddress, local: &BTreeSet<IpAddr>) -> bool {
+    usable(ip) && !on_tun(ip, tun) && !destination_is_loopback(ip) && !assigned_locally(ip, local)
+}
+
+/// `RTM_ADD` failed because this destination is already routed.
+///
+/// That is success. Deleting the route and adding it again can remove an
+/// interface route (a local alias, whose gateway is not the one we named)
+/// and the second add then fails the tun setup.
+pub fn route_add_already_present(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EEXIST)
+}
+
 /// Host routes for `targets` via the physical path of their family.
-/// Addresses inside the utun prefix, and non-unicast addresses, are skipped:
-/// a host route for the utun peer would steal the split-default gateway.
+/// Addresses inside the utun prefix, non-unicast addresses, loopback, and
+/// addresses assigned to a local interface (`local`) are skipped: a host
+/// route for the utun peer would steal the split-default gateway, and a
+/// local address is already reached on its own interface.
 /// A target whose family has no physical path is an error (the tunnel would
 /// capture the carrier).
 pub fn exclusion_routes(
@@ -328,11 +366,12 @@ pub fn exclusion_routes(
     v4: Option<&PhysicalPath>,
     v6: Option<&PhysicalPath>,
     tun: &TunAddress,
+    local: &BTreeSet<IpAddr>,
 ) -> Result<Vec<RouteSpec>, String> {
     let mut seen = BTreeSet::new();
     let mut routes = Vec::new();
     for ip in targets {
-        if !seen.insert(*ip) || on_tun(*ip, tun) || !usable(*ip) {
+        if !seen.insert(*ip) || !exit_needs_exclusion(*ip, tun, local) {
             continue;
         }
         let path = match ip {
@@ -882,9 +921,10 @@ impl Drop for TunSession {
 
 #[cfg(target_os = "macos")]
 mod sys {
+    use std::collections::BTreeSet;
     use std::ffi::CString;
     use std::io::{self, ErrorKind};
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::sync::Arc;
     use std::time::Duration;
@@ -921,9 +961,15 @@ mod sys {
             let routes = std::mem::take(&mut self.routes);
             for spec in routes.into_iter().rev() {
                 if let Err(e) = write_route(&spec, RouteOp::Delete) {
-                    if e.raw_os_error() != Some(libc::ESRCH) {
-                        eprintln!("segue-kernel: remove route {spec}: {e}");
+                    if e.raw_os_error() == Some(libc::ESRCH) {
+                        continue;
                     }
+                    let shown = if e.raw_os_error().is_some() {
+                        io_fail("route", &format!("write RTM_DELETE {spec}"), e).to_string()
+                    } else {
+                        e.to_string()
+                    };
+                    eprintln!("segue-kernel: {shown}");
                 }
             }
             // The packet runtime (`TunFdClosePolicy::Borrowed`) holds a
@@ -974,12 +1020,61 @@ mod sys {
         ioctl(sock.as_raw_fd(), libc::SIOCIFDESTROY, &mut ifr)
     }
 
+    fn io_fail(step: &str, command: &str, err: io::Error) -> io::Error {
+        let text = match err.raw_os_error() {
+            Some(errno) => format!("{step}: {command}: {err} (errno {errno})"),
+            None => format!("{step}: {command}: {err}"),
+        };
+        io::Error::new(err.kind(), text)
+    }
+
+    fn last_fail(step: &str, command: &str) -> io::Error {
+        io_fail(step, command, io::Error::last_os_error())
+    }
+
+    /// Unicast addresses assigned to a local interface, including aliases.
+    fn interface_addresses() -> io::Result<BTreeSet<IpAddr>> {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        // SAFETY: `head` is a local out-pointer. `freeifaddrs` releases the list.
+        if unsafe { libc::getifaddrs(&mut head) } != 0 {
+            return Err(last_fail("local addresses", "getifaddrs"));
+        }
+        let mut out = BTreeSet::new();
+        let mut cur = head;
+        while !cur.is_null() {
+            // SAFETY: this node came from getifaddrs and the list is not freed yet.
+            let ifa = unsafe { &*cur };
+            if !ifa.ifa_addr.is_null() {
+                // SAFETY: `ifa_addr` is non-null. The family is read before any
+                // wider view of the sockaddr.
+                let family = unsafe { (*ifa.ifa_addr).sa_family };
+                if family == libc::AF_INET as libc::sa_family_t {
+                    let sin = unsafe { &*(ifa.ifa_addr.cast::<libc::sockaddr_in>()) };
+                    let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                    if !ip.is_unspecified() {
+                        out.insert(IpAddr::V4(ip));
+                    }
+                } else if family == libc::AF_INET6 as libc::sa_family_t {
+                    let sin6 = unsafe { &*(ifa.ifa_addr.cast::<libc::sockaddr_in6>()) };
+                    let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                    if !ip.is_unspecified() {
+                        out.insert(IpAddr::V6(ip));
+                    }
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        // SAFETY: `head` is the list getifaddrs returned above.
+        unsafe { libc::freeifaddrs(head) };
+        Ok(out)
+    }
+
     pub fn bring_up(
         addr: &TunAddress,
         outbounds: &std::collections::BTreeMap<String, serde_json::Value>,
         relays: &[IpAddr],
     ) -> Result<TunSession, String> {
-        let (fd, name, index) = open_utun().map_err(|e| format!("utun: {e}"))?;
+        let (fd, name, index) = open_utun().map_err(|e| e.to_string())?;
         let result = configure(&fd, &name, index, addr, outbounds, relays);
         match result {
             Ok((routes, notes, physical)) => Ok(TunSession {
@@ -1009,22 +1104,30 @@ mod sys {
         outbounds: &std::collections::BTreeMap<String, serde_json::Value>,
         relays: &[IpAddr],
     ) -> Result<(Vec<super::RouteSpec>, Vec<String>, u32), String> {
-        set_mtu(name, addr.mtu).map_err(|e| format!("tun mtu: {e}"))?;
-        set_v4(name, addr).map_err(|e| format!("tun address: {e}"))?;
+        set_mtu(name, addr.mtu).map_err(|e| e.to_string())?;
+        set_v4(name, addr).map_err(|e| e.to_string())?;
         if let Some(v6) = &addr.v6 {
-            set_v6(name, v6).map_err(|e| format!("tun ipv6: {e}"))?;
+            set_v6(name, v6).map_err(|e| e.to_string())?;
         }
+        let local = interface_addresses().map_err(|e| e.to_string())?;
         let targets = resolve_targets(exit_targets(outbounds, relays));
-        let v4_probe =
-            first_family(&targets.ips, true).unwrap_or(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
-        let v4 = probe(v4_probe).map_err(|e| format!("physical route for {v4_probe}: {e}"))?;
+        // A local alias is not the default route. Probing it reports lo0 or
+        // the interface route and then either refuses to start or tries to
+        // re-add that route.
+        let v4_probe = exclusion_probe(&targets.ips, true, addr, &local)
+            .unwrap_or(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+        let v4 = probe(v4_probe).map_err(|e| e.to_string())?;
         if tunnel_name(&v4.name) {
             return Err(format!(
                 "default route is already on {} ({}); disconnect it before starting the utun",
                 v4.name, v4_probe
             ));
         }
-        let v6_probe = first_family(&targets.ips, false)
+        let v6_needed = targets
+            .ips
+            .iter()
+            .any(|ip| ip.is_ipv6() && super::exit_needs_exclusion(*ip, addr, &local));
+        let v6_probe = exclusion_probe(&targets.ips, false, addr, &local)
             .unwrap_or(IpAddr::V6("2606:4700:4700::1111".parse().unwrap()));
         let v6 = match probe(v6_probe) {
             Ok(path) if !tunnel_name(&path.name) => Some(path),
@@ -1035,8 +1138,8 @@ mod sys {
                 ));
             }
             Err(e) => {
-                if targets.ips.iter().any(|ip| ip.is_ipv6()) {
-                    return Err(format!("physical route for {v6_probe}: {e}"));
+                if v6_needed {
+                    return Err(e.to_string());
                 }
                 None
             }
@@ -1055,21 +1158,39 @@ mod sys {
                 "no IPv6 physical gateway; v6 split routes still capture ::/1 and 8000::/1".into(),
             );
         }
+        for ip in &targets.ips {
+            if super::assigned_locally(*ip, &local) {
+                notes.push(format!(
+                    "exit {ip} is assigned to a local interface; no exclusion route"
+                ));
+            } else if super::destination_is_loopback(*ip) {
+                notes.push(format!("exit {ip} is loopback; no exclusion route"));
+            }
+        }
         let exclusions = exclusion_routes(
             &targets.ips,
             Some(&v4.path),
             v6.as_ref().map(|p| &p.path),
             addr,
+            &local,
         )?;
         let mut specs = exclusions;
         specs.extend(split_defaults(addr, index));
-        install(&specs).map_err(|e| format!("route: {e}"))?;
-        notes.push(format!("installed {} routes", specs.len()));
-        Ok((specs, notes, v4.path.index))
+        let installed = install(&specs, &mut notes).map_err(|e| e.to_string())?;
+        notes.push(format!("installed {} routes", installed.len()));
+        Ok((installed, notes, v4.path.index))
     }
 
-    fn first_family(ips: &[IpAddr], v4: bool) -> Option<IpAddr> {
-        ips.iter().copied().find(|ip| ip.is_ipv4() == v4)
+    /// First address of `v4`'s family that still needs an exclusion route.
+    fn exclusion_probe(
+        ips: &[IpAddr],
+        v4: bool,
+        tun: &TunAddress,
+        local: &std::collections::BTreeSet<IpAddr>,
+    ) -> Option<IpAddr> {
+        ips.iter()
+            .copied()
+            .find(|ip| ip.is_ipv4() == v4 && super::exit_needs_exclusion(*ip, tun, local))
     }
 
     fn tunnel_name(name: &str) -> bool {
@@ -1112,19 +1233,26 @@ mod sys {
     }
 
     fn probe(dest: IpAddr) -> io::Result<FoundPath> {
-        let sock = route_socket()?;
+        let step = format!("physical route for {dest}");
+        let sock = route_socket().map_err(|e| io_fail(&step, "socket PF_ROUTE", e))?;
         let msg = encode_get(dest, 1);
-        write_all(sock.as_raw_fd(), &msg)?;
-        set_recv_timeout(sock.as_raw_fd(), Duration::from_secs(2))?;
+        write_all(sock.as_raw_fd(), &msg).map_err(|e| io_fail(&step, "write RTM_GET", e))?;
+        set_recv_timeout(sock.as_raw_fd(), Duration::from_secs(2))
+            .map_err(|e| io_fail(&step, "setsockopt SO_RCVTIMEO", e))?;
         let mut buf = vec![0u8; 2048];
         // SAFETY: getpid is a pure read of the process id.
         let pid = unsafe { libc::getpid() };
         let started = std::time::Instant::now();
         loop {
             if started.elapsed() > Duration::from_secs(2) {
-                return Err(io::Error::new(ErrorKind::TimedOut, "RTM_GET timed out"));
+                return Err(io_fail(
+                    &step,
+                    "read RTM_GET",
+                    io::Error::new(ErrorKind::TimedOut, "timed out"),
+                ));
             }
-            let n = read_fd(sock.as_raw_fd(), &mut buf)?;
+            let n = read_fd(sock.as_raw_fd(), &mut buf)
+                .map_err(|e| io_fail(&step, "read RTM_GET", e))?;
             let Some(parsed) = parse_route(&buf[..n]) else {
                 continue;
             };
@@ -1132,13 +1260,21 @@ mod sys {
                 continue;
             }
             if parsed.errno != 0 {
-                return Err(io::Error::from_raw_os_error(parsed.errno));
+                return Err(io_fail(
+                    &step,
+                    "RTM_GET",
+                    io::Error::from_raw_os_error(parsed.errno),
+                ));
             }
             let index = parsed.index as u32;
             if index == 0 {
-                return Err(io::Error::other("RTM_GET returned no interface"));
+                return Err(io_fail(
+                    &step,
+                    "RTM_GET",
+                    io::Error::other("returned no interface"),
+                ));
             }
-            let name = if_name(index)?;
+            let name = if_name(index).map_err(|e| io_fail(&step, "if_indextoname", e))?;
             let (gateway, on_link) = if let Some(gw) = parsed.gateway {
                 if gw.is_unspecified() {
                     (dest, true)
@@ -1148,7 +1284,11 @@ mod sys {
             } else if parsed.link_index.is_some() {
                 (dest, true)
             } else {
-                return Err(io::Error::other("RTM_GET returned no gateway"));
+                return Err(io_fail(
+                    &step,
+                    "RTM_GET",
+                    io::Error::other("returned no gateway"),
+                ));
             };
             return Ok(FoundPath {
                 path: PhysicalPath {
@@ -1161,32 +1301,46 @@ mod sys {
         }
     }
 
-    fn install(specs: &[super::RouteSpec]) -> io::Result<()> {
-        for (done, spec) in specs.iter().enumerate() {
-            if let Err(e) = add_one(spec) {
-                for added in specs[..done].iter().rev() {
-                    let _ = write_route(added, RouteOp::Delete);
+    /// Routes this process installed. An `EEXIST` route is adopted so shutdown
+    /// removes it, but a later failure does not delete it: it was already there.
+    fn install(
+        specs: &[super::RouteSpec],
+        notes: &mut Vec<String>,
+    ) -> io::Result<Vec<super::RouteSpec>> {
+        let mut owned = Vec::new();
+        let mut created = Vec::new();
+        for spec in specs {
+            match write_route(spec, RouteOp::Add) {
+                Ok(()) => {
+                    owned.push(spec.clone());
+                    created.push(spec.clone());
                 }
-                return Err(io::Error::new(e.kind(), format!("add {spec}: {e}")));
+                Err(e) if super::route_add_already_present(&e) => {
+                    notes.push(format!("route already exists, kept: {spec}"));
+                    owned.push(spec.clone());
+                }
+                Err(e) => {
+                    for added in created.iter().rev() {
+                        let _ = write_route(added, RouteOp::Delete);
+                    }
+                    // Socket and encode failures are already described and no
+                    // longer carry a raw errno. The write's errno is still raw
+                    // so EEXIST could be recognized above.
+                    if e.raw_os_error().is_none() {
+                        return Err(e);
+                    }
+                    return Err(io_fail("route", &format!("write RTM_ADD {spec}"), e));
+                }
             }
         }
-        Ok(())
-    }
-
-    fn add_one(spec: &super::RouteSpec) -> io::Result<()> {
-        match write_route(spec, RouteOp::Add) {
-            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-                let _ = write_route(spec, RouteOp::Delete);
-                write_route(spec, RouteOp::Add)
-            }
-            other => other,
-        }
+        Ok(owned)
     }
 
     fn write_route(spec: &super::RouteSpec, op: RouteOp) -> io::Result<()> {
-        let msg =
-            encode_route(spec, op, 1).map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
-        let sock = route_socket()?;
+        let msg = encode_route(spec, op, 1)
+            .map_err(|e| io::Error::new(ErrorKind::InvalidInput, format!("route: encode: {e}")))?;
+        let sock = route_socket().map_err(|e| io_fail("route", "socket PF_ROUTE", e))?;
+        // Raw write error: callers treat EEXIST as success and need the errno.
         write_all(sock.as_raw_fd(), &msg)
     }
 
@@ -1208,16 +1362,19 @@ mod sys {
         unsafe {
             let fd = libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL);
             if fd < 0 {
-                return Err(io::Error::last_os_error());
+                return Err(last_fail(
+                    "utun",
+                    "socket PF_SYSTEM/SOCK_DGRAM/SYSPROTO_CONTROL",
+                ));
             }
             let fd = OwnedFd::from_raw_fd(fd);
-            set_cloexec(fd.as_raw_fd())?;
+            set_cloexec(fd.as_raw_fd()).map_err(|e| io_fail("utun", "fcntl F_SETFD", e))?;
             let mut info: libc::ctl_info = std::mem::zeroed();
             for (dst, src) in info.ctl_name.iter_mut().zip(UTUN_CONTROL) {
                 *dst = *src as libc::c_char;
             }
             if libc::ioctl(fd.as_raw_fd(), libc::CTLIOCGINFO, &mut info) < 0 {
-                return Err(io::Error::last_os_error());
+                return Err(last_fail("utun", "ioctl CTLIOCGINFO"));
             }
             let addr = libc::sockaddr_ctl {
                 sc_len: std::mem::size_of::<libc::sockaddr_ctl>() as u8,
@@ -1233,7 +1390,7 @@ mod sys {
                 std::mem::size_of::<libc::sockaddr_ctl>() as libc::socklen_t,
             ) < 0
             {
-                return Err(io::Error::last_os_error());
+                return Err(last_fail("utun", "connect com.apple.net.utun_control"));
             }
             let mut name = [0u8; libc::IFNAMSIZ];
             let mut len = name.len() as libc::socklen_t;
@@ -1245,42 +1402,50 @@ mod sys {
                 &mut len,
             ) < 0
             {
-                return Err(io::Error::last_os_error());
+                return Err(last_fail("utun", "getsockopt UTUN_OPT_IFNAME"));
             }
             let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
             let name = String::from_utf8_lossy(&name[..end]).into_owned();
-            let index = if_index(&name)?;
+            let index = if_index(&name).map_err(|e| io_fail("utun", "if_nametoindex", e))?;
             Ok((fd, name, index))
         }
     }
 
     fn set_mtu(name: &str, mtu: u32) -> io::Result<()> {
-        let sock = inet_socket(libc::AF_INET)?;
+        let sock =
+            inet_socket(libc::AF_INET).map_err(|e| io_fail("tun mtu", "socket AF_INET", e))?;
         let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-        set_ifr_name(&mut ifr.ifr_name, name)?;
+        set_ifr_name(&mut ifr.ifr_name, name)
+            .map_err(|e| io_fail("tun mtu", "interface name", e))?;
         ifr.ifr_ifru.ifru_mtu = mtu as libc::c_int;
         let cmd = ioc_in(b'i', 52, std::mem::size_of::<libc::ifreq>()) as libc::c_ulong;
         ioctl(sock.as_raw_fd(), cmd, &mut ifr)
+            .map_err(|e| io_fail("tun mtu", "ioctl SIOCSIFMTU", e))
     }
 
     fn set_v4(name: &str, addr: &TunAddress) -> io::Result<()> {
-        let sock = inet_socket(libc::AF_INET)?;
+        let sock =
+            inet_socket(libc::AF_INET).map_err(|e| io_fail("tun address", "socket AF_INET", e))?;
         let mut req: libc::ifaliasreq = unsafe { std::mem::zeroed() };
-        set_ifr_name(&mut req.ifra_name, name)?;
+        set_ifr_name(&mut req.ifra_name, name)
+            .map_err(|e| io_fail("tun address", "interface name", e))?;
         req.ifra_addr = v4_sockaddr(addr.v4);
         req.ifra_broadaddr = v4_sockaddr(addr.v4_peer);
         req.ifra_mask = v4_sockaddr(prefix_mask_v4(addr.v4_prefix));
         let cmd = ioc_in(b'i', 26, std::mem::size_of::<libc::ifaliasreq>()) as libc::c_ulong;
         ioctl(sock.as_raw_fd(), cmd, &mut req)
+            .map_err(|e| io_fail("tun address", "ioctl SIOCAIFADDR", e))
     }
 
     fn set_v6(name: &str, addr: &super::V6Address) -> io::Result<()> {
-        let sock = inet_socket(libc::AF_INET6)?;
-        let req = v6_alias(name, addr)?;
+        let sock =
+            inet_socket(libc::AF_INET6).map_err(|e| io_fail("tun ipv6", "socket AF_INET6", e))?;
+        let req = v6_alias(name, addr).map_err(|e| io_fail("tun ipv6", "in6_aliasreq", e))?;
         // SIOCAIFADDR_IN6 is `_IOW('i', 26, struct in6_aliasreq)` and that
         // struct is 128 bytes (sing-tun's constant 0x8080691a).
         let cmd = ioc_in(b'i', 26, req.len()) as libc::c_ulong;
         ioctl(sock.as_raw_fd(), cmd, req.as_ptr() as *mut u8)
+            .map_err(|e| io_fail("tun ipv6", "ioctl SIOCAIFADDR_IN6", e))
     }
 
     fn v6_alias(name: &str, addr: &super::V6Address) -> io::Result<[u8; 128]> {
@@ -1517,6 +1682,15 @@ mod sys {
             (owned, ends[0], ends[1])
         }
 
+        #[test]
+        fn local_interfaces_include_ipv4_loopback() {
+            let addrs = super::interface_addresses().expect("getifaddrs");
+            assert!(
+                addrs.contains(&std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                "127.0.0.1 missing from {addrs:?}"
+            );
+        }
+
         fn session_holding(fd: OwnedFd) -> TunSession {
             TunSession {
                 name: None,
@@ -1567,6 +1741,8 @@ mod sys {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::io;
     #[cfg(target_os = "macos")]
     use std::net::SocketAddr;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1660,14 +1836,16 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V6("2001:db8::9".parse().unwrap()),
         ];
-        let err = exclusion_routes(&targets, Some(&v4), None, &tun()).unwrap_err();
+        let err =
+            exclusion_routes(&targets, Some(&v4), None, &tun(), &BTreeSet::new()).unwrap_err();
         assert!(err.contains("2001:db8::9"), "{err}");
         let v6 = PhysicalPath {
             gateway: "fe80::1".parse().unwrap(),
             index: 5,
             on_link: false,
         };
-        let routes = exclusion_routes(&targets, Some(&v4), Some(&v6), &tun()).unwrap();
+        let routes =
+            exclusion_routes(&targets, Some(&v4), Some(&v6), &tun(), &BTreeSet::new()).unwrap();
         assert_eq!(routes.len(), 2, "{routes:?}");
         assert_eq!(routes[0].destination, targets[0]);
         assert_eq!(routes[0].prefix, 32);
@@ -1685,8 +1863,64 @@ mod tests {
             index: 5,
             on_link: true,
         };
-        let routes = exclusion_routes(&targets[..1], Some(&on_link), None, &tun()).unwrap();
+        let routes = exclusion_routes(
+            &targets[..1],
+            Some(&on_link),
+            None,
+            &tun(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert!(matches!(routes[0].hop, NextHop::Interface { index: 5 }));
+    }
+
+    #[test]
+    fn local_and_loopback_exits_need_no_exclusion_route() {
+        let tun = tun();
+        let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let alias = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let mapped_alias = IpAddr::V6(Ipv4Addr::new(192, 0, 2, 10).to_ipv6_mapped());
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mapped_loop: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let local_v6: IpAddr = "fe80::1".parse().unwrap();
+        let mut local = BTreeSet::new();
+        local.insert(alias);
+        local.insert(local_v6);
+        assert!(!exit_needs_exclusion(loopback, &tun, &local));
+        assert!(!exit_needs_exclusion(mapped_loop, &tun, &local));
+        assert!(!exit_needs_exclusion(alias, &tun, &local));
+        assert!(
+            !exit_needs_exclusion(mapped_alias, &tun, &local),
+            "mapped form of a local v4"
+        );
+        assert!(!exit_needs_exclusion(local_v6, &tun, &local));
+        assert!(exit_needs_exclusion(remote, &tun, &local));
+        assert!(exit_needs_exclusion(remote, &tun, &BTreeSet::new()));
+        let peer = IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2));
+        assert!(!exit_needs_exclusion(peer, &tun, &BTreeSet::new()));
+
+        let v4 = PhysicalPath {
+            gateway: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            index: 5,
+            on_link: false,
+        };
+        let targets = [remote, alias, mapped_alias, loopback, mapped_loop, local_v6];
+        let routes = exclusion_routes(&targets, Some(&v4), None, &tun, &local).unwrap();
+        assert_eq!(routes.len(), 1, "{routes:?}");
+        assert_eq!(routes[0].destination, remote);
+    }
+
+    #[test]
+    fn an_existing_route_is_not_a_setup_failure() {
+        assert!(route_add_already_present(&io::Error::from_raw_os_error(
+            libc::EEXIST
+        )));
+        assert!(!route_add_already_present(&io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+        assert!(!route_add_already_present(&io::Error::other(
+            "route socket closed"
+        )));
     }
 
     #[test]
