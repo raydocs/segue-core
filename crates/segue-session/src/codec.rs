@@ -26,6 +26,11 @@
 //! CTRL_HELLO, RESOLVE, RESOLVED, REFRESH, REFRESHED and REVOKED are
 //! recognised (so they are not fatal) but carried as [`Frame::Control`] with
 //! an unparsed payload: their handlers live outside this crate.
+//!
+//! `REDUNDANT_ATTACH` / `REDUNDANT_OK` (v0.6 draft, no version bump) are
+//! additive and carry [`FLAG_IGNORABLE`]: a peer that does not know them
+//! skips the frame. They bind a second live carrier; they do not change
+//! OPEN, RESUME or DATA.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -72,6 +77,11 @@ pub mod ty {
     pub const REFRESH: u8 = 0x39;
     pub const REFRESHED: u8 = 0x3A;
     pub const REVOKED: u8 = 0x3B;
+    /// First frame on a redundant carrier (v0.6 draft). Always encoded with
+    /// [`FLAG_IGNORABLE`].
+    pub const REDUNDANT_ATTACH: u8 = 0x3C;
+    /// Answer to [`REDUNDANT_ATTACH`]. Always encoded with [`FLAG_IGNORABLE`].
+    pub const REDUNDANT_OK: u8 = 0x3D;
 }
 
 /// Error codes (§8).
@@ -237,6 +247,42 @@ pub struct ParkEntry {
     pub c_sent_offset: u64,
 }
 
+/// `REDUNDANT_ATTACH` (v0.6 draft): prove and bind a second carrier.
+///
+/// Same proof RESUME uses (`session_id` + `resume_secret`); no ticket.
+/// `attach_gen` is the session's current generation, not a new one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RedundantAttach {
+    pub session_id: SessionId,
+    pub resume_secret: Secret,
+    pub attach_gen: u32,
+    pub recv_offset: u64,
+    pub max_offset: u64,
+}
+
+impl std::fmt::Debug for RedundantAttach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedundantAttach")
+            .field("session_id", &self.session_id)
+            .field("resume_secret", &"<redacted>")
+            .field("attach_gen", &self.attach_gen)
+            .field("recv_offset", &self.recv_offset)
+            .field("max_offset", &self.max_offset)
+            .finish()
+    }
+}
+
+/// `REDUNDANT_OK` (v0.6 draft): the spare carrier is bound.
+///
+/// Offsets are the relay's snapshot (what it has received, and the window
+/// it advertises), same roles as in RESUMED.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RedundantOk {
+    pub attach_gen: u32,
+    pub recv_offset: u64,
+    pub max_offset: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParkAckEntry {
     pub session_id: SessionId,
@@ -289,6 +335,10 @@ pub enum Frame {
     Park(Vec<ParkEntry>),
     ParkAck(Vec<ParkAckEntry>),
     Stall(Vec<(SessionId, u32)>),
+    /// Bind a second carrier (v0.6 draft). Encoded with [`FLAG_IGNORABLE`].
+    RedundantAttach(RedundantAttach),
+    /// The second carrier is bound (v0.6 draft). Encoded with [`FLAG_IGNORABLE`].
+    RedundantOk(RedundantOk),
     /// A recognised control frame whose payload this crate does not parse
     /// (CTRL_HELLO, RESOLVE, RESOLVED, REFRESH, REFRESHED, REVOKED).
     Control {
@@ -556,6 +606,8 @@ impl Frame {
             Frame::Park(_) => ty::PARK,
             Frame::ParkAck(_) => ty::PARK_ACK,
             Frame::Stall(_) => ty::STALL,
+            Frame::RedundantAttach(_) => ty::REDUNDANT_ATTACH,
+            Frame::RedundantOk(_) => ty::REDUNDANT_OK,
             Frame::Control { ty, .. } => *ty,
         }
     }
@@ -708,6 +760,20 @@ impl Frame {
                     p.extend_from_slice(sid);
                     p.extend_from_slice(&gen.to_be_bytes());
                 }
+            }
+            Frame::RedundantAttach(a) => {
+                flags |= FLAG_IGNORABLE;
+                p.extend_from_slice(&a.session_id);
+                p.extend_from_slice(&a.resume_secret);
+                p.extend_from_slice(&a.attach_gen.to_be_bytes());
+                put_varint(p, a.recv_offset);
+                put_varint(p, a.max_offset);
+            }
+            Frame::RedundantOk(a) => {
+                flags |= FLAG_IGNORABLE;
+                p.extend_from_slice(&a.attach_gen.to_be_bytes());
+                put_varint(p, a.recv_offset);
+                put_varint(p, a.max_offset);
             }
             Frame::Control { payload, .. } => p.extend_from_slice(payload),
         }
@@ -968,6 +1034,18 @@ impl Frame {
                 }
                 Frame::Stall(entries)
             }
+            ty::REDUNDANT_ATTACH => Frame::RedundantAttach(RedundantAttach {
+                session_id: r.arr()?,
+                resume_secret: r.arr()?,
+                attach_gen: r.u32()?,
+                recv_offset: r.varint()?,
+                max_offset: r.varint()?,
+            }),
+            ty::REDUNDANT_OK => Frame::RedundantOk(RedundantOk {
+                attach_gen: r.u32()?,
+                recv_offset: r.varint()?,
+                max_offset: r.varint()?,
+            }),
             ty::CTRL_HELLO
             | ty::RESOLVE
             | ty::RESOLVED
