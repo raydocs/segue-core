@@ -74,6 +74,7 @@ use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 
 pub mod chart;
+pub mod impair;
 mod process_metrics;
 #[cfg(unix)]
 pub mod protocol_bench;
@@ -88,7 +89,7 @@ pub use stream_transport::{
     StreamBenchXhttpProfile,
 };
 
-const USAGE: &str = "usage: segue-bench run|compare|route-probe|dns-policy-probe|phase2-probe|reality-matrix|chart [options]\ncompare options: [--skip-sing-box]\nchart options: [--omit-sing-box-reality] [--omit-sing-box-1000-flows]";
+const USAGE: &str = "usage: segue-bench run|compare|route-probe|dns-policy-probe|phase2-probe|reality-matrix|chart|impair [options]\ncompare options: [--skip-sing-box]\nchart options: [--omit-sing-box-reality] [--omit-sing-box-1000-flows]\nimpair options: --listen <addr> --upstream <addr> [--profile clean|rtt170|rtt170-loss2|cn163-peak|cn163-offpeak] [--seed <n>] [--protocol udp|tcp|both] [--duration-ms <n>]";
 const TEST_VLESS_UUID: [u8; 16] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
 ];
@@ -181,6 +182,7 @@ pub enum CliArgs {
     Phase2Probe(Phase2ProbeOptions),
     RealityMatrix(RealityMatrixOptions),
     Chart(chart::ChartOptions),
+    Impair(impair::ImpairOptions),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1540,6 +1542,9 @@ where
     }
     if command == "chart" {
         return chart::parse_chart_args(&rest).map(CliArgs::Chart);
+    }
+    if command == "impair" {
+        return impair::parse_impair_args(&rest).map(CliArgs::Impair);
     }
 
     let mut index = 0;
@@ -8460,6 +8465,7 @@ where
             Ok(())
         }
         CliArgs::Chart(options) => chart::run_chart(&options),
+        CliArgs::Impair(options) => impair::run(options).await,
     }
 }
 
