@@ -1,6 +1,6 @@
-diff --color -ruN a/src/chrome_parrot.rs b/src/chrome_parrot.rs
---- a/src/chrome_parrot.rs
-+++ b/src/chrome_parrot.rs
+diff -ruN a/src/chrome_parrot.rs b/src/chrome_parrot.rs
+--- a/src/chrome_parrot.rs	1969-12-31 16:00:00
++++ b/src/chrome_parrot.rs	2026-11-18 10:06:57
 @@ -0,0 +1,655 @@
 +//! Xray-core's ChromeParrot client handshake
 +//!
@@ -657,9 +657,9 @@ diff --color -ruN a/src/chrome_parrot.rs b/src/chrome_parrot.rs
 +        }
 +    }
 +}
-diff --color -ruN a/src/config/transport.rs b/src/config/transport.rs
---- a/src/config/transport.rs
-+++ b/src/config/transport.rs
+diff -ruN a/src/config/transport.rs b/src/config/transport.rs
+--- a/src/config/transport.rs	2026-11-18 11:17:04
++++ b/src/config/transport.rs	2026-11-18 10:06:57
 @@ -47,7 +47,10 @@
      pub(crate) crypto_buffer_size: usize,
      pub(crate) allow_spin: bool,
@@ -763,9 +763,9 @@ diff --color -ruN a/src/config/transport.rs b/src/config/transport.rs
              // congestion_controller_factory not debug
              .field("enable_segmentation_offload", enable_segmentation_offload);
          if cfg!(feature = "qlog") {
-diff --color -ruN a/src/congestion/bbr/bw_estimation.rs b/src/congestion/bbr/bw_estimation.rs
---- a/src/congestion/bbr/bw_estimation.rs
-+++ b/src/congestion/bbr/bw_estimation.rs
+diff -ruN a/src/congestion/bbr/bw_estimation.rs b/src/congestion/bbr/bw_estimation.rs
+--- a/src/congestion/bbr/bw_estimation.rs	2026-11-18 11:17:04
++++ b/src/congestion/bbr/bw_estimation.rs	2026-11-18 10:06:57
 @@ -1,78 +1,191 @@
 +use std::collections::BTreeMap;
  use std::fmt::{Debug, Display, Formatter};
@@ -1249,9 +1249,9 @@ diff --color -ruN a/src/congestion/bbr/bw_estimation.rs b/src/congestion/bbr/bw_
 +        );
      }
  }
-diff --color -ruN a/src/congestion/bbr/mod.rs b/src/congestion/bbr/mod.rs
---- a/src/congestion/bbr/mod.rs
-+++ b/src/congestion/bbr/mod.rs
+diff -ruN a/src/congestion/bbr/mod.rs b/src/congestion/bbr/mod.rs
+--- a/src/congestion/bbr/mod.rs	2026-11-18 11:17:04
++++ b/src/congestion/bbr/mod.rs	2026-11-18 10:06:57
 @@ -5,13 +5,13 @@
  use rand::{RngExt, SeedableRng};
  use rand_pcg::Pcg32;
@@ -1826,9 +1826,9 @@ diff --color -ruN a/src/congestion/bbr/mod.rs b/src/congestion/bbr/mod.rs
 +        );
 +    }
 +}
-diff --color -ruN a/src/congestion.rs b/src/congestion.rs
---- a/src/congestion.rs
-+++ b/src/congestion.rs
+diff -ruN a/src/congestion.rs b/src/congestion.rs
+--- a/src/congestion.rs	2026-11-18 11:17:04
++++ b/src/congestion.rs	2026-11-18 10:06:57
 @@ -1,7 +1,7 @@
  //! Logic for controlling the rate at which data is sent
  
@@ -1974,9 +1974,9 @@ diff --color -ruN a/src/congestion.rs b/src/congestion.rs
  
      /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
      fn metrics(&self) -> ControllerMetrics {
-diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
---- a/src/connection/mod.rs
-+++ b/src/connection/mod.rs
+diff -ruN a/src/connection/mod.rs b/src/connection/mod.rs
+--- a/src/connection/mod.rs	2026-11-18 11:17:04
++++ b/src/connection/mod.rs	2026-11-18 10:07:11
 @@ -10,14 +10,12 @@
  use bytes::{Bytes, BytesMut};
  use frame::StreamMetaVec;
@@ -2004,7 +2004,20 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
  };
  
  mod ack_frequency;
-@@ -245,6 +246,9 @@
+@@ -222,6 +223,12 @@
+     //
+     /// The number of times a PTO has been sent without receiving an ack.
+     pto_count: u32,
++    /// Do not send the second loss-probe datagram before this instant.
++    ///
++    /// A PTO sends two datagrams. Emitted together, a burst of a few packets
++    /// erases both and the next probe waits out a doubled timeout. Holding the
++    /// second one across a short gap lets it survive that burst.
++    next_loss_probe: Option<Instant>,
+ 
+     //
+     // Congestion Control
+@@ -245,6 +252,9 @@
      stats: ConnectionStats,
      /// QUIC version used for the connection.
      version: u32,
@@ -2014,7 +2027,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
  }
  
  impl Connection {
-@@ -278,6 +282,8 @@
+@@ -278,6 +288,8 @@
              client_hello: None,
          });
          let mut rng = StdRng::from_seed(rng_seed);
@@ -2023,7 +2036,15 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
          let mut this = Self {
              endpoint_config,
              crypto,
-@@ -363,7 +369,12 @@
+@@ -344,6 +356,7 @@
+             next_bundled_ack_time: None,
+ 
+             pto_count: 0,
++            next_loss_probe: None,
+ 
+             app_limited: false,
+             receiving_ecn: false,
+@@ -363,7 +376,12 @@
              rng,
              stats: ConnectionStats::default(),
              version,
@@ -2036,7 +2057,20 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
          if path_validated {
              this.on_path_validated();
          }
-@@ -468,14 +479,36 @@
+@@ -464,18 +482,49 @@
+         buf: &mut Vec<u8>,
+     ) -> Option<Transmit> {
+         assert!(max_datagrams != 0);
++        // The second PTO datagram waits out a short burst. Returning here keeps
++        // the driver's transmit loop from emitting it in the same turn.
++        if let Some(at) = self.next_loss_probe {
++            if now < at && SpaceId::iter().any(|space| self.spaces[space].loss_probes > 0) {
++                self.timers.set(Timer::Pacing, at);
++                return None;
++            }
++            self.next_loss_probe = None;
++        }
+         let max_datagrams = match self.config.enable_segmentation_offload {
              false => 1,
              true => max_datagrams,
          };
@@ -2075,7 +2109,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
  
          if let Some(challenge) = self.send_path_challenge(now, buf) {
              return Some(challenge);
-@@ -559,6 +592,16 @@
+@@ -559,6 +608,16 @@
              }
  
              pad_datagram_to_mtu |= space_id == SpaceId::Data && self.config.pad_to_mtu;
@@ -2092,7 +2126,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
  
              // Can we append more data into the current buffer?
              // It is not safe to assume that `buf.len()` is the end of the data,
-@@ -614,36 +657,52 @@
+@@ -614,36 +673,52 @@
  
                      let bytes_to_send = segment_size as u64 + untracked_bytes;
                      if self.path.in_flight.bytes + bytes_to_send >= self.path.congestion.window() {
@@ -2158,15 +2192,25 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
                      }
  
                      if num_datagrams > 1 || pad_datagram_to_mtu {
-@@ -711,6 +770,7 @@
+@@ -710,7 +785,16 @@
+                     }
                  }
  
-                 // Allocate space for another datagram
+-                // Allocate space for another datagram
++                // Allocate space for another datagram.
++                // One probe per transmit. The next one is armed on the pacing
++                // timer so a 2–4 packet burst cannot erase both copies.
++                if num_datagrams >= 1 && self.spaces[space_id].loss_probes > 0 {
++                    let at = now + LOSS_PROBE_SPACING;
++                    self.next_loss_probe = Some(at);
++                    self.timers.set(Timer::Pacing, at);
++                    break;
++                }
 +                probe_datagram = self.spaces[space_id].loss_probes != 0;
                  let next_datagram_size_limit = match self.spaces[space_id].loss_probes {
                      0 => segment_size,
                      _ => {
-@@ -718,7 +778,7 @@
+@@ -718,7 +802,7 @@
                          // Clamp the datagram to at most the minimum MTU to ensure that loss probes
                          // can get through and enable recovery even if the path MTU has shrank
                          // unexpectedly.
@@ -2175,7 +2219,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
                      }
                  };
                  buf_capacity += next_datagram_size_limit;
-@@ -785,7 +845,7 @@
+@@ -785,7 +869,7 @@
                  ack_eliciting,
                  self,
              )?);
@@ -2184,7 +2228,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
  
              // https://tools.ietf.org/html/draft-ietf-quic-transport-34#section-14.1
              pad_datagram |=
-@@ -853,7 +913,7 @@
+@@ -853,7 +937,7 @@
  
              // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
              // validation can occur while the link is saturated.
@@ -2193,7 +2237,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
                  if let Some((token, remote)) = self.path_responses.pop_off_path(self.path.remote) {
                      // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                      // above.
-@@ -883,9 +943,30 @@
+@@ -883,9 +967,30 @@
                  }
              }
  
@@ -2226,7 +2270,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
              // ACK-only packets should only be sent when explicitly allowed. If we write them due to
              // any other reason, there is a bug which leads to one component announcing write
              // readiness while not writing any data. This degrades performance. The condition is
-@@ -918,7 +999,7 @@
+@@ -918,7 +1023,7 @@
          // Finish the last packet
          if let Some(mut builder) = builder_storage {
              if pad_datagram {
@@ -2235,7 +2279,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
              }
  
              // If this datagram is a loss probe and `segment_size` is larger than `min_mtu`,
-@@ -930,11 +1011,19 @@
+@@ -930,11 +1035,19 @@
                  builder.pad_to(segment_size as u16);
              }
  
@@ -2259,7 +2303,24 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
  
              self.config.qlog_sink.emit_recovery_metrics(
                  self.pto_count,
-@@ -1462,6 +1551,16 @@
+@@ -991,6 +1104,16 @@
+             trace!(?probe_size, "writing MTUD probe");
+         }
+ 
++        // A probe datagram already left in this transmit, or the batch stopped
++        // before the second one (a short first probe shrinks the GSO segment
++        // and the loop bails). Hold the rest for the next wakeup; the driver's
++        // transmit loop would otherwise send it in this same turn.
++        if SpaceId::iter().any(|space| self.spaces[space].loss_probes > 0) {
++            let at = now + LOSS_PROBE_SPACING;
++            self.next_loss_probe = Some(at);
++            self.timers.set(Timer::Pacing, at);
++        }
++
+         if buf.is_empty() {
+             return None;
+         }
+@@ -1462,6 +1585,16 @@
          }
      }
  
@@ -2276,7 +2337,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
      fn on_ack_received(
          &mut self,
          now: Instant,
-@@ -1500,6 +1599,7 @@
+@@ -1500,6 +1633,7 @@
              return Ok(());
          }
  
@@ -2284,7 +2345,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
          let mut ack_eliciting_acked = false;
          for packet in newly_acked.elts() {
              if let Some(info) = self.spaces[space].take(packet) {
-@@ -1528,13 +1628,6 @@
+@@ -1528,13 +1662,6 @@
              }
          }
  
@@ -2298,7 +2359,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
          if new_largest && ack_eliciting_acked {
              let ack_delay = if space != SpaceId::Data {
                  Duration::from_micros(0)
-@@ -1546,14 +1639,31 @@
+@@ -1546,14 +1673,31 @@
              };
              let rtt = now.saturating_duration_since(self.spaces[space].largest_acked_packet_sent);
              self.path.rtt.update(ack_delay, rtt);
@@ -2330,7 +2391,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
  
          if self.peer_completed_address_validation() {
              self.pto_count = 0;
-@@ -1615,12 +1725,13 @@
+@@ -1615,12 +1759,13 @@
          if info.ack_eliciting && self.path.challenge.is_none() {
              // Only pass ACKs to the congestion controller if we are not validating the current
              // path, so as to ignore any ACKs from older paths still coming in.
@@ -2345,7 +2406,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
              );
          }
  
-@@ -1655,7 +1766,11 @@
+@@ -1655,7 +1800,11 @@
      fn on_loss_detection_timeout(&mut self, now: Instant) {
          if let Some((_, pn_space)) = self.loss_time_and_space() {
              // Time threshold loss Detection
@@ -2357,7 +2418,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
              self.set_loss_detection_timer(now);
              return;
          }
-@@ -1699,6 +1814,7 @@
+@@ -1699,6 +1848,7 @@
          let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
          let packet_threshold = self.config.packet_threshold as u64;
          let mut size_of_lost_packets = 0u64;
@@ -2365,7 +2426,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
  
          // InPersistentCongestion: Determine if all packets in the time period before the newest
          // lost packet, including the edges, are marked lost. PTO computation must always
-@@ -1730,6 +1846,7 @@
+@@ -1730,6 +1880,7 @@
                  } else {
                      lost_packets.push(packet);
                      size_of_lost_packets += info.size as u64;
@@ -2373,7 +2434,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
                      if info.ack_eliciting && due_to_ack {
                          match persistent_congestion_start {
                              // Two ACK-eliciting packets lost more than congestion_period apart, with no
-@@ -1770,7 +1887,8 @@
+@@ -1770,7 +1921,8 @@
              self.stats.path.lost_bytes += size_of_lost_packets;
              trace!(
                  "packets lost: {:?}, bytes lost: {}",
@@ -2383,7 +2444,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
              );
  
              for &packet in &lost_packets {
-@@ -1784,6 +1902,13 @@
+@@ -1784,6 +1936,13 @@
                      self.orig_rem_cid,
                  );
                  self.remove_in_flight(&info);
@@ -2397,7 +2458,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
                  for frame in info.stream_frames {
                      self.streams.retransmit(frame);
                  }
-@@ -1804,6 +1929,11 @@
+@@ -1804,6 +1963,11 @@
  
              if lost_ack_eliciting {
                  self.stats.path.congestion_events += 1;
@@ -2409,7 +2470,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
                  self.path.congestion.on_congestion_event(
                      now,
                      largest_lost_sent,
-@@ -1817,6 +1947,11 @@
+@@ -1817,6 +1981,11 @@
          if let Some(packet) = lost_mtu_probe {
              let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
              self.remove_in_flight(&info);
@@ -2421,7 +2482,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
              self.path.mtud.on_probe_lost();
              self.stats.path.lost_plpmtud_probes += 1;
          }
-@@ -3179,6 +3314,7 @@
+@@ -3179,6 +3348,7 @@
              trace!("PING");
              buf.write(frame::FrameType::PING);
              sent.non_retransmits = true;
@@ -2429,7 +2490,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
              self.stats.frame_tx.ping += 1;
          }
  
-@@ -3192,6 +3328,7 @@
+@@ -3192,6 +3362,7 @@
  
          // ACK
          if space.pending_acks.can_send() {
@@ -2437,7 +2498,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
              Self::try_populate_acks(
                  now,
                  self.receiving_ecn,
-@@ -3201,6 +3338,9 @@
+@@ -3201,6 +3372,9 @@
                  &mut self.stats,
                  max_size,
              );
@@ -2447,7 +2508,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
          }
  
          // ACK_FREQUENCY
-@@ -3261,7 +3401,43 @@
+@@ -3261,7 +3435,43 @@
          }
  
          // CRYPTO
@@ -2492,7 +2553,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
              let mut frame = match space.pending.crypto.pop_front() {
                  Some(x) => x,
                  None => break,
-@@ -3295,6 +3471,11 @@
+@@ -3295,6 +3505,11 @@
              );
              truncated.encode(buf);
              self.stats.frame_tx.crypto += 1;
@@ -2504,7 +2565,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
              sent.retransmits.get_or_create().crypto.push_back(truncated);
              if !frame.data.is_empty() {
                  frame.offset += len as u64;
-@@ -3415,12 +3596,17 @@
+@@ -3415,12 +3630,17 @@
          // We want to reuse encryption and underlying protocol overhead,
          // but sending multiple ACKs for a single incoming packet is a waste of peer's resources,
          // so we have next_bundled_ack_time to control when to send ACKs.
@@ -2522,7 +2583,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
              Self::try_populate_acks(
                  now,
                  self.receiving_ecn,
-@@ -3430,6 +3616,9 @@
+@@ -3430,6 +3650,9 @@
                  &mut self.stats,
                  max_size,
              );
@@ -2532,7 +2593,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
          }
  
          sent
-@@ -3647,6 +3836,12 @@
+@@ -3647,6 +3870,12 @@
          Some(packet.payload.to_vec())
      }
  
@@ -2545,7 +2606,7 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
      /// The number of bytes of packets containing retransmittable frames that have not been
      /// acknowledged or declared lost.
      #[cfg(test)]
-@@ -3761,20 +3956,98 @@
+@@ -3761,20 +3990,98 @@
      /// rare. If `pn` is specified, may additionally change unpredictably due to variations in
      /// latency and packet loss.
      fn predict_1rtt_overhead(&self, pn: Option<u64>) -> usize {
@@ -2647,7 +2708,19 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
      fn tag_len_1rtt(&self) -> usize {
          let key = match self.spaces[SpaceId::Data].crypto.as_ref() {
              Some(crypto) => Some(&*crypto.packet.local),
-@@ -4082,6 +4355,36 @@
+@@ -4052,6 +4359,11 @@
+ // Prevents overflow and improves behavior in extreme circumstances
+ const MAX_BACKOFF_EXPONENT: u32 = 16;
+ 
++/// Gap between the two datagrams of one PTO. Wider than a few-packet burst,
++/// far shorter than a round trip, so the second copy is not lost with the first
++/// and does not wait for the doubled timeout.
++const LOSS_PROBE_SPACING: Duration = Duration::from_millis(10);
++
+ /// Minimal remaining size to allow packet coalescing, excluding cryptographic tag
+ ///
+ /// This must be at least as large as the header for a well-formed empty packet to be coalesced,
+@@ -4082,6 +4394,36 @@
      /// Whether the packet contains non-retransmittable frames (like datagrams)
      non_retransmits: bool,
      requires_padding: bool,
@@ -2684,9 +2757,9 @@ diff --color -ruN a/src/connection/mod.rs b/src/connection/mod.rs
  }
  
  impl SentFrames {
-diff --color -ruN a/src/connection/pacing.rs b/src/connection/pacing.rs
---- a/src/connection/pacing.rs
-+++ b/src/connection/pacing.rs
+diff -ruN a/src/connection/pacing.rs b/src/connection/pacing.rs
+--- a/src/connection/pacing.rs	2026-11-18 11:17:04
++++ b/src/connection/pacing.rs	2026-11-18 10:06:57
 @@ -15,6 +15,7 @@
  pub(super) struct Pacer {
      capacity: u64,
@@ -2942,9 +3015,9 @@ diff --color -ruN a/src/connection/pacing.rs b/src/connection/pacing.rs
 +        assert!(p.capacity <= 256 * 1000);
      }
  }
-diff --color -ruN a/src/connection/packet_builder.rs b/src/connection/packet_builder.rs
---- a/src/connection/packet_builder.rs
-+++ b/src/connection/packet_builder.rs
+diff -ruN a/src/connection/packet_builder.rs b/src/connection/packet_builder.rs
+--- a/src/connection/packet_builder.rs	2026-11-18 11:17:04
++++ b/src/connection/packet_builder.rs	2026-11-18 10:06:57
 @@ -2,12 +2,12 @@
  use rand::RngExt;
  use tracing::{debug, trace, trace_span};
@@ -3090,9 +3163,9 @@ diff --color -ruN a/src/connection/packet_builder.rs b/src/connection/packet_bui
      }
  
      /// Encrypt packet, returning the length of the packet and whether padding was added
-diff --color -ruN a/src/connection/paths.rs b/src/connection/paths.rs
---- a/src/connection/paths.rs
-+++ b/src/connection/paths.rs
+diff -ruN a/src/connection/paths.rs b/src/connection/paths.rs
+--- a/src/connection/paths.rs	2026-11-18 11:17:04
++++ b/src/connection/paths.rs	2026-11-18 10:07:11
 @@ -7,7 +7,7 @@
      pacing::Pacer,
      spaces::{PacketSpace, SentPacket},
@@ -3114,9 +3187,30 @@ diff --color -ruN a/src/connection/paths.rs b/src/connection/paths.rs
      pub(crate) fn new(initial_rtt: Duration) -> Self {
          Self {
              latest: initial_rtt,
-diff --color -ruN a/src/connection/spaces.rs b/src/connection/spaces.rs
---- a/src/connection/spaces.rs
-+++ b/src/connection/spaces.rs
+@@ -327,9 +332,18 @@
+         self.min
+     }
+ 
+-    // PTO computed as described in RFC9002#6.2.1
++    // PTO computed as described in RFC9002#6.2.1.
++    //
++    // Before any sample, quic-go uses `2 * initial RTT` and ignores the
++    // speculative variance of `initial/2`. Counting that variance makes the
++    // first probe `3 * initial` (about a second at the 333 ms default) and
++    // turns one handshake loss into a multi-second stall.
+     pub(crate) fn pto_base(&self) -> Duration {
+-        self.get() + cmp::max(4 * self.var, TIMER_GRANULARITY)
++        if self.smoothed.is_none() {
++            self.latest.saturating_mul(2)
++        } else {
++            self.get() + cmp::max(4 * self.var, TIMER_GRANULARITY)
++        }
+     }
+ 
+     pub(crate) fn update(&mut self, ack_delay: Duration, rtt: Duration) {
+diff -ruN a/src/connection/spaces.rs b/src/connection/spaces.rs
+--- a/src/connection/spaces.rs	2026-11-18 11:17:04
++++ b/src/connection/spaces.rs	2026-11-18 10:06:57
 @@ -11,9 +11,9 @@
  
  use super::assembler::Assembler;
@@ -3139,9 +3233,9 @@ diff --color -ruN a/src/connection/spaces.rs b/src/connection/spaces.rs
      /// [`PathData::generation`](super::PathData::generation) of the path on which this packet was sent
      pub(super) path_generation: u64,
      /// The time the packet was sent.
-diff --color -ruN a/src/connection/streams/mod.rs b/src/connection/streams/mod.rs
---- a/src/connection/streams/mod.rs
-+++ b/src/connection/streams/mod.rs
+diff -ruN a/src/connection/streams/mod.rs b/src/connection/streams/mod.rs
+--- a/src/connection/streams/mod.rs	2026-11-18 11:17:04
++++ b/src/connection/streams/mod.rs	2026-11-18 10:06:57
 @@ -138,7 +138,7 @@
              hash_map::Entry::Occupied(s) => s,
              hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
@@ -3151,9 +3245,9 @@ diff --color -ruN a/src/connection/streams/mod.rs b/src/connection/streams/mod.r
  
          let (read_credits, stop_sending) = stream.stop()?;
          if stop_sending.should_transmit() {
-diff --color -ruN a/src/connection/streams/recv.rs b/src/connection/streams/recv.rs
---- a/src/connection/streams/recv.rs
-+++ b/src/connection/streams/recv.rs
+diff -ruN a/src/connection/streams/recv.rs b/src/connection/streams/recv.rs
+--- a/src/connection/streams/recv.rs	2026-11-18 11:17:04
++++ b/src/connection/streams/recv.rs	2026-11-18 10:06:57
 @@ -93,8 +93,12 @@
  
          self.stopped = true;
@@ -3193,9 +3287,9 @@ diff --color -ruN a/src/connection/streams/recv.rs b/src/connection/streams/recv
                  true => return Err(ReadableError::ClosedStream),
                  false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
              };
-diff --color -ruN a/src/connection/streams/state.rs b/src/connection/streams/state.rs
---- a/src/connection/streams/state.rs
-+++ b/src/connection/streams/state.rs
+diff -ruN a/src/connection/streams/state.rs b/src/connection/streams/state.rs
+--- a/src/connection/streams/state.rs	2026-11-18 11:17:04
++++ b/src/connection/streams/state.rs	2026-11-18 10:06:57
 @@ -129,6 +129,9 @@
      pub(super) send_window: u64,
      /// Configured upper bound for how much unacked data the peer can send us per stream
@@ -3456,9 +3550,9 @@ diff --color -ruN a/src/connection/streams/state.rs b/src/connection/streams/sta
      }
  
      #[test]
-diff --color -ruN a/src/lib.rs b/src/lib.rs
---- a/src/lib.rs
-+++ b/src/lib.rs
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-11-18 11:17:04
++++ b/src/lib.rs	2026-11-18 10:06:57
 @@ -26,6 +26,9 @@
      ops,
  };
@@ -3469,9 +3563,9 @@ diff --color -ruN a/src/lib.rs b/src/lib.rs
  mod cid_queue;
  pub mod coding;
  mod constant_time;
-diff --color -ruN a/src/packet.rs b/src/packet.rs
---- a/src/packet.rs
-+++ b/src/packet.rs
+diff -ruN a/src/packet.rs b/src/packet.rs
+--- a/src/packet.rs	2026-11-18 11:17:04
++++ b/src/packet.rs	2026-11-18 10:06:57
 @@ -702,6 +702,17 @@
          }
      }
@@ -3490,9 +3584,9 @@ diff --color -ruN a/src/packet.rs b/src/packet.rs
      pub(crate) fn len(self) -> usize {
          use PacketNumber::*;
          match self {
-diff --color -ruN a/src/tests/congestion_sent.rs b/src/tests/congestion_sent.rs
---- a/src/tests/congestion_sent.rs
-+++ b/src/tests/congestion_sent.rs
+diff -ruN a/src/tests/congestion_sent.rs b/src/tests/congestion_sent.rs
+--- a/src/tests/congestion_sent.rs	1969-12-31 16:00:00
++++ b/src/tests/congestion_sent.rs	2026-11-18 10:06:57
 @@ -0,0 +1,697 @@
 +use super::*;
 +use crate::congestion::{Controller, ControllerFactory, CubicConfig};
@@ -4191,9 +4285,9 @@ diff --color -ruN a/src/tests/congestion_sent.rs b/src/tests/congestion_sent.rs
 +        "the second ack-eliciting packet is the Finished, not the ACK before it"
 +    );
 +}
-diff --color -ruN a/src/tests/mod.rs b/src/tests/mod.rs
---- a/src/tests/mod.rs
-+++ b/src/tests/mod.rs
+diff -ruN a/src/tests/mod.rs b/src/tests/mod.rs
+--- a/src/tests/mod.rs	2026-11-18 11:17:04
++++ b/src/tests/mod.rs	2026-11-18 11:16:39
 @@ -18,19 +18,19 @@
  #[cfg(feature = "rustls-ring")]
  use rustls::crypto::ring::default_provider;
@@ -4236,7 +4330,68 @@ diff --color -ruN a/src/tests/mod.rs b/src/tests/mod.rs
      let mut active_cid_num = CidQueue::LEN as u64;
      active_cid_num = active_cid_num.min(LOC_CID_COUNT);
  
-@@ -4386,3 +4386,138 @@
+@@ -3011,7 +3011,35 @@
+     assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), 1452);
+ }
+ 
++/// Segue: with a round trip longer than the 10 ms PTO probe gap, both probes
++/// still leave before either is acknowledged, and black-hole detection works
++/// exactly as upstream asserts in its zero-latency version of this test.
+ #[test]
++fn blackhole_after_mtu_change_is_detected_with_latency() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    pair.latency = Duration::from_millis(40);
++    pair.mtu = 1500;
++    let (client_ch, server_ch) = pair.connect();
++    pair.drive();
++    assert_eq!(pair.client_conn_mut(client_ch).path_mtu(), 1452);
++    assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), 1452);
++
++    pair.mtu = 1200;
++    let payload = vec![42; 1300];
++    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
++    pair.client_send(client_ch, s).write(&payload).unwrap();
++    assert!(!pair.drive_bounded(), "Connections never reached an idle state");
++
++    let recv = pair.server_recv(server_ch, s);
++    assert_eq!(stream_chunks(recv).len(), 1300);
++    let client_stats = pair.client_conn_mut(client_ch).stats();
++    assert!(client_stats.path.lost_packets >= 3);
++    assert!(client_stats.path.congestion_events >= 3);
++    assert_eq!(client_stats.path.black_holes_detected, 1);
++}
++
++#[test]
+ fn blackhole_after_mtu_change_repairs_itself() {
+     let _guard = subscribe();
+     let mut pair = Pair::default();
+@@ -3043,11 +3071,20 @@
+     // The whole packet arrived in the end
+     assert_eq!(buf.len(), 1300);
+ 
+-    // Sanity checks (black hole detected after 3 lost packets)
++    // The oversized datagram was lost and the bytes still arrived.
++    //
++    // Upstream requires `lost_packets >= 3`, `congestion_events >= 3` and one
++    // black-hole detection. Those counts describe both PTO datagrams leaving in
++    // one turn, before either is acknowledged: every retransmission is then a
++    // full-MTU packet, dropped again, until four suspicious bursts lower the
++    // path MTU. The probes are now 10 ms apart. This harness has no latency, so
++    // the first probe's ACK is handled before the second probe is sent, the loss
++    // is declared, and that probe carries the data clamped to the minimum MTU.
++    // One loss repairs the send. A round trip longer than the gap still emits
++    // both probes first, and black-hole detection there is unchanged.
+     let client_stats = pair.client_conn_mut(client_ch).stats();
+-    assert!(client_stats.path.lost_packets >= 3);
+-    assert!(client_stats.path.congestion_events >= 3);
+-    assert_eq!(client_stats.path.black_holes_detected, 1);
++    assert!(client_stats.path.lost_packets >= 1);
++    assert!(client_stats.path.congestion_events >= 1);
+ }
+ 
+ #[test]
+@@ -4386,3 +4423,138 @@
      let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
      pair.connect();
  }
@@ -4375,9 +4530,9 @@ diff --color -ruN a/src/tests/mod.rs b/src/tests/mod.rs
 +}
 +
 +mod congestion_sent;
-diff --color -ruN a/src/tests/util.rs b/src/tests/util.rs
---- a/src/tests/util.rs
-+++ b/src/tests/util.rs
+diff -ruN a/src/tests/util.rs b/src/tests/util.rs
+--- a/src/tests/util.rs	2026-11-18 11:17:04
++++ b/src/tests/util.rs	2026-11-18 10:06:57
 @@ -42,6 +42,8 @@
      /// Number of spin bit flips
      pub(super) spins: u64,
@@ -4403,9 +4558,9 @@ diff --color -ruN a/src/tests/util.rs b/src/tests/util.rs
              let packet_size = packet_size(&packet, &buffer);
              if packet_size > self.mtu {
                  info!(packet_size, "dropping packet (max size exceeded)");
-diff --color -ruN a/src/transport_parameters.rs b/src/transport_parameters.rs
---- a/src/transport_parameters.rs
-+++ b/src/transport_parameters.rs
+diff -ruN a/src/transport_parameters.rs b/src/transport_parameters.rs
+--- a/src/transport_parameters.rs	2026-11-18 11:17:04
++++ b/src/transport_parameters.rs	2026-11-18 10:06:57
 @@ -110,6 +110,11 @@
              /// This field is initialized only for outgoing `TransportParameters` instances and
              /// is set to `None` for `TransportParameters` received from a peer.
