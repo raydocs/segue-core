@@ -10,6 +10,16 @@ long-term supported release series.
 
 ## Unreleased
 
+- Vision switches to direct copy when a TLS application record finishes in a
+  later write, or in the middle of one, instead of padding the rest of the
+  transfer. Two back-to-back records after the handshake take the direct
+  path. (Xray-core #7164)
+- `random` and `randomized` uTLS fingerprints draw only from profiles whose
+  ClientHello carries X25519MLKEM768 (`hellofirefox_148`, `hellochrome_131`,
+  `hellochrome_133`, `hellochrome_155`, `hellosafari_26_3`). Asking for one
+  of the other modern names by name still uses that profile. (Xray-core
+  #7432)
+
 **Security**
 
 - The vendored `quinn-proto` moves from 0.11.16 to 0.11.19 and `quinn` from

@@ -150,6 +150,50 @@ fn vision_padding_accepts_max_u16_payload() {
     assert_eq!(unpadded.payload, payload);
 }
 
+/// Xray-core #7438 / #7369. `XtlsPadding` panicked (`slice bounds [8192:8171]`)
+/// when content filled an 8192-byte buffer, and `ReshapeMultiBuffer` silently
+/// dropped the tail of anything larger. Every one of those sizes must pad and
+/// unpad, and one byte past `u16` must be an error rather than a panic.
+#[test]
+fn xtls_padding_oversized_content_round_trips_or_errors() {
+    let user = [3; 16];
+    for len in [8_171_usize, 8_192, 8_213, 12_288, 20_000, 65_535] {
+        let mut padding = VisionPadding::new(user, [900, 500, 900, 256]);
+        let payload = BytesMut::from(vec![0xAB; len].as_slice());
+        let padded = padding
+            .pad(payload.clone(), VisionCommand::Continue, 0)
+            .unwrap_or_else(|error| panic!("len {len}: {error}"));
+        let unpadded = unpad_vision_block(&padded, &user).unwrap_or_else(|error| {
+            panic!("len {len}: unpad {error}");
+        });
+        assert_eq!(unpadded.payload, payload, "len {len}");
+    }
+}
+
+#[test]
+fn malformed_short_padding_headers_never_panic() {
+    let user = [9; 16];
+    for len in 0..64 {
+        let buffer = vec![0x3C; len];
+        let result = std::panic::catch_unwind(|| unpad_vision_block(&buffer, &user));
+        assert!(result.is_ok(), "panicked on a {len}-byte header");
+    }
+
+    let malformed: &[&[u8]] = &[
+        &[],
+        &[0x02],
+        &[VisionCommand::Continue as u8, 0x00, 0x05, 0x00],
+        &[VisionCommand::Continue as u8, 0xFF, 0xFF, 0xFF, 0xFF],
+        &[VisionCommand::Direct as u8, 0x00, 0x01, 0xFF, 0xFF, 0x00],
+        &[0x00, 0x1F, 0xFF, 0x00, 0x00],
+    ];
+    for header in malformed {
+        let result = std::panic::catch_unwind(|| unpad_vision_block(header, &user));
+        assert!(result.is_ok(), "panicked on {header:?}");
+        assert!(result.unwrap().is_err(), "accepted {header:?}");
+    }
+}
+
 #[test]
 fn vision_padding_rejects_payload_larger_than_u16() {
     let user = [3; 16];

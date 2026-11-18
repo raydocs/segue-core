@@ -125,6 +125,98 @@ async fn vision_stream_write_keeps_mixed_tls_prefix_padded() {
     assert_eq!(&unpadded.payload[..], mixed);
 }
 
+/// Xray-core #7164: two complete TLS application records in one read after the
+/// handshake must switch to direct copy. The second record is already past
+/// the boundary, so it is raw, not another padded frame.
+#[tokio::test]
+async fn two_tls_app_records_in_one_write_switch_to_direct_copy() {
+    let (mut stream, mut server) = tls13_vision_ready().await;
+    let record_a = tls_app_record(b"alpha-record");
+    let record_b = tls_app_record(b"beta-record");
+    let mut both = record_a.clone();
+    both.extend_from_slice(&record_b);
+
+    stream.write_all(&both).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut direct_frame = vec![0; 5 + record_a.len()];
+    server.read_exact(&mut direct_frame).await.unwrap();
+    let unpadded = unpad_vision_block(&direct_frame, &USER_ID).unwrap();
+    assert_eq!(unpadded.command, VisionCommand::Direct);
+    assert_eq!(&unpadded.payload[..], record_a.as_slice());
+
+    let mut raw = vec![0; record_b.len()];
+    server.read_exact(&mut raw).await.unwrap();
+    assert_eq!(raw, record_b);
+
+    stream.write_all(b"after switch").await.unwrap();
+    stream.flush().await.unwrap();
+    let mut after = vec![0; "after switch".len()];
+    server.read_exact(&mut after).await.unwrap();
+    assert_eq!(&after[..], b"after switch");
+}
+
+/// The same bug with the record cut between writes: the first buffer ends
+/// inside the second record, so a per-buffer completeness check never passes.
+#[tokio::test]
+async fn tls_records_split_across_writes_still_switch_to_direct_copy() {
+    let (mut stream, mut server) = tls13_vision_ready().await;
+    let record_a = tls_app_record(b"alpha-record");
+    let record_b = tls_app_record(b"beta-record-payload");
+    let split = 4;
+    let mut first = record_a.clone();
+    first.extend_from_slice(&record_b[..split]);
+
+    stream.write_all(&first).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut direct_frame = vec![0; 5 + record_a.len()];
+    server.read_exact(&mut direct_frame).await.unwrap();
+    let unpadded = unpad_vision_block(&direct_frame, &USER_ID).unwrap();
+    assert_eq!(unpadded.command, VisionCommand::Direct);
+    assert_eq!(&unpadded.payload[..], record_a.as_slice());
+
+    let mut raw_head = vec![0; split];
+    server.read_exact(&mut raw_head).await.unwrap();
+    assert_eq!(raw_head, record_b[..split]);
+
+    stream.write_all(&record_b[split..]).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut raw_tail = vec![0; record_b.len() - split];
+    server.read_exact(&mut raw_tail).await.unwrap();
+    assert_eq!(raw_tail, record_b[split..]);
+}
+
+/// Xray-core #7438: a buffer bigger than the legacy 8192-byte frame, and one
+/// bigger than a single u16 vision frame, must round-trip. No panic, no loss.
+#[tokio::test]
+async fn oversized_vision_buffers_round_trip_without_loss() {
+    let (client, server) = tokio::io::duplex(1024 * 1024);
+    let mut writer = VisionStream::new(client, USER_ID, [0, 0, 0, 0]);
+    let mut reader = VisionStream::new(server, USER_ID, [0, 0, 0, 0]);
+
+    for size in [8_171_usize, 8_192, 8_213, 12_288, 20_000, 65_535, 70_000] {
+        let payload = vec![0x5A; size];
+        writer.write_all(&payload).await.unwrap();
+        let mut got = vec![0; size];
+        reader.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, payload, "size {size}");
+    }
+}
+
+/// Xray-core #7369: a short or truncated padding header is an error, not a
+/// slice panic, including when the peer then closes.
+#[tokio::test]
+async fn short_padding_header_at_eof_errors_without_panic() {
+    let (client, mut server) = tokio::io::duplex(64);
+    let mut stream = VisionStream::new(client, USER_ID, [0, 0, 0, 0]);
+    server.write_all(&[0, 1, 2]).await.unwrap();
+    drop(server);
+    let mut output = [0_u8; 8];
+    let error = stream.read(&mut output).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+}
+
 #[tokio::test]
 async fn vision_stream_read_returns_unpadded_payload() {
     let (client, server) = tokio::io::duplex(4096);
@@ -198,6 +290,42 @@ async fn vision_stream_writes_direct_bytes_after_direct_block_via_direct_io() {
     let inner = stream.into_inner();
     assert_eq!(&inner.direct_written[..], b"direct raw");
     assert!(inner.direct_write_used);
+}
+
+fn tls_app_record(payload: &[u8]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(5 + payload.len());
+    record.extend_from_slice(&[0x17, 0x03, 0x03]);
+    record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    record.extend_from_slice(payload);
+    record
+}
+
+async fn tls13_vision_ready() -> (
+    VisionStream<tokio::io::DuplexStream>,
+    tokio::io::DuplexStream,
+) {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let mut stream = VisionStream::new(client, USER_ID, [0, 0, 0, 0]);
+    let client_hello = b"\x16\x03\x01\x00\x01\x01";
+    stream.write_all(client_hello).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut handshake_frame = vec![0; 16 + 5 + client_hello.len()];
+    server.read_exact(&mut handshake_frame).await.unwrap();
+
+    let server_hello = tls13_server_hello_fixture();
+    let mut padding = VisionPadding::new(USER_ID, [0, 0, 0, 0]);
+    let server_hello_frame = padding
+        .pad(
+            BytesMut::from(server_hello.as_slice()),
+            VisionCommand::Continue,
+            0,
+        )
+        .unwrap();
+    server.write_all(&server_hello_frame).await.unwrap();
+    let mut received = vec![0; server_hello.len()];
+    stream.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, server_hello);
+    (stream, server)
 }
 
 fn tls13_server_hello_fixture() -> Vec<u8> {
