@@ -120,6 +120,13 @@ pub struct VisionStream<S> {
     pending_write_len: usize,
     pending_direct_write_mode: bool,
     pending_end_write_mode: bool,
+    /// Bytes past the first complete TLS application record in the write that
+    /// switched this direction to direct copy. Written raw, after the padded
+    /// prefix has been flushed.
+    pending_direct_suffix: BytesMut,
+    /// Record boundaries across writes. Xray-core #7164: a check that restarts
+    /// on every buffer never switches when back-to-back records are split.
+    tls_records: TlsRecordTracker,
     raw_read: BytesMut,
     decoded_read: BytesMut,
     inbound_user_id_seen: bool,
@@ -146,6 +153,8 @@ impl<S> VisionStream<S> {
             pending_write_len: 0,
             pending_direct_write_mode: false,
             pending_end_write_mode: false,
+            pending_direct_suffix: BytesMut::new(),
+            tls_records: TlsRecordTracker::default(),
             raw_read: BytesMut::new(),
             decoded_read: BytesMut::new(),
             inbound_user_id_seen: false,
@@ -361,6 +370,19 @@ where
             self.pending_end_write_mode = false;
         }
 
+        while !self.pending_direct_suffix.is_empty() {
+            let written = std::task::ready!(
+                Pin::new(&mut self.inner).poll_write_direct(cx, &self.pending_direct_suffix,)
+            )?;
+            if written == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write vision direct suffix",
+                )));
+            }
+            self.pending_direct_suffix.advance(written);
+        }
+
         Poll::Ready(Ok(()))
     }
 }
@@ -443,6 +465,7 @@ where
         if !this.pending_write.is_empty()
             || this.pending_direct_write_mode
             || this.pending_end_write_mode
+            || !this.pending_direct_suffix.is_empty()
         {
             std::task::ready!(this.poll_drain_pending(cx))?;
         }
@@ -467,7 +490,19 @@ where
         let accepted_len = cmp::min(input.len(), MAX_CONTENT_LEN);
         let input = &input[..accepted_len];
         this.filter_tls_packet(input);
-        if this.is_tls && is_complete_tls_application_data_records(input) {
+        // End the padded prefix at the first complete application-data record,
+        // even when that record started in an earlier write. Anything after
+        // that boundary in this buffer is already direct-copy payload.
+        let direct_end = this
+            .tls_records
+            .application_data_end(input, this.enable_xtls);
+        if direct_end > 0 {
+            this.queue_padded_write(&input[..direct_end], VisionCommand::Direct, true)?;
+            if direct_end < input.len() {
+                this.pending_direct_suffix = BytesMut::from(&input[direct_end..]);
+            }
+            this.pending_direct_write_mode = true;
+        } else if this.is_tls && is_complete_tls_application_data_records(input) {
             if this.enable_xtls {
                 this.queue_padded_write(input, VisionCommand::Direct, true)?;
                 this.pending_direct_write_mode = true;
@@ -513,6 +548,68 @@ where
 
 fn vision_to_io(error: VisionError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+/// Follows the original byte stream from its first record. Never searches
+/// ciphertext for a new header once the stream is not valid TLS.
+#[derive(Default)]
+struct TlsRecordTracker {
+    header: [u8; HEADER_LEN],
+    header_len: usize,
+    remaining: usize,
+    application: bool,
+    invalid: bool,
+}
+
+impl TlsRecordTracker {
+    /// Bytes of `data` that still belong in the padded prefix, ending at the
+    /// first complete application-data record once `enabled`. `0` means this
+    /// buffer does not contain that boundary. Payload is not retained.
+    fn application_data_end(&mut self, mut data: &[u8], enabled: bool) -> usize {
+        if self.invalid {
+            return 0;
+        }
+
+        let mut offset = 0;
+        while !data.is_empty() {
+            if self.remaining > 0 {
+                let n = cmp::min(self.remaining, data.len());
+                self.remaining -= n;
+                offset += n;
+                data = &data[n..];
+                if self.remaining == 0 && self.application && enabled {
+                    return offset;
+                }
+                continue;
+            }
+
+            let n = cmp::min(HEADER_LEN - self.header_len, data.len());
+            self.header[self.header_len..self.header_len + n].copy_from_slice(&data[..n]);
+            self.header_len += n;
+            offset += n;
+            data = &data[n..];
+            if self.header_len < HEADER_LEN {
+                continue;
+            }
+
+            let header = self.header;
+            // Handshake, change_cipher_spec, alert and application data,
+            // including a TLS 1.0 legacy record version on ClientHello.
+            if !(20..=23).contains(&header[0]) || header[1] != 3 || !(1..=3).contains(&header[2]) {
+                self.invalid = true;
+                return 0;
+            }
+            self.remaining = u16::from_be_bytes([header[3], header[4]]) as usize;
+            self.header_len = 0;
+            self.application = header[0] == 23 && header[2] == 3;
+            if self.remaining == 0 {
+                self.invalid = true;
+                return 0;
+            }
+        }
+
+        0
+    }
 }
 
 fn is_complete_tls_application_data_records(input: &[u8]) -> bool {

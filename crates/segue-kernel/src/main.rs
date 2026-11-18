@@ -122,6 +122,16 @@ fn run_kernel(args: &RunArgs) -> Result<Code, RunFailure> {
         let path = args.log.as_deref().unwrap_or(Path::new("-"));
         RunFailure::config(format!("log {}: {e}", path.display()))
     })?;
+    let result = run_loaded(args, &log);
+    if let Err(failure) = &result {
+        // stderr still comes from main. --log used to miss this: tun setup
+        // exits 4 after the policy lines, and the helper only reads the file.
+        log.record(failure);
+    }
+    result
+}
+
+fn run_loaded(args: &RunArgs, log: &Log) -> Result<Code, RunFailure> {
     let text = std::fs::read_to_string(&args.config)
         .map_err(|e| RunFailure::config(format!("{}: {e}", args.config.display())))?;
     let base = args.config.parent().unwrap_or(Path::new("."));
@@ -135,7 +145,7 @@ fn run_kernel(args: &RunArgs) -> Result<Code, RunFailure> {
         .enable_all()
         .build()
         .map_err(|e| RunFailure::runtime(format!("runtime: {e}")))?;
-    runtime.block_on(run_session(&config, &log))
+    runtime.block_on(run_session(&config, log))
 }
 
 async fn run_session(config: &KernelConfig, log: &Log) -> Result<Code, RunFailure> {
@@ -268,6 +278,9 @@ async fn run_session(config: &KernelConfig, log: &Log) -> Result<Code, RunFailur
         r = wait_tun(tun_task.as_mut()) => Stop::Tun(r),
         name = wait_for_stop() => Stop::Signal(name),
     };
+    // Stop the pump before closing the control fd so its duplicate is gone.
+    // shutdown() then removes the split routes and closes the utun fd.
+    // SIGKILL skips this; the kernel closes the process's fds instead.
     if let Some(drive) = tun_task {
         drive.runtime.stop().await;
         if !matches!(stopped, Stop::Tun(_)) {
@@ -321,6 +334,9 @@ fn drive_tun(
         mtu: addr.mtu as usize,
         queue_depth: 512,
     }));
+    // Borrowed: this runtime duplicates the control fd and must not close
+    // the caller's. `tun.shutdown` closes that fd after `runtime.stop()`
+    // drops the duplicate.
     let runtime = TunFdRuntime::start(
         TunFdConfig::new(
             fd,

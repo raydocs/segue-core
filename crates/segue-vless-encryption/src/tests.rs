@@ -329,7 +329,7 @@ async fn resumed_confirmation_obeys_handshake_deadline_and_invalidates_ticket() 
     let Prepared::Resume(resumption) = cache.prepare().unwrap() else {
         panic!("ticket must be available")
     };
-    let (carrier, _peer) = tokio::io::duplex(64);
+    let (carrier, _peer) = tokio::io::duplex(4096);
     let key = [5; 96];
     let mut stream = EncryptedStream::resumed(
         carrier,
@@ -338,13 +338,61 @@ async fn resumed_confirmation_obeys_handshake_deadline_and_invalidates_ticket() 
         None,
         vec![1, 2, 3],
         resumption.lease,
-        tokio::time::Instant::now() + handshake::HANDSHAKE_TIMEOUT,
+        tokio::time::Instant::now() + Duration::from_secs(120),
     );
 
+    // Time spent before the hello is written is not the server's silence.
     tokio::time::advance(handshake::HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
-    let error = stream.write_all(b"request").await.unwrap_err();
+    stream.write_all(b"request").await.unwrap();
+    tokio::time::advance(handshake::HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+    let error = stream.write_all(b"again").await.unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert!(matches!(cache.prepare().unwrap(), Prepared::Fresh(_)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn buffered_resumption_confirmation_wins_over_a_due_deadline() {
+    let cache = Cache::default();
+    let Prepared::Fresh(epoch) = cache.prepare().unwrap() else {
+        panic!("cache must be empty")
+    };
+    Candidate::new(cache.clone(), epoch, Zeroizing::new([7; 64]), [9; 16], 60).publish();
+    let Prepared::Resume(resumption) = cache.prepare().unwrap() else {
+        panic!("ticket must be available")
+    };
+    let (carrier, mut peer) = tokio::io::duplex(4096);
+    let key = [5; 96];
+    let mut stream = EncryptedStream::resumed(
+        carrier,
+        Zeroizing::new(key),
+        Aead::new(b"write", &key, CipherSuite::Aes256Gcm).unwrap(),
+        None,
+        vec![1, 2, 3],
+        resumption.lease,
+        tokio::time::Instant::now() + Duration::from_secs(120),
+    );
+    stream.write_all(b"request").await.unwrap();
+    let mut hello = [0u8; 64];
+    let n = peer.read(&mut hello).await.unwrap();
+    assert!(n > 0, "the resumption hello must leave before the budget");
+
+    let random = [4u8; 16];
+    peer.write_all(&random).await.unwrap();
+    let mut body = b"pong".to_vec();
+    let header = [23, 3, 3, 0, (body.len() + 16) as u8];
+    Aead::new(&random, &key, CipherSuite::Aes256Gcm)
+        .unwrap()
+        .seal(&mut body, &header)
+        .unwrap();
+    peer.write_all(&header).await.unwrap();
+    peer.write_all(&body).await.unwrap();
+
+    // The deadline and the confirmation are both ready. The record wins.
+    tokio::time::advance(handshake::HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+    let mut got = [0; 4];
+    stream.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"pong");
+    assert!(matches!(cache.prepare().unwrap(), Prepared::Resume(_)));
 }
 
 #[tokio::test]

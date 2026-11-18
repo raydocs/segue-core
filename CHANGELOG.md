@@ -10,6 +10,40 @@ long-term supported release series.
 
 ## Unreleased
 
+- Vision switches to direct copy when a TLS application record finishes in a
+  later write, or in the middle of one, instead of padding the rest of the
+  transfer. Two back-to-back records after the handshake take the direct
+  path. (Xray-core #7164)
+- `random` and `randomized` uTLS fingerprints draw only from profiles whose
+  ClientHello carries X25519MLKEM768 (`hellofirefox_148`, `hellochrome_131`,
+  `hellochrome_133`, `hellochrome_155`, `hellosafari_26_3`). Asking for one
+  of the other modern names by name still uses that profile. (Xray-core
+  #7432)
+- VLESS encryption resumption confirmation is timed from the moment the client
+  hello is written, not from when the 0-RTT handshake returns. Xray confirms a
+  resumed session with the first response bytes and has no separate timer; a
+  first-payload hold was burning that budget before the server had anything to
+  answer, and a confirmation already buffered when the budget elapsed was
+  reported as a timeout.
+- A gRPC call whose uplink is already closed condemns the pooled connection
+  immediately. The next VLESS open dials a fresh one instead of failing with
+  "the gRPC uplink is closed". That happened when the REALITY cover probe's
+  five-second server sleep (`GlobalPostHandshakeRecordsLens` in
+  `github.com/xtls/reality`) outlasted the matrix warmup and the shared dial
+  was reset underneath the following call. The warmup now waits 15s, the same
+  bound the pool uses for a REALITY dial.
+**Performance**
+
+- A VLESS request is no longer held for 500 ms when the client sends nothing.
+  Xray-core waits that long (`ReadMultiBufferTimeout`) so the header and the
+  first payload can share one write; on a server-first download nothing ever
+  arrives, and the server cannot speak until the request does. A payload that
+  is already buffered still shares the header's write. With nothing buffered,
+  the next read sends the header, and Vision still pads an empty frame, the
+  same bytes Xray-core sends when its wait expires. On the VLESS+gRPC 1 GiB
+  download (3 release runs) the median run fell from 1072 ms to 450 ms, and
+  the median gap before the transfer window from 513 ms to 10 ms.
+
 **Security**
 
 - The vendored `quinn-proto` moves from 0.11.16 to 0.11.19 and `quinn` from
@@ -449,6 +483,7 @@ long-term supported release series.
 
 **Kernel**
 
+- End-to-end loopback: an SSE chat stream (4,000 events, about 2 MB) through SOCKS, the kernel session and segue-relay stays on one app TCP connection across a 1.5 s carrier RST and refused reconnects. Every event arrives once, in order, and the stall stays under 5 s. The same cut on a direct path resets the app connection, so resumption is what saves the stream (SESSION_PROTOCOL v0.5 §4.4, §5.1, §5.3).
 - The kernel kill switch is the decision on the data path.
   `protection_for_exit_class` maps an AI exit to Strict and an overseas exit
   to Wait; any other class fails closed. The session dialer and the
@@ -535,6 +570,15 @@ long-term supported release series.
   utun descriptor is the existing Darwin packet pump, and routes are removed
   on every exit, including a setup failure. `GET /v1/status` reports
   `tun.interface` and `tun.routes`.
+- A dial whose next hop is loopback (`127.0.0.0/8` or `::1`, including an
+  IPv4-mapped loopback) is not pinned with `IP_BOUND_IF`. The physical NIC
+  has no route to the host's loopback, so a local exit (a SOCKS server on
+  `127.0.0.1`) never completed its handshake. Every other next hop stays
+  bound, which keeps the tunnel's own traffic out of the utun. A graceful
+  stop still removes the split routes and closes the utun control
+  descriptor, then issues `SIOCIFDESTROY` so the interface does not depend
+  on that close alone. `SIGKILL` never runs this path; the kernel closes
+  the process's fds.
 - Kernel outbounds and direct flows can share the host's protected
   transport through the new `EngineDialer::with_transport_dialer`.
 - The opt-in `proprietary-kernel` FFI skeleton is in place (ABI 1.18:
