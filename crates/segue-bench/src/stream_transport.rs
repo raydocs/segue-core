@@ -321,7 +321,11 @@ impl StreamBenchScenario {
     }
 
     pub(crate) fn supports_engine(self, engine: EngineKind) -> bool {
-        engine != EngineKind::SingBox || self.transport.supports_sing_box()
+        match engine {
+            EngineKind::XrayRust | EngineKind::XrayCore => true,
+            EngineKind::SingBox => self.transport.supports_sing_box(),
+            EngineKind::Mihomo => false,
+        }
     }
 }
 
@@ -446,7 +450,8 @@ pub(super) fn engine_config(
     scenario.validate_max_post_bytes(options.payload_size, options.xhttp_max_post_bytes)?;
     if !scenario.supports_engine(engine) {
         return Err(BenchError::InvalidArguments(format!(
-            "sing-box does not support the {} stream transport",
+            "{} does not support the {} stream transport",
+            engine.as_str(),
             scenario.transport.as_str()
         )));
     }
@@ -473,6 +478,9 @@ pub(super) fn engine_config(
                 .unwrap_or(options.payload_size),
         ),
         EngineKind::SingBox => sing_box_client_config(port, vless_addr, scenario),
+        EngineKind::Mihomo => Err(BenchError::InvalidArguments(
+            "mihomo does not support stream-transport in this harness".to_owned(),
+        )),
     }
 }
 
@@ -1075,9 +1083,9 @@ fn xray_client_config(
             "fingerprint": "chrome",
             "alpn": [scenario.transport.alpn()]
         }),
-        EngineKind::SingBox => {
+        EngineKind::SingBox | EngineKind::Mihomo => {
             return Err(BenchError::InvalidArguments(
-                "internal error: Xray config requested for sing-box".to_owned(),
+                "internal error: Xray config requested for a non-Xray engine".to_owned(),
             ))
         }
     };
