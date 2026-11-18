@@ -14,7 +14,7 @@
 //! # TCP loss-recovery emulation
 //!
 //! [`TcpLoss::Emulate`] (CLI `--tcp-loss emulate`, off by default) never drops
-//! a TCP byte. Each read chunk, capped at [`TCP_SEGMENT_CAP`] (1400 B), is one
+//! a TCP byte. Each read chunk, capped at `TCP_SEGMENT_CAP` (1400 B), is one
 //! segment. A segment the profile's [`LossModel`] marks lost is delivered
 //! later, and every segment behind it waits (head-of-line), then flushes in
 //! order. This is a model of TCP recovery, not TCP, and a Linux `tc netem`
@@ -34,7 +34,7 @@
 //! - otherwise a tail-loss probe, `2 × rtt`;
 //! - each lost retransmission adds an RTO of `max(200 ms, 3 × rtt)`, doubling
 //!   per further loss, each step capped at 8 s, and at most
-//!   [`TCP_MAX_RETX`] retries.
+//!   `TCP_MAX_RETX` retries.
 //!
 //! The first segment in each direction stands for the SYN / first handshake
 //! flight: a loss delays it 1 s (macOS initial RTO), and a lost retransmission

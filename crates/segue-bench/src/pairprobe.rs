@@ -7,7 +7,7 @@
 //!
 //! Statistics are pure functions of `&[Option<Duration>]` (an echo's round
 //! trip, or `None` when it did not arrive). UDP treats an echo later than
-//! [`LOSS_TIMEOUT`] as lost. TCP has no loss; a stall is an echo later than
+//! `LOSS_TIMEOUT` as lost. TCP has no loss; a stall is an echo later than
 //! that flow's minimum RTT plus 200 ms. A loss burst's duration is the time
 //! from its first lost probe to its last (`(length - 1) / pps`); a single
 //! lost probe has duration 0.
@@ -1766,6 +1766,7 @@ mod tests {
                 udp: true,
                 tcp: true,
                 duration: Some(Duration::from_secs(30)),
+                tcp_loss: crate::impair::TcpLoss::Off,
             };
             let task = tokio::spawn(crate::impair::run(options));
             if wait_impair(listen, &task).await {
