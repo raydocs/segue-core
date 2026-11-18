@@ -22,6 +22,7 @@ pub mod flow;
 pub mod park;
 pub mod pipe;
 pub mod pool;
+pub mod quality;
 pub mod relay;
 
 use std::time::Duration;

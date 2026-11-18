@@ -603,6 +603,7 @@ fn user_exit_change_resets_the_ai_pin() {
         choice_gen: 0,
         ai_pin: None,
         health: vec![Health::new(), Health::new()],
+        auto: AutoChoice::default(),
     };
     st.health[0].ks.on_event(Event::ChannelUp);
     let groups = vec!["la".to_string(), "ny".to_string()];
@@ -628,6 +629,7 @@ fn user_exit_change_resets_the_ai_pin() {
         choice_gen: 0,
         ai_pin: Some(0),
         health: vec![Health::new(), Health::new()],
+        auto: AutoChoice::default(),
     };
     st.health[0].ks.on_event(Event::ChannelLost);
     st.health[1].ks.on_event(Event::ChannelUp);
@@ -1311,6 +1313,7 @@ mod exit_health {
             choice_gen: 0,
             ai_pin: None,
             health: vec![exit()],
+            auto: AutoChoice::default(),
         }));
         let a = HealthReporter::new(st.clone(), 0);
         let b = HealthReporter::new(st.clone(), 0);
@@ -1430,6 +1433,141 @@ mod exit_health {
         let t = t + PROOF_FRESH;
         assert_eq!(feed(&mut h, 1, S::Failed, t), Posture::Reconnecting);
         assert_eq!(feed(&mut h, 2, S::Up, t), Posture::Connected);
+    }
+}
+
+/// The quality-based `Auto` choice, end to end: both exits are up, but
+/// one has measured worse quality. `Auto` prefers the better one, and
+/// `status()` reports the per-exit quality the choice was made from.
+mod auto_quality {
+    use super::*;
+    use segue_session::quality::Quality;
+
+    /// Mark exit `i` up (its carrier connected), as a probe or a session
+    /// would.
+    fn bring_up(d: &KernelDialer, i: usize) {
+        d.state.lock().unwrap().health[i]
+            .ks
+            .on_event(Event::ChannelUp);
+    }
+
+    /// Feed `quality` into exit `i`'s tracker as if its sessions and
+    /// control stream had measured it.
+    fn measure(d: &KernelDialer, i: usize, quality: Quality) {
+        let mut st = d.state.lock().unwrap();
+        let q = &mut st.health[i].quality;
+        if let Some(srtt) = quality.srtt {
+            q.on_rtt(srtt);
+        }
+        if quality.loss > 0.0 {
+            // A replay of `loss` of the sent bytes.
+            q.on_replay(1000, (quality.loss * 1000.0) as u64);
+        }
+        for _ in 0..quality.stalls {
+            q.on_carrier_lost();
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_prefers_lower_loss_then_rtt() {
+        let l = lab();
+        // Both carriers up (a probe only dials the first).
+        l.d.probe().await.unwrap();
+        bring_up(&l.d, 1);
+        assert_eq!(l.d.status().current_exit.as_deref(), Some("la"));
+        // la is lossy, ny is clean: after the hysteresis, Auto moves.
+        measure(
+            &l.d,
+            0,
+            Quality {
+                srtt: Some(Duration::from_millis(200)),
+                loss: 0.10,
+                stalls: 0,
+            },
+        );
+        measure(
+            &l.d,
+            1,
+            Quality {
+                srtt: Some(Duration::from_millis(100)),
+                loss: 0.0,
+                stalls: 0,
+            },
+        );
+        // The streak needs three fresh observations; `status()` polls
+        // with the same evidence and must not count.
+        for _ in 0..5 {
+            assert_eq!(l.d.status().current_exit.as_deref(), Some("la"));
+        }
+        // New evidence each round (a fresh RTT sample) advances it. The
+        // loss is already measured; only the RTT moves.
+        for k in 1..=3u64 {
+            measure(
+                &l.d,
+                0,
+                Quality {
+                    srtt: Some(Duration::from_millis(200 + k)),
+                    loss: 0.0,
+                    stalls: 0,
+                },
+            );
+            let _ = l.d.status();
+        }
+        assert_eq!(
+            l.d.status().current_exit.as_deref(),
+            Some("ny"),
+            "Auto did not move to the cleaner exit"
+        );
+        // The status carries the quality the choice was made from. la's
+        // loss has aged a little on the PING clock (each RTT sample
+        // decays it), but it is still clearly the lossier exit.
+        let st = l.d.status();
+        assert_eq!(st.quality[0].name, "la");
+        assert!(
+            st.quality[0].quality.loss > 0.05,
+            "la loss {}",
+            st.quality[0].quality.loss
+        );
+        assert_eq!(st.quality[1].name, "ny");
+        assert_eq!(st.quality[1].quality.loss, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_down_incumbent_fails_over_at_once() {
+        let l = lab();
+        l.d.probe().await.unwrap();
+        assert_eq!(l.d.status().current_exit.as_deref(), Some("la"));
+        // la's carrier goes down: no hysteresis, Auto moves to ny.
+        l.la_up.store(false, Ordering::SeqCst);
+        let _ = l.d.probe().await;
+        assert_eq!(l.d.status().current_exit.as_deref(), Some("ny"));
+    }
+
+    #[tokio::test]
+    async fn a_named_exit_ignores_quality() {
+        let l = lab();
+        l.d.set_exit("la").unwrap();
+        measure(
+            &l.d,
+            0,
+            Quality {
+                srtt: Some(Duration::from_millis(300)),
+                loss: 0.20,
+                stalls: 3,
+            },
+        );
+        measure(
+            &l.d,
+            1,
+            Quality {
+                srtt: Some(Duration::from_millis(50)),
+                loss: 0.0,
+                stalls: 0,
+            },
+        );
+        for _ in 0..5 {
+            assert_eq!(l.d.status().current_exit.as_deref(), Some("la"));
+        }
     }
 }
 

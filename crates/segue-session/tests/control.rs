@@ -151,7 +151,17 @@ async fn a_real_relay_accepts_and_the_stream_stays_up() {
     let c = relay_connector(Box::new(AllowAll), dials.clone());
     let r = run_for(c, hello(VERSION), Duration::from_millis(1500)).await;
     assert!(!r.ended);
-    assert!(r.hints.is_empty(), "{:?}", r.hints);
+    // The only hints are PING/PONG round trips (path quality): no Dead,
+    // no Stall, no Rejected.
+    assert!(
+        r.hints.iter().all(|h| matches!(h, ControlHint::Rtt(_))),
+        "{:?}",
+        r.hints
+    );
+    assert!(
+        r.hints.iter().any(|h| matches!(h, ControlHint::Rtt(_))),
+        "no RTT sample from an answering relay"
+    );
     assert_eq!(dials.load(Ordering::SeqCst), 1);
 }
 

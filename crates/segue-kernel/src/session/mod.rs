@@ -56,8 +56,12 @@ use segue_session::driver::{
     run_client_ctl, run_control, BoxCarrier, ClientCtl, Connector, ControlHint, ControlTiming,
 };
 use segue_session::pool::Pool;
+use segue_session::quality::{Quality, QualityEvent, QualityTracker};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+
+mod choice;
+pub use choice::AutoChoice;
 
 use crate::dial::{Datagrams, DialError, Dialer};
 
@@ -168,6 +172,9 @@ struct Health {
     /// Every live session on this exit, by reporter id: its own health,
     /// apart from its recovery budget (r10 N6).
     sessions: HashMap<u64, SessionMark>,
+    /// Measured path quality (RTT, replay loss, stalls) for the exit
+    /// choice (see [`crate::session::ExitChoice`] and [`Quality`]).
+    quality: QualityTracker,
 }
 
 /// One session's latest health on its exit.
@@ -196,6 +203,7 @@ impl Health {
             last_fail: None,
             unproven: false,
             sessions: HashMap::new(),
+            quality: QualityTracker::new(),
         }
     }
 
@@ -237,19 +245,31 @@ struct State {
     /// first AI flow, and after the user switches back to Auto.
     ai_pin: Option<usize>,
     health: Vec<Health>,
+    /// The quality-based `Auto` choice and its hysteresis (see
+    /// [`crate::session::choice`]).
+    auto: AutoChoice,
 }
 
 impl State {
-    fn pick(&self) -> usize {
+    /// Exit for a new session. A named choice is that exit. Under Auto,
+    /// the quality-based choice ([`AutoChoice`]) decides among the exits
+    /// that are up, preferring lower loss then lower RTT with hysteresis;
+    /// when none is up, the old fallback order applies (first not
+    /// recently failed, else the one that failed longest ago).
+    fn pick(&mut self) -> usize {
         if let Some(i) = self.choice {
             return i;
         }
-        if let Some(i) = self
+        let up: Vec<bool> = self
             .health
             .iter()
-            .position(|h| h.ks.posture() == Posture::Connected)
-        {
-            return i;
+            .map(|h| h.ks.posture() == Posture::Connected)
+            .collect();
+        if up.iter().any(|&u| u) {
+            let quality: Vec<Quality> = self.health.iter().map(|h| h.quality.snapshot()).collect();
+            if let Some(i) = self.auto.observe(&up, &quality) {
+                return i;
+            }
         }
         if let Some(i) = self.health.iter().position(|h| !h.recently_failed()) {
             return i;
@@ -298,14 +318,15 @@ impl State {
         h.ks.posture() == Posture::Connected && !h.unproven
     }
 
-    fn posture(&self) -> Posture {
+    fn posture(&mut self) -> Posture {
         if self.user_off {
             return Posture::Disconnected;
         }
         if self.revoked.is_some() {
             return Posture::Error;
         }
-        match self.health.get(self.pick()) {
+        let i = self.pick();
+        match self.health.get(i) {
             Some(h) => h.ks.posture(),
             None => Posture::Connecting,
         }
@@ -334,14 +355,23 @@ impl Channel {
     }
 }
 
+/// One exit's measured path quality, for the control API.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExitQuality {
+    pub name: String,
+    pub quality: Quality,
+}
+
 /// Snapshot for the control API.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Status {
     pub posture: Posture,
     pub choice: ExitChoice,
     /// The exit new sessions use now (None: no exits configured).
     pub current_exit: Option<String>,
     pub exits: Vec<String>,
+    /// Per exit, same order as `exits`: measured RTT, loss and stalls.
+    pub quality: Vec<ExitQuality>,
     /// Set when the relay revoked this device: its code.
     pub revoked: Option<u8>,
     /// Exits whose relay refused the control stream for good, with the
@@ -403,6 +433,7 @@ impl KernelDialer {
                 choice_gen: 0,
                 ai_pin: None,
                 health,
+                auto: AutoChoice::default(),
             })),
             off: watch::channel(false).0,
             revoked: Arc::new(watch::channel(None).0),
@@ -480,6 +511,11 @@ impl KernelDialer {
                             eprintln!("segue-kernel: exit {name}: channel dead, resuming sessions");
                             epoch.send_modify(|e| *e += 1);
                         }
+                        // A control PING/PONG round trip: the exit's RTT
+                        // sample for the quality-based exit choice.
+                        ControlHint::Rtt(rtt) => {
+                            state.lock().unwrap().health[i].quality.on_rtt(rtt);
+                        }
                         // The relay resets the sessions too, but its RSTs
                         // ride the data carriers, which may be dead while
                         // this stream works: reset every session locally and
@@ -530,16 +566,28 @@ impl KernelDialer {
     }
 
     pub fn status(&self) -> Status {
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
         let choice = match st.choice {
             None => ExitChoice::Auto,
             Some(i) => ExitChoice::Named(self.exits[i].name.clone()),
         };
+        let posture = st.posture();
+        let current = (!self.exits.is_empty()).then(|| st.pick());
+        let quality: Vec<ExitQuality> = self
+            .exits
+            .iter()
+            .zip(&st.health)
+            .map(|(e, h)| ExitQuality {
+                name: e.name.clone(),
+                quality: h.quality.snapshot(),
+            })
+            .collect();
         Status {
-            posture: st.posture(),
+            posture,
             choice,
-            current_exit: (!self.exits.is_empty()).then(|| self.exits[st.pick()].name.clone()),
+            current_exit: current.map(|i| self.exits[i].name.clone()),
             exits: self.exits.iter().map(|e| e.name.clone()).collect(),
+            quality,
             revoked: st.revoked,
             control_refused: self
                 .exits
@@ -629,7 +677,7 @@ impl KernelDialer {
         let mut last = DialError("no exits configured".into());
         for _ in 0..self.exits.len() {
             let (i, auto) = {
-                let st = self.state.lock().unwrap();
+                let mut st = self.state.lock().unwrap();
                 if st.user_off {
                     return Err(DialError("disconnected".into()));
                 }
@@ -836,6 +884,12 @@ impl KernelDialer {
             health: Some({
                 let rep = HealthReporter::new(self.state.clone(), i);
                 Arc::new(move |r| rep.report(r))
+            }),
+            quality: Some({
+                let state = self.state.clone();
+                Arc::new(move |e: QualityEvent| {
+                    state.lock().unwrap().health[i].quality.on_event(e);
+                })
             }),
         };
         let run = run_client_ctl(s, far, self.connector(i), ctl);
