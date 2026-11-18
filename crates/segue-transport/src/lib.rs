@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use segue_routing::{Target, TargetAddr};
-use std::net::{SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{fmt, io, sync::Arc};
@@ -452,6 +452,21 @@ impl SocketHandle {
 pub trait SocketProtector: Send + Sync {
     fn protect(&self, socket: SocketHandle) -> io::Result<()>;
 
+    /// Whether [`protect`](Self::protect) should run for a dial to `dest`.
+    ///
+    /// The default protects every destination. A tunnel bind overrides this
+    /// for loopback: pinning `127.0.0.0/8` or `::1` to the physical NIC makes
+    /// the connect unreachable. Callers that know the peer (TCP connect)
+    /// honor it. [`protect`](Self::protect) itself still does not see `dest`,
+    /// and UDP helpers that protect before they connect do not ask.
+    ///
+    /// A wrapper must forward this. Returning false skips the whole protector,
+    /// including options the wrapper would have applied after the inner bind.
+    fn protects_destination(&self, dest: IpAddr) -> bool {
+        let _ = dest;
+        true
+    }
+
     /// Whether TCP sockets ask for Multipath TCP, as Go's
     /// `Dialer.SetMultipathTCP(true)` does for `sockopt.tcpMptcp`.
     fn multipath_tcp(&self) -> bool {
@@ -619,6 +634,10 @@ pub async fn connect_tcp_stream(
     socket_protector: Option<&dyn SocketProtector>,
 ) -> Result<TcpStream, TransportError> {
     let addr = canonicalize_socket_addr(addr);
+    // Loopback stays unbound when the protector says so. Filtering here, where
+    // the peer is known, is what `protect` itself cannot do.
+    let socket_protector =
+        socket_protector.filter(|protector| protector.protects_destination(addr.ip()));
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(protector) = socket_protector.filter(|protector| protector.multipath_tcp()) {
         // Go's `dialMPTCP` dials plain TCP after any Multipath TCP failure.

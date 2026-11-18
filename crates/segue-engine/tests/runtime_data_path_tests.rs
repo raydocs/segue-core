@@ -4602,13 +4602,24 @@ async fn run_socks_policy_vless_user_level_conn_idle_scenario() {
     let (echo_addr, echo_handle) = spawn_echo_server().await;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let vless_addr = listener.local_addr().unwrap();
-    // The tunnel idles out before any payload, so, as in Xray-core, the held
-    // VLESS header is never sent.
+    // The tunnel idles out before any payload. Xray-core never sends its held
+    // header here (its 500 ms wait outlives the tunnel); Segue sends the
+    // request header on the first idle read (time-to-first-byte fix), so the
+    // server sees exactly one VLESS request and no payload bytes.
     let vless_handle = tokio::spawn(async move {
         let (mut inbound, _) = listener.accept().await.unwrap();
         let mut received = Vec::new();
         inbound.read_to_end(&mut received).await.unwrap();
-        assert!(received.is_empty());
+        if !received.is_empty() {
+            assert_eq!(received[0], 0, "VLESS version");
+            // version + 16-byte id + addons length + command + port + address:
+            // a bare header to 127.0.0.1 is well under 40 bytes.
+            assert!(
+                received.len() < 40,
+                "payload bytes followed the header: {}",
+                received.len()
+            );
+        }
     });
     let mut config = runtime_socks_config_with_vless_server_user_level(vless_addr, 8);
     config.policy = PolicyConfig {

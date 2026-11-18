@@ -40,3 +40,5 @@ rcgen.workspace = true
 # Policy tests verify signatures directly.
 ring = "0.17.14"
 rustls.workspace = true
+# Loopback roaming test: the production relay in front of a local origin.
+segue-relay = { path = "../segue-relay" }
