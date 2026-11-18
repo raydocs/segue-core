@@ -449,6 +449,7 @@ long-term supported release series.
 
 **Kernel**
 
+- End-to-end loopback: an SSE chat stream (4,000 events, about 2 MB) through SOCKS, the kernel session and segue-relay stays on one app TCP connection across a 1.5 s carrier RST and refused reconnects. Every event arrives once, in order, and the stall stays under 5 s. The same cut on a direct path resets the app connection, so resumption is what saves the stream (SESSION_PROTOCOL v0.5 §4.4, §5.1, §5.3).
 - The kernel kill switch is the decision on the data path.
   `protection_for_exit_class` maps an AI exit to Strict and an overseas exit
   to Wait; any other class fails closed. The session dialer and the
