@@ -5,6 +5,11 @@ fn target() -> Target {
     Target::new(TargetAddr::Domain("dns.example".into()), 53, Network::Udp)
 }
 
+/// Connect decodes back with the network the command implies: a TCP relay.
+fn tcp_target() -> Target {
+    Target::new(TargetAddr::Domain("dns.example".into()), 53, Network::Tcp)
+}
+
 fn packet(id: u16, total: u8, index: u8, payload: &[u8]) -> Packet {
     Packet {
         association_id: 0x1234,
@@ -22,9 +27,11 @@ fn packet(id: u16, total: u8, index: u8, payload: &[u8]) -> Packet {
 
 #[test]
 fn address_encodings_cover_domains_ips_and_the_fragment_sentinel() {
+    // Connect always establishes a TCP relay (TUIC v5 SPEC): the network is
+    // implied by the command and never encoded in the address.
     for (address, expected) in [
         (
-            Target::new(TargetAddr::Domain("a.example".into()), 443, Network::Udp),
+            Target::new(TargetAddr::Domain("a.example".into()), 443, Network::Tcp),
             &[
                 0, 9, b'a', b'.', b'e', b'x', b'a', b'm', b'p', b'l', b'e', 1, 187,
             ][..],
@@ -33,7 +40,7 @@ fn address_encodings_cover_domains_ips_and_the_fragment_sentinel() {
             Target::new(
                 TargetAddr::Ip(IpAddr::from([192, 0, 2, 1])),
                 53,
-                Network::Udp,
+                Network::Tcp,
             ),
             &[1, 192, 0, 2, 1, 0, 53][..],
         ),
@@ -41,7 +48,7 @@ fn address_encodings_cover_domains_ips_and_the_fragment_sentinel() {
             Target::new(
                 TargetAddr::Ip("2001:db8::1".parse().unwrap()),
                 443,
-                Network::Udp,
+                Network::Tcp,
             ),
             &[
                 2, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 187,
@@ -58,7 +65,7 @@ fn address_encodings_cover_domains_ips_and_the_fragment_sentinel() {
     let target = Target::new(
         TargetAddr::Ip("2001:db8::1".parse().unwrap()),
         443,
-        Network::Udp,
+        Network::Tcp,
     );
     let (decoded, _) = decode(&encode(&Command::Connect(target.clone())).unwrap()).unwrap();
     assert_eq!(decoded, Command::Connect(target));
@@ -70,7 +77,7 @@ fn all_five_command_kinds_have_an_exact_wire_codec() {
     let token = [0x22; 32];
     let cases = vec![
         Command::Authenticate { uuid, token },
-        Command::Connect(target()),
+        Command::Connect(tcp_target()),
         Command::Packet(packet(1, 1, 0, b"request")),
         Command::Dissociate {
             association_id: 0x1234,
@@ -142,9 +149,11 @@ fn native_fragmentation_respects_datagram_limits_and_timeout_eviction() {
         for fragment in decoded[..last].iter().rev() {
             assert!(reassembly.feed(fragment, now).unwrap().is_none());
         }
-        // Duplicate delivery is ignored and does not complete the packet early.
-        assert!(reassembly.feed(&decoded[last], now).unwrap().is_none());
+        // The completing fragment delivers the assembled packet at once, as in
+        // sing-quic and mihomo; re-delivering it afterwards is a duplicate for
+        // an already finished bag, not a second delivery of the same payload.
         let completed = reassembly.feed(&decoded[last], now).unwrap().unwrap();
+        assert!(reassembly.feed(&decoded[last], now).unwrap().is_none());
         assert_eq!(completed.payload, original);
         assert_eq!(
             completed.address.unwrap().routing(Network::Udp),
@@ -169,7 +178,8 @@ fn native_fragmentation_respects_datagram_limits_and_timeout_eviction() {
         expired.feed(&half, now).unwrap_err(),
         WireError::ReassemblyLimit
     );
-    let commands = fragment_datagrams(4, 0, &target(), b"", 300).unwrap();
+    // The `packet` helper builds association 0x1234; fragment with the same ID.
+    let commands = fragment_datagrams(0x1234, 0, &target(), b"", 300).unwrap();
     assert_eq!(commands.len(), 1);
     assert_eq!(
         decode_datagram(&commands[0]).unwrap(),
@@ -202,12 +212,15 @@ fn reassembly_orders_fragments_deduplicates_and_rejects_conflicts() {
         .feed(&packet(10, 2, 0, b"one"), start)
         .unwrap()
         .is_none());
+    // The last missing fragment completes the packet in delivery order too:
+    // sing-quic and mihomo assemble and return it immediately.
     assert_eq!(
-        reassembly.feed(
-            &packet(10, 2, 1, b"different"),
-            start + Duration::from_secs(1)
-        ),
-        Err(WireError::Fragmentation)
+        reassembly
+            .feed(&packet(10, 2, 1, b" two"), start + Duration::from_secs(1))
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"one two"
     );
     // A duplicate mismatch is not accepted as an idempotent retransmission.
     let mut reassembly = Reassembler::new(Duration::from_secs(10), 65535).unwrap();
