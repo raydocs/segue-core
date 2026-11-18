@@ -1,10 +1,113 @@
-# AI tools matched by the owning process, not by destination. Shared
-# telemetry and CDN hosts cannot be listed (see data/ai-lock.txt); a flow
-# from one of these processes still takes the AI exit when no domain or
-# CIDR did. A line is `name <file>`, `path <absolute path>`, `bundle <id>`
-# or `cmd <argv>`. `#` starts a comment. Only `name` and `path` match;
-# `bundle` and `cmd` are stored for a later check. `name` is the executable
-# file name, not a substring.
+# Built-in AI process list. The kernel merges this with the signed bundle's
+# own list to decide which processes belong to the AI tier. `#` starts a
+# comment. A line is one of:
+#   name  <exact process name>        e.g. `name claude` (add the .exe form
+#                                     separately on Windows if the matcher
+#                                     does not strip it)
+#   path  <absolute path or prefix/>  e.g. `path /Applications/Claude.app/`
+#   bundle <macOS bundle id>          e.g. `bundle com.anthropic.claudefordesktop`
+#   cmd  <basename of the script a generic runtime runs>
+#                                     for node/python CLIs whose process shows
+#                                     up as the runtime itself (node, python,
+#                                     Electron): `cmd gemini` matches
+#                                     `node .../gemini`. Never use it for
+#                                     tools that exec a native binary.
+#
+# Generic names that would capture everything (node, python3, Electron,
+# "Code Helper", chrome, pwsh) are deliberately NOT listed as `name`; only
+# vendor-qualified helper names like "Claude Helper (GPU)" are.
+# Verified on this Mac 2026-11-17 (`ls /Applications`, `mdls -name
+# kMDItemCFBundleIdentifier`, `which`, Info.plist/Frameworks inspection).
+# Everything else is marked `# unverified` and comes from vendor docs or
+# widely published bundle ids; re-verify before tightening policy on it.
 
+# --- Anthropic: Claude desktop -------------------------------------------
+# Electron app. Helper process names verified in Contents/Frameworks/.
+name Claude
+name Claude Helper
+name Claude Helper (GPU)
+name Claude Helper (Plugin)
+name Claude Helper (Renderer)
+bundle com.anthropic.claudefordesktop
+path /Applications/Claude.app/
+# Windows installs to %LOCALAPPDATA%\Programs\Claude\ (Claude.exe, same
+# helper naming). unverified
+
+# --- Anthropic: Claude Code ----------------------------------------------
+# Native Bun-compiled binary (verified Mach-O on this Mac), installed to
+# ~/.local/bin/claude; the VS Code and JetBrains extensions exec the same
+# binary, so `name claude` covers them. The npm install (@anthropic-ai/
+# claude-code) runs `node .../cli.js`, hence the cmd line.
 name claude
+cmd claude
+# Windows native build is claude.exe in %USERPROFILE%\.local\bin. unverified
+
+# --- OpenAI: ChatGPT desktop ---------------------------------------------
+# macOS app verified here: bundle id com.openai.codex, executable ChatGPT,
+# ships "Codex Framework.framework" — the 2026 unified ChatGPT/Codex app.
+name ChatGPT
+bundle com.openai.codex
+path /Applications/ChatGPT.app/
+# The older standalone ChatGPT app used bundle com.openai.chat. unverified
+# Windows installs to %LOCALAPPDATA%\Programs\ChatGPT\ (ChatGPT.exe).
+# unverified
+
+# --- OpenAI: Codex CLI ----------------------------------------------------
+# Native Rust binary (verified Mach-O on this Mac, ~/.local/bin/codex). The
+# npm wrapper (@openai/codex bin/codex.js) only execs this binary, and the
+# IDE extensions bundle their own copy of it, so `name codex` covers the CLI,
+# the wrapper's child, and the extensions. cmd codex is kept for the
+# short-lived node wrapper process itself.
 name codex
+cmd codex
+# codex-code-mode-host: Codex "code mode" MCP host binary, seen next to the
+# codex binary in ~/.local/bin on this Mac.
+name codex-code-mode-host
+# Windows native build is codex.exe. unverified
+
+# --- Cursor (Anysphere) ---------------------------------------------------
+# Todesktop-built Electron app. Helpers follow Electron naming; not
+# installed on this Mac. unverified
+name Cursor
+name Cursor Helper
+name Cursor Helper (GPU)
+name Cursor Helper (Plugin)
+name Cursor Helper (Renderer)
+bundle com.todesktop.230313mzl4w4u92  # unverified
+path /Applications/Cursor.app/  # unverified
+# cursor-agent: the agent CLI (cursor.com/install), a native binary.
+name cursor-agent
+# Windows installs to %LOCALAPPDATA%\Programs\cursor\ (Cursor.exe).
+# unverified
+# NOTE: "Grok Bot" is NOT xAI's Grok — verified on this Mac:
+# /Applications/Grok Bot.app has bundle id com.anysphere.sand and its
+# Info.plist names Anysphere; it is Cursor's nested-agent/sandbox runner
+# (matches the nested-agent hosts behind cursorvm.com). Listing both keeps
+# it out of the generic-name trap.
+name Grok Bot
+bundle com.anysphere.sand
+
+# --- GitHub Copilot --------------------------------------------------------
+# Copilot CLI (npm @github/copilot): node wrapper for a native binary, so
+# the process is `copilot` either way.
+name copilot
+cmd copilot
+# copilot-language-server: standalone LSP server (npm
+# @github/copilot-language-server, also shipped inside the VS Code
+# extensions); run over stdio as `node .../language-server.js --stdio`,
+# hence cmd. The launched binary name matches too. unverified
+name copilot-language-server  # unverified
+cmd copilot-language-server
+# Windows CLI is copilot.exe. unverified
+
+# --- Google: Gemini CLI ----------------------------------------------------
+# npm @google/gemini-cli runs as `node .../gemini` (and gemini.cmd/gemini.ps1
+# shims on Windows) — process name is the runtime, so only cmd applies.
+# Not installed on this Mac. unverified
+cmd gemini
+
+# --- xAI: Grok desktop ------------------------------------------------------
+# Distributed via the Mac App Store, so no local Info.plist was inspectable
+# and no bundle id was verified. The App Store build's process name is
+# `Grok`. unverified — re-verify before tightening policy on it.
+name Grok  # unverified
