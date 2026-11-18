@@ -722,3 +722,127 @@ answers `REJECT(version)` with generation 0 (`relay.rs:404-407`) — the client
 accepts a version reject across generations for that reason (`client.rs:750-756`).
 v5 is v4 plus `t_stall_ms` in OPEN/RESUME (r10 N3); the change is
 incompatible, hence the bump (`codec.rs:24-33`, `tests/codec.rs:137-139`).
+
+## 11. Implementation status (2026-11-17)
+
+Legend: **implemented** (running in tests/integration), **codec-only** (frames
+parse/encode, no behaviour), **hook-only** (interface exists, no producer),
+**not started**.
+
+| Feature | Status | Evidence |
+|---------|--------|----------|
+| TCP sessions (OPEN→OPENED→DATA/ACK/FIN) | implemented | `client.rs:699-795`, `relay.rs:489-725`, integration `tests/driver.rs:158`, `tests/sim.rs:441` |
+| Carrier swap with replay (RESUME/RESUMED, offsets, generations) | implemented | `flow.rs:249-258`, `relay.rs:629-670`, `tests/sim.rs:458` (no loss/duplication), `tests/sim.rs:483`, `tests/driver.rs:171` |
+| Flow control + global pool (rule 8) | implemented | `flow.rs:709-803`, `pool.rs`, `tests/driver.rs:701` (pool exhaustion), `tests/driver.rs:856` (8 MB pool, hundreds of flows), `tests/window_growth.rs:1` |
+| Control stream (CTRL_HELLO, PING/PONG, STALL, REVOKED) | implemented | `driver.rs:1853-1949`, `relay.rs:421-487`, kernel wiring `crates/segue-kernel/src/session/mod.rs:445` |
+| Tickets (SGT1/Ed25519, offline verify) | implemented (relay crate) | `crates/segue-relay/src/ticket.rs:195-247`; session crate sees only the `Authorizer` hook (`relay.rs:59-64`) |
+| Revocation | implemented as a local-file stand-in; control-plane feed not | `crates/segue-relay/src/revoke.rs:68`, freshness `revoke.rs:223`; "control plane deferred" `crates/segue-relay/src/lib.rs:17-21` |
+| Device reset (RST all sessions + REVOKED) | implemented | `relay.rs:978-1005`, `RelayCtrl::ResetDevice` `driver.rs:107-111`, client `ClientCtl::cancel` `driver.rs:920-923` |
+| Client multi-exit, AI anchor pinning, kill switch | implemented (kernel) | `crates/segue-kernel/src/session/mod.rs:8-30`, `Exit::group` `mod.rs:115-124`, `killswitch.rs` |
+| Health reports (Up/Failed/GaveUp/Alive) | implemented | `client.rs:122-153`, `HealthHook` `driver.rs:931` |
+| UDP sessions (DGRAM) | **codec-only** | frames `codec.rs:674-678`, `codec.rs:902-905`; relay refuses `Kind::Udp` (`crates/segue-relay/src/ticket.rs:236-240`); kernel refuses UDP to home routes (`mod.rs:1050-1055`) |
+| REFRESH / REFRESHED | **codec-only** | recognised, payload unparsed (`codec.rs:970-976`); "REFRESH is not implemented, so it is refused like OPEN" (`relay.rs:426-428`) |
+| RESOLVE / RESOLVED | **codec-only** | `codec.rs:970-976`; the only non-codec mention is the relay's skip note ("RESOLVE, REFRESH, PARK are not implemented", `relay.rs:375-381`) |
+| PARK / PARK_ACK | **hook-only** (matching rule implemented) | `park.rs:1-53`; client `request_park` `client.rs:1153-1167`; relay has no PARK handler ("RESOLVE, REFRESH, PARK are not implemented", `relay.rs:379-381`) |
+| WAKE | **not started** (M9+) | frame defined `codec.rs:684-693`; "PARK/WAKE as a whole is M9+" (`lib.rs:9-11`, `lib.rs:16-17`) |
+| Cross-instance hand-off (§9.2) | **not started** | any other `anchor_instance_id` → `unknown_session` (`relay.rs:568-571`, `relay.rs:502-504`) |
+| Cross-node forwarding | **not started** (M9+) | `crates/segue-session/src/lib.rs:16-17`, `crates/segue-relay/src/lib.rs:19-21` |
+| Session layer on mobile (FFI) | **not shipped** | `segue-session`/`segue-kernel` are behind the `proprietary-kernel` feature, "Deliberately not enabled in platform/build scripts yet" (`crates/segue-ffi/Cargo.toml:14-20`); no reference in `platform/android` or `platform/apple` |
+
+## 12. What this gives an AI app that Xray/sing-box/mihomo do not
+
+Claims below are exactly what the code and its tests support.
+
+1. **A stream survives its tunnel dying.** In Xray/sing-box/mihomo a proxy
+   connection is bound to the transport connection it arrived on; when the
+   outer TCP/Wi-Fi↔cellular switch kills it, the app's stream dies. Here the
+   session layer holds the stream state (offsets, replay buffer) in the relay
+   and re-attaches with RESUME on a fresh carrier: "a dropped carrier is
+   replaced with RESUME, so the app connection survives the outer tunnel
+   dying" (`crates/segue-kernel/src/session/mod.rs:3-6`). The property is
+   tested as *no loss and no duplication*: cut mid-transfer, resume, both
+   directions byte-exact (`tests/sim.rs:458-481` `assert_exact`,
+   `tests/sim.rs:616` randomized faults, `tests/driver.rs:171`). A network
+   change (epoch signal) moves sessions to a new carrier without the app
+   noticing (`ClientCtl::reattach`, `driver.rs:905-908`).
+2. **The relay notices stalls the client cannot.** A download-heavy AI client
+   has nothing unacknowledged upstream, so a dead path looks like a slow
+   download. The relay's `t_live` marks the session DETACHED and pushes
+   `STALL` over the control stream; the client re-attaches (`relay.rs:1078-1096`,
+   `client.rs:481-491`, rationale `crates/segue-kernel/src/session/mod.rs:36-37`).
+   A black-holed channel (packets dropped, socket never closed) is detected
+   by the control stream's `dead_after` and every session of that exit moves
+   (`driver.rs:1885-1890`).
+3. **Refusal is a dial error, not a hang or a silent fallback.** The app sees
+   success only after OPENED, which the relay sends only after the site
+   connect worked; a refused route (`exit_denied`, `target_denied`,
+   `home_unavailable`, …) is an error at the front end and "nothing is ever
+   retried direct" (`crates/segue-kernel/src/session/mod.rs:17-21`,
+   `crates/segue-relay/src/dial.rs:1-3`).
+4. **Close reasons survive the trip.** Reset vs clean vs refused-with-code
+   reach the application (`CloseReason` `client.rs:54-64`, `SessionStream`
+   `crates/segue-kernel/src/session/stream.rs:44-61`); a truncated upload is
+   never reported clean (`relay.rs:255-273`, `tests/driver.rs:800`).
+5. **Bounded, shared memory.** One 8 MB pool backs every session, driver
+   queue and the TUN stack's TCP buffers; the pool size is "a hard bound on
+   buffered session data" (`pool.rs:5-10`, `crates/segue-kernel/src/session/mod.rs:76-86`),
+   and hundreds of flows fit it (`tests/driver.rs:856`).
+6. **AI-specific anchoring.** `exit_class`/`ai_anchor_node_id` in tickets plus
+   the kernel's exit groups pin an AI flow to one egress identity and never
+   move it to a different egress on failure (`crates/segue-kernel/src/session/mod.rs:8-15`,
+   `crates/segue-relay/src/ticket.rs:49-50`) — the ISP-Home property AI
+   vendors verify by exit IP.
+
+**Still missing to deliver this end to end today:**
+
+- **Mobile.** `segue-ffi` links `segue-session`/`segue-kernel` only behind the
+  non-default `proprietary-kernel` feature, "deliberately not enabled in
+  platform/build scripts yet" (`crates/segue-ffi/Cargo.toml:14-20`; no
+  reference under `platform/android` or `platform/apple`). An AI app on
+  iOS/Android cannot reach the session layer through the shipped ABI; the
+  resumable-stream property is currently delivered only inside the kernel
+  (TUN/SOCKS front ends) and the CLI/bench harnesses.
+- **Control plane.** Ticket issuing, revocation feed and Home-line credential
+  sync are local-file stand-ins ("control plane deferred",
+  `crates/segue-relay/src/lib.rs:17-21`); REFRESH for expired tickets does not
+  exist (`relay.rs:426-428`), so a device must re-provision out of band after
+  the 1 h RESUME grace (`ticket.rs:26-28`).
+- **The M9+ set**: PARK/WAKE (battery-friendly parked sessions), UDP (DGRAM
+  is codec-only), cross-instance hand-off and cross-node forwarding
+  (`crates/segue-session/src/lib.rs:9-17`).
+- **SRTT-driven stall bound.** `t_stall` is a fixed 1 s default; the spec's
+  `max(1 s, 4 × SRTT)` is not modelled (`lib.rs:50-52`) even though the
+  receiver-side SRTT estimate itself exists (`flow.rs:363-405`).
+
+## Appendix A: citations that point at *other* specs
+
+Collected so readers do not mistake them for SESSION_PROTOCOL sections:
+
+- `KERNEL_SPEC` — §5.4 (UDP never via Home, `crates/segue-kernel/src/session/mod.rs:41`),
+  §5.5 items 2/3/7 (exit checks, `crates/segue-relay/src/guard.rs:1`,
+  `policy.rs:1-2`, `config.rs:27`), §5.5 B6 (clean close, §5.5 above),
+  §5.6 item 5 / item 7 (`crates/segue-relay/src/dial.rs:282`,
+  `metrics.rs:16`), §5.6/§5.7 D2 (Home lines, `home.rs:1-7`), §6.2 (policy
+  bundle, `crates/segue-relay/src/policy.rs:2`), §6.3 (memory pool,
+  `crates/segue-session/src/pool.rs:1`, `crates/segue-kernel/src/session/mod.rs:76`),
+  §6.4/§6.5 (`crates/segue-relay/src/lib.rs:1`, `server.rs:341`), §7.2
+  (数据停滞 / 网络变化 timers, `lib.rs:51`, `driver.rs:906`).
+- `CONTROL_PLANE_SPEC` — §3.3 (ticket issuing, `crates/segue-relay/src/ticket.rs:1`),
+  §4 (revocation feed, `crates/segue-relay/src/revoke.rs:1`).
+
+## Appendix B: gaps in this reconstruction
+
+- SESSION_PROTOCOL **§1, §7 and most of §9** are never cited in code; their
+  content (if any distinct from what §2–§6, §8, §10 cover above) is not
+  recoverable from the repository.
+- §4's numbered rules are cited as rules 1, 2, 5, 6, 7 and 8
+  (`flow.rs:6-13`, `flow.rs:226-247`, `flow.rs:630`, `flow.rs:708`); rules 3
+  and 4 are never cited by number — their content, if distinct, is unknown.
+- The spec's original §5 subsection titles are known only where code quotes
+  them: §5.1 "通道判死" (`driver.rs:1820`), §5.2 (attach/lifetime rules,
+  `relay.rs:631`, `lib.rs:66`), §5.3 (client, `client.rs:1`), §5.5 (close
+  semantics, `crates/segue-kernel/src/session/stream.rs:6`), §5.6 R2-2c
+  (PARK matching, `park.rs:1`).
+- The spec itself lives outside this repository; if it is found, this file
+  should be replaced by it and kept only as an implementation-accurate
+  companion.
