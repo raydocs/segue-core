@@ -85,7 +85,7 @@ impl AutoChoice {
     /// - The incumbent is down or unset: fail over at once to the first
     ///   up exit, no hysteresis.
     /// - Otherwise a challenger that beats the incumbent by the margin
-    ///   must do so for [`SWITCH_SAMPLES`] observations in a row.
+    ///   must do so for `SWITCH_SAMPLES` observations in a row.
     pub fn observe(&mut self, up: &[bool], quality: &[Quality]) -> Option<usize> {
         // The same evidence twice (a UI polling `status()`) is one
         // observation, not two.
