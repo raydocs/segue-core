@@ -615,3 +615,110 @@ device's primary Home (Decodo ISP SOCKS5) line; when that line is DOWN the
 dial is refused with `home_unavailable` — "never sent direct and never moved
 to another line unless failover is switched on"
 (`crates/segue-relay/src/home.rs:1-7`, `crates/segue-relay/src/dial.rs:389-396`).
+
+## 6. Ticket lifetime, REFRESH and revocation (spec §6)
+
+- **Ticket format** (`crates/segue-relay/src/ticket.rs:1-7`): `SGT1.`
+  base64url(payload JSON) `.` base64url(Ed25519 signature), no padding; the
+  signature covers `"segue-ticket-v1\n" || payload`. Claims (`ticket.rs:38-53`):
+  version, key id, device id, account id, plan, `exit_classes`, `ai_anchor_node_id`
+  (0 = any node), `not_before`, `not_after`. The relay holds only public keys
+  and verifies offline (`Verifier`, `ticket.rs:116-171`); a ticket is a bearer
+  secret and is never logged (`ticket.rs:7-8`). Longest accepted ticket: 2048
+  bytes (`MAX_TICKET`, `ticket.rs:25`).
+- **Validity window and RESUME grace (§6):** an expired ticket still authorizes
+  RESUME — never a new OPEN — for `RESUME_GRACE_SECS` = 1 h after `not_after`,
+  *only while the revocation list is fresh* (`ticket.rs:26-28`, `check`
+  `ticket.rs:203-223`: `resume && now < not_after + 3600 && revoked.is_fresh_at(now)`).
+  A ticket for a revoked device is `revoked` regardless of grace
+  (`ticket.rs:215-219`).
+- **Revocation freshness (§6: 5 min):** the revocation list is a complete
+  snapshot file (`seq`, `synced_at`, one device id per line, `end N` trailer)
+  reloaded when it changes; a truncated or half-written file is refused
+  (`crates/segue-relay/src/revoke.rs:1-20`). "Freshness (RESUME grace,
+  SESSION_PROTOCOL §6) comes only from that `synced_at`: … the list goes stale
+  5 min later however often the relay re-reads it" (`FRESH_FOR_SECS` = 300,
+  `revoke.rs:28-31`, `is_fresh_at` `revoke.rs:223`). The accepted snapshot is
+  persisted atomically so a restart never replays an older list
+  (`revoke.rs:20-22`).
+- **REFRESH is not implemented.** CTRL_HELLO with an expired ticket would get
+  a control stream "for REFRESH (§6); REFRESH is not implemented, so it is
+  refused like OPEN" (`crates/segue-session/src/relay.rs:426-438`). The
+  REFRESH/REFRESHED frame types are codec-recognised only (§2.3).
+- **Device reset:** revocation or admin resets every session of the device
+  (RST with the code, tombstones) and sends `REVOKED[code]` on its control
+  streams before closing them (`relay.rs:978-1005`, `RelayCtrl::ResetDevice`
+  `driver.rs:107-111`). A client that sees REVOKED resets its live sessions
+  locally with that code so "the reason reaches `closed` before the app stream
+  ends, so the app sees a reset" (`ClientCtl::cancel`, `driver.rs:920-923`).
+
+## 8. Error codes (spec §8) and their local mapping
+
+Codes are one byte each (`codec.rs:77-103`). Producers cited; everything else
+is closed with the code it carries.
+
+| code | value | produced where |
+|------|-------|----------------|
+| `clean` | 0 | tombstone `close_code` for a clean close; "not a §8 code; it only appears inside `REJECT(closed)`" (`codec.rs:100-103`, `check_done` `relay.rs:816-824`) |
+| `version` | 1 | wrong wire version in OPEN/RESUME/CTRL_HELLO (§10) — `relay.rs:404-407`, `relay.rs:424-426` |
+| `auth` | 2 | bad ticket signature/shape, or resume secret / device mismatch — `relay.rs:496`, `relay.rs:578-584`, `ticket.rs:210-214` |
+| `expired` | 3 | ticket past `not_after` without RESUME grace — `ticket.rs:206-209` |
+| `unknown_session` | 4 | RESUME for an unknown session; OPEN retry for an unknown session (A2); §9.2 instance mismatch — `relay.rs:532-536`, `relay.rs:571-576` |
+| `stale_gen` | 5 | OPEN/RESUME at a generation ≤ the current one, or a non-retry duplicate OPEN — `relay.rs:499-502`, `relay.rs:585-587` |
+| `capacity` | 6 | pool cannot cover the admission floors — `relay.rs:540-549`; maps to `CloseReason::Refused` (`client.rs:66-68`) |
+| `exit_denied` | 7 | ticket lacks the exit class; UDP on this relay — `ticket.rs:236-240`, `dial.rs` |
+| `target_denied` | 8 | SSRF guard / policy refused the target — `crates/segue-relay/src/dial.rs` (9 uses), `guard.rs` |
+| `closed` | 9 | session ended (tombstone) — carries `ClosedInfo` (`codec.rs:94-99`) |
+| `anchor_unreachable` | 10 | client retried with backoff until `t_detached` (B2) — `client.rs:755-766` |
+| `revoked` | 11 | device on the revocation list — `ticket.rs:215-219` |
+| `rate_limited` | 12 | reserved (no producer in-tree) |
+| `connect_refused` | 20 | site dial refused / generic site-connect error — `SiteError::code_of` `driver.rs:96-106`, `dial.rs:332-357` |
+| `connect_timeout` | 21 | site dial timed out — `dial.rs:358`; also the client's local give-up code (`LOCAL_GIVE_UP`, `client.rs:101`) |
+| `dns_failure` | 22 | relay-side resolve failed — `dial.rs:182` |
+| `site_reset` | 23 | site reset the session; also the code for a local app abort (`client.rs:1119-1125`) — `relay.rs:936-942` |
+| `idle` | 24 | DETACHED past `t_detached` — `relay.rs:1111` |
+| `admin` | 25 | admin reset (no in-tree producer; available to `RelayCtrl::ResetDevice`) |
+| `max_lifetime` | 26 | past the absolute lifetime — `relay.rs:1071-1074`, `relay.rs:1108-1110` |
+| `protocol` | 27 | any `ProtoError` (malformed frame, violation) — `fail` `relay.rs:409-415`, `fatal` `client.rs:638-644` |
+| `internal` | 28 | driver fallback when a session ends without a reason (`driver.rs:1307-1308`) |
+| `home_unavailable` | 29 | Home line DOWN for an AI dial — `dial.rs:389-396`; maps to `CloseReason::Refused` (`client.rs:66-68`) |
+
+**Local mapping (§8).** `CloseReason` (`client.rs:54-64`) decides how the app's
+connection ends: `Refused` codes (`capacity`, `home_unavailable`) never reach
+the wire; `Reset(code)` becomes a local RST (and, via `SessionStream`, an
+`ECONNRESET` for SOCKS/TUN, §5.5); `Clean` a local FIN. The kernel surfaces
+the code in dial errors ("session refused (code N)" / "session reset (code N)",
+`crates/segue-kernel/src/session/mod.rs:1020-1031`).
+
+## 9. Multi-instance (spec §9)
+
+A relay process is an *instance* with a random `instance_id`
+(`relay.rs:234`). A session lives in exactly one instance, learned by the
+client from OPENED/RESUMED (`instance_id` field) or the CTRL_HELLO reply
+(`codec.rs:476-507`) and echoed back as `anchor_instance_id` in OPEN retries
+(the carrier's hello hint, `client.rs:40-42`, `client.rs:421-425`) and RESUME
+(`attach` `client.rs:394-404`).
+
+**§9.2 status: cross-instance hand-off is not implemented.** Any RESUME (or
+OPEN retry) whose `anchor_instance_id` is non-zero and not this instance is
+answered `REJECT(unknown_session)` (`relay.rs:568-571`,
+"`§9.2 hand-off between instances is not implemented`"; same for OPEN retries
+`relay.rs:502-504`). The client treats `unknown_session` on an OPEN retry as
+"the session is gone here" and may re-open fresh (the kernel allows a pinned
+fresh OPEN after UNKNOWN_SESSION, `crates/segue-kernel/src/session/mod.rs:22-26`,
+`FRESH_OPENS` `mod.rs:90-91`). `anchor_node_id` (the node catalog id) is
+carried but only advisory for instance selection today
+(`client.rs:40-42`); cross-node forwarding is M9+ (`crates/segue-session/src/lib.rs:16-17`).
+
+## 10. Versioning (spec §10)
+
+Wire version 5 (`VERSION`, `codec.rs:39`). "Nothing older is deployed, so
+there is no negotiation: a peer of another version answers `REJECT(version)`
+before reading any other field" (`codec.rs:33-37`). Version is the first
+payload byte of OPEN, RESUME and CTRL_HELLO; a mismatched value aborts
+decoding of the rest of the frame (`ProtoError::Version`,
+`codec.rs:790-795`, `codec.rs:830-836`, `codec.rs:451-454`) and the relay
+answers `REJECT(version)` with generation 0 (`relay.rs:404-407`) — the client
+accepts a version reject across generations for that reason (`client.rs:750-756`).
+v5 is v4 plus `t_stall_ms` in OPEN/RESUME (r10 N3); the change is
+incompatible, hence the bump (`codec.rs:24-33`, `tests/codec.rs:137-139`).
