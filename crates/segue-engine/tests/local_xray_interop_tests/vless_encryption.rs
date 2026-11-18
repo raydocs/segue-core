@@ -425,8 +425,12 @@ impl FullMatrix {
         };
         if security == XrayInboundSecurity::Reality {
             let target = Target::new(TargetAddr::Ip(Ipv4Addr::LOCALHOST.into()), 9, Network::Tcp);
+            // Xray sleeps 5s inside the first REALITY handshake while the
+            // post-handshake record lengths are still unknown. A 5s cap cancels
+            // that shared gRPC dial mid-sleep and the reset closes the next
+            // call's uplink. The pool allows 15s for the same reason.
             let _ = timeout(
-                Duration::from_secs(5),
+                Duration::from_secs(15),
                 open_vless_tcp_stream_with_resolver_and_dialer(
                     &outbound,
                     &target,

@@ -14,6 +14,7 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
@@ -179,6 +180,9 @@ pub struct GrpcStream {
     /// Shared rather than owned, because a pooled connection carries many
     /// calls at once and the last of them to go is not knowable from here.
     driver: Arc<H2ConnectionDriver>,
+    /// Set when this call finds the uplink gone, so the pool will not hand the
+    /// connection out again. See [`super::h2client::H2Connection`].
+    connection_failed: Arc<AtomicBool>,
     /// Keeps the connection's keepalive out of dormancy for as long as this
     /// call is open — see [`super::keepalive`].
     ///
@@ -198,6 +202,7 @@ impl GrpcStream {
         mode: HunkMode,
         driver: Arc<H2ConnectionDriver>,
         open_call: OpenCall,
+        connection_failed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             downlink: Downlink::Awaiting(response),
@@ -216,6 +221,7 @@ impl GrpcStream {
             eof: false,
             send_closed: false,
             driver,
+            connection_failed,
             _open_call: open_call,
         }
     }
@@ -332,7 +338,13 @@ impl GrpcStream {
             let granted = match ready!(self.uplink.poll_capacity(cx)) {
                 Some(Ok(granted)) => granted,
                 Some(Err(error)) => return Poll::Ready(Err(h2_io_error("uplink stalled", &error))),
-                None => return Poll::Ready(Ok(Uplink::Closed)),
+                None => {
+                    // The send half is gone before this frame left. The
+                    // connection underneath is not usable for a new call even
+                    // if its driver has not finished yet.
+                    self.connection_failed.store(true, Ordering::Release);
+                    return Poll::Ready(Ok(Uplink::Closed));
+                }
             };
 
             let take = granted.min(self.pending_write.len());
