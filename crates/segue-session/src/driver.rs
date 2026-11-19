@@ -937,6 +937,570 @@ pub type HealthHook = Arc<dyn Fn(Health) + Send + Sync>;
 /// Receives a session's [`QualityEvent`]s.
 pub type QualityHook = Arc<dyn Fn(QualityEvent) + Send + Sync>;
 
+/// Dial state for one optional spare carrier. Allocated only when the caller
+/// asks for one, so the default driver task stays inside the idle-memory budget.
+struct SpareCtl {
+    notes: mpsc::UnboundedReceiver<()>,
+    tx: Option<mpsc::Sender<(u64, io::Result<BoxCarrier>)>>,
+    rx: Option<mpsc::Receiver<(u64, io::Result<BoxCarrier>)>>,
+    dial: Option<Task>,
+    bridge: Option<Task>,
+    connecting: bool,
+}
+
+/// [`run_client_ctl`] with an optional redundant-carrier request.
+pub async fn run_client_ctl_with_redundant<A>(
+    s: ClientSession,
+    app: A,
+    connect: Connector,
+    ctl: ClientCtl,
+    add_redundant: mpsc::UnboundedReceiver<()>,
+) -> CloseReason
+where
+    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    run_client_loop(s, app, connect, ctl, Some(add_redundant)).await
+}
+
+async fn run_client_loop<A>(
+    mut s: ClientSession,
+    app: A,
+    connect: Connector,
+    ctl: ClientCtl,
+    mut add_redundant: Option<mpsc::UnboundedReceiver<()>>,
+) -> CloseReason
+where
+    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let ClientCtl {
+        mut reattach,
+        mut stall,
+        mut closed,
+        mut opened,
+        mut cancel,
+        health,
+        quality,
+    } = ctl;
+    let report = |s: &mut ClientSession| {
+        if let Some(h) = s.take_health() {
+            if let Some(f) = &health {
+                f(h);
+            }
+        }
+        if let Some(q) = s.take_quality() {
+            if let Some(f) = &quality {
+                f(q);
+            }
+        }
+    };
+    let writable = Arc::new(Notify::new());
+    let (mut app_r, mut app_w) = tokio::io::split(app);
+    // One received byte whose write to the app is pending, and a pending
+    // shutdown of the app's read side (the relay's FIN reached it).
+    let mut probe = [0u8; 1];
+    let mut probe_len = 0usize;
+    let mut shut_pending = false;
+    let mut app_failed = false;
+    let (ev_tx, mut ev_rx) = mpsc::channel::<CarrierEv>(64);
+    let (conn_tx, mut conn_rx) = mpsc::channel::<(u64, io::Result<BoxCarrier>)>(4);
+    // Present only when the caller passed `add_redundant`. The bridge turns
+    // that receiver into notes and wakes `writable`, so the loop can
+    // `try_recv` without a select arm (an arm would bloat every session).
+    let mut spare: Option<Box<SpareCtl>> = add_redundant.take().map(|mut requests| {
+        let (note_tx, notes) = mpsc::unbounded_channel();
+        let wake = writable.clone();
+        let bridge = spawn(async move {
+            while requests.recv().await.is_some() {
+                let _ = note_tx.send(());
+                wake.notify_one();
+            }
+        });
+        Box::new(SpareCtl {
+            notes,
+            tx: None,
+            rx: None,
+            dial: None,
+            bridge: Some(bridge),
+            connecting: false,
+        })
+    });
+    let mut carriers: HashMap<u64, CarrierIo> = HashMap::new();
+    let mut tasks = Tasks::default();
+    let mut dial: Option<Task> = None;
+    let mut next_cid = 0u64;
+    let mut connecting = false;
+    let mut connect_backoff: Option<tokio::time::Instant> = None;
+    let mut app_eof = false;
+    let mut app_shut = false;
+    let pool = s.pool().clone();
+    let tx_slot = Arc::new(AtomicBool::new(false));
+    let mut tx_ticket: Option<Ticket> = None;
+    // The queued frame that holds the transport slot (see [`TxHold`]).
+    let mut tx_hold: Option<TxHold> = None;
+    let mut abuf = ReadBuffer::new(Some(pool.clone()));
+    // A queued message the pool could not cover is waiting for blocks.
+    let mut pool_blocked;
+
+    loop {
+        let t = now();
+        // An attach's clock runs from the last byte of its hello the
+        // carrier took: a slow carrier still taking a large OPEN is not
+        // an unanswered one.
+        for (&cid, io) in &carriers {
+            if let Some(at) = io.tx_at.get() {
+                s.on_carrier_sent(cid, at.into_std());
+            }
+        }
+        s.handle_timeout(t);
+        report(&mut s);
+        let backoff_ok = connect_backoff.is_none_or(|b| tokio::time::Instant::now() >= b);
+        if !connecting && backoff_ok && s.wants_attach(t) {
+            connecting = true;
+            next_cid += 1;
+            let cid = next_cid;
+            let fut = connect();
+            let tx = conn_tx.clone();
+            dial = Some(spawn(async move {
+                let _ = tx.send((cid, fut.await)).await;
+            }));
+        }
+        if let Some(spare) = spare.as_mut() {
+            match spare.notes.try_recv() {
+                Ok(()) => s.request_redundant(),
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {}
+            }
+            if let Some(rx) = spare.rx.as_mut() {
+                if let Ok((cid, res)) = rx.try_recv() {
+                    spare.connecting = false;
+                    spare.dial = None;
+                    match res {
+                        Ok(stream) => {
+                            let (r, w, tx_at) = split_carrier(stream);
+                            let rx_at = Stamp::new();
+                            let reader = spawn_reader(
+                                cid,
+                                r,
+                                ev_tx.clone(),
+                                Some(pool.clone()),
+                                rx_at.clone(),
+                            );
+                            let etx = ev_tx.clone();
+                            let (tx, writer) = spawn_writer(w, writable.clone(), async move {
+                                let _ = etx.send(CarrierEv::Closed(cid)).await;
+                            });
+                            carriers.insert(
+                                cid,
+                                CarrierIo {
+                                    tx,
+                                    reader,
+                                    writer,
+                                    tx_at,
+                                    rx_at,
+                                    _charge: None,
+                                },
+                            );
+                            s.attach_redundant(cid, now());
+                        }
+                        Err(_) => s.redundant_dial_failed(),
+                    }
+                }
+            }
+            if !spare.connecting && s.wants_redundant() {
+                if spare.tx.is_none() {
+                    let (tx, rx) = mpsc::channel(2);
+                    spare.tx = Some(tx);
+                    spare.rx = Some(rx);
+                }
+                spare.connecting = true;
+                next_cid += 1;
+                let cid = next_cid;
+                let fut = connect();
+                let tx = spare.tx.clone().expect("just set");
+                let wake = writable.clone();
+                spare.dial = Some(spawn(async move {
+                    let _ = tx.send((cid, fut.await)).await;
+                    wake.notify_one();
+                }));
+            }
+        }
+        for old in s.take_abandoned() {
+            if let Some(io) = carriers.remove(&old) {
+                io.reader.abort();
+                io.writer.abort();
+            }
+        }
+        tasks.prune();
+        pool_blocked = false;
+        let mut freed = None;
+        // Carrier output, generated only while the writer has room and
+        // there is something to send. Each queued frame is charged to the
+        // pool before it is built (elastic blocks, else the session's one
+        // slot in the transport region), so the session progresses with a
+        // full pool and no memory of its own outside it (r6 R5/R6).
+        let tx_cids = [s.carrier(), s.redundant_carrier()];
+        for cid in tx_cids.into_iter().flatten() {
+            if let Some(io) = carriers.get(&cid) {
+                let mut min = 1;
+                while io.tx.capacity() > 0 && s.has_transmit(cid, t) {
+                    let c = match take_charge(&pool, &tx_slot, &mut tx_ticket, min, FRAME_MAX) {
+                        Some(c) => Some(c),
+                        None => {
+                            // Listen before the second try, so blocks or a
+                            // turn in line given in between wake the loop.
+                            freed = Some(pool.armed());
+                            take_charge(&pool, &tx_slot, &mut tx_ticket, min, FRAME_MAX)
+                        }
+                    };
+                    let Some(c) = c else {
+                        pool_blocked = true;
+                        break;
+                    };
+                    freed = None;
+                    let transport = c.grant.tier() == Tier::Transport;
+                    let mut v = Vec::new();
+                    match s.poll_transmit_into(cid, t, &mut v, c.grant.bytes()) {
+                        Tx::Wrote => {
+                            let mut out = charged(v, c);
+                            if transport {
+                                let h = TxHold {
+                                    cid,
+                                    queued: tokio::time::Instant::now(),
+                                    started: Stamp::new(),
+                                };
+                                out.started = Some(h.started.clone());
+                                tx_hold = Some(h);
+                            }
+                            let _ = io.tx.try_send(out);
+                            tx_ticket = None;
+                            min = 1;
+                        }
+                        Tx::Idle => break,
+                        Tx::NeedRoom(n) => min = n,
+                    }
+                }
+            }
+        }
+        if !pool_blocked {
+            // Not waiting for blocks: leave the line for the transport
+            // region.
+            tx_ticket = None;
+        }
+        if !tx_slot.load(Ordering::Acquire) {
+            tx_hold = None;
+        }
+        // Received bytes go from the receive buffer straight to the app,
+        // with no buffer in between: when the app would block, one byte is
+        // taken out and its write awaited below, which wakes the loop.
+        if probe_len == 0 && !app_failed {
+            loop {
+                let data = s.readable();
+                if data.is_empty() {
+                    let _ = s.read(&mut [], t);
+                    if s.read_eof() && !app_shut {
+                        shut_pending = true;
+                    }
+                    break;
+                }
+                match try_write(&mut app_w, data) {
+                    Some(Ok(n)) if n > 0 => s.consume(n, t),
+                    Some(_) => {
+                        // The app stopped taking data: the download cannot
+                        // complete, reset.
+                        app_failed = true;
+                        s.abort();
+                        break;
+                    }
+                    None => {
+                        probe_len = s.read(&mut probe, t);
+                        break;
+                    }
+                }
+            }
+        }
+        if s.state() == State::Active {
+            if let Some(tx) = opened.take() {
+                let _ = tx.send(());
+            }
+        }
+        if s.is_closed() {
+            break;
+        }
+        let cap = if app_eof {
+            0
+        } else {
+            // Promise (and hold) only what the next app read can fill: an
+            // idle session's 512-byte read fits in its send floor, no
+            // 16 KiB prefetch per connection (r7 #7).
+            s.write_capacity_for(abuf.len().min(CHUNK))
+        };
+        // Sending can serve a deadline only with room in the writer queue
+        // and pool credit for the frame (elastic blocks or the transport
+        // slot). While either is missing, deadlines only sending can serve
+        // (the delayed ACK) are left out: the loop wakes when the writer
+        // drains or credit is given back (r10 N4).
+        let room = s
+            .carrier()
+            .and_then(|cid| carriers.get(&cid))
+            .is_none_or(|io| io.tx.capacity() > 0);
+        let deadline = s
+            .poll_timeout_writable(room && !pool_blocked)
+            .map(tokio::time::Instant::from_std);
+        let backoff = connect_backoff.filter(|_| !connecting);
+        let abuf_idle = abuf.idle_at();
+        let drain = tasks.next_deadline();
+        let hold_at = tx_hold
+            .as_ref()
+            .map(|h| h.deadline(carriers.get(&h.cid).and_then(|io| io.tx_at.get()), &pool));
+        tokio::select! {
+            ev = ev_rx.recv() => {
+                let t = now();
+                match ev {
+                    // A frame is evidence of bytes read when they were
+                    // read, not when it is handled (r13).
+                    Some(CarrierEv::Frame(cid, Ok(f), _c)) => {
+                        let at = carriers.get(&cid).and_then(|io| io.rx_at.get()).map_or(t, |a| a.into_std());
+                        let _ = s.on_frame_at(cid, f, at, t);
+                    }
+                    Some(CarrierEv::Frame(cid, Err(e), _)) => s.on_decode_error(cid, e),
+                    Some(CarrierEv::Progress(cid, at)) => s.on_carrier_progress(cid, at, t),
+                    Some(CarrierEv::Closed(cid)) => {
+                        s.on_carrier_closed(cid, t);
+                        if let Some(io) = carriers.remove(&cid) {
+                            io.reader.abort();
+                            io.writer.abort();
+                        }
+                    }
+                    Some(CarrierEv::Stuck(cid)) => {
+                        s.on_carrier_stuck(cid, t);
+                        if let Some(io) = carriers.remove(&cid) {
+                            io.reader.abort();
+                            io.writer.abort();
+                        }
+                    }
+                    None => {}
+                }
+            }
+            c = conn_rx.recv() => {
+                connecting = false;
+                dial = None;
+                if let Some((cid, res)) = c {
+                    match res {
+                        Ok(stream) => {
+                            connect_backoff = None;
+                            let (r, w, tx_at) = split_carrier(stream);
+                            let rx_at = Stamp::new();
+                            let reader = spawn_reader(
+                                cid,
+                                r,
+                                ev_tx.clone(),
+                                Some(pool.clone()),
+                                rx_at.clone(),
+                            );
+                            let etx = ev_tx.clone();
+                            let (tx, writer) = spawn_writer(w, writable.clone(), async move {
+                                let _ = etx.send(CarrierEv::Closed(cid)).await;
+                            });
+                            carriers.insert(cid, CarrierIo { tx, reader, writer, tx_at, rx_at, _charge: None });
+                            s.attach(cid, now());
+                        }
+                        Err(_) => {
+                            connect_backoff = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(200));
+                        }
+                    }
+                }
+            }
+            r = { let k = cap.min(abuf.len()).max(1); app_r.read(&mut abuf.get()[..k]) }, if cap > 0 => {
+                match r {
+                    Ok(0) => { app_eof = true; s.close_write(); }
+                    // A read error is not a clean end of the upload: reset,
+                    // never FIN (the site must not see a truncated stream as
+                    // complete).
+                    Err(_) => { app_eof = true; s.abort(); }
+                    Ok(n) => {
+                        let w = s.write(&abuf.get()[..n]);
+                        debug_assert_eq!(w, n);
+                        abuf.adapt(n);
+                    }
+                }
+            }
+            r = async { reattach.as_mut().expect("guarded").changed().await }, if reattach.is_some() => {
+                match r {
+                    Ok(()) => s.reattach(now()),
+                    Err(_) => reattach = None,
+                }
+            }
+            c = async {
+                cancel.as_mut().expect("guarded").wait_for(Option::is_some).await.map(|c| c.unwrap_or(code::REVOKED))
+            }, if cancel.is_some() => {
+                match c {
+                    Ok(c) => s.reset(c),
+                    Err(_) => cancel = None,
+                }
+            }
+            g = async { stall.as_mut().expect("guarded").recv().await }, if stall.is_some() => {
+                match g {
+                    Some(g) => s.on_stall(g, now()),
+                    None => stall = None,
+                }
+            }
+            r = async {
+                if probe_len > 0 {
+                    app_w.write_all(&probe[..probe_len]).await
+                } else {
+                    app_w.shutdown().await
+                }
+            }, if !app_failed && (probe_len > 0 || shut_pending) => {
+                match r {
+                    Ok(()) if probe_len > 0 => probe_len = 0,
+                    Ok(()) => {
+                        shut_pending = false;
+                        app_shut = true;
+                    }
+                    Err(_) => {
+                        app_failed = true;
+                        s.abort();
+                    }
+                }
+            }
+            _ = writable.notified() => {}
+            // Armed before the last failed charge, so nothing given back
+            // since is missed; the timeout is a backstop.
+            _ = async {
+                let freed = freed.take();
+                tokio::select! {
+                    _ = async {
+                        let freed = async {
+                            match freed {
+                                Some(f) => f.wait().await,
+                                None => pool.freed().await,
+                            }
+                        };
+                        match &tx_ticket {
+                            // First in line: also woken for its turn.
+                            Some(t) => tokio::select! {
+                                _ = t.ready() => {}
+                                _ = freed => {}
+                            },
+                            None => freed.await,
+                        }
+                    } => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                }
+            }, if pool_blocked => {}
+            _ = tokio::time::sleep_until(abuf_idle.unwrap_or_else(tokio::time::Instant::now)), if abuf_idle.is_some() => {
+                abuf.shrink();
+            }
+            _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
+            _ = tokio::time::sleep_until(backoff.unwrap_or_else(tokio::time::Instant::now)), if backoff.is_some() => {}
+            _ = tokio::time::sleep_until(drain.unwrap_or_else(tokio::time::Instant::now)), if drain.is_some() => {}
+            // A frame held the transport region past the hold: its carrier
+            // stopped moving. Give the carrier up (the frame's blocks go
+            // back with its writer); the session resumes on a new one and
+            // replays what was not acknowledged (r7 #1).
+            _ = tokio::time::sleep_until(hold_at.unwrap_or_else(tokio::time::Instant::now)), if hold_at.is_some() => {
+                // Bytes may have moved while this slept: the loop computes
+                // the hold again from them.
+                let at = tx_hold
+                    .as_ref()
+                    .map(|h| h.deadline(carriers.get(&h.cid).and_then(|io| io.tx_at.get()), &pool));
+                if at.is_some_and(|at| at > tokio::time::Instant::now()) {
+                    continue;
+                }
+                if let Some(TxHold { cid, .. }) = tx_hold.take() {
+                    if tx_slot.load(Ordering::Acquire) {
+                        s.on_carrier_stuck(cid, now());
+                        if let Some(io) = carriers.remove(&cid) {
+                            io.reader.abort();
+                            io.writer.abort();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(h) = dial.take() {
+        h.abort();
+    }
+    if let Some(spare) = spare.as_mut() {
+        if let Some(h) = spare.dial.take() {
+            h.abort();
+        }
+        if let Some(h) = spare.bridge.take() {
+            h.abort();
+        }
+    }
+    report(&mut s);
+    let mut reason = s
+        .close_reason()
+        .unwrap_or(CloseReason::Reset(code::INTERNAL));
+    // Not clean: nothing more reaches the app. The reason goes out before
+    // the app stream ends, so the caller turns that end into a reset.
+    if reason != CloseReason::Clean {
+        if let Some(tx) = closed.take() {
+            let _ = tx.send(reason);
+        }
+        drop(app_w);
+    } else {
+        // A clean close can be learnt from a REJECT(closed) (B6) while
+        // received data is still buffered: it belongs to the app.
+        // Bounded: an app that stopped reading cannot hold the session
+        // open. Clean is only reported once every byte reached the app
+        // (r5 N8): a drain cut short by the deadline is a reset, never a
+        // short clean EOF.
+        let until = tokio::time::Instant::now() + DRAIN;
+        let delivered = !app_failed
+            && (app_shut
+                || tokio::time::timeout_at(until, async {
+                    if probe_len > 0 {
+                        app_w.write_all(&probe[..probe_len]).await?;
+                    }
+                    loop {
+                        let data = s.readable();
+                        if data.is_empty() {
+                            break;
+                        }
+                        let n = app_w.write(data).await?;
+                        if n == 0 {
+                            return Err(io::ErrorKind::WriteZero.into());
+                        }
+                        s.consume(n, now());
+                    }
+                    if s.read_eof() {
+                        app_w.shutdown().await?;
+                    }
+                    io::Result::Ok(())
+                })
+                .await
+                .is_ok_and(|r| r.is_ok()));
+        if !delivered {
+            reason = CloseReason::Reset(code::INTERNAL);
+        }
+        if let Some(tx) = closed.take() {
+            let _ = tx.send(reason);
+        }
+        drop(app_w);
+    }
+    // Flush a final RST / ACK on the current carrier, then close everything.
+    if let Some(cid) = s.carrier() {
+        if let Some(io) = carriers.get(&cid) {
+            while let Some(f) = s.poll_transmit(cid, now()) {
+                if io.tx.try_send(f.to_bytes().into()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    // The final RST / ACK gets a bounded flush; a dead carrier is not
+    // waited for.
+    for (_, io) in carriers.drain() {
+        io.reader.abort();
+        tasks.drain(io.writer);
+    }
+    tasks.finish().await;
+    reason
+}
+
 /// [`run_client`] with hooks.
 pub async fn run_client_ctl<A>(
     mut s: ClientSession,

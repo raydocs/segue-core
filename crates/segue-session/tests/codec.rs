@@ -218,3 +218,110 @@ mod stall_field {
         assert_eq!(t, ty::RESUME);
     }
 }
+
+/// v0.6 draft: REDUNDANT_ATTACH / REDUNDANT_OK. Additive, FLAG_IGNORABLE,
+/// so a decoder that does not know the types skips them.
+mod redundant_frames {
+    use segue_session::codec::{
+        ty, Frame, FrameDecoder, RedundantAttach, RedundantOk, FLAG_IGNORABLE,
+    };
+    use segue_session::ProtoError;
+
+    fn attach() -> Frame {
+        Frame::RedundantAttach(RedundantAttach {
+            session_id: [0x11; 16],
+            resume_secret: [0x22; 32],
+            attach_gen: 7,
+            recv_offset: 4096,
+            max_offset: 20_480,
+        })
+    }
+
+    fn ok() -> Frame {
+        Frame::RedundantOk(RedundantOk {
+            attach_gen: 7,
+            recv_offset: 100,
+            max_offset: 16_384,
+        })
+    }
+
+    #[test]
+    fn round_trip() {
+        for f in [attach(), ok()] {
+            let bytes = f.to_bytes();
+            assert_eq!(bytes[1] & FLAG_IGNORABLE, FLAG_IGNORABLE, "{f:?}");
+            let mut d = FrameDecoder::new();
+            d.push(&bytes);
+            assert_eq!(d.next_frame().unwrap(), Some(f));
+            assert_eq!(d.buffered(), 0);
+        }
+    }
+
+    #[test]
+    fn truncated_payload_is_malformed_and_a_short_stream_waits() {
+        for f in [attach(), ok()] {
+            let bytes = f.to_bytes();
+            let (len, n) = segue_session::codec::get_varint(&bytes[2..]).unwrap();
+            let payload = &bytes[2 + n..];
+            assert_eq!(payload.len() as u64, len);
+            let ty = bytes[0];
+            let flags = bytes[1];
+            for cut in 1..payload.len() {
+                assert_eq!(
+                    Frame::decode(ty, flags, &payload[..cut]),
+                    Err(ProtoError::Malformed),
+                    "type {ty:#x} cut {cut}"
+                );
+            }
+            let mut d = FrameDecoder::new();
+            d.push(&bytes[..bytes.len() - 1]);
+            assert!(d.next_frame().unwrap().is_none(), "incomplete frame waits");
+            d.push(&bytes[bytes.len() - 1..]);
+            assert!(d.next_frame().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn trailing_byte_is_malformed() {
+        for f in [attach(), ok()] {
+            let bytes = f.to_bytes();
+            let (len, n) = segue_session::codec::get_varint(&bytes[2..]).unwrap();
+            let mut payload = bytes[2 + n..].to_vec();
+            assert_eq!(payload.len() as u64, len);
+            payload.push(0);
+            assert_eq!(
+                Frame::decode(bytes[0], bytes[1], &payload),
+                Err(ProtoError::Malformed)
+            );
+        }
+    }
+
+    /// An old decoder has no arm for 0x3C/0x3D. Both frames are encoded with
+    /// FLAG_IGNORABLE, so that decoder takes the same skip path as any other
+    /// unknown ignorable type (here 0x3E stands in for "not in the old match").
+    #[test]
+    fn old_decoder_skips_both_frames() {
+        assert_eq!(ty::REDUNDANT_ATTACH, 0x3C);
+        assert_eq!(ty::REDUNDANT_OK, 0x3D);
+        assert_eq!(
+            Frame::decode(0x3E, 0, &[]),
+            Err(ProtoError::UnknownFrame(0x3E))
+        );
+        assert_eq!(Frame::decode(0x3E, FLAG_IGNORABLE, &[]), Ok(None));
+
+        let mut skipped = Vec::new();
+        for f in [attach(), ok()] {
+            let b = f.to_bytes();
+            assert_eq!(b[1] & FLAG_IGNORABLE, FLAG_IGNORABLE);
+            skipped.push(0x3E);
+            skipped.push(b[1]);
+            skipped.extend_from_slice(&b[2..]);
+        }
+        Frame::Ping { nonce: 9 }.encode(&mut skipped);
+        let mut d = FrameDecoder::new();
+        d.push(&skipped);
+        assert_eq!(d.next_frame().unwrap(), Some(Frame::Ping { nonce: 9 }));
+        assert!(d.next_frame().unwrap().is_none());
+        assert_eq!(d.buffered(), 0);
+    }
+}
