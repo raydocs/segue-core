@@ -583,3 +583,27 @@ The 5 s wait rarely applies. Redialling the spare at once keeps one bound, so th
 ### Blackouts
 
 `SEGUE_CONVO_FAULTS=blackout` on the same build. Every `rtt170` blackout row survived. Carrier counts match the previous standby-on run: upload 2 s is 4 session carriers, tokens 8 s is 2, tokens 40 s is 13, tokens 120 s is 33. The moves during the long holds are `t_attach` (the RESUME is not answered while the impair holds the carrier), not `t_stall`. Token `delay_max` on the blackout turn is the hold plus under a second (8.07 s, 40.7–40.8 s, 120.7–120.8 s). That is inside `t_stall_solo` of the previous recovery. The 2 s upload's second turn takes 3.0–3.5 s.
+
+### After t_stall_ai
+
+Same no-fault command, after two changes. An AI session waits `t_stall_ai` (5 s) before unacked silence or a `STALL` hint gives the carrier up, whether or not a spare is bound. The relay waits `t_live_ai` (5 s) for that session. A `STALL` that arrives after a promotion is remembered and acted on once the new carrier is quiet, including a download with nothing unacked: the previous build dropped that hint, the relay went DETACHED, and the token stream stayed open until the harness timed out. The client announces `t_stall_ms` 5000. The relay's keepalive stays 500 ms, because it is half the shorter of the relay's own `t_stall` (1 s) and that announcement.
+
+| profile | seed | survived | carriers | standby_dials | promotions | stall | relay_stall | resumes | replay_bytes | recover_max_ms | up_bytes | up/payload |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| rtt170 | 1 | yes | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3158962 | 1.00 |
+| rtt170 | 2 | yes | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3158971 | 1.00 |
+| rtt170 | 3 | yes | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3159060 | 1.00 |
+| cn163-offpeak | 1 | yes | 7 | 3 | 9 | 8 | 4 | 3 | 1920318 | 5595 | 4040402 | 1.28 |
+| cn163-offpeak | 2 | yes | 13 | 7 | 14 | 13 | 3 | 5 | 3370024 | 9683 | 3507598 | 1.12 |
+| cn163-offpeak | 3 | yes | 2 | 1 | 6 | 5 | 1 | 0 | 1318954 | 4712 | 4333341 | 1.38 |
+| cn163-peak | 1 | yes | 18 | 9 | 31 | 33 | 6 | 8 | 3387140 | 17183 | 4548337 | 1.45 |
+| cn163-peak | 2 | yes | 11 | 5 | 16 | 13 | 5 | 5 | 3018394 | 9852 | 4949436 | 1.57 |
+| cn163-peak | 3 | yes | 10 | 5 | 15 | 13 | 5 | 4 | 1839104 | 13437 | 4057977 | 1.29 |
+
+Every row survived, including the two peak rows that timed out in the token phase before. `hold`, `io`, `reject` and `attach` are 0. `closed` is 0 except offpeak seed 2 (3), peak seed 2 (3) and peak seed 3 (1). `rtt170` does not move.
+
+Targets were still `cn163-offpeak` ≤ 4 carriers and `cn163-peak` ≤ 8 on every seed, and upload ≤ 1.15× payload. Offpeak seed 3 is the only carrier-count hit (2). Offpeak seed 2 is the only cn163 byte-ratio hit (1.12). The other cn163 rows are 7–18 carriers and 1.28–1.57×. Waiting 5 s cut the peak rows that used to die (26 and 39 carriers, timeout) to 18, 11 and 10, and they finish. It did not get them under the target. `recover_max_ms` is now the 5 s wait plus the dial, up to 17 s on peak seed 1, not the old 1.6 s.
+
+### Blackouts after t_stall_ai
+
+`SEGUE_CONVO_FAULTS=blackout` on this build. Every row survived, including every `rtt170` blackout. Upload 2 s is 2 session carriers. Tokens 8 s is 2–3, tokens 40 s is 13, tokens 120 s is 33. The moves during the 40 s and 120 s holds are `t_attach` (9–29) and the RESUME that follows (10–30), not `t_stall`. Token `delay_max` on the blackout turn is the hold plus under a second: 8.07 s, 40.8–40.9 s, 120.8–121.0 s. An 8 s blackout does not stall the stream more than 6 s after the path returns. The 2 s upload's second turn takes 2.4 s.
