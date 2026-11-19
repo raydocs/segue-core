@@ -425,3 +425,54 @@ Same conversation (3 turns, 1 MiB, 5 s silence, 500 tokens, seeds 1–3, every p
 | overseas | 1 | rtt170 | 3 | none | 1 | 1922.885 | 87.828 | 87.293 | 90.416 | 90.894 | 0 | 0 | 0 | 27.764 |
 | overseas | 1 | rtt170 | 3 | none | 2 | 474.702 | 92.485 | 87.495 | 90.421 | 90.673 | 0 | 0 | 0 | 26.178 |
 | overseas | 1 | rtt170 | 3 | none | 3 | 273.458 | 90.165 | 87.409 | 90.321 | 90.493 | 0 | 0 | 0 | 26.522 |
+
+### AI, standby off (patience only)
+
+`SEGUE_EXIT_CLASS=ai SEGUE_STANDBY=0`. The session may stay detached for 150 s. No spare is dialled.
+
+| class | standby | profile | seed | fault | survived | end_turn | end_phase | app_saw | engine_dials | control_streams | session_carriers | standby_dials | standby_bound | promotions | swaps | impair_accepts | up_bytes | down_bytes | payload_up | payload_down |
+|---|---:|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ai | 0 | rtt170 | 1 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159162 | 55284 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159093 | 55196 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159190 | 55196 | 3145794 | 45000 |
+| ai | 0 | cn163-offpeak | 1 | none | yes | - | - |  | 12 | 1 | 11 | 0 | 0 | 0 | 0 | 12 | 3464942 | 56027 | 3145794 | 45000 |
+| ai | 0 | cn163-offpeak | 2 | none | yes | - | - |  | 20 | 1 | 19 | 0 | 0 | 0 | 0 | 20 | 3430735 | 52780 | 3145794 | 45000 |
+| ai | 0 | cn163-offpeak | 3 | none | yes | - | - |  | 13 | 1 | 12 | 0 | 0 | 0 | 0 | 13 | 3633586 | 56516 | 3145794 | 45000 |
+| ai | 0 | cn163-peak | 1 | none | yes | - | - |  | 28 | 1 | 27 | 0 | 0 | 0 | 0 | 28 | 3960877 | 58486 | 3145794 | 45000 |
+| ai | 0 | cn163-peak | 2 | none | yes | - | - |  | 20 | 1 | 19 | 0 | 0 | 0 | 0 | 20 | 3449933 | 53041 | 3145794 | 45000 |
+| ai | 0 | cn163-peak | 3 | none | yes | - | - |  | 64 | 1 | 63 | 0 | 0 | 0 | 0 | 64 | 4873938 | 61566 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3308231 | 55241 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3323947 | 55373 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3376507 | 55296 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156745 | 54314 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156622 | 55000 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156699 | 56237 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | blackout-tokens-40s | yes | - | - |  | 15 | 4 | 11 | 0 | 0 | 0 | 0 | 15 | 3157195 | 68810 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | blackout-tokens-40s | yes | - | - |  | 15 | 4 | 11 | 0 | 0 | 0 | 0 | 15 | 3157143 | 52218 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | blackout-tokens-40s | yes | - | - |  | 15 | 4 | 11 | 0 | 0 | 0 | 0 | 15 | 3157172 | 52049 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | blackout-tokens-120s | yes | - | - |  | 42 | 11 | 31 | 0 | 0 | 0 | 0 | 42 | 3157106 | 51899 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | blackout-tokens-120s | yes | - | - |  | 42 | 11 | 31 | 0 | 0 | 0 | 0 | 42 | 3156971 | 51943 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | blackout-tokens-120s | yes | - | - |  | 42 | 11 | 31 | 0 | 0 | 0 | 0 | 42 | 3157091 | 81875 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | reset-upload | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159844 | 55360 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | reset-upload | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159621 | 55349 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | reset-upload | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159363 | 55294 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | reset-tokens | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159684 | 55337 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | reset-tokens | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159989 | 55188 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | reset-tokens | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159642 | 55216 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3160073 | 55288 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3160056 | 55222 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159918 | 55262 | 3145794 | 45000 |
+
+The 40 s and 120 s token blackouts survive on the same app connection. They do it by redialling: 11 session carriers for 40 s, 31 for 120 s. Lossy profiles dial about as many session carriers as the overseas run (`cn163-peak` seed 3 is 63 again). `rtt170` with no fault is one session carrier, no stall over 300 ms.
+
+| class | standby | profile | seed | fault | turn | upload_ms | ttft_after_silence_ms | delay_p50_ms | delay_p99_ms | delay_max_ms | stalls_300 | stalls_1s | stalls_20s | longest_gap_ms |
+|---|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ai | 0 | rtt170 | 1 | none | 1 | 1939.748 | 92.883 | 87.554 | 90.454 | 92.211 | 0 | 0 | 0 | 29.319 |
+| ai | 0 | rtt170 | 1 | none | 2 | 475.661 | 93.776 | 87.534 | 90.495 | 91.035 | 0 | 0 | 0 | 26.884 |
+| ai | 0 | rtt170 | 1 | none | 3 | 286.813 | 90.919 | 87.29 | 90.569 | 91.111 | 0 | 0 | 0 | 27.413 |
+| ai | 0 | rtt170 | 2 | none | 1 | 1949.921 | 89.787 | 87.483 | 90.536 | 91.033 | 0 | 0 | 0 | 26.845 |
+| ai | 0 | rtt170 | 2 | none | 2 | 479.183 | 92.915 | 87.52 | 90.552 | 91.025 | 0 | 0 | 0 | 26.304 |
+| ai | 0 | rtt170 | 2 | none | 3 | 270.312 | 89.896 | 87.421 | 90.457 | 90.984 | 0 | 0 | 0 | 27.605 |
+| ai | 0 | rtt170 | 3 | none | 1 | 1945.087 | 91.711 | 87.469 | 90.298 | 90.605 | 0 | 0 | 0 | 26.733 |
+| ai | 0 | rtt170 | 3 | none | 2 | 502.709 | 89.786 | 87.545 | 90.47 | 91.427 | 0 | 0 | 0 | 28.326 |
+| ai | 0 | rtt170 | 3 | none | 3 | 272.47 | 93.607 | 87.49 | 90.615 | 99.58 | 0 | 0 | 0 | 30.209 |
