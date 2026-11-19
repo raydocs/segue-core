@@ -370,3 +370,58 @@ A 2 s upload blackout survives and costs one extra carrier; that turn's upload i
 | rtt170 | 3 | silent-silence | 3 | 293.398 | 91.971 | 87.62 | 90.808 | 91.115 | 0 | 0 | 0 | 26.79 |
 
 On `rtt170` with no fault, token-delay p50 stays near the 85 ms one-way delay and no inter-arrival gap exceeds 300 ms. The first 1 MiB upload takes about 1.9 s; the second and third take about 0.3–0.5 s. On `cn163-peak` the same upload takes 7–30 s and the token stream stalls for 1–2 s, the same head-of-line shape as the token-stream table above. `cn163-offpeak` seed 2 is that shape too; seeds 1 and 3 keep token-delay p50 on the one-way delay while the upload still takes about 6 s.
+
+## Stream survival: before and after
+
+Same conversation (3 turns, 1 MiB, 5 s silence, 500 tokens, seeds 1–3, every profile and fault, plus a 120 s token blackout). Debug test binary, loopback, 2026-11-18. `standby` is the switch; an overseas route never dials one, so its standby counters stay 0 even when the switch is on. Turn rows for `rtt170` with no fault are below each runs table. The other turn rows match the shape in the conversation section above, except where a row says it died.
+
+### Overseas (before: no standby, 30 s give-up)
+
+`SEGUE_EXIT_CLASS=overseas`. The switch was left at the product default (`SEGUE_STANDBY=1`); nothing was dialled.
+
+| class | standby | profile | seed | fault | survived | end_turn | end_phase | app_saw | engine_dials | control_streams | session_carriers | standby_dials | standby_bound | promotions | swaps | impair_accepts | up_bytes | down_bytes | payload_up | payload_down |
+|---|---:|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| overseas | 1 | rtt170 | 1 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159196 | 55207 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159029 | 55218 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159044 | 55218 | 3145794 | 45000 |
+| overseas | 1 | cn163-offpeak | 1 | none | yes | - | - |  | 12 | 1 | 11 | 0 | 0 | 0 | 0 | 12 | 3396077 | 56063 | 3145794 | 45000 |
+| overseas | 1 | cn163-offpeak | 2 | none | yes | - | - |  | 20 | 1 | 19 | 0 | 0 | 0 | 0 | 20 | 3435701 | 52747 | 3145794 | 45000 |
+| overseas | 1 | cn163-offpeak | 3 | none | yes | - | - |  | 13 | 1 | 12 | 0 | 0 | 0 | 0 | 13 | 3534376 | 56494 | 3145794 | 45000 |
+| overseas | 1 | cn163-peak | 1 | none | yes | - | - |  | 28 | 1 | 27 | 0 | 0 | 0 | 0 | 28 | 4200384 | 57883 | 3145794 | 45000 |
+| overseas | 1 | cn163-peak | 2 | none | yes | - | - |  | 20 | 1 | 19 | 0 | 0 | 0 | 0 | 20 | 3549373 | 53274 | 3145794 | 45000 |
+| overseas | 1 | cn163-peak | 3 | none | yes | - | - |  | 64 | 1 | 63 | 0 | 0 | 0 | 0 | 64 | 5061147 | 62587 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3304216 | 55345 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3310640 | 55351 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3380286 | 55373 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156774 | 55823 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156623 | 61206 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156718 | 56374 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | blackout-tokens-40s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102435 | 18270 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | blackout-tokens-40s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102381 | 18226 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | blackout-tokens-40s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102396 | 18226 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | blackout-tokens-120s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102487 | 18204 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | blackout-tokens-120s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102429 | 18193 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | blackout-tokens-120s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102440 | 18281 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | reset-upload | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159706 | 55371 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | reset-upload | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159305 | 55338 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | reset-upload | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159430 | 55316 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | reset-tokens | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159756 | 55255 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | reset-tokens | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159667 | 55321 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | reset-tokens | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159814 | 55283 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3160118 | 55255 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159990 | 55218 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3160071 | 55211 | 3145794 | 45000 |
+
+`rtt170` with no fault: one session carrier, one control stream, token-delay p50 about 87 ms, no stall over 300 ms (longest gap about 28 ms). The 40 s and 120 s token blackouts both die on turn 2 with `reset: Connection reset by peer (os error 54)`, 9 session carriers and 3 control streams. `cn163-peak` seed 3 dialled 63 session carriers and the relay wrote about 1.61× the upload (`5061147 / 3145794`).
+
+| class | standby | profile | seed | fault | turn | upload_ms | ttft_after_silence_ms | delay_p50_ms | delay_p99_ms | delay_max_ms | stalls_300 | stalls_1s | stalls_20s | longest_gap_ms |
+|---|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| overseas | 1 | rtt170 | 1 | none | 1 | 1938.856 | 93.145 | 87.28 | 90.351 | 90.632 | 0 | 0 | 0 | 26.662 |
+| overseas | 1 | rtt170 | 1 | none | 2 | 477.441 | 91.211 | 87.521 | 90.347 | 91.312 | 0 | 0 | 0 | 27.207 |
+| overseas | 1 | rtt170 | 1 | none | 3 | 275.106 | 93.186 | 87.485 | 90.614 | 90.965 | 0 | 0 | 0 | 26.715 |
+| overseas | 1 | rtt170 | 2 | none | 1 | 1980.764 | 90.91 | 87.351 | 90.345 | 90.558 | 0 | 0 | 0 | 26.423 |
+| overseas | 1 | rtt170 | 2 | none | 2 | 482.27 | 90.434 | 87.329 | 90.552 | 91.123 | 0 | 0 | 0 | 27.294 |
+| overseas | 1 | rtt170 | 2 | none | 3 | 483.66 | 93.413 | 87.386 | 90.494 | 90.792 | 0 | 0 | 0 | 26.469 |
+| overseas | 1 | rtt170 | 3 | none | 1 | 1922.885 | 87.828 | 87.293 | 90.416 | 90.894 | 0 | 0 | 0 | 27.764 |
+| overseas | 1 | rtt170 | 3 | none | 2 | 474.702 | 92.485 | 87.495 | 90.421 | 90.673 | 0 | 0 | 0 | 26.178 |
+| overseas | 1 | rtt170 | 3 | none | 3 | 273.458 | 90.165 | 87.409 | 90.321 | 90.493 | 0 | 0 | 0 | 26.522 |
