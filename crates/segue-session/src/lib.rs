@@ -54,7 +54,17 @@ pub struct Timing {
     /// Relay: unacked downlink and no ACK progress → DETACHED.
     pub t_live: Duration,
     /// Both: how long a session may stay without a working carrier.
+    /// Sessions whose OPEN carried [`EXIT_CLASS_AI`] use
+    /// [`Self::t_detached_ai`] instead.
     pub t_detached: Duration,
+    /// Both: detach bound for an AI session ([`EXIT_CLASS_AI`]). Under the
+    /// 180 s after which an AI client aborts a stream it cannot resume.
+    /// Other sessions keep [`Self::t_detached`].
+    pub t_detached_ai: Duration,
+    /// Both: a carrier demoted by a stall stays the spare this long with no
+    /// frame received, then it is dropped. A frame resets the wait: the
+    /// carrier is a live standby again.
+    pub t_detached_standby: Duration,
     /// Client: how long OPEN may be retried before the local connection is reset.
     pub t_open_retry: Duration,
     /// Relay: tombstone lifetime.
@@ -89,6 +99,12 @@ pub struct Timing {
 /// only ever applies to a misbehaving peer.
 pub const MIN_CLIENT_STALL: Duration = Duration::from_millis(100);
 
+/// OPEN `exit_class` hint for an AI / home session. Both sides use it to
+/// pick [`Timing::t_detached_ai`]. The relay still classifies exits on its
+/// own; this is only the hint the client put on OPEN. Matches the kernel's
+/// `EXIT_AI`.
+pub const EXIT_CLASS_AI: u8 = 1;
+
 /// A client timing the protocol cannot honour.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TimingError {
@@ -113,6 +129,15 @@ impl Timing {
         }
         Ok(())
     }
+
+    /// How long a session of `exit_class` may stay without a working carrier.
+    pub fn detach_for(&self, exit_class: u8) -> Duration {
+        if exit_class == EXIT_CLASS_AI {
+            self.t_detached_ai
+        } else {
+            self.t_detached
+        }
+    }
 }
 
 impl Default for Timing {
@@ -122,6 +147,8 @@ impl Default for Timing {
             t_stall: Duration::from_secs(1),
             t_live: Duration::from_secs(3),
             t_detached: Duration::from_secs(30),
+            t_detached_ai: Duration::from_secs(150),
+            t_detached_standby: Duration::from_secs(10),
             t_open_retry: Duration::from_secs(15),
             t_tomb: Duration::from_secs(60),
             ack_delay: Duration::from_millis(20),

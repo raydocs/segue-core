@@ -117,6 +117,94 @@ A new flow on `rtt170` is about two round trips (SOCKS is local; the session
 open crosses the impaired carrier). These three lossy seeds did not lose the
 handshake flight, so their TTFB stays next to `rtt170`.
 
+## Standby carrier
+
+`SEGUE_STANDBY=0|1` (default 1, the product default) is the `standby` column.
+`SEGUE_EXIT_CLASS=ai|overseas` (default `ai`) is the `class` column. The
+tables in this section were recorded before that switch, on an overseas
+route, so an AI standby was not dialled in either mode. The impairment is
+TCP loss recovery on one carrier, not a carrier being replaced, which is
+the only stall a standby can skip. The conversation scenario is below.
+
+`SEGUE_TOKEN_SECONDS=10`, same seeds, debug test binary, 2026-11-18.
+
+### Token stream, standby off
+
+| standby | profile | seed | ttft_ms | delay_p50_ms | delay_p99_ms | delay_p99.9_ms | delay_max_ms | ia_p50_ms | ia_p99_ms | ia_p99.9_ms | stalls_300 | stalls_1s | up_bytes | down_bytes | payload_bytes |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | clean | 1 | 3.069 | 0.199 | 0.627 | 0.657 | 0.657 | 20.199 | 22.175 | 22.578 | 0 | 0 | 3765 | 17596 | 15012 |
+| 0 | clean | 2 | 2.786 | 0.416 | 0.71 | 0.79 | 0.79 | 20.139 | 21.931 | 22.132 | 0 | 0 | 3639 | 17596 | 15012 |
+| 0 | clean | 3 | 2.251 | 0.369 | 0.844 | 1.484 | 1.484 | 20.092 | 22.324 | 22.631 | 0 | 0 | 3621 | 17585 | 15012 |
+| 0 | rtt170 | 1 | 355.887 | 87.576 | 90.457 | 90.881 | 90.881 | 20.085 | 25.307 | 26.158 | 0 | 0 | 3518 | 17588 | 15012 |
+| 0 | rtt170 | 2 | 355.279 | 87.533 | 90.707 | 95.078 | 95.078 | 20.122 | 26.468 | 29.101 | 0 | 0 | 3553 | 17588 | 15012 |
+| 0 | rtt170 | 3 | 355.13 | 87.619 | 90.837 | 91.087 | 91.087 | 20.072 | 24.788 | 26.69 | 0 | 0 | 3625 | 17588 | 15012 |
+| 0 | cn163-offpeak | 1 | 361.219 | 88.95 | 155.636 | 175.395 | 175.395 | 19.985 | 40.671 | 105.772 | 0 | 0 | 3203 | 17588 | 15012 |
+| 0 | cn163-offpeak | 2 | 354.741 | 1614.179 | 3414.544 | 3443.933 | 3443.933 | 0.003 | 29.057 | 3373.996 | 3 | 3 | 2428 | 16400 | 15012 |
+| 0 | cn163-offpeak | 3 | 344.246 | 88.812 | 95.045 | 105.047 | 105.047 | 20.137 | 32.625 | 36.538 | 0 | 0 | 3581 | 17588 | 15012 |
+| 0 | cn163-peak | 1 | 360.137 | 1183.958 | 4495.183 | 4595.418 | 4595.418 | 0.003 | 627.602 | 3393.185 | 7 | 3 | 1988 | 16793 | 15012 |
+| 0 | cn163-peak | 2 | 345.263 | 1616.414 | 3410.847 | 3441.22 | 3441.22 | 0.002 | 30.628 | 3374.008 | 3 | 3 | 2438 | 16540 | 15012 |
+| 0 | cn163-peak | 3 | 348.192 | 244.686 | 1681.143 | 1723.198 | 1723.198 | 0.006 | 31.596 | 1652.182 | 4 | 4 | 2573 | 16980 | 15012 |
+
+### Token stream, standby on
+
+| standby | profile | seed | ttft_ms | delay_p50_ms | delay_p99_ms | delay_p99.9_ms | delay_max_ms | ia_p50_ms | ia_p99_ms | ia_p99.9_ms | stalls_300 | stalls_1s | up_bytes | down_bytes | payload_bytes |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | clean | 1 | 2.881 | 0.394 | 0.698 | 1.266 | 1.266 | 20.101 | 22.457 | 22.689 | 0 | 0 | 3656 | 17596 | 15012 |
+| 1 | clean | 2 | 2.136 | 0.412 | 0.916 | 4.641 | 4.641 | 20.141 | 22.626 | 25.516 | 0 | 0 | 3639 | 17596 | 15012 |
+| 1 | clean | 3 | 1.688 | 0.296 | 0.721 | 1.577 | 1.577 | 20.089 | 22.389 | 31.138 | 0 | 0 | 3675 | 17585 | 15012 |
+| 1 | rtt170 | 1 | 357.463 | 87.411 | 90.439 | 91.042 | 91.042 | 20.147 | 25.357 | 26.482 | 0 | 0 | 3598 | 17588 | 15012 |
+| 1 | rtt170 | 2 | 353.132 | 87.523 | 90.555 | 91.04 | 91.04 | 20.12 | 25.353 | 26.143 | 0 | 0 | 3571 | 17588 | 15012 |
+| 1 | rtt170 | 3 | 352.418 | 87.269 | 90.43 | 90.846 | 90.846 | 20.049 | 25.832 | 26.867 | 0 | 0 | 3590 | 17588 | 15012 |
+| 1 | cn163-offpeak | 1 | 361.924 | 88.706 | 154.518 | 175.88 | 175.88 | 20.123 | 40.948 | 108.991 | 0 | 0 | 3203 | 17588 | 15012 |
+| 1 | cn163-offpeak | 2 | 351.484 | 1601.171 | 3413.294 | 3439.147 | 3439.147 | 0.003 | 29.799 | 3372.659 | 3 | 3 | 2455 | 16440 | 15012 |
+| 1 | cn163-offpeak | 3 | 348.216 | 88.694 | 95.284 | 104.851 | 104.851 | 20.255 | 30.834 | 37.705 | 0 | 0 | 3662 | 17588 | 15012 |
+| 1 | cn163-peak | 1 | 363.319 | 1181.433 | 4490.247 | 4590.651 | 4590.651 | 0.003 | 626.449 | 3388.69 | 7 | 3 | 1997 | 16793 | 15012 |
+| 1 | cn163-peak | 2 | 347.937 | 1610.587 | 3413.569 | 3451.751 | 3451.751 | 0.002 | 30.397 | 3384.597 | 3 | 3 | 2446 | 16085 | 15012 |
+| 1 | cn163-peak | 3 | 350.505 | 244.983 | 1681.174 | 1722.548 | 1722.548 | 0.001 | 31.259 | 1654.019 | 4 | 3 | 2717 | 16975 | 15012 |
+
+### New flows, standby off
+
+| standby | profile | seed | ttfb_p50_ms | ttfb_p99_ms | ttfb_max_ms |
+|---:|---|---:|---:|---:|---:|
+| 0 | clean | 1 | 1.181 | 1.697 | 1.697 |
+| 0 | clean | 2 | 1.873 | 3.225 | 3.225 |
+| 0 | clean | 3 | 1.318 | 1.724 | 1.724 |
+| 0 | rtt170 | 1 | 354.316 | 357.706 | 357.706 |
+| 0 | rtt170 | 2 | 353.343 | 356.577 | 356.577 |
+| 0 | rtt170 | 3 | 350.254 | 357.554 | 357.554 |
+| 0 | cn163-offpeak | 1 | 360.033 | 364.912 | 364.912 |
+| 0 | cn163-offpeak | 2 | 347.339 | 352.891 | 352.891 |
+| 0 | cn163-offpeak | 3 | 348.739 | 352.61 | 352.61 |
+| 0 | cn163-peak | 1 | 360.3 | 366.414 | 366.414 |
+| 0 | cn163-peak | 2 | 350.216 | 358.843 | 358.843 |
+| 0 | cn163-peak | 3 | 347.467 | 352.141 | 352.141 |
+
+### New flows, standby on
+
+| standby | profile | seed | ttfb_p50_ms | ttfb_p99_ms | ttfb_max_ms |
+|---:|---|---:|---:|---:|---:|
+| 1 | clean | 1 | 1.936 | 6.5 | 6.5 |
+| 1 | clean | 2 | 1.443 | 1.802 | 1.802 |
+| 1 | clean | 3 | 1.876 | 5.194 | 5.194 |
+| 1 | rtt170 | 1 | 356.43 | 359.202 | 359.202 |
+| 1 | rtt170 | 2 | 351.695 | 354.224 | 354.224 |
+| 1 | rtt170 | 3 | 352.239 | 355.619 | 355.619 |
+| 1 | cn163-offpeak | 1 | 362.746 | 367.584 | 367.584 |
+| 1 | cn163-offpeak | 2 | 349.403 | 357.691 | 357.691 |
+| 1 | cn163-offpeak | 3 | 350.303 | 353.367 | 353.367 |
+| 1 | cn163-peak | 1 | 360.462 | 367.216 | 367.216 |
+| 1 | cn163-peak | 2 | 350.643 | 353.006 | 353.006 |
+| 1 | cn163-peak | 3 | 350.104 | 357.408 | 357.408 |
+
+No token-stall row improved. Head-of-line stalls on `cn163-offpeak` seed 2 and
+`cn163-peak` (the multi-second delay and the stall counts) are the same shape
+in both modes. `rtt170` delay p50 stays about 87 ms. The clean-path p99.9 on
+seed 2 (0.79 ms to 4.6 ms) and two clean new-flow p99 samples (about 2 ms to
+5–6 ms) moved, and `cn163-peak` seed 3 lost one `stalls_1s` count (4 to 3).
+Those are single-run noise on a path that never dials the spare, not a
+standby effect. Nothing got worse in a way this harness can attribute to the
+switch.
+
 ## Conversation
 
 One app TCP connection, kept open the way an HTTP/2 connection would be.
@@ -282,3 +370,170 @@ A 2 s upload blackout survives and costs one extra carrier; that turn's upload i
 | rtt170 | 3 | silent-silence | 3 | 293.398 | 91.971 | 87.62 | 90.808 | 91.115 | 0 | 0 | 0 | 26.79 |
 
 On `rtt170` with no fault, token-delay p50 stays near the 85 ms one-way delay and no inter-arrival gap exceeds 300 ms. The first 1 MiB upload takes about 1.9 s; the second and third take about 0.3–0.5 s. On `cn163-peak` the same upload takes 7–30 s and the token stream stalls for 1–2 s, the same head-of-line shape as the token-stream table above. `cn163-offpeak` seed 2 is that shape too; seeds 1 and 3 keep token-delay p50 on the one-way delay while the upload still takes about 6 s.
+
+## Stream survival: before and after
+
+Same conversation (3 turns, 1 MiB, 5 s silence, 500 tokens, seeds 1–3, every profile and fault, plus a 120 s token blackout). Debug test binary, loopback, 2026-11-18. `standby` is the switch; an overseas route never dials one, so its standby counters stay 0 even when the switch is on. Turn rows for `rtt170` with no fault are below each runs table. The other turn rows match the shape in the conversation section above, except where a row says it died.
+
+### Overseas (before: no standby, 30 s give-up)
+
+`SEGUE_EXIT_CLASS=overseas`. The switch was left at the product default (`SEGUE_STANDBY=1`); nothing was dialled.
+
+| class | standby | profile | seed | fault | survived | end_turn | end_phase | app_saw | engine_dials | control_streams | session_carriers | standby_dials | standby_bound | promotions | swaps | impair_accepts | up_bytes | down_bytes | payload_up | payload_down |
+|---|---:|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| overseas | 1 | rtt170 | 1 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159196 | 55207 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159029 | 55218 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159044 | 55218 | 3145794 | 45000 |
+| overseas | 1 | cn163-offpeak | 1 | none | yes | - | - |  | 12 | 1 | 11 | 0 | 0 | 0 | 0 | 12 | 3396077 | 56063 | 3145794 | 45000 |
+| overseas | 1 | cn163-offpeak | 2 | none | yes | - | - |  | 20 | 1 | 19 | 0 | 0 | 0 | 0 | 20 | 3435701 | 52747 | 3145794 | 45000 |
+| overseas | 1 | cn163-offpeak | 3 | none | yes | - | - |  | 13 | 1 | 12 | 0 | 0 | 0 | 0 | 13 | 3534376 | 56494 | 3145794 | 45000 |
+| overseas | 1 | cn163-peak | 1 | none | yes | - | - |  | 28 | 1 | 27 | 0 | 0 | 0 | 0 | 28 | 4200384 | 57883 | 3145794 | 45000 |
+| overseas | 1 | cn163-peak | 2 | none | yes | - | - |  | 20 | 1 | 19 | 0 | 0 | 0 | 0 | 20 | 3549373 | 53274 | 3145794 | 45000 |
+| overseas | 1 | cn163-peak | 3 | none | yes | - | - |  | 64 | 1 | 63 | 0 | 0 | 0 | 0 | 64 | 5061147 | 62587 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3304216 | 55345 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3310640 | 55351 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3380286 | 55373 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156774 | 55823 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156623 | 61206 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156718 | 56374 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | blackout-tokens-40s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102435 | 18270 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | blackout-tokens-40s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102381 | 18226 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | blackout-tokens-40s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102396 | 18226 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | blackout-tokens-120s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102487 | 18204 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | blackout-tokens-120s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102429 | 18193 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | blackout-tokens-120s | no | 2 | tokens | reset: Connection reset by peer (os error 54) | 12 | 3 | 9 | 0 | 0 | 0 | 0 | 12 | 2102440 | 18281 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | reset-upload | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159706 | 55371 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | reset-upload | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159305 | 55338 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | reset-upload | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159430 | 55316 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | reset-tokens | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159756 | 55255 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | reset-tokens | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159667 | 55321 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | reset-tokens | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159814 | 55283 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 1 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3160118 | 55255 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 2 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159990 | 55218 | 3145794 | 45000 |
+| overseas | 1 | rtt170 | 3 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3160071 | 55211 | 3145794 | 45000 |
+
+`rtt170` with no fault: one session carrier, one control stream, token-delay p50 about 87 ms, no stall over 300 ms (longest gap about 28 ms). The 40 s and 120 s token blackouts both die on turn 2 with `reset: Connection reset by peer (os error 54)`, 9 session carriers and 3 control streams. `cn163-peak` seed 3 dialled 63 session carriers and the relay wrote about 1.61× the upload (`5061147 / 3145794`).
+
+| class | standby | profile | seed | fault | turn | upload_ms | ttft_after_silence_ms | delay_p50_ms | delay_p99_ms | delay_max_ms | stalls_300 | stalls_1s | stalls_20s | longest_gap_ms |
+|---|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| overseas | 1 | rtt170 | 1 | none | 1 | 1938.856 | 93.145 | 87.28 | 90.351 | 90.632 | 0 | 0 | 0 | 26.662 |
+| overseas | 1 | rtt170 | 1 | none | 2 | 477.441 | 91.211 | 87.521 | 90.347 | 91.312 | 0 | 0 | 0 | 27.207 |
+| overseas | 1 | rtt170 | 1 | none | 3 | 275.106 | 93.186 | 87.485 | 90.614 | 90.965 | 0 | 0 | 0 | 26.715 |
+| overseas | 1 | rtt170 | 2 | none | 1 | 1980.764 | 90.91 | 87.351 | 90.345 | 90.558 | 0 | 0 | 0 | 26.423 |
+| overseas | 1 | rtt170 | 2 | none | 2 | 482.27 | 90.434 | 87.329 | 90.552 | 91.123 | 0 | 0 | 0 | 27.294 |
+| overseas | 1 | rtt170 | 2 | none | 3 | 483.66 | 93.413 | 87.386 | 90.494 | 90.792 | 0 | 0 | 0 | 26.469 |
+| overseas | 1 | rtt170 | 3 | none | 1 | 1922.885 | 87.828 | 87.293 | 90.416 | 90.894 | 0 | 0 | 0 | 27.764 |
+| overseas | 1 | rtt170 | 3 | none | 2 | 474.702 | 92.485 | 87.495 | 90.421 | 90.673 | 0 | 0 | 0 | 26.178 |
+| overseas | 1 | rtt170 | 3 | none | 3 | 273.458 | 90.165 | 87.409 | 90.321 | 90.493 | 0 | 0 | 0 | 26.522 |
+
+### AI, standby off (patience only)
+
+`SEGUE_EXIT_CLASS=ai SEGUE_STANDBY=0`. The session may stay detached for 150 s. No spare is dialled.
+
+| class | standby | profile | seed | fault | survived | end_turn | end_phase | app_saw | engine_dials | control_streams | session_carriers | standby_dials | standby_bound | promotions | swaps | impair_accepts | up_bytes | down_bytes | payload_up | payload_down |
+|---|---:|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ai | 0 | rtt170 | 1 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159162 | 55284 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159093 | 55196 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | none | yes | - | - |  | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 2 | 3159190 | 55196 | 3145794 | 45000 |
+| ai | 0 | cn163-offpeak | 1 | none | yes | - | - |  | 12 | 1 | 11 | 0 | 0 | 0 | 0 | 12 | 3464942 | 56027 | 3145794 | 45000 |
+| ai | 0 | cn163-offpeak | 2 | none | yes | - | - |  | 20 | 1 | 19 | 0 | 0 | 0 | 0 | 20 | 3430735 | 52780 | 3145794 | 45000 |
+| ai | 0 | cn163-offpeak | 3 | none | yes | - | - |  | 13 | 1 | 12 | 0 | 0 | 0 | 0 | 13 | 3633586 | 56516 | 3145794 | 45000 |
+| ai | 0 | cn163-peak | 1 | none | yes | - | - |  | 28 | 1 | 27 | 0 | 0 | 0 | 0 | 28 | 3960877 | 58486 | 3145794 | 45000 |
+| ai | 0 | cn163-peak | 2 | none | yes | - | - |  | 20 | 1 | 19 | 0 | 0 | 0 | 0 | 20 | 3449933 | 53041 | 3145794 | 45000 |
+| ai | 0 | cn163-peak | 3 | none | yes | - | - |  | 64 | 1 | 63 | 0 | 0 | 0 | 0 | 64 | 4873938 | 61566 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3308231 | 55241 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3323947 | 55373 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | blackout-upload-2s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3376507 | 55296 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156745 | 54314 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156622 | 55000 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 0 | 0 | 0 | 0 | 3 | 3156699 | 56237 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | blackout-tokens-40s | yes | - | - |  | 15 | 4 | 11 | 0 | 0 | 0 | 0 | 15 | 3157195 | 68810 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | blackout-tokens-40s | yes | - | - |  | 15 | 4 | 11 | 0 | 0 | 0 | 0 | 15 | 3157143 | 52218 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | blackout-tokens-40s | yes | - | - |  | 15 | 4 | 11 | 0 | 0 | 0 | 0 | 15 | 3157172 | 52049 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | blackout-tokens-120s | yes | - | - |  | 42 | 11 | 31 | 0 | 0 | 0 | 0 | 42 | 3157106 | 51899 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | blackout-tokens-120s | yes | - | - |  | 42 | 11 | 31 | 0 | 0 | 0 | 0 | 42 | 3156971 | 51943 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | blackout-tokens-120s | yes | - | - |  | 42 | 11 | 31 | 0 | 0 | 0 | 0 | 42 | 3157091 | 81875 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | reset-upload | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159844 | 55360 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | reset-upload | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159621 | 55349 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | reset-upload | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159363 | 55294 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | reset-tokens | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159684 | 55337 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | reset-tokens | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159989 | 55188 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | reset-tokens | yes | - | - |  | 4 | 2 | 2 | 0 | 0 | 0 | 0 | 4 | 3159642 | 55216 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 1 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3160073 | 55288 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 2 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3160056 | 55222 | 3145794 | 45000 |
+| ai | 0 | rtt170 | 3 | silent-silence | yes | - | - |  | 5 | 2 | 3 | 0 | 0 | 0 | 0 | 5 | 3159918 | 55262 | 3145794 | 45000 |
+
+The 40 s and 120 s token blackouts survive on the same app connection. They do it by redialling: 11 session carriers for 40 s, 31 for 120 s. Lossy profiles dial about as many session carriers as the overseas run (`cn163-peak` seed 3 is 63 again). `rtt170` with no fault is one session carrier, no stall over 300 ms.
+
+| class | standby | profile | seed | fault | turn | upload_ms | ttft_after_silence_ms | delay_p50_ms | delay_p99_ms | delay_max_ms | stalls_300 | stalls_1s | stalls_20s | longest_gap_ms |
+|---|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ai | 0 | rtt170 | 1 | none | 1 | 1939.748 | 92.883 | 87.554 | 90.454 | 92.211 | 0 | 0 | 0 | 29.319 |
+| ai | 0 | rtt170 | 1 | none | 2 | 475.661 | 93.776 | 87.534 | 90.495 | 91.035 | 0 | 0 | 0 | 26.884 |
+| ai | 0 | rtt170 | 1 | none | 3 | 286.813 | 90.919 | 87.29 | 90.569 | 91.111 | 0 | 0 | 0 | 27.413 |
+| ai | 0 | rtt170 | 2 | none | 1 | 1949.921 | 89.787 | 87.483 | 90.536 | 91.033 | 0 | 0 | 0 | 26.845 |
+| ai | 0 | rtt170 | 2 | none | 2 | 479.183 | 92.915 | 87.52 | 90.552 | 91.025 | 0 | 0 | 0 | 26.304 |
+| ai | 0 | rtt170 | 2 | none | 3 | 270.312 | 89.896 | 87.421 | 90.457 | 90.984 | 0 | 0 | 0 | 27.605 |
+| ai | 0 | rtt170 | 3 | none | 1 | 1945.087 | 91.711 | 87.469 | 90.298 | 90.605 | 0 | 0 | 0 | 26.733 |
+| ai | 0 | rtt170 | 3 | none | 2 | 502.709 | 89.786 | 87.545 | 90.47 | 91.427 | 0 | 0 | 0 | 28.326 |
+| ai | 0 | rtt170 | 3 | none | 3 | 272.47 | 93.607 | 87.49 | 90.615 | 99.58 | 0 | 0 | 0 | 30.209 |
+
+### AI, standby on
+
+`SEGUE_EXIT_CLASS=ai SEGUE_STANDBY=1`. In this run `standby_bound` counts a demoted carrier again, once per swap (`standby_bound − swaps` is the fresh `REDUNDANT_OK` count; it matches `standby_dials` on every lossy row except `cn163-peak` seed 3, where one dial had not bound). That double count is fixed after this run.
+
+| class | standby | profile | seed | fault | survived | end_turn | end_phase | app_saw | engine_dials | control_streams | session_carriers | standby_dials | standby_bound | promotions | swaps | impair_accepts | up_bytes | down_bytes | payload_up | payload_down |
+|---|---:|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ai | 1 | rtt170 | 1 | none | yes | - | - |  | 3 | 1 | 2 | 1 | 1 | 0 | 0 | 3 | 3159282 | 55979 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 2 | none | yes | - | - |  | 3 | 1 | 2 | 1 | 1 | 0 | 0 | 3 | 3159211 | 56080 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 3 | none | yes | - | - |  | 3 | 1 | 2 | 1 | 1 | 0 | 0 | 3 | 3159113 | 55803 | 3145794 | 45000 |
+| ai | 1 | cn163-offpeak | 1 | none | yes | - | - |  | 12 | 1 | 11 | 3 | 8 | 5 | 5 | 12 | 3388308 | 66095 | 3145794 | 45000 |
+| ai | 1 | cn163-offpeak | 2 | none | yes | - | - |  | 15 | 1 | 14 | 7 | 16 | 9 | 9 | 15 | 3510429 | 70290 | 3145794 | 45000 |
+| ai | 1 | cn163-offpeak | 3 | none | yes | - | - |  | 7 | 1 | 6 | 2 | 9 | 7 | 7 | 7 | 4135953 | 58571 | 3145794 | 45000 |
+| ai | 1 | cn163-peak | 1 | none | yes | - | - |  | 28 | 1 | 27 | 4 | 12 | 8 | 8 | 28 | 3881747 | 58401 | 3145794 | 45000 |
+| ai | 1 | cn163-peak | 2 | none | yes | - | - |  | 18 | 1 | 17 | 4 | 13 | 9 | 9 | 18 | 3431380 | 59933 | 3145794 | 45000 |
+| ai | 1 | cn163-peak | 3 | none | yes | - | - |  | 64 | 1 | 63 | 6 | 11 | 6 | 6 | 64 | 4753324 | 68153 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 1 | blackout-upload-2s | yes | - | - |  | 5 | 1 | 4 | 2 | 3 | 1 | 1 | 5 | 3474744 | 56140 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 2 | blackout-upload-2s | yes | - | - |  | 5 | 1 | 4 | 2 | 3 | 1 | 1 | 5 | 3712649 | 56129 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 3 | blackout-upload-2s | yes | - | - |  | 5 | 1 | 4 | 2 | 3 | 1 | 1 | 5 | 3606047 | 55929 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 1 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 1 | 2 | 1 | 1 | 3 | 3156335 | 59830 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 2 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 1 | 2 | 1 | 1 | 3 | 3156409 | 59747 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 3 | blackout-tokens-8s | yes | - | - |  | 3 | 1 | 2 | 1 | 2 | 1 | 1 | 3 | 3156241 | 59668 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 1 | blackout-tokens-40s | yes | - | - |  | 17 | 4 | 13 | 2 | 2 | 0 | 0 | 17 | 3157036 | 57815 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 2 | blackout-tokens-40s | yes | - | - |  | 17 | 4 | 13 | 2 | 2 | 0 | 0 | 17 | 3157295 | 57914 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 3 | blackout-tokens-40s | yes | - | - |  | 17 | 4 | 13 | 2 | 2 | 0 | 0 | 17 | 3157170 | 57493 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 1 | blackout-tokens-120s | yes | - | - |  | 44 | 11 | 33 | 2 | 2 | 0 | 0 | 44 | 3157140 | 52608 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 2 | blackout-tokens-120s | yes | - | - |  | 44 | 11 | 33 | 2 | 2 | 0 | 0 | 44 | 3157107 | 52776 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 3 | blackout-tokens-120s | yes | - | - |  | 44 | 11 | 33 | 2 | 2 | 0 | 0 | 44 | 3157235 | 67527 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 1 | reset-upload | yes | - | - |  | 6 | 2 | 4 | 2 | 2 | 0 | 0 | 6 | 3159422 | 56215 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 2 | reset-upload | yes | - | - |  | 6 | 2 | 4 | 2 | 2 | 0 | 0 | 6 | 3159511 | 55905 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 3 | reset-upload | yes | - | - |  | 7 | 2 | 5 | 2 | 2 | 0 | 0 | 7 | 3159820 | 56017 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 1 | reset-tokens | yes | - | - |  | 7 | 2 | 4 | 2 | 2 | 0 | 0 | 7 | 3159740 | 56093 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 2 | reset-tokens | yes | - | - |  | 6 | 2 | 4 | 2 | 2 | 1 | 0 | 6 | 3159726 | 55961 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 3 | reset-tokens | yes | - | - |  | 6 | 2 | 4 | 2 | 2 | 0 | 0 | 6 | 3159799 | 56236 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 1 | silent-silence | yes | - | - |  | 8 | 2 | 6 | 3 | 4 | 1 | 1 | 8 | 3160293 | 55971 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 2 | silent-silence | yes | - | - |  | 8 | 2 | 6 | 3 | 4 | 1 | 1 | 8 | 3160151 | 56067 | 3145794 | 45000 |
+| ai | 1 | rtt170 | 3 | silent-silence | yes | - | - |  | 8 | 2 | 6 | 3 | 4 | 1 | 1 | 8 | 3159983 | 56286 | 3145794 | 45000 |
+
+`rtt170` with no fault: 1 session carrier + 1 standby, one control stream, no stall over 300 ms (longest gap about 27 ms). The 40 s and 120 s token blackouts survive on the same app connection. The spare does not: a blackout holds every connection that already exists, promotions stay 0, and the session redials through the outage the same way patience-only does (13 and 33 session carriers, against 11 and 31). Lossy profiles do not dial far fewer carriers. `cn163-peak` seed 3 is still 63 session carriers (6 of them standby dials) and the relay wrote 4753324 bytes against 5061147 overseas. `cn163-offpeak` seed 3 dropped from 12 carriers to 6 and wrote more (`4135953` against `3534376`): a swap at `t_stall` replays uplink that TCP recovery was about to deliver, and the spare shares the impaired relay, so the next stall usually re-attaches instead of swapping again.
+
+| class | standby | profile | seed | fault | turn | upload_ms | ttft_after_silence_ms | delay_p50_ms | delay_p99_ms | delay_max_ms | stalls_300 | stalls_1s | stalls_20s | longest_gap_ms |
+|---|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ai | 1 | rtt170 | 1 | none | 1 | 1915.662 | 88.896 | 87.375 | 90.406 | 90.856 | 0 | 0 | 0 | 26.435 |
+| ai | 1 | rtt170 | 1 | none | 2 | 470.546 | 92.944 | 87.533 | 90.27 | 90.979 | 0 | 0 | 0 | 25.656 |
+| ai | 1 | rtt170 | 1 | none | 3 | 287.675 | 92.69 | 87.377 | 90.613 | 91.007 | 0 | 0 | 0 | 27.254 |
+| ai | 1 | rtt170 | 2 | none | 1 | 2156.825 | 93.449 | 87.571 | 90.468 | 90.648 | 0 | 0 | 0 | 26.587 |
+| ai | 1 | rtt170 | 2 | none | 2 | 495.351 | 93.287 | 87.32 | 90.42 | 90.805 | 0 | 0 | 0 | 25.447 |
+| ai | 1 | rtt170 | 2 | none | 3 | 272.758 | 89.52 | 87.491 | 90.526 | 90.719 | 0 | 0 | 0 | 26.544 |
+| ai | 1 | rtt170 | 3 | none | 1 | 1930.088 | 88.474 | 87.295 | 90.629 | 91.02 | 0 | 0 | 0 | 26.492 |
+| ai | 1 | rtt170 | 3 | none | 2 | 470.283 | 94.568 | 87.508 | 90.457 | 90.751 | 0 | 0 | 0 | 26.569 |
+| ai | 1 | rtt170 | 3 | none | 3 | 270.749 | 92.462 | 87.437 | 90.468 | 90.979 | 0 | 0 | 0 | 26.506 |
+
+### What the three runs say
+
+| | 40 s blackout | 120 s blackout | rtt170 none | cn163-peak seed 3 carriers | cn163-peak seed 3 up |
+|---|---|---|---|---:|---:|
+| overseas | dies, reset, 9 carriers | dies, reset, 9 carriers | 1 carrier, no stall > 300 ms | 63 | 5061147 |
+| ai, standby off | survives, 11 carriers | survives, 31 carriers | 1 carrier, no stall > 300 ms | 63 | 4873938 |
+| ai, standby on | survives, 13 carriers | survives, 33 carriers | 1 carrier + 1 standby, no stall > 300 ms | 63 | 4753324 |
+
+Patience is what keeps the app connection through a 40 s or 120 s token blackout. The standby does not, on this harness: the impair sits on every carrier, so a spare cannot skip a blackout, and on a lossy profile it swaps a handful of times and then the session re-attaches as before.

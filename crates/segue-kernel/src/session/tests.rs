@@ -10,7 +10,7 @@ use segue_session::driver::{run_relay_ctl, RelayCtrl, SiteConnector, SiteRequest
 use segue_session::relay::{AllowAll, Authorizer, RelayTable};
 use segue_session::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::*;
 use crate::dial::UdpSession;
@@ -77,7 +77,9 @@ struct Counted {
     seen: bool,
 }
 
-type Holes = Arc<Mutex<Vec<(Arc<AtomicBool>, Arc<AtomicBool>)>>>;
+/// Blackhole flag, control-stream flag, and a watch that closes the carrier
+/// (EOF both ways) when it becomes true.
+type Holes = Arc<Mutex<Vec<(Arc<AtomicBool>, Arc<AtomicBool>, watch::Sender<bool>)>>>;
 
 /// One direction of a carrier's network path. With `cut`, it delivers
 /// that many bytes and then turns into a blackhole, unless the carrier
@@ -86,6 +88,7 @@ async fn path<R, W>(
     mut r: R,
     mut w: W,
     hole: Arc<AtomicBool>,
+    mut end: watch::Receiver<bool>,
     cut: Option<(usize, Arc<AtomicBool>)>,
     slow: Option<(usize, Arc<AtomicBool>)>,
 ) where
@@ -95,6 +98,9 @@ async fn path<R, W>(
     let mut buf = vec![0u8; 4096];
     let mut left = cut.as_ref().map(|c| c.0);
     loop {
+        if *end.borrow() {
+            break;
+        }
         // Throttled: at most rate/10 bytes per 100 ms.
         let lim = match &slow {
             Some((rate, control)) if !control.load(Ordering::SeqCst) => {
@@ -103,9 +109,18 @@ async fn path<R, W>(
             }
             _ => buf.len(),
         };
-        let mut n = match r.read(&mut buf[..lim]).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
+        let mut n = tokio::select! {
+            biased;
+            res = end.changed() => {
+                if res.is_err() || *end.borrow() {
+                    break;
+                }
+                continue;
+            }
+            res = r.read(&mut buf[..lim]) => match res {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            },
         };
         if let (Some(l), Some((_, control))) = (left.as_mut(), &cut) {
             if !control.load(Ordering::SeqCst) {
@@ -240,10 +255,11 @@ impl Dialer for Engine {
         });
         let hole = Arc::new(AtomicBool::new(dropped));
         let is_control = Arc::new(AtomicBool::new(false));
+        let (end_tx, end_rx) = watch::channel(false);
         node.holes
             .lock()
             .unwrap()
-            .push((hole.clone(), is_control.clone()));
+            .push((hole.clone(), is_control.clone(), end_tx));
         let (ar, aw) = tokio::io::split(a);
         let (br, bw) = tokio::io::split(b);
         let cut = match node.cut.load(Ordering::SeqCst) {
@@ -254,8 +270,8 @@ impl Dialer for Engine {
             0 => None,
             n => Some((n, is_control.clone())),
         };
-        tokio::spawn(path(ar, bw, hole.clone(), None, None));
-        tokio::spawn(path(br, aw, hole, cut, slow));
+        tokio::spawn(path(ar, bw, hole.clone(), end_rx.clone(), None, None));
+        tokio::spawn(path(br, aw, hole, end_rx, cut, slow));
         node.accept
             .send(Box::new(relay))
             .await
@@ -362,7 +378,7 @@ impl Lab {
     /// Every la carrier open now (session carriers, and the control stream
     /// too when `control`) starts dropping all packets. New ones work.
     fn blackhole_la(&self, control: bool) {
-        for (hole, is_control) in self.la_holes.lock().unwrap().iter() {
+        for (hole, is_control, _) in self.la_holes.lock().unwrap().iter() {
             if control || !is_control.load(Ordering::SeqCst) {
                 hole.store(true, Ordering::SeqCst);
             }
@@ -663,7 +679,17 @@ async fn auto_moves_new_sessions_off_a_failed_exit() {
     assert_eq!(l.la_carriers.load(Ordering::SeqCst), 0);
     assert_eq!(l.d.status().current_exit.as_deref(), Some("ny"));
     roundtrip(l.d.dial(Some("ai"), &site(), 443).await.unwrap()).await;
-    assert_eq!(l.ny_carriers.load(Ordering::SeqCst), 2, "probe + session");
+    for _ in 0..100 {
+        if l.d.standby_bound.load(Ordering::Relaxed) >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        l.ny_carriers.load(Ordering::SeqCst),
+        3,
+        "probe + session + standby"
+    );
     assert_eq!(l.d.posture(), Posture::Connected);
     // Both down: AI refused fast, overseas never goes direct.
     l.ny_up.store(false, Ordering::SeqCst);
@@ -983,7 +1009,7 @@ async fn download_lab_cfg(la_cfg: Config) -> (Lab, crate::dial::Stream, u64) {
             .lock()
             .unwrap()
             .iter()
-            .all(|(_, c)| !c.load(Ordering::SeqCst))
+            .all(|(_, c, _)| !c.load(Ordering::SeqCst))
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1623,10 +1649,10 @@ async fn one_good_and_one_bad_session_on_an_exit() {
     l.la_cut.store(120, Ordering::SeqCst);
     {
         let holes = l.la_holes.lock().unwrap();
-        let (hole, _) = holes
+        let (hole, _, _) = holes
             .iter()
             .rev()
-            .find(|(_, c)| !c.load(Ordering::SeqCst))
+            .find(|(_, c, _)| !c.load(Ordering::SeqCst))
             .expect("no session carrier");
         hole.store(true, Ordering::SeqCst);
     }
@@ -2125,10 +2151,10 @@ async fn start_bad_session(l: &Lab) -> tokio::task::JoinHandle<()> {
     l.la_drop_next.store(1000, Ordering::SeqCst);
     {
         let holes = l.la_holes.lock().unwrap();
-        let (hole, _) = holes
+        let (hole, _, _) = holes
             .iter()
             .rev()
-            .find(|(_, c)| !c.load(Ordering::SeqCst))
+            .find(|(_, c, _)| !c.load(Ordering::SeqCst))
             .expect("no session carrier");
         hole.store(true, Ordering::SeqCst);
     }
@@ -2363,10 +2389,10 @@ async fn a_buffered_ack_after_a_pool_wait_is_no_liveness_beside_a_failing_sessio
     let t0 = Instant::now();
     {
         let holes = l.la_holes.lock().unwrap();
-        let (hole, _) = holes
+        let (hole, _, _) = holes
             .iter()
             .rev()
-            .find(|(_, c)| !c.load(Ordering::SeqCst))
+            .find(|(_, c, _)| !c.load(Ordering::SeqCst))
             .expect("no session carrier");
         hole.store(true, Ordering::SeqCst);
     }
@@ -2503,4 +2529,286 @@ async fn both_carrier_attempts_failing_marks_the_exit_once() {
         0,
         "named exit was not left"
     );
+}
+
+async fn spin_until(mut ready: impl FnMut() -> bool) {
+    for _ in 0..100 {
+        if ready() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..40 {
+        if ready() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("condition not met");
+}
+
+/// AI sessions dial a second carrier after OPENED and bind it. A non-AI
+/// session never does, and turning the switch off is the old one-dial path.
+#[tokio::test(start_paused = true)]
+async fn an_ai_session_binds_a_standby_and_other_sessions_do_not() {
+    let l = lab();
+    let overseas = l.d.dial(Some("overseas"), &site(), 443).await.unwrap();
+    roundtrip(overseas).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(l.d.standby_dials.load(Ordering::Relaxed), 0);
+    assert_eq!(l.d.standby_bound.load(Ordering::Relaxed), 0);
+
+    let l = lab();
+    let ai = l.d.dial(Some("ai"), &site(), 443).await.unwrap();
+    spin_until(|| l.d.standby_bound.load(Ordering::Relaxed) >= 1).await;
+    assert!(
+        l.d.standby_dials.load(Ordering::Relaxed) >= 1,
+        "no standby dial"
+    );
+    let dials = l.d.standby_dials.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        l.d.standby_dials.load(Ordering::Relaxed),
+        dials,
+        "a bound standby was dialled again"
+    );
+    roundtrip(ai).await;
+
+    let mut l = lab();
+    l.d.set_standby_ai(false);
+    let ai = l.d.dial(Some("ai"), &site(), 443).await.unwrap();
+    spin_until(|| l.la_controls.load(Ordering::SeqCst) >= 1).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(l.d.standby_dials.load(Ordering::Relaxed), 0);
+    assert_eq!(l.d.standby_bound.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        l.la_carriers.load(Ordering::SeqCst),
+        1,
+        "standby off dialled more than the session carrier"
+    );
+    roundtrip(ai).await;
+}
+
+/// Three failed standby dials leave the exit's posture and loss counters
+/// alone, and the waits double from 1 s.
+#[tokio::test(start_paused = true)]
+async fn a_failing_standby_does_not_mark_the_exit_and_backs_off() {
+    let l = lab();
+    l.d.set_exit("la").unwrap();
+    l.d.fail_standby_dials(true);
+    let s = l.d.dial(Some("ai"), &site(), 443).await.unwrap();
+    spin_until(|| l.d.standby_lost.load(Ordering::Relaxed) >= 1).await;
+    assert_eq!(l.d.standby_dials.load(Ordering::Relaxed), 1);
+    assert_eq!(l.d.fail_marks(0), 0, "standby dial marked the exit failed");
+    assert_eq!(l.d.posture(), Posture::Connected);
+    assert_eq!(l.d.status().quality[0].quality.stalls, 0);
+
+    let t0 = tokio::time::Instant::now();
+    tokio::time::sleep_until(t0 + Duration::from_millis(900)).await;
+    assert_eq!(
+        l.d.standby_dials.load(Ordering::Relaxed),
+        1,
+        "retried before the 1 s backoff"
+    );
+    tokio::time::sleep_until(t0 + Duration::from_millis(1100)).await;
+    spin_until(|| l.d.standby_lost.load(Ordering::Relaxed) >= 2).await;
+    assert_eq!(l.d.standby_dials.load(Ordering::Relaxed), 2);
+
+    let t1 = tokio::time::Instant::now();
+    tokio::time::sleep_until(t1 + Duration::from_millis(1900)).await;
+    assert_eq!(
+        l.d.standby_dials.load(Ordering::Relaxed),
+        2,
+        "retried before the doubled 2 s backoff"
+    );
+    tokio::time::sleep_until(t1 + Duration::from_millis(2200)).await;
+    spin_until(|| l.d.standby_lost.load(Ordering::Relaxed) >= 3).await;
+    assert_eq!(l.d.standby_dials.load(Ordering::Relaxed), 3);
+    assert_eq!(l.d.fail_marks(0), 0);
+    assert_eq!(l.d.posture(), Posture::Connected);
+    assert_eq!(l.d.status().quality[0].quality.stalls, 0);
+    assert_eq!(l.d.standby_promotions.load(Ordering::Relaxed), 0);
+    roundtrip(s).await;
+}
+
+/// Two failed dials leave the next wait at 4 s. A spare that then stays
+/// bound for 10 s resets that wait to 1 s when it is closed.
+#[tokio::test(start_paused = true)]
+async fn standby_backoff_resets_to_one_second_after_ten_seconds_bound() {
+    let l = lab();
+    l.d.set_exit("la").unwrap();
+    l.d.fail_standby_dials(true);
+    let s = l.d.dial(Some("ai"), &site(), 443).await.unwrap();
+    spin_until(|| l.d.standby_lost.load(Ordering::Relaxed) >= 1).await;
+    let t0 = tokio::time::Instant::now();
+    tokio::time::sleep_until(t0 + Duration::from_millis(900)).await;
+    assert_eq!(l.d.standby_dials.load(Ordering::Relaxed), 1);
+    tokio::time::sleep_until(t0 + Duration::from_millis(1100)).await;
+    spin_until(|| l.d.standby_lost.load(Ordering::Relaxed) >= 2).await;
+    assert_eq!(l.d.standby_dials.load(Ordering::Relaxed), 2);
+
+    l.d.fail_standby_dials(false);
+    let t1 = tokio::time::Instant::now();
+    tokio::time::sleep_until(t1 + Duration::from_millis(1900)).await;
+    assert_eq!(
+        l.d.standby_dials.load(Ordering::Relaxed),
+        2,
+        "retried before the 2 s backoff"
+    );
+    tokio::time::sleep_until(t1 + Duration::from_millis(2200)).await;
+    spin_until(|| l.d.standby_bound.load(Ordering::Relaxed) >= 1).await;
+    let dials = l.d.standby_dials.load(Ordering::Relaxed);
+    assert_eq!(dials, 3, "the spare that reset the backoff was not dialled");
+    let lost = l.d.standby_lost.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        l.d.standby_dials.load(Ordering::Relaxed),
+        dials,
+        "a bound standby was redialled"
+    );
+
+    let end = {
+        let holes = l.la_holes.lock().unwrap();
+        let mut session = Vec::new();
+        for (_, is_control, end) in holes.iter() {
+            if is_control.load(Ordering::SeqCst) {
+                continue;
+            }
+            session.push(end.clone());
+        }
+        assert!(
+            session.len() >= 2,
+            "expected the session carrier and the standby, saw {}",
+            session.len()
+        );
+        session.swap_remove(1)
+    };
+    end.send(true).expect("standby path is gone");
+    spin_until(|| l.d.standby_lost.load(Ordering::Relaxed) > lost).await;
+    assert_eq!(
+        l.d.standby_promotions.load(Ordering::Relaxed),
+        0,
+        "closing the spare promoted it"
+    );
+    let t2 = tokio::time::Instant::now();
+    tokio::time::sleep_until(t2 + Duration::from_millis(900)).await;
+    assert_eq!(
+        l.d.standby_dials.load(Ordering::Relaxed),
+        dials,
+        "retried before the reset 1 s backoff"
+    );
+    tokio::time::sleep_until(t2 + Duration::from_millis(1200)).await;
+    spin_until(|| l.d.standby_dials.load(Ordering::Relaxed) > dials).await;
+    roundtrip(s).await;
+}
+
+/// Killing the current carrier promotes the standby. Bytes keep matching,
+/// and the replacement standby is dialled only after data has resumed.
+#[tokio::test(start_paused = true)]
+async fn ai_standby_promotes_without_waiting_for_a_dial() {
+    let l = lab_parts(Box::new(AllowAll), Some(endless_download()));
+    l.d.set_exit("la").unwrap();
+    let mut s = l.d.dial(Some("ai"), &site(), 443).await.unwrap();
+    let mut at = 0u64;
+    read_pattern(&mut s, &mut at, 8192, Duration::from_secs(5)).await;
+    spin_until(|| {
+        l.d.standby_bound.load(Ordering::Relaxed) >= 1 && l.la_controls.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    let dials = l.d.standby_dials.load(Ordering::Relaxed);
+    {
+        let holes = l.la_holes.lock().unwrap();
+        let mut session_holes = 0usize;
+        for (hole, is_control, _) in holes.iter() {
+            if is_control.load(Ordering::SeqCst) {
+                continue;
+            }
+            if session_holes == 0 {
+                hole.store(true, Ordering::SeqCst);
+            }
+            session_holes += 1;
+        }
+        assert!(
+            session_holes >= 2,
+            "expected the session carrier and the standby, saw {session_holes}"
+        );
+    }
+    read_pattern(&mut s, &mut at, 128 * 1024, Duration::from_secs(8)).await;
+    assert_eq!(
+        l.d.standby_dials.load(Ordering::Relaxed),
+        dials,
+        "promotion waited for a new dial"
+    );
+    assert!(
+        l.d.standby_promotions.load(Ordering::Relaxed) >= 1,
+        "standby was not promoted"
+    );
+    assert!(
+        l.d.standby_swaps.load(Ordering::Relaxed) >= 1,
+        "the stall did not swap"
+    );
+    assert_eq!(
+        l.d.standby_bound.load(Ordering::Relaxed),
+        1,
+        "a swap was counted as another bind"
+    );
+    // The old carrier is the spare now. It is dropped after 10 s with no
+    // frame, and the replacement dial waits out the backoff that schedule
+    // armed (1 s, then 2 s because the swap itself scheduled once).
+    let swapped = tokio::time::Instant::now();
+    tokio::time::sleep_until(swapped + Duration::from_secs(10)).await;
+    assert_eq!(
+        l.d.standby_dials.load(Ordering::Relaxed),
+        dials,
+        "a swapped carrier was replaced before it had been silent for 10 s"
+    );
+    tokio::time::sleep_until(swapped + Duration::from_secs(13)).await;
+    spin_until(|| l.d.standby_dials.load(Ordering::Relaxed) > dials).await;
+}
+
+/// A disconnect or a revocation stops standby dials, including ones the
+/// backoff would otherwise start.
+#[tokio::test(start_paused = true)]
+async fn no_standby_dials_while_disconnected_or_revoked() {
+    let l = lab();
+    l.d.set_exit("la").unwrap();
+    l.d.fail_standby_dials(true);
+    let live = l.d.dial(Some("ai"), &site(), 443).await.unwrap();
+    spin_until(|| l.d.standby_lost.load(Ordering::Relaxed) >= 1).await;
+    let n = l.d.standby_dials.load(Ordering::Relaxed);
+    l.d.disconnect();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        l.d.standby_dials.load(Ordering::Relaxed),
+        n,
+        "disconnected session dialled a standby"
+    );
+    let _ = live;
+
+    let l = lab();
+    l.d.set_exit("la").unwrap();
+    l.d.fail_standby_dials(true);
+    let mut live = l.d.dial(Some("ai"), &site(), 443).await.unwrap();
+    spin_until(|| {
+        l.d.standby_lost.load(Ordering::Relaxed) >= 1 && l.la_controls.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    let n = l.d.standby_dials.load(Ordering::Relaxed);
+    l.la_ctrl
+        .send(RelayCtrl::ResetDevice {
+            device: 0,
+            close_code: code::REVOKED,
+        })
+        .await
+        .unwrap();
+    let mut buf = [0u8; 8];
+    let end = tokio::time::timeout(Duration::from_secs(2), live.read(&mut buf)).await;
+    assert!(end.is_ok(), "revoked session did not end");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        l.d.standby_dials.load(Ordering::Relaxed),
+        n,
+        "revoked session dialled a standby"
+    );
+    assert_eq!(l.d.status().revoked, Some(code::REVOKED));
 }
