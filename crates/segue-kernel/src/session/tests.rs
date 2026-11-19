@@ -1712,9 +1712,10 @@ async fn one_good_and_one_bad_session_on_an_exit() {
         .expect_err("good session ended clean");
     assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
     assert_ne!(l.d.posture(), Posture::Connected);
-    // The path heals. Wait until any backing-off AI probe session clears so
-    // the strict route admits a new request (t_stall_ai = 5 s can still hold
-    // an exit past the 3 s STRICT_RETRY_AFTER pause).
+    // The path heals. A session still backing off keeps a strict route
+    // refused (`failing` or a failure inside `STRICT_RETRY_AFTER`). An AI
+    // stall waits `t_stall_ai` (5 s), so the old 3.2 s pause can still see
+    // that session. Wait until the route would allow the dial.
     l.la_cut.store(0, Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {

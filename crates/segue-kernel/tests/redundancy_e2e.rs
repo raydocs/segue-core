@@ -12,13 +12,20 @@
 //! upload / silence / token turns, plus optional impair faults. Runs that do
 //! not survive are reported. Only `rtt170` with no fault is asserted.
 //!
-//! Carrier re-attach is not a column. `SessionHealth` is not observable from
-//! this test without changing the kernel.
+//! Move reasons (`stall`, `hold`, `relay_stall`, `closed`, `io`, `reject`,
+//! `attach`) are the kernel dialer's sums for that run, plus `resumes`,
+//! `replay_bytes` and `recover_max_ms`.
 //!
 //! `SEGUE_EXIT_CLASS=ai|overseas` (default `ai`) picks the route, the ticket
 //! class and, for `ai`, a pinned exit plus a loopback home SOCKS line.
 //! `SEGUE_STANDBY=0|1` (default 1, the product default) is the standby
 //! switch. Both are columns. An overseas route never dials a standby.
+//! `SEGUE_CONVO_FAULTS=none|0|blackout|all|<comma-list>` (default `all`)
+//! limits the conversation faults. `none` is the no-fault rows only;
+//! `blackout` adds the 2 s / 8 s / 40 s / 120 s blackouts on `rtt170`; a
+//! comma-separated list selects explicit fault names.
+//! `SEGUE_PROFILES` and `SEGUE_SEEDS` (comma-separated, or `all`) restrict
+//! which rows run. Unset runs every profile and seed.
 //!
 //! Relay, ticket and SOCKS wiring matches `roaming_e2e.rs`. An AI route also
 //! needs a home line: the relay sends a confirmed AI target there, not direct.
@@ -134,6 +141,9 @@ fn selected_profiles(all: &[&'static str]) -> Vec<&'static str> {
     let Ok(raw) = std::env::var("SEGUE_PROFILES") else {
         return all.to_vec();
     };
+    if raw.is_empty() || raw == "all" {
+        return all.to_vec();
+    }
     let mut out = Vec::new();
     for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let matched = all
@@ -151,6 +161,9 @@ fn selected_seeds() -> Vec<u64> {
     let Ok(raw) = std::env::var("SEGUE_SEEDS") else {
         return SEEDS.to_vec();
     };
+    if raw.is_empty() || raw == "all" {
+        return SEEDS.to_vec();
+    }
     let out: Vec<u64> = raw
         .split(',')
         .map(str::trim)
@@ -1138,34 +1151,67 @@ fn convo_tokens() -> u64 {
     n
 }
 
-fn convo_cases(faults_on_rtt: bool) -> Vec<(&'static str, u64, ConvoFault)> {
+/// `SEGUE_CONVO_FAULTS`: `all` (default) keeps every fault, `none` / `0` is the
+/// no-fault rows, `blackout` adds only the timed blackouts on `rtt170`, or a
+/// comma-separated list of explicit fault names.
+fn convo_cases() -> Vec<(&'static str, u64, ConvoFault)> {
     let profiles = selected_profiles(CONVO_PROFILES);
     let seeds = selected_seeds();
-    let fault_filter: Option<BTreeSet<String>> =
-        std::env::var("SEGUE_CONVO_FAULTS").ok().map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect()
-        });
     let mut cases = Vec::new();
     for &profile in &profiles {
         for &seed in &seeds {
             cases.push((profile, seed, ConvoFault::None));
         }
     }
-    if faults_on_rtt && profiles.contains(&"rtt170") {
-        let faults = [
-            ConvoFault::BlackoutUpload2s,
-            ConvoFault::BlackoutTokens8s,
-            ConvoFault::BlackoutTokens40s,
-            ConvoFault::BlackoutTokens120s,
-            ConvoFault::ResetUpload,
-            ConvoFault::ResetTokens,
-            ConvoFault::SilentSilence,
-        ];
-        for fault in faults {
+    let raw_faults = std::env::var("SEGUE_CONVO_FAULTS").ok();
+    let fault_filter: Option<BTreeSet<String>>;
+    let faults: &[ConvoFault] = match raw_faults.as_deref() {
+        None | Some("") | Some("all") => {
+            fault_filter = None;
+            &[
+                ConvoFault::BlackoutUpload2s,
+                ConvoFault::BlackoutTokens8s,
+                ConvoFault::BlackoutTokens40s,
+                ConvoFault::BlackoutTokens120s,
+                ConvoFault::ResetUpload,
+                ConvoFault::ResetTokens,
+                ConvoFault::SilentSilence,
+            ]
+        }
+        Some("none") | Some("0") => {
+            fault_filter = None;
+            &[]
+        }
+        Some("blackout") => {
+            fault_filter = None;
+            &[
+                ConvoFault::BlackoutUpload2s,
+                ConvoFault::BlackoutTokens8s,
+                ConvoFault::BlackoutTokens40s,
+                ConvoFault::BlackoutTokens120s,
+            ]
+        }
+        Some(raw) => {
+            fault_filter = Some(
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            );
+            &[
+                ConvoFault::BlackoutUpload2s,
+                ConvoFault::BlackoutTokens8s,
+                ConvoFault::BlackoutTokens40s,
+                ConvoFault::BlackoutTokens120s,
+                ConvoFault::ResetUpload,
+                ConvoFault::ResetTokens,
+                ConvoFault::SilentSilence,
+            ]
+        }
+    };
+    if profiles.contains(&"rtt170") {
+        for &fault in faults {
             for &seed in &seeds {
                 cases.push(("rtt170", seed, fault));
             }
@@ -1332,6 +1378,16 @@ struct ConvoRow {
     standby_bound: u64,
     standby_promotions: u64,
     swaps: u64,
+    stall: u64,
+    hold: u64,
+    relay_stall: u64,
+    closed: u64,
+    io: u64,
+    reject: u64,
+    attach: u64,
+    resumes: u64,
+    replay_bytes: u64,
+    recover_max_ms: u64,
     impair_accepts: u64,
     up_bytes: u64,
     down_bytes: u64,
@@ -1732,6 +1788,16 @@ async fn run_convo(
         standby_bound: 0,
         standby_promotions: 0,
         swaps: 0,
+        stall: 0,
+        hold: 0,
+        relay_stall: 0,
+        closed: 0,
+        io: 0,
+        reject: 0,
+        attach: 0,
+        resumes: 0,
+        replay_bytes: 0,
+        recover_max_ms: 0,
         impair_accepts: 0,
         up_bytes: 0,
         down_bytes: 0,
@@ -1779,6 +1845,17 @@ async fn run_convo(
     row.standby_bound = dialer.standby_bound();
     row.standby_promotions = dialer.standby_promotions();
     row.swaps = dialer.standby_swaps();
+    let moves = dialer.move_stats();
+    row.stall = moves.stall;
+    row.hold = moves.hold;
+    row.relay_stall = moves.relay_stall;
+    row.closed = moves.closed;
+    row.io = moves.io;
+    row.reject = moves.reject;
+    row.attach = moves.attach;
+    row.resumes = moves.resumes;
+    row.replay_bytes = moves.bytes_replayed;
+    row.recover_max_ms = moves.recovery_us_max / 1000;
     row.impair_accepts = impair.accepted();
     row.up_bytes = impair.up_bytes();
     row.down_bytes = impair.down_bytes();
@@ -1791,10 +1868,10 @@ fn print_convo(rows: &[ConvoRow]) {
     let red = redundancy_name();
     println!("## conversation (redundancy={red})");
     println!(
-        "| class | standby | redundancy | profile | seed | fault | survived | end_turn | end_phase | app_saw | engine_dials | control_streams | session_carriers | standby_dials | standby_bound | promotions | swaps | impair_accepts | up_bytes | down_bytes | payload_up | payload_down |"
+        "| class | standby | redundancy | profile | seed | fault | survived | end_turn | end_phase | app_saw | engine_dials | control_streams | session_carriers | standby_dials | standby_bound | promotions | swaps | stall | hold | relay_stall | closed | io | reject | attach | resumes | replay_bytes | recover_max_ms | impair_accepts | up_bytes | down_bytes | payload_up | payload_down |"
     );
     println!(
-        "|---|---:|---|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---:|---|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     );
     for row in rows {
         let (end_turn, end_phase, saw) = match &row.end {
@@ -1803,7 +1880,7 @@ fn print_convo(rows: &[ConvoRow]) {
         };
         let survived = if row.survived { "yes" } else { "no" };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             row.class,
             row.standby,
             red,
@@ -1821,6 +1898,16 @@ fn print_convo(rows: &[ConvoRow]) {
             row.standby_bound,
             row.standby_promotions,
             row.swaps,
+            row.stall,
+            row.hold,
+            row.relay_stall,
+            row.closed,
+            row.io,
+            row.reject,
+            row.attach,
+            row.resumes,
+            row.replay_bytes,
+            row.recover_max_ms,
             row.impair_accepts,
             row.up_bytes,
             row.down_bytes,
@@ -1830,7 +1917,7 @@ fn print_convo(rows: &[ConvoRow]) {
     }
     println!();
     println!(
-        "session_carriers counts engine dials whose first byte was not CTRL_HELLO (a standby dial is one of these). control_streams counts CTRL_HELLO. engine_dials counts every dial, including a raced dial dropped before it wrote. standby_dials, standby_bound, promotions and swaps are the kernel dialer's counters for this run. impair_accepts is TCP connections the relay accepted. Relay byte totals include session framing and the control stream. Stalls are token inter-arrival gaps, not the planned silence. ttft_after_silence_ms is first-token arrival minus (origin has the body + silence)."
+        "session_carriers counts engine dials whose first byte was not CTRL_HELLO (a standby dial is one of these). control_streams counts CTRL_HELLO. engine_dials counts every dial, including a raced dial dropped before it wrote. standby_dials, standby_bound, promotions and swaps are the kernel dialer's counters for this run. stall, hold, relay_stall, closed, io, reject and attach count why the session gave a carrier up. resumes is a RESUME re-attach. replay_bytes is uplink sent again after a promotion or a RESUME. recover_max_ms is the longest wait from that loss until the next byte of progress. impair_accepts is TCP connections the relay accepted. Relay byte totals include session framing and the control stream. Stalls in the turn table are token inter-arrival gaps, not the planned silence. ttft_after_silence_ms is first-token arrival minus (origin has the body + silence)."
     );
     println!();
     println!(
@@ -1879,6 +1966,21 @@ fn convo_json(rows: &[ConvoRow], spec: (u64, u64, u64, u64)) -> Value {
     })
 }
 
+fn turn_json(turn: &TurnMetrics) -> Value {
+    json!({
+        "turn": turn.turn,
+        "upload_ms": turn.upload_ms,
+        "ttft_after_silence_ms": turn.ttft_after_silence_ms,
+        "delay_p50_ms": turn.delay_p50_ms,
+        "delay_p99_ms": turn.delay_p99_ms,
+        "delay_max_ms": turn.delay_max_ms,
+        "stalls_300": turn.stalls_300,
+        "stalls_1s": turn.stalls_1s,
+        "stalls_20s": turn.stalls_20s,
+        "longest_gap_ms": turn.longest_gap_ms,
+    })
+}
+
 fn convo_run_json(row: &ConvoRow) -> Value {
     json!({
         "class": row.class,
@@ -1898,23 +2000,22 @@ fn convo_run_json(row: &ConvoRow) -> Value {
         "standby_bound": row.standby_bound,
         "promotions": row.standby_promotions,
         "swaps": row.swaps,
+        "stall": row.stall,
+        "hold": row.hold,
+        "relay_stall": row.relay_stall,
+        "closed": row.closed,
+        "io": row.io,
+        "reject": row.reject,
+        "attach": row.attach,
+        "resumes": row.resumes,
+        "replay_bytes": row.replay_bytes,
+        "recover_max_ms": row.recover_max_ms,
         "impair_accepts": row.impair_accepts,
         "up_bytes": row.up_bytes,
         "down_bytes": row.down_bytes,
         "payload_up": row.payload_up,
         "payload_down": row.payload_down,
-        "turn_metrics": row.turns.iter().map(|turn| json!({
-            "turn": turn.turn,
-            "upload_ms": turn.upload_ms,
-            "ttft_after_silence_ms": turn.ttft_after_silence_ms,
-            "delay_p50_ms": turn.delay_p50_ms,
-            "delay_p99_ms": turn.delay_p99_ms,
-            "delay_max_ms": turn.delay_max_ms,
-            "stalls_300": turn.stalls_300,
-            "stalls_1s": turn.stalls_1s,
-            "stalls_20s": turn.stalls_20s,
-            "longest_gap_ms": turn.longest_gap_ms,
-        })).collect::<Vec<_>>(),
+        "turn_metrics": row.turns.iter().map(turn_json).collect::<Vec<_>>(),
     })
 }
 
@@ -1992,7 +2093,7 @@ async fn conversation_baseline() {
     );
     let stack = stack().await;
     let mut rows = Vec::new();
-    for (profile, seed, fault) in convo_cases(true) {
+    for (profile, seed, fault) in convo_cases() {
         rows.push(run_convo(&stack, profile, seed, fault, spec).await);
     }
     print_convo(&rows);

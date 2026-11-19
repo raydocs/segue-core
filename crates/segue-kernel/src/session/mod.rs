@@ -442,10 +442,12 @@ pub struct KernelDialer {
     pub(crate) standby_lost: Arc<AtomicU64>,
     /// Test hook: standby dials fail before touching the engine.
     standby_fail: Arc<AtomicBool>,
-    /// Sum of each session's [`MoveStats`], updated as counters change.
+    /// Sum of each session's [`MoveStats`], updated as the counters change.
     move_counters: Arc<MoveCounters>,
 }
 
+/// Dialer-level sums of [`MoveStats`]. One session's snapshot is diffed
+/// against the previous one that session reported, then added here.
 struct MoveCounters {
     stall: AtomicU64,
     hold: AtomicU64,
@@ -575,7 +577,28 @@ impl KernelDialer {
         self
     }
 
+    /// Standby dials started since this dialer was built. One per dial, not
+    /// per raced attempt.
+    pub fn standby_dials(&self) -> u64 {
+        self.standby_dials
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Standby carriers that reached `REDUNDANT_OK`.
+    pub fn standby_bound(&self) -> u64 {
+        self.standby_bound
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Times a standby became the current carrier, including stall swaps.
+    pub fn standby_promotions(&self) -> u64 {
+        self.standby_promotions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Sum of move counters from sessions this dialer has run.
+    /// Relay-only fields (`t_live`, `stall_hints`) stay zero: those are
+    /// counted on the relay, not here.
     pub fn move_stats(&self) -> MoveStats {
         let c = &self.move_counters;
         let load = |a: &AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
@@ -599,6 +622,8 @@ impl KernelDialer {
         }
     }
 
+    /// Hook passed to each session. Diffs that session's snapshots so two
+    /// sessions on this dialer do not overwrite each other.
     fn move_hook(&self) -> MoveHook {
         let counters = Arc::clone(&self.move_counters);
         let last = Mutex::new(MoveStats::default());
@@ -607,25 +632,6 @@ impl KernelDialer {
             apply_move_delta(&counters, &snap, &prev);
             *prev = snap;
         })
-    }
-
-    /// Standby dials started since this dialer was built. One per dial, not
-    /// per raced attempt.
-    pub fn standby_dials(&self) -> u64 {
-        self.standby_dials
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Standby carriers that reached `REDUNDANT_OK`.
-    pub fn standby_bound(&self) -> u64 {
-        self.standby_bound
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Times a standby became the current carrier, including stall swaps.
-    pub fn standby_promotions(&self) -> u64 {
-        self.standby_promotions
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Stall swaps. A hard loss that promotes the spare is a promotion and

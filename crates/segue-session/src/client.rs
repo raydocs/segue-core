@@ -279,10 +279,15 @@ pub struct ClientSession {
     /// idle steady-state session allocates nothing).
     moves: Option<Box<MoveStats>>,
     /// When the current loss started, until the next byte of progress.
+    /// The first loss wins if another happens before progress.
     loss_at: Option<Instant>,
-    /// A relay `STALL` waiting out `stall_limit` after a swap or on AI.
+    /// A relay `STALL` is waiting out [`Self::stall_limit`] on the current
+    /// carrier. Set for an AI session that has not been quiet that long,
+    /// and after a promotion while the new carrier is still receiving.
+    /// Cleared by any byte received on the current carrier.
     stall_hint: bool,
-    /// The spare was dropped by a move (RESUME), not because it failed.
+    /// The spare was dropped because the session moved (RESUME), not because
+    /// the spare failed. The driver redials it with no backoff.
     spare_dropped_for_move: bool,
 }
 
@@ -490,7 +495,8 @@ impl ClientSession {
 
     /// How long unacked silence, a blackholed downlink with spare progress,
     /// and a relay `STALL` wait before this carrier is given up. An AI
-    /// session uses `t_stall_ai` whether or not a spare is bound.
+    /// session uses `t_stall_ai` whether or not a spare is bound; every other
+    /// session uses `t_stall`.
     fn stall_limit(&self) -> std::time::Duration {
         if self.params.exit_class == crate::EXIT_CLASS_AI {
             self.cfg.timing.t_stall_ai
@@ -705,10 +711,15 @@ impl ClientSession {
     }
 
     /// This side's stall bound, told to the relay so its keepalive comes
-    /// often enough for it (r9). In the wire range ([`STALL_MS_MAX`]); a
-    /// validated configuration ([`crate::Timing::validate_client`]) is
-    /// never below [`crate::MIN_CLIENT_STALL`], so the relay serves it as
-    /// announced.
+    /// often enough for it (r9). An AI session announces [`crate::Timing::t_stall_ai`]
+    /// (5 s): that is the silence it actually waits, spare or not, and the
+    /// relay's keepalive is half of the shorter of its own `t_stall` and
+    /// this announcement (never below [`crate::MIN_CLIENT_STALL`]).
+    /// Announcing the old 1 s bound would tell the relay the client gives
+    /// the carrier up inside normal TCP recovery. In the wire range
+    /// ([`STALL_MS_MAX`]); a validated configuration
+    /// ([`crate::Timing::validate_client`]) is never below the floor, so
+    /// the relay serves it as announced.
     fn stall_ms(&self) -> u64 {
         self.stall_limit()
             .as_millis()
@@ -759,17 +770,28 @@ impl ClientSession {
     /// A bound spare is promoted instead of dialing: the relay emits this
     /// when it gives the current carrier up, and promotes the same spare on
     /// its side. A hint that arrives after that promotion, while this
-    /// carrier is still receiving, is remembered and acted on once this
-    /// carrier goes quiet. A byte received on the current carrier clears it.
+    /// carrier is still receiving, is about the carrier already left and is
+    /// remembered. If this one then goes quiet, the hint is a real loss,
+    /// including a download that has nothing unacked upstream: the relay has
+    /// stopped sending. A byte on this carrier clears it.
     pub fn on_stall(&mut self, gen: u32, now: Instant) {
         if gen != self.gen || self.state != State::Active {
             return;
         }
+        // Silence is enough. Requiring unacked uplink dropped every hint
+        // after a promotion during a token stream: nothing was unacked, so
+        // the hint was forgotten, and a relay that had gone DETACHED (the
+        // demoted spare never moved, so it would not promote) sent no more
+        // downlink.
         if self.promoted_in_gen && now < self.last_rx + self.stall_limit() {
             self.stall_hint = true;
             return;
         }
         self.promoted_in_gen = false;
+        // An AI session waits out `t_stall_ai` with or without a spare. A
+        // byte received clears the hint. A non-AI session acts now: its
+        // relay already waited `t_live`. A hard loss does not come through
+        // here.
         if self.params.exit_class == crate::EXIT_CLASS_AI && now < self.last_rx + self.stall_limit()
         {
             self.stall_hint = true;
@@ -1837,6 +1859,8 @@ impl ClientSession {
             self.drop_redundant();
         }
         if self.stall_hint_at().is_some_and(|due| now >= due) {
+            // The remembered hint is about this carrier now, not the one
+            // the promotion already left.
             self.promoted_in_gen = false;
             self.act_on_stall(now);
         }
@@ -1848,6 +1872,11 @@ impl ClientSession {
                     && r.demoted_at.is_none()
                     && r.progressed_at.is_some_and(|p| p > self.last_rx)
             });
+        // A bound spare becomes current. A stall keeps the old carrier as the
+        // spare. No RESUME, no failure report. A spare that was demoted and has
+        // been silent is not promoted: neither side moved, so this
+        // re-attaches. An AI session waits `t_stall_ai` (see [`Self::stall_limit`])
+        // with or without a spare; a hard loss does not.
         if self.confirmed
             && (self.send.unacked() || spare_ahead)
             && now >= self.last_rx + stall_limit

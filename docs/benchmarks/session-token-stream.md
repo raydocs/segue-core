@@ -538,6 +538,76 @@ The 40 s and 120 s token blackouts survive on the same app connection. They do i
 
 Patience is what keeps the app connection through a 40 s or 120 s token blackout. The standby does not, on this harness: the impair sits on every carrier, so a spare cannot skip a blackout, and on a lossy profile it swaps a handful of times and then the session re-attaches as before.
 
+## Move reasons
+
+`SEGUE_CONVO_FAULTS=none SEGUE_SCENARIO=convo SEGUE_EXIT_CLASS=ai SEGUE_STANDBY=1`, same 3×1 MiB / 5 s / 500 conversation. No behaviour change yet: the client still gives a carrier up at `t_stall` (1 s) with or without a spare. `stall` is the client's own timer, `relay_stall` is a `STALL` hint (the relay's `t_live`), `resumes` is a RESUME onto a new carrier, `replay_bytes` is uplink sent again after a promotion or a RESUME, `recover_max_ms` is the longest wait from that loss until the next byte of progress. `hold`, `closed`, `io`, `reject` and `attach` were 0 on every row and are omitted.
+
+### Before
+
+| profile | seed | carriers | standby_dials | promotions | stall | relay_stall | resumes | replay_bytes | recover_max_ms | up_bytes | up/payload |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| rtt170 | 1 | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3159177 | 1.00 |
+| rtt170 | 2 | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3159178 | 1.00 |
+| rtt170 | 3 | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3158986 | 1.00 |
+| cn163-offpeak | 1 | 11 | 3 | 5 | 9 | 3 | 7 | 1822852 | 1598 | 3495323 | 1.11 |
+| cn163-offpeak | 2 | 16 | 3 | 5 | 12 | 5 | 12 | 2141802 | 1565 | 3346096 | 1.06 |
+| cn163-offpeak | 3 | 6 | 1 | 6 | 10 | 0 | 4 | 3358968 | 1589 | 4143161 | 1.32 |
+| cn163-peak | 1 | 27 | 4 | 8 | 27 | 3 | 22 | 3166208 | 1592 | 4050142 | 1.29 |
+| cn163-peak | 2 | 16 | 3 | 5 | 12 | 5 | 12 | 1499166 | 1382 | 3453382 | 1.10 |
+| cn163-peak | 3 | 63 | 6 | 6 | 57 | 5 | 56 | 2408562 | 1565 | 4379437 | 1.39 |
+
+Payload up is 3145794. Every row survived. `rtt170` does not move.
+
+On both `cn163-offpeak` and `cn163-peak` the client's `t_stall` is the move. A relay `STALL` is a few of them (0–5 against 9–57). The 2 s transport hold, a close, a write or decode error, `REJECT` and `t_attach` did not fire. Recovery tops out around 1.6 s, which is the 1 s timer plus a dial. Offpeak seed 1 has no token gap over 300 ms while `stall` is 9 and the three uploads take 7.6 s, 7.7 s and 4.9 s, so those moves are in the upload. Peak, and offpeak seed 2, also have multi-second token gaps, so the same timer fires while tokens are in flight. A RESUME then drops the spare; most moves have no spare bound (`resumes` is almost `stall + relay_stall − promotions`).
+
+### After
+
+Same command, after the solo rule: an AI session with no spare bound waits `t_stall_solo` (5 s); a bound spare still swaps at 1 s; a spare dropped by the RESUME is redialled at once. The transport hold is unchanged.
+
+| profile | seed | survived | carriers | standby_dials | promotions | stall | relay_stall | resumes | replay_bytes | recover_max_ms | up_bytes | up/payload |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| rtt170 | 1 | yes | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3159004 | 1.00 |
+| rtt170 | 2 | yes | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3159033 | 1.00 |
+| rtt170 | 3 | yes | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3159065 | 1.00 |
+| cn163-offpeak | 1 | yes | 12 | 6 | 10 | 13 | 2 | 5 | 2978420 | 1598 | 3593199 | 1.14 |
+| cn163-offpeak | 2 | yes | 13 | 8 | 11 | 14 | 1 | 4 | 2928868 | 1574 | 3327047 | 1.06 |
+| cn163-offpeak | 3 | yes | 4 | 2 | 8 | 9 | 0 | 1 | 2965032 | 1566 | 4401088 | 1.40 |
+| cn163-peak | 1 | no (turn 3 tokens, timeout) | 26 | 13 | 25 | 35 | 2 | 12 | 3239097 | 1597 | 3867219 | 1.23 |
+| cn163-peak | 2 | yes | 13 | 8 | 11 | 14 | 1 | 4 | 2154496 | 1574 | 3466649 | 1.10 |
+| cn163-peak | 3 | no (turn 2 tokens, timeout) | 39 | 20 | 38 | 55 | 1 | 18 | 2609379 | 1563 | 2928481 | 0.93 |
+
+Targets were `cn163-offpeak` ≤ 4 carriers and `cn163-peak` ≤ 8 on every seed, upload on the wire ≤ 1.15× payload, and every row surviving. None of those hold, except offpeak seed 3's carrier count and three rows' byte ratio. `rtt170` is unchanged.
+
+The 5 s wait rarely applies. Redialling the spare at once keeps one bound, so the next silence swaps at 1 s (`stall` is still almost every move; `promotions` equals `swaps`). On this impair the spare is the same lossy path, the demoted carrier stays quiet, and the following stall RESUMEs. That is what still moves the carrier. Two peak rows that survived before now time out in the token phase. `relay_stall` is 0–2. `hold`, `closed`, `io`, `reject` and `attach` are still 0.
+
+### Blackouts
+
+`SEGUE_CONVO_FAULTS=blackout` on the same build. Every `rtt170` blackout row survived. Carrier counts match the previous standby-on run: upload 2 s is 4 session carriers, tokens 8 s is 2, tokens 40 s is 13, tokens 120 s is 33. The moves during the long holds are `t_attach` (the RESUME is not answered while the impair holds the carrier), not `t_stall`. Token `delay_max` on the blackout turn is the hold plus under a second (8.07 s, 40.7–40.8 s, 120.7–120.8 s). That is inside `t_stall_solo` of the previous recovery. The 2 s upload's second turn takes 3.0–3.5 s.
+
+### After t_stall_ai
+
+Same no-fault command, after two changes. An AI session waits `t_stall_ai` (5 s) before unacked silence or a `STALL` hint gives the carrier up, whether or not a spare is bound. The relay waits `t_live_ai` (5 s) for that session. A `STALL` that arrives after a promotion is remembered and acted on once the new carrier is quiet, including a download with nothing unacked: the previous build dropped that hint, the relay went DETACHED, and the token stream stayed open until the harness timed out. The client announces `t_stall_ms` 5000. The relay's keepalive stays 500 ms, because it is half the shorter of the relay's own `t_stall` (1 s) and that announcement.
+
+| profile | seed | survived | carriers | standby_dials | promotions | stall | relay_stall | resumes | replay_bytes | recover_max_ms | up_bytes | up/payload |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| rtt170 | 1 | yes | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3158962 | 1.00 |
+| rtt170 | 2 | yes | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3158971 | 1.00 |
+| rtt170 | 3 | yes | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3159060 | 1.00 |
+| cn163-offpeak | 1 | yes | 7 | 3 | 9 | 8 | 4 | 3 | 1920318 | 5595 | 4040402 | 1.28 |
+| cn163-offpeak | 2 | yes | 13 | 7 | 14 | 13 | 3 | 5 | 3370024 | 9683 | 3507598 | 1.12 |
+| cn163-offpeak | 3 | yes | 2 | 1 | 6 | 5 | 1 | 0 | 1318954 | 4712 | 4333341 | 1.38 |
+| cn163-peak | 1 | yes | 18 | 9 | 31 | 33 | 6 | 8 | 3387140 | 17183 | 4548337 | 1.45 |
+| cn163-peak | 2 | yes | 11 | 5 | 16 | 13 | 5 | 5 | 3018394 | 9852 | 4949436 | 1.57 |
+| cn163-peak | 3 | yes | 10 | 5 | 15 | 13 | 5 | 4 | 1839104 | 13437 | 4057977 | 1.29 |
+
+Every row survived, including the two peak rows that timed out in the token phase before. `hold`, `io`, `reject` and `attach` are 0. `closed` is 0 except offpeak seed 2 (3), peak seed 2 (3) and peak seed 3 (1). `rtt170` does not move.
+
+Targets were still `cn163-offpeak` ≤ 4 carriers and `cn163-peak` ≤ 8 on every seed, and upload ≤ 1.15× payload. Offpeak seed 3 is the only carrier-count hit (2). Offpeak seed 2 is the only cn163 byte-ratio hit (1.12). The other cn163 rows are 7–18 carriers and 1.28–1.57×. Waiting 5 s cut the peak rows that used to die (26 and 39 carriers, timeout) to 18, 11 and 10, and they finish. It did not get them under the target. `recover_max_ms` is now the 5 s wait plus the dial, up to 17 s on peak seed 1, not the old 1.6 s.
+
+### Blackouts after t_stall_ai
+
+`SEGUE_CONVO_FAULTS=blackout` on this build. Every row survived, including every `rtt170` blackout. Upload 2 s is 2 session carriers. Tokens 8 s is 2–3, tokens 40 s is 13, tokens 120 s is 33. The moves during the 40 s and 120 s holds are `t_attach` (9–29) and the RESUME that follows (10–30), not `t_stall`. Token `delay_max` on the blackout turn is the hold plus under a second: 8.07 s, 40.8–40.9 s, 120.8–121.0 s. An 8 s blackout does not stall the stream more than 6 s after the path returns. The 2 s upload's second turn takes 2.4 s.
+
 ## Stage 2 small-frame duplication (A/B)
 
 Synthetic loopback benchmark (`127.0.0.1` impairment proxy with per-connection

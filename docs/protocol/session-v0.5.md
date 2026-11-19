@@ -319,24 +319,48 @@ Rules:
   quality "carrier lost".
 - If the **current** carrier is lost while a spare is bound, both sides
   **promote** it. Loss means the carrier closed, the transport hold gave it
-  up (`on_carrier_stuck`), the client's `t_stall` fired, or the relay's
-  `t_live` fired. Same `attach_gen`. **No RESUME and no other frame** is
-  sent to announce the promotion.
-- A **stall** (client `t_stall`, a `STALL` hint, a transport hold, relay
-  `t_live`) does not close the carrier that was current. It is **demoted**
+  up (`on_carrier_stuck`), the client's `t_stall`/`t_stall_ai` fired, or the
+  relay's `t_live`/`t_live_ai` fired. Same `attach_gen`. **No RESUME and no
+  other frame** is sent to announce the promotion.
+- A **stall** (client `t_stall`/`t_stall_ai`, a `STALL` hint, relay
+  `t_live`/`t_live_ai`) does not close the carrier that was current. It is **demoted**
   to the spare: still open, still authenticated at this generation. If it
   receives a frame it is a standby again and the next stall of the new
   current swaps back, still with no dial. A demoted carrier that receives
   nothing for `t_detached_standby` (10 s) is dropped. If the new current
   stalls and the demoted one has received nothing since the demotion,
   neither moved: both are dropped and the session re-attaches with RESUME.
-  A hard loss (closed, decode error, REJECT, write error) still drops the
-  carrier. The relay follows a stall swap when an ACK or FIN arrives on a
+  A hard loss (closed, decode error, REJECT, write error, or transport hold
+  `on_carrier_stuck`) drops the carrier rather than demoting it. The relay follows a stall swap when an ACK or FIN arrives on a
   spare that has never been current (the client sends those only on the
   carrier it considers current), or when DATA arrives there after the
   current carrier has been silent for a stall. A later swap-back is the
   relay's `t_live`, which demotes rather than closes. A RESUME onto a third
   carrier still drops the spare.
+- **AI stall.** An AI session (`exit_class == 1`) does not give a carrier
+  up at `t_stall` (1 s), spare or not. Unacked silence, and a `STALL`
+  hint, wait `t_stall_ai` (default 5 s). That sits outside a normal TCP
+  loss recovery (typically 0.3 s, up to about 1.5 s). At 5 s with a spare
+  bound the spare is swapped; with none the session re-attaches. A byte
+  received clears a deferred hint. A hint that arrives after this
+  generation already promoted, while the new carrier is still receiving,
+  is remembered rather than dropped: if that carrier then goes quiet —
+  including a download with nothing unacked upstream — it is a real loss.
+  The relay's give-up for an AI session is `t_live_ai` (5 s), the same
+  wait, so it does not go DETACHED while the client is still holding the
+  carrier. A hard loss (closed, decode error, write error, `REJECT`) acts
+  at once, with or without a spare. A non-AI session is unchanged. The
+  transport hold stays 2 s: a carrier that is silent and whose write side
+  makes no progress is still given up then. The client announces
+  `t_stall_ms` = 5000 for an AI session (1000 otherwise): that is the
+  bound it waits, and the relay's keepalive is half the shorter of its
+  own `t_stall` and this announcement (never below `MIN_CLIENT_STALL`).
+  With the default relay `t_stall` of 1 s the keepalive stays 500 ms,
+  which is inside the 5 s wait.
+- A spare dropped because the session moved (RESUME, including `reattach`)
+  is requested again at once, with the failure backoff reset to 1 s. A
+  spare that failed to dial or bind, or that died, still waits from 1 s,
+  doubling up to 30 s.
 - What crosses the wire is only what already did. `REDUNDANT_OK`'s
   `recv_offset` / `max_offset` is the relay's snapshot at bind time; later
   ACKs (mirrored onto the spare) move each side's acknowledged offset. On
@@ -553,10 +577,11 @@ defaults (`crates/segue-session/src/lib.rs:45-135`):
 | timer | default | meaning (citing line) |
 |-------|---------|------------------------|
 | `t_attach` | 2 s | client: give up one attach attempt, retry on a new carrier (`lib.rs:48-49`) |
-| `t_stall` | 1 s | client: unacked data and nothing received → re-attach (KERNEL_SPEC §7.2 数据停滞, `max(1 s, 4×SRTT)`; SRTT not modelled, `lib.rs:50-52`) |
-| `t_stall_ai` | 5 s | client: `exit_class == AI` stall bound |
-| `t_live` | 3 s | relay: unacked downlink, no ACK progress → DETACHED (`lib.rs:53-54`) |
-| `t_live_ai` | 5 s | relay: `exit_class == AI` unacked downlink live bound |
+| `t_attach` | 2 s | client: give up one attach attempt, retry on a new carrier (`lib.rs:48-49`) |
+| `t_stall` | 1 s | client, non-AI: unacked data and nothing received → re-attach (KERNEL_SPEC §7.2 数据停滞, `max(1 s, 4×SRTT)`; SRTT not modelled). An AI session uses `t_stall_ai` instead |
+| `t_stall_ai` | 5 s | client, AI only: unacked silence, a blackholed downlink with spare progress, and a `STALL` hint wait this long whether or not a spare is bound. A spare is swapped; with none the session re-attaches. Other sessions ignore it |
+| `t_live` | 3 s | relay, non-AI: unacked downlink, no ACK progress → DETACHED. An AI session uses `t_live_ai` |
+| `t_live_ai` | 5 s | relay, AI only: the same give-up as `t_stall_ai`, so the relay does not drop a carrier the client is still waiting on |
 | `t_detached` | 30 s | both: how long a non-AI session may live without a working carrier (`lib.rs`, `Timing::t_detached`) |
 | `t_detached_ai` | 150 s | both: the same bound for a session whose OPEN carried `exit_class == 1` (AI). Under the 180 s after which an AI client aborts a stream it cannot resume |
 | `t_detached_standby` | 10 s | both: a carrier demoted by a stall, with no frame since, is dropped |
@@ -570,20 +595,25 @@ defaults (`crates/segue-session/src/lib.rs:45-135`):
 | `t_ctrl_idle` | 30 s | relay: control stream closed after this with no frame (`lib.rs:68-72`) |
 | `site_flush_idle` / `site_flush_max` | 30 s / 300 s | relay: bounds on handing the upload tail to the site; past either the session is reset (`site_reset`), never CLEAN (`lib.rs:73-82`) |
 
-Client configuration is validated: `t_stall` ≥ 100 ms (`MIN_CLIENT_STALL`,
-`lib.rs:89-92`, r10 N3) and its milliseconds must fit the wire field
-(`validate_client`, `lib.rs:107-125`). The client sends `t_stall` as
-`t_stall_ms`; the relay keeps a stalled session alive with keepalive ACKs at
-half the **shorter** of its own and the announced bound, never below the
-100 ms floor, so "a peer cannot make the relay send ACKs in a loop"
-(`relay.rs:874-885`, `lib.rs:83-92`).
+Client configuration is validated: `t_stall` and `t_stall_ai` are each
+≥ 100 ms (`MIN_CLIENT_STALL`, r10 N3) and their milliseconds must fit the
+wire field (`validate_client`). The client sends the bound it waits as
+`t_stall_ms`: `t_stall` (1000) for a non-AI session, `t_stall_ai` (5000)
+for an AI session. The relay keeps a stalled session alive with keepalive
+ACKs at half the **shorter** of its own `t_stall` and the announced bound,
+never below the 100 ms floor, so "a peer cannot make the relay send ACKs
+in a loop". An AI announcement of 5000 does not slow that keepalive below
+the relay's own 1 s `t_stall` (it stays 500 ms, which is inside the 5 s
+client wait).
 
 ### 5.1 Channel health and channel death (§5.1 通道判死)
 
 Sessions multiplex over a *channel* (control stream + carriers) to one relay.
-A `STALL` for `(session_id, attach_gen)` from the control stream moves that
-session to a new carrier at once — the relay holds unacknowledged data for it
-(B1, `client.rs:481-491`). A control stream that answers nothing for
+A `STALL` for `(session_id, attach_gen)` from the control stream tells the
+client the relay holds unacknowledged data for it (B1). A non-AI session
+moves to a new carrier at once. An AI session waits until the current
+carrier has been quiet for `t_stall_ai`, then swaps a bound spare or
+re-attaches. A control stream that answers nothing for
 `dead_after`, or breaks after being accepted, means "the channel is dead,
 move every session of that exit" (`ControlHint::Dead`, `driver.rs:1813-1831`;
 kernel wiring `crates/segue-kernel/src/session/mod.rs:32-37`). Without the

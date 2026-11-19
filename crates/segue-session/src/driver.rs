@@ -458,7 +458,7 @@ enum CarrierEv {
     /// stopped arriving for the transport hold or outlived the hold cap:
     /// it owed us bytes it never delivered (r9 F2).
     Stuck(u64),
-    /// A write failed (broken carrier stream).
+    /// A write failed. Not an EOF: the session counts it apart from a close.
     Io(u64),
 }
 
@@ -1000,7 +1000,9 @@ pub struct ClientCtl {
     /// the same backoff. The standby does not reserve pool blocks.
     pub standby: Option<StandbyCtl>,
     /// Called with the session's [`MoveStats`] whenever the counters change,
-    /// and once more at the end if they changed again.
+    /// and once more at the end if they changed again. Each call is the full
+    /// snapshot, not a delta, so a caller that sums across sessions keeps the
+    /// previous snapshot itself.
     pub moves: Option<MoveHook>,
 }
 
@@ -1103,6 +1105,8 @@ impl StandbyKeep {
         if self.cid.is_some() && cid != self.cid {
             let prev = self.cid.take().expect("cid was some");
             let promoted = s.carrier() == Some(prev);
+            // A RESUME drops a spare that did not fail. Redial it now.
+            // A spare that failed to dial or bind, or that died, waits.
             let dropped_for_move = s.take_spare_dropped_for_move();
             if promoted {
                 self.emit(StandbyEvent::Promoted);
@@ -1130,7 +1134,8 @@ impl StandbyKeep {
         }
     }
 
-    /// Clear backoff so a replacement standby dials immediately without penalty.
+    /// The spare was dropped by a move, not a failure: dial the next one
+    /// on the next loop, and start the failure backoff over at the minimum.
     fn rearm_now(&mut self) {
         self.backoff = STANDBY_BACKOFF_MIN;
         self.next_at = None;

@@ -317,8 +317,12 @@ fn control_stream_answers_ping_and_carries_stall_and_revoked() {
     };
     assert_eq!(entries, vec![(SID, c.gen())]);
     c.on_stall(entries[0].1, t);
-    // A stalled carrier counts against the redial bound (r9 F2) even
-    // with nothing to upload: the first redial waits the first backoff.
+    // AI does not abandon the carrier on the hint until it has been quiet
+    // for `t_stall_ai`, spare or not. The hint above arrived at that bound,
+    // so it already counted. A stalled carrier counts against the redial
+    // bound (r9 F2) even with nothing to upload.
+    let t = t0 + Config::default().timing.t_stall_ai;
+    c.handle_timeout(t);
     assert_eq!(c.fruitless_carriers(), 1);
     assert!(c.wants_attach(t + segue_session::client::RECONNECT_BACKOFF));
     // Device reset: REVOKED on the control stream, which then closes.
@@ -526,7 +530,7 @@ fn deadlines_served_by_sending_wait_for_a_writable_carrier() {
         blocked > t,
         "a blocked carrier's keepalive kept a due deadline"
     );
-    // Still bounded by the session's own timers (t_live_ai here).
+    // Still bounded by the session's own timers (t_live_ai: this session is AI).
     assert!(blocked <= t0 + Config::default().timing.t_live_ai);
 }
 
@@ -540,6 +544,7 @@ fn relay_keepalive_follows_the_shorter_stall_bound() {
         rc.timing.t_stall = Duration::from_millis(relay_ms);
         let mut cc = Config::default();
         cc.timing.t_stall = Duration::from_millis(client_ms);
+        // The client is AI, so the wire field is `t_stall_ai`, not `t_stall`.
         cc.timing.t_stall_ai = Duration::from_millis(client_ms);
         held_fin_relay(t0, rc, cc).keepalive(&SID).unwrap()
     };
@@ -728,7 +733,8 @@ fn a_stall_after_success_reports_failed_and_progress_refreshes_up() {
     let t = t0 + HEALTH_REFRESH;
     c.on_frame(1, data(100), t).unwrap();
     assert_eq!(c.take_health(), Some(Health::Up), "no refreshed proof");
-    // Upload, never acknowledged, nothing received: a stall (AI waits `t_stall_ai`).
+    // Upload, never acknowledged, nothing received: a stall. This client is
+    // AI, so the only carrier waits `t_stall_ai`.
     assert_eq!(c.write(b"hello"), 5);
     while c.poll_transmit(1, t).is_some() {}
     let t = t + Config::default().timing.t_stall_ai + Duration::from_millis(1);
@@ -904,7 +910,8 @@ fn liveness_neither_resets_the_budget_nor_hides_a_failure() {
     )
     .unwrap();
     assert_eq!(c.take_health(), Some(Health::Up));
-    // An upload nobody acknowledges: the carrier stalls, moved nothing (`t_stall_ai`).
+    // An upload nobody acknowledges: the carrier stalls, moved nothing.
+    // AI waits `t_stall_ai`, not `t_stall`.
     assert_eq!(c.write(b"hello"), 5);
     while c.poll_transmit(1, t0).is_some() {}
     let mut t = t0 + Config::default().timing.t_stall_ai + Duration::from_millis(1);

@@ -14,14 +14,14 @@
 #                         the standby column. Ignored for an overseas route.
 #   SEGUE_REDUNDANCY      off, dup, or hedge (default dup: 30 ms delay,
 #                         <= 1024 B frames on AI sessions).
-#   SEGUE_PROFILES        comma-separated profile subset (default all).
-#   SEGUE_SEEDS           comma-separated seed subset (default 1,2,3).
-#   SEGUE_CONVO_FAULTS    comma-separated fault subset for convo_cases.
+#   SEGUE_CONVO_FAULTS    comma-separated fault subset, or none / blackout / all
 #   SEGUE_CONVO_TURNS     conversation turns (default 3)
 #   SEGUE_CONVO_UPLOAD    upload bytes per turn (default 1 MiB)
 #   SEGUE_CONVO_SILENCE_MS
 #                         silence after each upload (default 5000)
 #   SEGUE_CONVO_TOKENS    30-byte events per turn (default 500)
+#   SEGUE_PROFILES        comma-separated profile names, or all (default all)
+#   SEGUE_SEEDS           comma-separated seeds, or all (default 1,2,3)
 #   SEGUE_BENCH_OUT       if set, the test also writes JSON. When both
 #                         scenarios run, the token JSON is moved to
 #                         <path>.token.json and the conversation JSON to

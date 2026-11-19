@@ -1198,6 +1198,96 @@ fn stall_swaps_with_the_standby_and_swaps_back() {
     assert!(s.client.gen() > gen, "re-attach was not a RESUME");
 }
 
+/// Download-only, after one swap: the relay's next `STALL` must not be
+/// dropped. Uplink is fully acknowledged, so the client's own `t_stall`
+/// stays quiet. The demoted spare has received nothing, so the relay will
+/// not promote it and goes DETACHED, which sends no more downlink. Forgetting
+/// that hint (it used to require unacked uplink, which a token stream does
+/// not have) leaves the app connection open and idle.
+#[test]
+fn a_download_stall_after_a_swap_is_not_ignored() {
+    use segue_session::relay::SessionState;
+
+    let mut s = Sim::new(51, 4_000, 200_000);
+    s.keep_redundant = true;
+    let mut ready = false;
+    for _ in 0..80_000 {
+        s.step();
+        if s.client.redundant_bound()
+            && s.up_eof
+            && !s.client.send_half().unacked()
+            && s.down_got.len() > 1_000
+            && s.down_got.len() < s.down.len()
+        {
+            ready = true;
+            break;
+        }
+        assert!(!s.finished(), "session ended before the stall window");
+    }
+    assert!(
+        ready,
+        "download never idled with uplink acked and a spare bound"
+    );
+    s.keep_redundant = false;
+    let opened = s.carriers_opened;
+    let first = s.client.carrier().unwrap();
+    let spare = s.client.redundant_carrier().unwrap();
+    let sid = s.client.session_id();
+
+    // Hold the current carrier. The client has nothing unacked, so only the
+    // relay's `t_live` moves it. Nothing on the held carrier is delivered,
+    // so once demoted it stays silent.
+    s.hold_carrier = Some(first);
+    let mut swapped = false;
+    for _ in 0..8_000 {
+        s.step();
+        if s.client.carrier() == Some(spare) && s.relay.current_carrier(&sid) == Some(spare) {
+            swapped = true;
+            break;
+        }
+    }
+    assert!(swapped, "first stall did not swap both sides");
+    assert_eq!(s.carriers_opened, opened, "first stall dialed");
+    assert!(
+        !s.client.send_half().unacked(),
+        "uplink became unacked across the swap"
+    );
+
+    // The carrier we just promoted is black-holed too. `t_live` cannot
+    // promote the silent demoted spare, so the relay goes DETACHED.
+    s.mute_rx = Some(spare);
+    let mut detached = false;
+    for _ in 0..8_000 {
+        s.step();
+        if s.relay.state(&sid) == Some(SessionState::Detached) {
+            detached = true;
+            break;
+        }
+    }
+    assert!(detached, "relay did not go DETACHED on the second stall");
+    let stuck_at = s.down_got.len();
+
+    // The path returns. Acting on the remembered hint re-attaches (the
+    // demoted spare never moved) and the rest of the download arrives.
+    s.hold_carrier = None;
+    s.mute_rx = None;
+    let mut resumed = false;
+    for _ in 0..40_000 {
+        s.step();
+        if s.finished() {
+            resumed = true;
+            break;
+        }
+    }
+    assert!(
+        resumed,
+        "download stuck at {stuck_at} of {} after the path returned; relay {:?}",
+        s.down.len(),
+        s.relay.state(&sid)
+    );
+    s.assert_exact();
+}
+
 #[test]
 fn promotion_allows_another_redundant_carrier() {
     let mut s = Sim::new(34, 80_000, 80_000);
