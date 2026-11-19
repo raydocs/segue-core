@@ -50,7 +50,12 @@ pub struct Timing {
     pub t_attach: Duration,
     /// Client: unacked data and nothing received for this long → re-attach
     /// (KERNEL_SPEC §7.2 "数据停滞", `max(1 s, 4 × SRTT)`; SRTT not modelled).
+    /// An AI session with no spare bound waits [`Self::t_stall_solo`] instead.
     pub t_stall: Duration,
+    /// Client, AI sessions only (`exit_class` [`EXIT_CLASS_AI`]): with no spare
+    /// bound, a stall waits this long before the only carrier is abandoned.
+    /// A bound spare still swaps at [`Self::t_stall`]. Other sessions ignore it.
+    pub t_stall_solo: Duration,
     /// Relay: unacked downlink and no ACK progress → DETACHED.
     pub t_live: Duration,
     /// Both: how long a session may stay without a working carrier.
@@ -145,6 +150,7 @@ impl Default for Timing {
         Self {
             t_attach: Duration::from_secs(2),
             t_stall: Duration::from_secs(1),
+            t_stall_solo: Duration::from_secs(5),
             t_live: Duration::from_secs(3),
             t_detached: Duration::from_secs(30),
             t_detached_ai: Duration::from_secs(150),

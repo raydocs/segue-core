@@ -317,8 +317,11 @@ fn control_stream_answers_ping_and_carries_stall_and_revoked() {
     };
     assert_eq!(entries, vec![(SID, c.gen())]);
     c.on_stall(entries[0].1, t);
-    // A stalled carrier counts against the redial bound (r9 F2) even
-    // with nothing to upload: the first redial waits the first backoff.
+    // AI with no spare does not abandon the carrier on the hint until it
+    // has been quiet for `t_stall_solo`. A stalled carrier then counts
+    // against the redial bound (r9 F2) even with nothing to upload.
+    let t = t0 + Config::default().timing.t_stall_solo;
+    c.handle_timeout(t);
     assert_eq!(c.fruitless_carriers(), 1);
     assert!(c.wants_attach(t + segue_session::client::RECONNECT_BACKOFF));
     // Device reset: REVOKED on the control stream, which then closes.
@@ -727,10 +730,11 @@ fn a_stall_after_success_reports_failed_and_progress_refreshes_up() {
     let t = t0 + HEALTH_REFRESH;
     c.on_frame(1, data(100), t).unwrap();
     assert_eq!(c.take_health(), Some(Health::Up), "no refreshed proof");
-    // Upload, never acknowledged, nothing received: a stall.
+    // Upload, never acknowledged, nothing received: a stall. This client is
+    // AI with no spare, so the only carrier waits `t_stall_solo`.
     assert_eq!(c.write(b"hello"), 5);
     while c.poll_transmit(1, t).is_some() {}
-    let t = t + Config::default().timing.t_stall + Duration::from_millis(1);
+    let t = t + Config::default().timing.t_stall_solo + Duration::from_millis(1);
     c.handle_timeout(t);
     assert_eq!(
         c.take_health(),
@@ -904,9 +908,10 @@ fn liveness_neither_resets_the_budget_nor_hides_a_failure() {
     .unwrap();
     assert_eq!(c.take_health(), Some(Health::Up));
     // An upload nobody acknowledges: the carrier stalls, moved nothing.
+    // AI with no spare waits `t_stall_solo`, not `t_stall`.
     assert_eq!(c.write(b"hello"), 5);
     while c.poll_transmit(1, t0).is_some() {}
-    let mut t = t0 + Config::default().timing.t_stall + Duration::from_millis(1);
+    let mut t = t0 + Config::default().timing.t_stall_solo + Duration::from_millis(1);
     c.handle_timeout(t);
     assert_eq!(c.take_health(), Some(Health::Failed));
     assert_eq!(c.fruitless_carriers(), 1);

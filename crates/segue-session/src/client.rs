@@ -267,6 +267,12 @@ pub struct ClientSession {
     /// When the current loss started, until the next byte of progress.
     /// The first loss wins if another happens before progress.
     loss_at: Option<Instant>,
+    /// A relay `STALL` arrived for an AI session with no spare, and
+    /// `t_stall_solo` has not elapsed yet. Cleared by any byte received.
+    stall_hint: bool,
+    /// The spare was dropped because the session moved (RESUME), not because
+    /// the spare failed. The driver redials it with no backoff.
+    spare_dropped_for_move: bool,
 }
 
 // Manual so the resume secret and ticket never reach a log.
@@ -352,6 +358,8 @@ impl ClientSession {
             park: ParkTracker::default(),
             moves: MoveStats::default(),
             loss_at: None,
+            stall_hint: false,
+            spare_dropped_for_move: false,
         })
     }
 
@@ -444,6 +452,38 @@ impl ClientSession {
             if self.carrier != Some(r.cid) {
                 self.abandoned.push(r.cid);
             }
+        }
+    }
+
+    /// The session is moving onto another carrier, so the spare cannot stay:
+    /// it was authenticated at this generation. Not a spare failure.
+    fn drop_spare_for_move(&mut self) {
+        if self.redundant.is_some() {
+            self.spare_dropped_for_move = true;
+        }
+        self.drop_redundant();
+    }
+
+    /// `true` once, after a move dropped a spare that had not failed.
+    /// The driver uses it to redial with no backoff.
+    pub fn take_spare_dropped_for_move(&mut self) -> bool {
+        std::mem::take(&mut self.spare_dropped_for_move)
+    }
+
+    /// AI, and no spare is bound. A spare that is only dialling does not
+    /// count: swapping onto it is not possible yet.
+    fn ai_solo(&self) -> bool {
+        self.params.exit_class == crate::EXIT_CLASS_AI && !self.redundant_bound()
+    }
+
+    /// How long unacked silence waits before this carrier is abandoned.
+    /// AI with no spare bound uses `t_stall_solo`. Everyone else, and an AI
+    /// session that has a spare to swap onto, uses `t_stall`.
+    fn stall_limit(&self) -> std::time::Duration {
+        if self.ai_solo() {
+            self.cfg.timing.t_stall_solo
+        } else {
+            self.cfg.timing.t_stall
         }
     }
 
@@ -558,7 +598,7 @@ impl ClientSession {
         // ambiguous, so it is dropped (rule 6).
         self.promoted_in_gen = false;
         if self.carrier != Some(cid) {
-            self.drop_redundant();
+            self.drop_spare_for_move();
         }
         if let Some(old) = self.carrier.replace(cid) {
             if old != cid {
@@ -681,7 +721,7 @@ impl ClientSession {
         }
         // Same as [`attach`](Self::attach): a move drops the spare.
         self.promoted_in_gen = false;
-        self.drop_redundant();
+        self.drop_spare_for_move();
         if let Some(old) = self.carrier.take() {
             self.abandoned.push(old);
         }
@@ -710,6 +750,18 @@ impl ClientSession {
             }
             self.promoted_in_gen = false;
         }
+        // No spare to swap onto, and the carrier has not been quiet for
+        // `t_stall_solo`: remember the hint. A byte received clears it.
+        // A bound spare still swaps now. A non-AI session does too.
+        if self.ai_solo() && now < self.last_rx + self.cfg.timing.t_stall_solo {
+            self.stall_hint = true;
+            return;
+        }
+        self.act_on_stall(now);
+    }
+
+    fn act_on_stall(&mut self, now: Instant) {
+        self.stall_hint = false;
         self.note_move(MoveReason::RelayStall, now);
         if self.promote_redundant(now, true) {
             return;
@@ -735,6 +787,7 @@ impl ClientSession {
             return;
         }
         self.last_rx = self.last_rx.max(now);
+        self.stall_hint = false;
         self.rx_partial = true;
         if self.confirmed && now >= self.last_sent + self.keepalive() {
             self.ka_due = true;
@@ -956,7 +1009,7 @@ impl ClientSession {
         if self.promote_redundant(now, stuck) {
             return;
         }
-        self.drop_redundant();
+        self.drop_spare_for_move();
         self.carrier_lost(now, stuck);
         self.carrier = None;
         if self.is_closed() {
@@ -1032,6 +1085,7 @@ impl ClientSession {
             return Ok(());
         }
         self.last_rx = now;
+        self.stall_hint = false;
         self.rx_partial = false;
         let r = self.on_current(frame, now);
         if let Err(e) = r {
@@ -1475,7 +1529,10 @@ impl ClientSession {
         }
         if self.confirmed {
             if self.send.unacked() {
-                put(Some(self.last_rx + t.t_stall));
+                put(Some(self.last_rx + self.stall_limit()));
+            }
+            if self.stall_hint {
+                put(Some(self.last_rx + t.t_stall_solo));
             }
             if writable {
                 put(self.recv.ack_deadline());
@@ -1531,11 +1588,16 @@ impl ClientSession {
         }) {
             self.drop_redundant();
         }
-        if self.confirmed && self.send.unacked() && now >= self.last_rx + t.t_stall {
+        if self.stall_hint && now >= self.last_rx + t.t_stall_solo {
+            self.act_on_stall(now);
+        }
+        let stall_limit = self.stall_limit();
+        if self.confirmed && self.send.unacked() && now >= self.last_rx + stall_limit {
             // A bound spare becomes current. A stall keeps the old carrier
             // as the spare. No RESUME, no failure report. A spare that was
             // demoted and has been silent is not promoted: neither side
-            // moved, so this re-attaches.
+            // moved, so this re-attaches. AI with no spare waits
+            // `t_stall_solo` (see [`Self::stall_limit`]); a hard loss does not.
             self.note_move(MoveReason::Stall, now);
             if !self.promote_redundant(now, true) {
                 self.carrier_lost(now, true);

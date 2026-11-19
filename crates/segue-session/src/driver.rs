@@ -1028,7 +1028,7 @@ impl StandbyKeep {
     }
 
     /// The spare appeared, bound, or went away since the last look.
-    fn observe(&mut self, s: &ClientSession) {
+    fn observe(&mut self, s: &mut ClientSession) {
         let now = tokio::time::Instant::now();
         let cid = s.redundant_carrier();
         // Bound only on the rising edge of one spare: seen unbound, then
@@ -1046,6 +1046,9 @@ impl StandbyKeep {
         if self.cid.is_some() && cid != self.cid {
             let prev = self.cid.take().expect("cid was some");
             let promoted = s.carrier() == Some(prev);
+            // A RESUME drops a spare that did not fail. Redial it now.
+            // A spare that failed to dial or bind, or that died, waits.
+            let dropped_for_move = s.take_spare_dropped_for_move();
             if promoted {
                 self.emit(StandbyEvent::Promoted);
                 // A swap leaves the old carrier bound as the spare. A hard
@@ -1055,14 +1058,25 @@ impl StandbyKeep {
                         counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                self.schedule(now);
+            } else if dropped_for_move {
+                self.rearm_now();
             } else {
                 self.emit(StandbyEvent::Lost);
+                self.schedule(now);
             }
-            self.schedule(now);
         }
         if self.cid.is_none() {
             self.cid = cid;
         }
+    }
+
+    /// The spare was dropped by a move, not a failure: dial the next one
+    /// on the next loop, and start the failure backoff over at the minimum.
+    fn rearm_now(&mut self) {
+        self.backoff = STANDBY_BACKOFF_MIN;
+        self.next_at = None;
+        self.bound_at = None;
     }
 
     /// Wait `backoff`, then double it. A spare that was bound for 10 s
@@ -1284,7 +1298,7 @@ where
                 }
             }
             if let Some(keep) = spare.keep.as_mut() {
-                keep.observe(&s);
+                keep.observe(&mut s);
                 let now_tk = tokio::time::Instant::now();
                 let idle = !spare.connecting
                     && s.redundant_carrier().is_none()

@@ -28,15 +28,13 @@ fn params() -> OpenParams {
 }
 
 fn client(now: Instant) -> ClientSession {
-    ClientSession::with_ids(
-        Config::default(),
-        &Pool::new(1 << 20),
-        params(),
-        SID,
-        SECRET,
-        now,
-    )
-    .unwrap()
+    client_class(now, 1)
+}
+
+fn client_class(now: Instant, exit_class: u8) -> ClientSession {
+    let mut p = params();
+    p.exit_class = exit_class;
+    ClientSession::with_ids(Config::default(), &Pool::new(1 << 20), p, SID, SECRET, now).unwrap()
 }
 
 fn opened(gen: u32) -> Frame {
@@ -90,7 +88,11 @@ fn bind_spare(c: &mut ClientSession, now: Instant) {
 fn stall_then_resume_counts_the_stall_the_resume_and_the_replay() {
     let t0 = Instant::now();
     let mut c = with_unacked(t0);
-    let stalled = t0 + Duration::from_secs(1);
+    // AI, no spare: the 1 s timer must not abandon the only carrier.
+    c.handle_timeout(t0 + Duration::from_secs(1));
+    assert_eq!(c.move_stats().stall, 0);
+    assert_eq!(c.carrier(), Some(1));
+    let stalled = t0 + Duration::from_secs(5);
     c.handle_timeout(stalled);
     let mid = c.move_stats();
     assert_eq!(mid.stall, 1);
@@ -264,13 +266,21 @@ fn a_relay_stall_hint_counts_even_when_it_promotes() {
     bare.on_stall(bare.gen().wrapping_add(1), t0);
     assert_eq!(bare.move_stats().relay_stall, 0, "wrong generation");
     bare.on_stall(bare.gen(), t0);
+    assert_eq!(
+        bare.move_stats().relay_stall,
+        0,
+        "no spare: wait t_stall_solo"
+    );
+    assert_eq!(bare.carrier(), Some(1));
+    let due = t0 + Duration::from_secs(5);
+    bare.handle_timeout(due);
     assert_eq!(bare.move_stats().relay_stall, 1);
     assert_eq!(
         bare.move_stats().resumes,
         0,
         "resume waits for the next attach"
     );
-    assert!(bare.wants_attach(t0 + segue_session::client::RECONNECT_BACKOFF));
+    assert!(bare.wants_attach(due + segue_session::client::RECONNECT_BACKOFF));
 
     let mut spared = with_unacked(t0);
     bind_spare(&mut spared, t0);
@@ -323,4 +333,160 @@ fn relay_counts_t_live_and_the_stall_hint_it_queues() {
     assert_eq!(s.stall_hints, 1);
     assert!(matches!(r.poll_transmit(9, t0), Some(Frame::Stall(_))));
     assert_eq!(s.stall, 0, "client counters stay zero on the relay");
+}
+
+#[test]
+fn a_non_ai_session_still_stalls_at_one_second() {
+    let t0 = Instant::now();
+    let mut c = client_class(t0, 0);
+    c.attach(1, t0);
+    while c.poll_transmit(1, t0).is_some() {}
+    c.on_frame(1, opened(c.gen()), t0).unwrap();
+    assert_eq!(c.write(b"abcdefghijklmnopqrstuvwxyz0123456789"), 36);
+    while c.poll_transmit(1, t0).is_some() {}
+    c.handle_timeout(t0 + Duration::from_secs(1));
+    assert_eq!(c.move_stats().stall, 1);
+    assert!(c.carrier().is_none());
+}
+
+#[test]
+fn a_received_byte_cancels_a_deferred_stall_hint() {
+    let t0 = Instant::now();
+    let mut c = active(t0);
+    c.on_stall(c.gen(), t0);
+    c.on_frame(
+        1,
+        Frame::Ack {
+            recv_offset: 0,
+            max_offset: 1 << 20,
+        },
+        t0 + Duration::from_secs(1),
+    )
+    .unwrap();
+    c.handle_timeout(t0 + Duration::from_secs(5));
+    assert_eq!(c.move_stats().relay_stall, 0);
+    assert_eq!(c.carrier(), Some(1));
+}
+
+#[test]
+fn a_move_marks_a_live_spare_dropped_for_the_move_and_a_failure_does_not() {
+    let t0 = Instant::now();
+    let mut c = active(t0);
+    bind_spare(&mut c, t0);
+    c.reattach(t0);
+    assert!(c.take_spare_dropped_for_move());
+    assert!(!c.take_spare_dropped_for_move());
+
+    let mut c = active(t0);
+    bind_spare(&mut c, t0);
+    c.on_carrier_closed(2, t0);
+    assert!(
+        !c.take_spare_dropped_for_move(),
+        "a spare that died is not a move"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resume_redials_the_spare_without_waiting_out_the_backoff() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use segue_session::driver::{
+        run_client_standby, run_relay, BoxCarrier, ClientCtl, Connector, StandbyCtl, StandbyEvent,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{mpsc, watch};
+
+    let cfg = Config::default();
+    let pool = Pool::new(8 << 20);
+    let table = RelayTable::new(cfg.clone(), pool.clone(), Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(8);
+    let site: segue_session::driver::SiteConnector = Arc::new(|_target, _kind| {
+        Box::pin(async {
+            let (site_end, relay_end) = tokio::io::duplex(64 << 10);
+            tokio::spawn(async move {
+                let mut site_end = site_end;
+                let mut buf = [0u8; 1024];
+                loop {
+                    match site_end.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+            Ok(Box::new(relay_end) as BoxCarrier)
+        })
+    });
+    tokio::spawn(run_relay(table, accept_rx, site, None));
+
+    let standby_dials = Arc::new(AtomicU64::new(0));
+    let connect_session: Connector = {
+        let accept_tx = accept_tx.clone();
+        Arc::new(move || {
+            let accept_tx = accept_tx.clone();
+            Box::pin(async move {
+                let (client_end, relay_end) = tokio::io::duplex(64 << 10);
+                accept_tx
+                    .send(Box::new(relay_end))
+                    .await
+                    .map_err(|_| std::io::Error::other("relay gone"))?;
+                Ok(Box::new(client_end) as BoxCarrier)
+            })
+        })
+    };
+    let connect_standby: Connector = {
+        let accept_tx = accept_tx.clone();
+        let dials = Arc::clone(&standby_dials);
+        Arc::new(move || {
+            let accept_tx = accept_tx.clone();
+            let dials = Arc::clone(&dials);
+            Box::pin(async move {
+                dials.fetch_add(1, Ordering::Relaxed);
+                let (client_end, relay_end) = tokio::io::duplex(64 << 10);
+                accept_tx
+                    .send(Box::new(relay_end))
+                    .await
+                    .map_err(|_| std::io::Error::other("relay gone"))?;
+                Ok(Box::new(client_end) as BoxCarrier)
+            })
+        })
+    };
+    let (bound_tx, mut bound_rx) = mpsc::unbounded_channel();
+    let bound_tx = Arc::new(Mutex::new(Some(bound_tx)));
+    let (epoch_tx, epoch_rx) = watch::channel(0u64);
+    let session = ClientSession::new(cfg, &pool, params(), Instant::now()).unwrap();
+    let (mut app, far) = tokio::io::duplex(64 << 10);
+    let ctl = ClientCtl {
+        reattach: Some(epoch_rx),
+        standby: Some(StandbyCtl {
+            connect: connect_standby,
+            allowed: Arc::new(|| true),
+            on_event: Arc::new(move |ev| {
+                if ev == StandbyEvent::Bound {
+                    if let Some(tx) = bound_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }),
+            swaps: None,
+        }),
+        ..ClientCtl::default()
+    };
+    tokio::spawn(run_client_standby(session, far, connect_session, ctl));
+    app.write_all(b"hello").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), bound_rx.recv())
+        .await
+        .expect("standby never bound")
+        .expect("bound channel closed");
+    let dials = standby_dials.load(Ordering::Relaxed);
+    assert!(dials >= 1, "no standby dial");
+    epoch_tx.send(1).unwrap();
+    // The move itself backs off the RESUME by 200 ms. The spare used to wait
+    // another 1 s after that. 800 ms covers the RESUME and not that wait.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        standby_dials.load(Ordering::Relaxed) > dials,
+        "spare was not redialled within 800 ms of the RESUME (backoff is 1 s), dials {dials} now {}",
+        standby_dials.load(Ordering::Relaxed)
+    );
 }
