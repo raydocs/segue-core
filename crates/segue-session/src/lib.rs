@@ -195,6 +195,70 @@ pub struct Config {
     pub limits: Limits,
 }
 
+/// Why the client gave up the carrier it was using.
+///
+/// A hard loss (closed, write or decode error, `REJECT`) is not a stall.
+/// Counters live on [`MoveStats`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveReason {
+    /// Confirmed, with unacked bytes, and nothing received for `t_stall`.
+    Stall,
+    /// A frame on the carrier stopped moving (transport hold).
+    Hold,
+    /// A `STALL` hint from the relay.
+    RelayStall,
+    /// The carrier closed, or read EOF.
+    Closed,
+    /// A write failed, or a frame failed to decode.
+    Io,
+    /// `REJECT` on the current carrier (not an ignored stale generation).
+    Reject,
+    /// No `OPENED` or `RESUMED` within `t_attach`.
+    Attach,
+}
+
+/// Per-session move counters.
+///
+/// The client fills every field except `t_live` and `stall_hints`. The relay
+/// fills those two and leaves the rest at zero. [`client::ClientSession::move_stats`]
+/// and [`relay::RelayTable::move_stats`] return a copy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MoveStats {
+    /// [`MoveReason::Stall`].
+    pub stall: u64,
+    /// [`MoveReason::Hold`].
+    pub hold: u64,
+    /// [`MoveReason::RelayStall`].
+    pub relay_stall: u64,
+    /// [`MoveReason::Closed`].
+    pub closed: u64,
+    /// [`MoveReason::Io`].
+    pub io: u64,
+    /// [`MoveReason::Reject`].
+    pub reject: u64,
+    /// [`MoveReason::Attach`].
+    pub attach: u64,
+    /// Stall-type promotions that left the old carrier bound.
+    pub swaps: u64,
+    /// A bound spare became the current carrier. Includes `swaps`.
+    pub promotions: u64,
+    /// `RESUME` sent on a new carrier (the generation moved).
+    pub resumes: u64,
+    /// Bytes sent again after a promotion or a `RESUME`.
+    pub bytes_replayed: u64,
+    /// Sum of the waits from a loss until the next byte of progress, in
+    /// microseconds. A loss the session never recovered from is not included.
+    pub recovery_us_sum: u64,
+    /// Longest of those waits, microseconds.
+    pub recovery_us_max: u64,
+    /// How many waits `recovery_us_sum` includes.
+    pub recoveries: u64,
+    /// Relay: `t_live` fired, whether or not a spare was promoted.
+    pub t_live: u64,
+    /// Relay: `STALL` entries actually queued on a control stream.
+    pub stall_hints: u64,
+}
+
 /// Constant-time comparison for `resume_secret` (§3).
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {

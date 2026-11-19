@@ -24,7 +24,7 @@ use crate::flow::{RecvHalf, SendHalf};
 use crate::park::{ParkDecision, ParkTracker};
 use crate::pool::Pool;
 use crate::quality::QualityEvent;
-use crate::{Config, ProtoError};
+use crate::{Config, MoveReason, MoveStats, ProtoError};
 
 pub type CarrierId = u64;
 
@@ -262,6 +262,11 @@ pub struct ClientSession {
     send: SendHalf,
     recv: RecvHalf,
     park: ParkTracker,
+    /// Why carriers were given up, and what a move cost.
+    moves: MoveStats,
+    /// When the current loss started, until the next byte of progress.
+    /// The first loss wins if another happens before progress.
+    loss_at: Option<Instant>,
 }
 
 // Manual so the resume secret and ticket never reach a log.
@@ -345,6 +350,8 @@ impl ClientSession {
             send,
             recv,
             park: ParkTracker::default(),
+            moves: MoveStats::default(),
+            loss_at: None,
         })
     }
 
@@ -500,8 +507,10 @@ impl ClientSession {
         // charged: a live spare means the path did not fail.
         self.progressed = false;
         let acked = self.send.acked();
+        let replayed = self.send.sent_hw().saturating_sub(acked);
         let max = self.send.peer_max();
         let _ = self.send.rewind(acked, max);
+        self.note_promotion(demote_old, replayed);
         true
     }
     pub fn is_closed(&self) -> bool {
@@ -593,6 +602,8 @@ impl ClientSession {
             let sent_hw = self.send.sent_hw();
             let sent = sent_hw.saturating_sub(self.quality_sent);
             let replayed = sent_hw.saturating_sub(self.send.acked());
+            self.moves.resumes = self.moves.resumes.saturating_add(1);
+            self.moves.bytes_replayed = self.moves.bytes_replayed.saturating_add(replayed);
             if sent > 0 || replayed > 0 {
                 self.quality = Some(QualityEvent::Replay { sent, replayed });
                 self.quality_sent = sent_hw;
@@ -699,6 +710,7 @@ impl ClientSession {
             }
             self.promoted_in_gen = false;
         }
+        self.note_move(MoveReason::RelayStall, now);
         if self.promote_redundant(now, true) {
             return;
         }
@@ -756,6 +768,57 @@ impl ClientSession {
     /// moved (see [`MAX_FRUITLESS`]).
     pub fn fruitless_carriers(&self) -> u32 {
         self.fruitless
+    }
+
+    /// Why this session has given carriers up, and what the moves cost.
+    /// A copy; nothing is cleared.
+    pub fn move_stats(&self) -> MoveStats {
+        self.moves
+    }
+
+    fn bump(&mut self, reason: MoveReason) {
+        let slot = match reason {
+            MoveReason::Stall => &mut self.moves.stall,
+            MoveReason::Hold => &mut self.moves.hold,
+            MoveReason::RelayStall => &mut self.moves.relay_stall,
+            MoveReason::Closed => &mut self.moves.closed,
+            MoveReason::Io => &mut self.moves.io,
+            MoveReason::Reject => &mut self.moves.reject,
+            MoveReason::Attach => &mut self.moves.attach,
+        };
+        *slot = slot.saturating_add(1);
+    }
+
+    /// Count `reason` and start the recovery clock if one is not already
+    /// running. A session that has already ended counts nothing.
+    fn note_move(&mut self, reason: MoveReason, now: Instant) {
+        if self.is_closed() {
+            return;
+        }
+        self.bump(reason);
+        if self.loss_at.is_none() {
+            self.loss_at = Some(now);
+        }
+    }
+
+    fn note_promotion(&mut self, swapped: bool, replayed: u64) {
+        self.moves.promotions = self.moves.promotions.saturating_add(1);
+        if swapped {
+            self.moves.swaps = self.moves.swaps.saturating_add(1);
+        }
+        self.moves.bytes_replayed = self.moves.bytes_replayed.saturating_add(replayed);
+    }
+
+    fn note_recovery(&mut self, now: Instant) {
+        let Some(at) = self.loss_at.take() else {
+            return;
+        };
+        let us = u64::try_from(now.saturating_duration_since(at).as_micros()).unwrap_or(u64::MAX);
+        self.moves.recovery_us_sum = self.moves.recovery_us_sum.saturating_add(us);
+        if us > self.moves.recovery_us_max {
+            self.moves.recovery_us_max = us;
+        }
+        self.moves.recoveries = self.moves.recoveries.saturating_add(1);
     }
 
     /// The latest [`Health`] report since the last call.
@@ -833,17 +896,24 @@ impl ClientSession {
     }
 
     pub fn on_carrier_closed(&mut self, cid: CarrierId, now: Instant) {
-        self.carrier_gone(cid, now, false);
+        self.carrier_gone(cid, now, MoveReason::Closed);
     }
 
     /// The driver gave carrier `cid` up because a frame on it stopped
     /// moving for the transport hold, or outlived the hold cap (either
     /// direction): it owed us bytes, whatever else is outstanding (r9 F2).
     pub fn on_carrier_stuck(&mut self, cid: CarrierId, now: Instant) {
-        self.carrier_gone(cid, now, true);
+        self.carrier_gone(cid, now, MoveReason::Hold);
     }
 
-    fn carrier_gone(&mut self, cid: CarrierId, now: Instant, stuck: bool) {
+    /// A write on carrier `cid` failed. A hard loss, the same as a close,
+    /// counted apart from EOF so a stall can be told from a broken write.
+    pub fn on_carrier_io(&mut self, cid: CarrierId, now: Instant) {
+        self.carrier_gone(cid, now, MoveReason::Io);
+    }
+
+    fn carrier_gone(&mut self, cid: CarrierId, now: Instant, reason: MoveReason) {
+        let stuck = reason == MoveReason::Hold;
         // The spare dying (closed, stuck) drops only that carrier: no
         // re-attach, no [`MAX_FRUITLESS`] count, no health or quality event.
         // A stall demotion leaves the old carrier here; a transport hold that
@@ -880,7 +950,9 @@ impl ClientSession {
         }
         // A bound spare becomes the current carrier. A stall demotes the
         // one that stuck; a hard close drops it. An unbound spare is
-        // dropped; the session re-attaches the ordinary way.
+        // dropped; the session re-attaches the ordinary way. A session that
+        // has already ended (a decode error closed it) is not a new move.
+        self.note_move(reason, now);
         if self.promote_redundant(now, stuck) {
             return;
         }
@@ -978,6 +1050,7 @@ impl ClientSession {
             return;
         }
         if self.carrier == Some(cid) && !self.is_closed() {
+            self.bump(MoveReason::Io);
             let _ = self.fatal(e);
         }
     }
@@ -1089,6 +1162,7 @@ impl ClientSession {
                 match rj.code {
                     code::STALE_GEN => {}
                     code::ANCHOR_UNREACHABLE => {
+                        self.note_move(MoveReason::Reject, now);
                         // B2: retry with backoff until T_detached.
                         if let Some(old) = self.carrier.take() {
                             self.abandoned.push(old);
@@ -1100,6 +1174,7 @@ impl ClientSession {
                         self.detached_since.get_or_insert(now);
                     }
                     _ => {
+                        self.note_move(MoveReason::Reject, now);
                         let reason = CloseReason::from_reject(
                             &rj,
                             self.send.fin_offset(),
@@ -1134,6 +1209,7 @@ impl ClientSession {
 
     /// New data moved end to end on the current carrier.
     fn made_progress(&mut self, now: Instant) {
+        self.note_recovery(now);
         if !self.progressed {
             self.progressed = true;
             self.fruitless = 0;
@@ -1430,6 +1506,7 @@ impl ClientSession {
         {
             // T_attach: abandon this attempt, retry on a new carrier (an
             // attempt that got no answer counts against the bound).
+            self.note_move(MoveReason::Attach, now);
             self.carrier_lost(now, true);
             if self.is_closed() {
                 return;
@@ -1459,6 +1536,7 @@ impl ClientSession {
             // as the spare. No RESUME, no failure report. A spare that was
             // demoted and has been silent is not promoted: neither side
             // moved, so this re-attaches.
+            self.note_move(MoveReason::Stall, now);
             if !self.promote_redundant(now, true) {
                 self.carrier_lost(now, true);
                 self.move_carrier(now);
