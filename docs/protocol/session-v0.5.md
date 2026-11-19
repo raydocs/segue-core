@@ -323,6 +323,17 @@ Rules:
   current carrier has been silent for a stall. A later swap-back is the
   relay's `t_live`, which demotes rather than closes. A RESUME onto a third
   carrier still drops the spare.
+- **Solo stall (AI).** An AI session (`exit_class == 1`) with no spare
+  bound does not abandon its only carrier at `t_stall`. Unacked silence,
+  and a `STALL` hint, wait `t_stall_solo` (default 5 s) first. A byte
+  received clears a deferred hint. A bound spare still swaps at `t_stall`
+  (1 s). A hard loss (closed, decode error, write error, `REJECT`) acts at
+  once, with or without a spare. A non-AI session is unchanged. The
+  transport hold stays 2 s: measured moves were `t_stall`, not holds.
+- A spare dropped because the session moved (RESUME, including `reattach`)
+  is requested again at once, with the failure backoff reset to 1 s. A
+  spare that failed to dial or bind, or that died, still waits from 1 s,
+  doubling up to 30 s.
 - What crosses the wire is only what already did. `REDUNDANT_OK`'s
   `recv_offset` / `max_offset` is the relay's snapshot at bind time; later
   ACKs (mirrored onto the spare) move each side's acknowledged offset. On
@@ -539,7 +550,8 @@ defaults (`crates/segue-session/src/lib.rs:45-135`):
 | timer | default | meaning (citing line) |
 |-------|---------|------------------------|
 | `t_attach` | 2 s | client: give up one attach attempt, retry on a new carrier (`lib.rs:48-49`) |
-| `t_stall` | 1 s | client: unacked data and nothing received → re-attach (KERNEL_SPEC §7.2 数据停滞, `max(1 s, 4×SRTT)`; SRTT not modelled, `lib.rs:50-52`) |
+| `t_stall` | 1 s | client: unacked data and nothing received → re-attach (KERNEL_SPEC §7.2 数据停滞, `max(1 s, 4×SRTT)`; SRTT not modelled). An AI session with a spare bound still swaps at this. An AI session with no spare waits `t_stall_solo` |
+| `t_stall_solo` | 5 s | client, AI only, no spare bound: unacked silence and a `STALL` hint wait this long before the only carrier is abandoned. Other sessions ignore it |
 | `t_live` | 3 s | relay: unacked downlink, no ACK progress → DETACHED (`lib.rs:53-54`) |
 | `t_detached` | 30 s | both: how long a non-AI session may live without a working carrier (`lib.rs`, `Timing::t_detached`) |
 | `t_detached_ai` | 150 s | both: the same bound for a session whose OPEN carried `exit_class == 1` (AI). Under the 180 s after which an AI client aborts a stream it cannot resume |
