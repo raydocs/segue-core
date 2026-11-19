@@ -185,6 +185,11 @@ struct RedundantCarrier {
     /// [`Frame`] here would keep every idle session above the fixed
     /// per-session heap budget.
     hello: bool,
+    /// Set when this carrier was the current one and a stall demoted it.
+    /// `None` for a spare opened with `REDUNDANT_ATTACH`.
+    demoted_at: Option<Instant>,
+    /// A frame arrived after [`Self::demoted_at`].
+    rx_since_demote: bool,
 }
 
 pub struct ClientSession {
@@ -412,6 +417,8 @@ impl ClientSession {
             bound: false,
             started: now,
             hello: true,
+            demoted_at: None,
+            rx_since_demote: false,
         }));
     }
 
@@ -437,10 +444,24 @@ impl ClientSession {
     /// session, make the spare current at the same generation, and replay
     /// unacked uplink from the last acknowledged offset. Not a RESUME, so
     /// it does not count against [`MAX_FRUITLESS`] and reports no failure.
-    /// The carrier left is abandoned so the relay sees it close and promotes
-    /// on its side (no frame is sent to announce the promotion).
-    fn promote_redundant(&mut self, now: Instant) -> bool {
+    ///
+    /// `demote_old` is a stall (client `t_stall`, a `STALL` hint, a transport
+    /// hold). The carrier left stays open and becomes the spare: if it
+    /// receives a frame it can be swapped back, with no dial. A hard loss
+    /// passes `false` and the carrier left is closed. Returns false when no
+    /// spare is bound, or when `demote_old` and that spare was itself demoted
+    /// and has received nothing since: neither carrier moved, and the caller
+    /// re-attaches with RESUME. No frame is sent to announce the promotion.
+    fn promote_redundant(&mut self, now: Instant, demote_old: bool) -> bool {
         if !self.redundant_bound() {
+            return false;
+        }
+        if demote_old
+            && self
+                .redundant
+                .as_ref()
+                .is_some_and(|r| r.demoted_at.is_some() && !r.rx_since_demote)
+        {
             return false;
         }
         let Some(r) = self.redundant.take() else {
@@ -448,7 +469,19 @@ impl ClientSession {
         };
         if let Some(old) = self.carrier {
             if old != r.cid {
-                self.abandoned.push(old);
+                if demote_old {
+                    self.redundant = Some(Box::new(RedundantCarrier {
+                        cid: old,
+                        gen: self.gen,
+                        bound: true,
+                        started: now,
+                        hello: false,
+                        demoted_at: Some(now),
+                        rx_since_demote: false,
+                    }));
+                } else {
+                    self.abandoned.push(old);
+                }
             }
         }
         self.carrier = Some(r.cid);
@@ -666,7 +699,7 @@ impl ClientSession {
             }
             self.promoted_in_gen = false;
         }
-        if self.promote_redundant(now) {
+        if self.promote_redundant(now, true) {
             return;
         }
         // The relay holds unacknowledged data for us: something was
@@ -813,7 +846,18 @@ impl ClientSession {
     fn carrier_gone(&mut self, cid: CarrierId, now: Instant, stuck: bool) {
         // The spare dying (closed, stuck) drops only that carrier: no
         // re-attach, no [`MAX_FRUITLESS`] count, no health or quality event.
+        // A stall demotion leaves the old carrier here; a transport hold that
+        // is still reporting it is not a new failure. It stays until
+        // `t_detached_standby` with no frame. A hard close still drops it.
         if self.redundant.as_ref().is_some_and(|r| r.cid == cid) {
+            if stuck
+                && self
+                    .redundant
+                    .as_ref()
+                    .is_some_and(|r| r.demoted_at.is_some())
+            {
+                return;
+            }
             self.drop_redundant();
             return;
         }
@@ -834,9 +878,10 @@ impl ClientSession {
             self.drop_redundant();
             return;
         }
-        // A bound spare becomes the current carrier. An unbound one is
+        // A bound spare becomes the current carrier. A stall demotes the
+        // one that stuck; a hard close drops it. An unbound spare is
         // dropped; the session re-attaches the ordinary way.
-        if self.promote_redundant(now) {
+        if self.promote_redundant(now, stuck) {
             return;
         }
         self.drop_redundant();
@@ -942,6 +987,11 @@ impl ClientSession {
     /// are free). Anything that fails parsing of the stream, a REJECT, or
     /// a generation mismatch drops only this carrier.
     fn on_redundant(&mut self, frame: Frame, now: Instant) -> Result<(), ProtoError> {
+        if let Some(r) = self.redundant.as_mut() {
+            if r.demoted_at.is_some() {
+                r.rx_since_demote = true;
+            }
+        }
         let bound = self.redundant_bound();
         let gen = self.redundant.as_ref().map(|r| r.gen);
         match frame {
@@ -1340,6 +1390,8 @@ impl ClientSession {
         if let Some(r) = &self.redundant {
             if !r.bound {
                 put(Some(r.started + t.t_attach));
+            } else if let Some(at) = r.demoted_at.filter(|_| !r.rx_since_demote) {
+                put(Some(at + t.t_detached_standby));
             }
         }
         if self.need_attach {
@@ -1396,9 +1448,18 @@ impl ClientSession {
         {
             self.drop_redundant();
         }
+        if self.redundant.as_ref().is_some_and(|r| {
+            r.demoted_at
+                .is_some_and(|at| !r.rx_since_demote && now >= at + t.t_detached_standby)
+        }) {
+            self.drop_redundant();
+        }
         if self.confirmed && self.send.unacked() && now >= self.last_rx + t.t_stall {
-            // A bound spare becomes current. No RESUME, no failure report.
-            if !self.promote_redundant(now) {
+            // A bound spare becomes current. A stall keeps the old carrier
+            // as the spare. No RESUME, no failure report. A spare that was
+            // demoted and has been silent is not promoted: neither side
+            // moved, so this re-attaches.
+            if !self.promote_redundant(now, true) {
                 self.carrier_lost(now, true);
                 self.move_carrier(now);
             }

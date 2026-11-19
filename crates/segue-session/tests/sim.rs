@@ -849,6 +849,9 @@ fn randomized_faults_with_redundant_never_lose_or_duplicate() {
         s.silent_abandon = r.gen_bool(0.3);
         // Cut the spare as often as the current carrier.
         let cut_spare = r.gen_bool(0.5);
+        // Stall the current carrier often enough that a bound spare is
+        // swapped in and, once the stalled one delivers again, swapped back.
+        let swap_faults = r.gen_bool(0.5);
         let mut steps = 0;
         while !s.finished() {
             if s.keep_redundant && cut_spare && s.p_cut > 0.0 && s.rng.gen_bool(s.p_cut) {
@@ -856,10 +859,17 @@ fn randomized_faults_with_redundant_never_lose_or_duplicate() {
                     s.cut(cid);
                 }
             }
+            if swap_faults && s.hold_carrier.is_none() && s.rng.gen_bool(0.002) {
+                s.hold_carrier = s.client.carrier();
+            }
+            if s.hold_carrier.is_some() && s.rng.gen_bool(0.02) {
+                s.hold_carrier = None;
+            }
             s.step();
             steps += 1;
             if steps == 150_000 {
                 s.p_cut = 0.0;
+                s.hold_carrier = None;
             }
             assert!(
                 steps < 400_000,
@@ -1054,7 +1064,9 @@ fn stall_hint_promotes_the_spare_without_a_new_dial() {
     assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
     let sid = s.client.session_id();
     assert_eq!(s.relay.current_carrier(&sid), Some(spare));
-    assert!(s.relay.redundant_carrier(&sid).is_none());
+    // A stall demotes the old carrier. It stays bound as the spare.
+    assert_eq!(s.relay.redundant_carrier(&sid), Some(current));
+    assert_eq!(s.client.redundant_carrier(), Some(current));
     s.mute_rx = None;
     s.run(200_000);
     s.assert_exact();
@@ -1076,19 +1088,116 @@ fn transport_hold_promotes_the_spare_without_a_new_dial() {
     s.client.on_carrier_stuck(current, s.now);
     assert_eq!(s.client.carrier(), Some(spare));
     assert_eq!(s.client.gen(), gen);
-    assert!(s.client.redundant_carrier().is_none());
+    // A transport hold demotes the old carrier instead of closing it.
+    assert_eq!(s.client.redundant_carrier(), Some(current));
     assert_eq!(s.client.fruitless_carriers(), fruitless);
     assert!(!s.client.wants_attach(s.now));
     assert_ne!(s.client.take_health(), Some(Health::Failed));
     assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
-    // The abandon closes the old carrier; the relay promotes on that close.
-    s.step();
+    // In-flight frames on the old carrier keep it from looking silent, so
+    // the relay follows on `t_live` (3s): unacked downlink and no ACK on
+    // that carrier. The old carrier stays open as the spare.
     let sid = s.client.session_id();
-    assert_eq!(s.relay.current_carrier(&sid), Some(spare));
+    let mut followed = false;
+    for _ in 0..5_000 {
+        s.step();
+        if s.relay.current_carrier(&sid) == Some(spare) {
+            followed = true;
+            break;
+        }
+    }
+    assert!(followed, "relay did not follow the transport-hold swap");
+    assert_eq!(s.relay.redundant_carrier(&sid), Some(current));
+    assert!(s.pipes.contains_key(&current));
     assert_eq!(s.carriers_opened, opened);
     s.run(200_000);
     s.assert_exact();
     assert_eq!(s.client.gen(), gen, "promotion is not a RESUME");
+}
+
+/// A stall swaps the current carrier with the bound spare. The old carrier
+/// stays open. When the new one stalls and the old one has been heard from,
+/// they swap back, still with no dial. When both are dead the session
+/// re-attaches the ordinary way.
+#[test]
+fn stall_swaps_with_the_standby_and_swaps_back() {
+    let mut s = Sim::new(41, 400_000, 400_000);
+    s.keep_redundant = true;
+    let spare = wait_until_redundant(&mut s);
+    let current = s.client.carrier().unwrap();
+    let opened = s.carriers_opened;
+    let gen = s.client.gen();
+    s.keep_redundant = false;
+    let sid = s.client.session_id();
+
+    s.hold_carrier = Some(current);
+    let mut swapped = false;
+    for _ in 0..3_000 {
+        s.step();
+        if s.client.carrier() == Some(spare)
+            && s.client.redundant_carrier() == Some(current)
+            && s.relay.current_carrier(&sid) == Some(spare)
+            && s.relay.redundant_carrier(&sid) == Some(current)
+        {
+            swapped = true;
+            break;
+        }
+    }
+    assert!(swapped, "t_stall did not swap both sides");
+    assert_eq!(s.carriers_opened, opened, "a swap dialed");
+    assert_eq!(s.client.gen(), gen);
+    assert!(!s.client.wants_attach(s.now));
+    assert_ne!(s.client.take_health(), Some(Health::Failed));
+    assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
+    assert!(s.pipes.contains_key(&current), "demoted carrier was closed");
+
+    // The demoted carrier delivers again, so it is a live standby.
+    s.hold_carrier = None;
+    for _ in 0..30 {
+        s.step();
+    }
+    s.hold_carrier = Some(spare);
+    let mut back = false;
+    for _ in 0..5_000 {
+        s.step();
+        if s.client.carrier() == Some(current) {
+            back = true;
+            break;
+        }
+        assert_eq!(s.carriers_opened, opened, "swap back dialed");
+        assert_eq!(s.client.gen(), gen);
+    }
+    assert!(back, "recovered carrier was not swapped back");
+    assert_eq!(s.client.redundant_carrier(), Some(spare));
+    let mut relay_back = false;
+    for _ in 0..4_000 {
+        s.step();
+        if s.relay.current_carrier(&sid) == Some(current)
+            && s.relay.redundant_carrier(&sid) == Some(spare)
+        {
+            relay_back = true;
+            break;
+        }
+        assert_eq!(s.carriers_opened, opened, "relay swap back dialed");
+    }
+    assert!(relay_back, "relay did not swap back");
+
+    // Both carriers dead: drop them and re-attach with a new dial.
+    s.hold_carrier = None;
+    s.cut(spare);
+    s.cut(current);
+    let mut reattached = false;
+    for _ in 0..5_000 {
+        s.step();
+        if s.carriers_opened > opened {
+            reattached = true;
+            break;
+        }
+    }
+    assert!(reattached, "both dead did not re-attach");
+    s.run(200_000);
+    s.assert_exact();
+    assert!(s.client.gen() > gen, "re-attach was not a RESUME");
 }
 
 #[test]

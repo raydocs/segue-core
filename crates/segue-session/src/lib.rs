@@ -61,6 +61,10 @@ pub struct Timing {
     /// 180 s after which an AI client aborts a stream it cannot resume.
     /// Other sessions keep [`Self::t_detached`].
     pub t_detached_ai: Duration,
+    /// Both: a carrier demoted by a stall stays the spare this long with no
+    /// frame received, then it is dropped. A frame resets the wait: the
+    /// carrier is a live standby again.
+    pub t_detached_standby: Duration,
     /// Client: how long OPEN may be retried before the local connection is reset.
     pub t_open_retry: Duration,
     /// Relay: tombstone lifetime.
@@ -144,6 +148,7 @@ impl Default for Timing {
             t_live: Duration::from_secs(3),
             t_detached: Duration::from_secs(30),
             t_detached_ai: Duration::from_secs(150),
+            t_detached_standby: Duration::from_secs(10),
             t_open_retry: Duration::from_secs(15),
             t_tomb: Duration::from_secs(60),
             ack_delay: Duration::from_millis(20),
