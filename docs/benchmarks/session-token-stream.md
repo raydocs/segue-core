@@ -537,3 +537,25 @@ The 40 s and 120 s token blackouts survive on the same app connection. They do i
 | ai, standby on | survives, 13 carriers | survives, 33 carriers | 1 carrier + 1 standby, no stall > 300 ms | 63 | 4753324 |
 
 Patience is what keeps the app connection through a 40 s or 120 s token blackout. The standby does not, on this harness: the impair sits on every carrier, so a spare cannot skip a blackout, and on a lossy profile it swaps a handful of times and then the session re-attaches as before.
+
+## Move reasons
+
+`SEGUE_CONVO_FAULTS=none SEGUE_SCENARIO=convo SEGUE_EXIT_CLASS=ai SEGUE_STANDBY=1`, same 3×1 MiB / 5 s / 500 conversation. No behaviour change yet: the client still gives a carrier up at `t_stall` (1 s) with or without a spare. `stall` is the client's own timer, `relay_stall` is a `STALL` hint (the relay's `t_live`), `resumes` is a RESUME onto a new carrier, `replay_bytes` is uplink sent again after a promotion or a RESUME, `recover_max_ms` is the longest wait from that loss until the next byte of progress. `hold`, `closed`, `io`, `reject` and `attach` were 0 on every row and are omitted.
+
+### Before
+
+| profile | seed | carriers | standby_dials | promotions | stall | relay_stall | resumes | replay_bytes | recover_max_ms | up_bytes | up/payload |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| rtt170 | 1 | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3159177 | 1.00 |
+| rtt170 | 2 | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3159178 | 1.00 |
+| rtt170 | 3 | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 3158986 | 1.00 |
+| cn163-offpeak | 1 | 11 | 3 | 5 | 9 | 3 | 7 | 1822852 | 1598 | 3495323 | 1.11 |
+| cn163-offpeak | 2 | 16 | 3 | 5 | 12 | 5 | 12 | 2141802 | 1565 | 3346096 | 1.06 |
+| cn163-offpeak | 3 | 6 | 1 | 6 | 10 | 0 | 4 | 3358968 | 1589 | 4143161 | 1.32 |
+| cn163-peak | 1 | 27 | 4 | 8 | 27 | 3 | 22 | 3166208 | 1592 | 4050142 | 1.29 |
+| cn163-peak | 2 | 16 | 3 | 5 | 12 | 5 | 12 | 1499166 | 1382 | 3453382 | 1.10 |
+| cn163-peak | 3 | 63 | 6 | 6 | 57 | 5 | 56 | 2408562 | 1565 | 4379437 | 1.39 |
+
+Payload up is 3145794. Every row survived. `rtt170` does not move.
+
+On both `cn163-offpeak` and `cn163-peak` the client's `t_stall` is the move. A relay `STALL` is a few of them (0–5 against 9–57). The 2 s transport hold, a close, a write or decode error, `REJECT` and `t_attach` did not fire. Recovery tops out around 1.6 s, which is the 1 s timer plus a dial. Offpeak seed 1 has no token gap over 300 ms while `stall` is 9 and the three uploads take 7.6 s, 7.7 s and 4.9 s, so those moves are in the upload. Peak, and offpeak seed 2, also have multi-second token gaps, so the same timer fires while tokens are in flight. A RESUME then drops the spare; most moves have no spare bound (`resumes` is almost `stall + relay_stall − promotions`).
