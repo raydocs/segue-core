@@ -6,9 +6,12 @@
 # impair faults during turn 2. Both are ignored cargo tests. Loopback only.
 #
 #   SEGUE_SCENARIO        token, convo, or both (default both)
+#   SEGUE_EXIT_CLASS      ai or overseas (default ai). ai pins the exit and
+#                         dials through a loopback home line. overseas is the
+#                         old one-carrier, 30 s give-up path.
 #   SEGUE_TOKEN_SECONDS   token-stream length in seconds (default 30)
 #   SEGUE_STANDBY         0 or 1 (default 1, the product default). Printed as
-#                         the standby column.
+#                         the standby column. Ignored for an overseas route.
 #   SEGUE_CONVO_TURNS     conversation turns (default 3)
 #   SEGUE_CONVO_UPLOAD    upload bytes per turn (default 1 MiB)
 #   SEGUE_CONVO_SILENCE_MS

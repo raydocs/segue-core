@@ -969,6 +969,11 @@ pub struct StandbyCtl {
     pub allowed: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Called on the driver task for each [`StandbyEvent`].
     pub on_event: Arc<dyn Fn(StandbyEvent) + Send + Sync>,
+    /// Incremented once per stall swap (the spare becomes current and the
+    /// old carrier stays bound). A hard-loss promotion is
+    /// [`StandbyEvent::Promoted`] and is not counted here. `None` leaves
+    /// swaps uncounted.
+    pub swaps: Option<Arc<AtomicU64>>,
 }
 
 /// First wait after a standby is lost. Doubles up to [`STANDBY_BACKOFF_MAX`].
@@ -983,6 +988,7 @@ struct StandbyKeep {
     connect: Connector,
     allowed: Arc<dyn Fn() -> bool + Send + Sync>,
     on_event: Arc<dyn Fn(StandbyEvent) + Send + Sync>,
+    swaps: Option<Arc<AtomicU64>>,
     backoff: std::time::Duration,
     next_at: Option<tokio::time::Instant>,
     cid: Option<u64>,
@@ -995,6 +1001,7 @@ impl StandbyKeep {
             connect: ctl.connect,
             allowed: ctl.allowed,
             on_event: ctl.on_event,
+            swaps: ctl.swaps,
             backoff: STANDBY_BACKOFF_MIN,
             next_at: None,
             cid: None,
@@ -1019,6 +1026,13 @@ impl StandbyKeep {
             let promoted = s.carrier() == Some(prev);
             if promoted {
                 self.emit(StandbyEvent::Promoted);
+                // A swap leaves the old carrier bound as the spare. A hard
+                // loss leaves no spare.
+                if s.redundant_carrier().is_some() {
+                    if let Some(counter) = &self.swaps {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             } else {
                 self.emit(StandbyEvent::Lost);
             }

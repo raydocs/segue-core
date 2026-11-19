@@ -15,11 +15,13 @@
 //! Carrier re-attach is not a column. `SessionHealth` is not observable from
 //! this test without changing the kernel.
 //!
-//! `SEGUE_STANDBY=0|1` (default 1, the product default) is printed as the
-//! `standby` column. The route here is overseas, so the AI standby policy
-//! does not dial either way; the column records which switch the run used.
+//! `SEGUE_EXIT_CLASS=ai|overseas` (default `ai`) picks the route, the ticket
+//! class and, for `ai`, a pinned exit plus a loopback home SOCKS line.
+//! `SEGUE_STANDBY=0|1` (default 1, the product default) is the standby
+//! switch. Both are columns. An overseas route never dials a standby.
 //!
-//! Relay, ticket and SOCKS wiring matches `roaming_e2e.rs`.
+//! Relay, ticket and SOCKS wiring matches `roaming_e2e.rs`. An AI route also
+//! needs a home line: the relay sends a confirmed AI target there, not direct.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, ErrorKind};
@@ -71,6 +73,32 @@ fn standby_enabled() -> bool {
         Ok(v) if v == "1" => true,
         Ok(v) if v == "0" => false,
         Ok(v) => panic!("SEGUE_STANDBY={v} is not 0 or 1"),
+    }
+}
+
+/// `SEGUE_EXIT_CLASS=ai|overseas`. Default is `ai`.
+fn exit_is_ai() -> bool {
+    match std::env::var("SEGUE_EXIT_CLASS") {
+        Err(_) => true,
+        Ok(v) if v == "ai" => true,
+        Ok(v) if v == "overseas" => false,
+        Ok(v) => panic!("SEGUE_EXIT_CLASS={v} is not ai or overseas"),
+    }
+}
+
+fn class_name() -> &'static str {
+    if exit_is_ai() {
+        "ai"
+    } else {
+        "overseas"
+    }
+}
+
+fn route_tag() -> &'static str {
+    if exit_is_ai() {
+        "ai"
+    } else {
+        "ov"
     }
 }
 
@@ -135,25 +163,35 @@ struct RelayEnv {
     _dir: TempDir,
 }
 
-fn relay_env() -> RelayEnv {
+fn relay_env(home: Option<SocketAddr>) -> RelayEnv {
     let dir = tempdir("relay");
     let signer = Signer::from_pkcs8(3, &generate_pkcs8()).unwrap();
     let pk = base64::engine::general_purpose::STANDARD.encode(signer.public_key());
     let (policy_key, policy_pub) = segue_policy::generate_key();
+    // An AI-classified name is sent Home even when the client hint is
+    // overseas, so the overseas runs keep echo.test off the list.
+    let ai_domain = if exit_is_ai() { "echo.test" } else { "ai.test" };
     let body = json!({
         "version": 1,
         "expires_at": now_unix() + 3600,
-        "ai_domains": ["ai.test"],
+        "ai_domains": [ai_domain],
         "ai_cidrs": [],
         "default": {"type": "proxy", "outbound": "overseas"}
     });
     let bundle = segue_policy::sign(&policy_key, 1, body.to_string().as_bytes()).unwrap();
     std::fs::write(dir.0.join("policy.bundle"), bundle).unwrap();
+    let home_lines = match home {
+        Some(addr) => {
+            format!(r#""home_lines": [{{"id": "L1", "server": "{addr}", "isp": "lab"}}],"#,)
+        }
+        None => String::new(),
+    };
     let json = format!(
         r#"{{
             "listen": "127.0.0.1:1",
             "node_id": 1,
             "ticket_keys": [{{"key_id": 3, "public_key": "{pk}"}}],
+            {home_lines}
             "policy": {{
                 "public_keys": [{{"key_id": 1, "public_key": "{policy_pub}"}}],
                 "bundle": "policy.bundle"
@@ -190,7 +228,11 @@ fn ticket(env: &RelayEnv) -> Vec<u8> {
         device_id: 7,
         account_id: 1,
         plan: "pro".into(),
-        exit_classes: vec![ExitClass::Overseas],
+        exit_classes: vec![if exit_is_ai() {
+            ExitClass::Ai
+        } else {
+            ExitClass::Overseas
+        }],
         ai_anchor_node_id: 0,
         not_before: t.saturating_sub(60),
         not_after: t + 7_200,
@@ -232,29 +274,105 @@ async fn spawn_socks(dialer: Arc<dyn Dialer>, tag: &str) -> SocketAddr {
     addr
 }
 
-fn session_dialer(engine: Arc<dyn Dialer>, proxy: SocketAddr, ticket: Vec<u8>) -> Arc<dyn Dialer> {
+/// No-auth SOCKS5. The relay's home dial CONNECTs an IPv4 target through it.
+async fn spawn_home_socks() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let _ = home_socks_one(&mut sock).await;
+            });
+        }
+    });
+    addr
+}
+
+async fn home_socks_one(sock: &mut TcpStream) -> io::Result<()> {
+    let mut greet = [0u8; 2];
+    sock.read_exact(&mut greet).await?;
+    if greet[0] != 5 {
+        return Err(io::Error::other("not socks5"));
+    }
+    let mut methods = vec![0u8; greet[1] as usize];
+    sock.read_exact(&mut methods).await?;
+    if !methods.contains(&0) {
+        sock.write_all(&[5, 0xff]).await?;
+        return Err(io::Error::other("no no-auth method"));
+    }
+    sock.write_all(&[5, 0]).await?;
+    let mut req = [0u8; 4];
+    if sock.read_exact(&mut req).await.is_err() {
+        return Ok(());
+    }
+    if req[0] != 5 || req[1] != 1 || req[3] != 1 {
+        let _ = sock.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+        return Err(io::Error::other("unsupported connect"));
+    }
+    let mut raw = [0u8; 6];
+    sock.read_exact(&mut raw).await?;
+    let target = SocketAddr::from((
+        [raw[0], raw[1], raw[2], raw[3]],
+        u16::from_be_bytes([raw[4], raw[5]]),
+    ));
+    match TcpStream::connect(target).await {
+        Ok(mut upstream) => {
+            let _ = upstream.set_nodelay(true);
+            sock.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+            let _ = tokio::io::copy_bidirectional(sock, &mut upstream).await;
+            Ok(())
+        }
+        Err(_) => {
+            let _ = sock.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+            Err(io::Error::other("connect failed"))
+        }
+    }
+}
+
+fn session_dialer(
+    engine: Arc<dyn Dialer>,
+    proxy: SocketAddr,
+    ticket: Vec<u8>,
+) -> Arc<KernelDialer> {
+    let class = if exit_is_ai() {
+        segue_kernel::session::EXIT_AI
+    } else {
+        segue_kernel::session::EXIT_OVERSEAS
+    };
+    let tag = route_tag();
     let mut routes = BTreeMap::new();
     routes.insert(
-        "ov".into(),
+        tag.into(),
         SegueRoute {
             ticket,
-            exit_class: segue_kernel::session::EXIT_OVERSEAS,
+            exit_class: class,
         },
     );
+    let mut home = BTreeSet::new();
+    if exit_is_ai() {
+        home.insert(tag.to_string());
+    }
     let dialer = KernelDialer::new(
         engine,
         vec![Exit {
-            name: "ov".into(),
+            name: "exit".into(),
             carrier: "tcp".into(),
             relay: proxy,
             node_id: 1,
             egress_group: String::new(),
         }],
         routes,
-        BTreeSet::new(),
+        home,
     )
     .with_pool(Pool::new(8 << 20))
     .with_standby_ai(standby_enabled());
+    if exit_is_ai() {
+        // Named choice: the AI session stays on this exit.
+        dialer.set_exit("exit").expect("pin the only exit");
+    }
     Arc::new(dialer)
 }
 
@@ -507,7 +625,12 @@ struct Stack {
 async fn stack() -> Stack {
     let seconds = token_seconds();
     let origin = serve_origin(seconds).await;
-    let env = relay_env();
+    let home = if exit_is_ai() {
+        Some(spawn_home_socks().await)
+    } else {
+        None
+    };
+    let env = relay_env(home);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_addr = listener.local_addr().unwrap();
     let (stop, stop_rx) = watch::channel(false);
@@ -580,7 +703,7 @@ async fn open_path(stack: &Stack, profile_name: &str, seed: u64) -> (SocketAddr,
     .await
     .expect("impair relay");
     let dialer = session_dialer(Arc::new(PlainCarrier), impair.local, stack.ticket.clone());
-    let socks = spawn_socks(dialer, "ov").await;
+    let socks = spawn_socks(dialer, route_tag()).await;
     (socks, impair)
 }
 
@@ -692,14 +815,18 @@ async fn run_flows(stack: &Stack, profile: &'static str, seed: u64) -> FlowRow {
 
 fn print_token_table(rows: &[TokenRow]) {
     let mode = u8::from(standby_enabled());
+    let class = class_name();
     println!("## token stream");
     println!(
-        "| standby | profile | seed | ttft_ms | delay_p50_ms | delay_p99_ms | delay_p99.9_ms | delay_max_ms | ia_p50_ms | ia_p99_ms | ia_p99.9_ms | stalls_300 | stalls_1s | up_bytes | down_bytes | payload_bytes |"
+        "| class | standby | profile | seed | ttft_ms | delay_p50_ms | delay_p99_ms | delay_p99.9_ms | delay_max_ms | ia_p50_ms | ia_p99_ms | ia_p99.9_ms | stalls_300 | stalls_1s | up_bytes | down_bytes | payload_bytes |"
     );
-    println!("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!(
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    );
     for r in rows {
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            class,
             mode,
             r.profile,
             r.seed,
@@ -722,19 +849,21 @@ fn print_token_table(rows: &[TokenRow]) {
 
 fn print_flow_table(rows: &[FlowRow]) {
     let mode = u8::from(standby_enabled());
+    let class = class_name();
     println!("## new flows");
-    println!("| standby | profile | seed | ttfb_p50_ms | ttfb_p99_ms | ttfb_max_ms |");
-    println!("|---:|---|---:|---:|---:|---:|");
+    println!("| class | standby | profile | seed | ttfb_p50_ms | ttfb_p99_ms | ttfb_max_ms |");
+    println!("|---|---:|---|---:|---:|---:|---:|");
     for r in rows {
         println!(
-            "| {} | {} | {} | {} | {} | {} |",
-            mode, r.profile, r.seed, r.ttfb_p50_ms, r.ttfb_p99_ms, r.ttfb_max_ms
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            class, mode, r.profile, r.seed, r.ttfb_p50_ms, r.ttfb_p99_ms, r.ttfb_max_ms
         );
     }
 }
 
 fn token_json(row: &TokenRow) -> Value {
     json!({
+        "class": class_name(),
         "standby": u8::from(standby_enabled()),
         "profile": row.profile,
         "seed": row.seed,
@@ -756,6 +885,7 @@ fn token_json(row: &TokenRow) -> Value {
 
 fn flow_json(row: &FlowRow) -> Value {
     json!({
+        "class": class_name(),
         "standby": u8::from(standby_enabled()),
         "profile": row.profile,
         "seed": row.seed,
@@ -851,6 +981,7 @@ enum ConvoFault {
     BlackoutUpload2s,
     BlackoutTokens8s,
     BlackoutTokens40s,
+    BlackoutTokens120s,
     ResetUpload,
     ResetTokens,
     SilentSilence,
@@ -862,6 +993,7 @@ fn fault_name(fault: ConvoFault) -> &'static str {
         ConvoFault::BlackoutUpload2s => "blackout-upload-2s",
         ConvoFault::BlackoutTokens8s => "blackout-tokens-8s",
         ConvoFault::BlackoutTokens40s => "blackout-tokens-40s",
+        ConvoFault::BlackoutTokens120s => "blackout-tokens-120s",
         ConvoFault::ResetUpload => "reset-upload",
         ConvoFault::ResetTokens => "reset-tokens",
         ConvoFault::SilentSilence => "silent-silence",
@@ -909,6 +1041,7 @@ fn convo_cases(faults_on_rtt: bool) -> Vec<(&'static str, u64, ConvoFault)> {
             ConvoFault::BlackoutUpload2s,
             ConvoFault::BlackoutTokens8s,
             ConvoFault::BlackoutTokens40s,
+            ConvoFault::BlackoutTokens120s,
             ConvoFault::ResetUpload,
             ConvoFault::ResetTokens,
             ConvoFault::SilentSilence,
@@ -1047,6 +1180,8 @@ struct TurnMetrics {
 }
 
 struct ConvoRow {
+    class: &'static str,
+    standby: u8,
     profile: &'static str,
     seed: u64,
     fault: &'static str,
@@ -1055,6 +1190,10 @@ struct ConvoRow {
     engine_dials: u64,
     control_streams: u64,
     session_carriers: u64,
+    standby_dials: u64,
+    standby_bound: u64,
+    standby_promotions: u64,
+    swaps: u64,
     impair_accepts: u64,
     up_bytes: u64,
     down_bytes: u64,
@@ -1139,6 +1278,7 @@ fn arm_tokens(fault: ConvoFault, turn: u64, impair: &impair::TcpRelay) {
     match fault {
         ConvoFault::BlackoutTokens8s => impair.arm_blackout(Duration::from_secs(8)),
         ConvoFault::BlackoutTokens40s => impair.arm_blackout(Duration::from_secs(40)),
+        ConvoFault::BlackoutTokens120s => impair.arm_blackout(Duration::from_secs(120)),
         ConvoFault::ResetTokens => impair.arm_reset(),
         _ => {}
     }
@@ -1151,6 +1291,7 @@ fn token_pad(fault: ConvoFault, turn: u64) -> Duration {
     match fault {
         ConvoFault::BlackoutTokens8s => Duration::from_secs(8),
         ConvoFault::BlackoutTokens40s => Duration::from_secs(40),
+        ConvoFault::BlackoutTokens120s => Duration::from_secs(120),
         ConvoFault::BlackoutUpload2s => Duration::from_secs(2),
         _ => Duration::ZERO,
     }
@@ -1387,7 +1528,7 @@ async fn open_convo(
     profile_name: &str,
     seed: u64,
     counts: Arc<DialCounts>,
-) -> io::Result<(TcpStream, impair::TcpRelay)> {
+) -> io::Result<(TcpStream, impair::TcpRelay, Arc<KernelDialer>)> {
     let profile = impair::profile(profile_name).expect("profile");
     let impair = impair::serve_tcp(
         "127.0.0.1:0".parse().unwrap(),
@@ -1400,14 +1541,15 @@ async fn open_convo(
     .map_err(|err| io::Error::other(err.to_string()))?;
     let engine = Arc::new(CountingDialer { counts });
     let dialer = session_dialer(engine, impair.local, stack.ticket.clone());
-    let socks = spawn_socks(dialer, "ov").await;
+    let socks_dialer: Arc<dyn Dialer> = dialer.clone();
+    let socks = spawn_socks(socks_dialer, route_tag()).await;
     let sock = tokio::time::timeout(
         Duration::from_secs(60),
         try_socks_connect(socks, "echo.test", origin.port()),
     )
     .await
     .map_err(|_| io::Error::new(ErrorKind::TimedOut, "timeout"))??;
-    Ok((sock, impair))
+    Ok((sock, impair, dialer))
 }
 
 fn payload_of(turns: u64, upload: u64, silence_ms: u64, tokens: u64) -> (u64, u64) {
@@ -1438,6 +1580,8 @@ async fn run_convo(
     let waiters = Arc::new(BodyWaiters::new());
     let origin = serve_origin_with(1, Some(Arc::clone(&waiters))).await;
     let mut row = ConvoRow {
+        class: class_name(),
+        standby: u8::from(standby_enabled()),
         profile,
         seed,
         fault: name,
@@ -1446,6 +1590,10 @@ async fn run_convo(
         engine_dials: 0,
         control_streams: 0,
         session_carriers: 0,
+        standby_dials: 0,
+        standby_bound: 0,
+        standby_promotions: 0,
+        swaps: 0,
         impair_accepts: 0,
         up_bytes: 0,
         down_bytes: 0,
@@ -1454,8 +1602,8 @@ async fn run_convo(
         turns: Vec::new(),
     };
     let opened = open_convo(stack, origin, profile, seed, Arc::clone(&counts)).await;
-    let (mut sock, impair) = match opened {
-        Ok(pair) => pair,
+    let (mut sock, impair, dialer) = match opened {
+        Ok(opened) => opened,
         Err(err) => {
             row.end = Some(TurnEnd {
                 turn: 0,
@@ -1489,6 +1637,10 @@ async fn run_convo(
     row.engine_dials = counts.dials.load(Ordering::Relaxed) as u64;
     row.control_streams = counts.control.load(Ordering::Relaxed) as u64;
     row.session_carriers = counts.session.load(Ordering::Relaxed) as u64;
+    row.standby_dials = dialer.standby_dials();
+    row.standby_bound = dialer.standby_bound();
+    row.standby_promotions = dialer.standby_promotions();
+    row.swaps = dialer.standby_swaps();
     row.impair_accepts = impair.accepted();
     row.up_bytes = impair.up_bytes();
     row.down_bytes = impair.down_bytes();
@@ -1499,9 +1651,11 @@ async fn run_convo(
 fn print_convo(rows: &[ConvoRow]) {
     println!("## conversation");
     println!(
-        "| profile | seed | fault | survived | end_turn | end_phase | app_saw | engine_dials | control_streams | session_carriers | impair_accepts | up_bytes | down_bytes | payload_up | payload_down |"
+        "| class | standby | profile | seed | fault | survived | end_turn | end_phase | app_saw | engine_dials | control_streams | session_carriers | standby_dials | standby_bound | promotions | swaps | impair_accepts | up_bytes | down_bytes | payload_up | payload_down |"
     );
-    println!("|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!(
+        "|---|---:|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    );
     for row in rows {
         let (end_turn, end_phase, saw) = match &row.end {
             Some(end) => (end.turn.to_string(), end.phase, cell(&end.saw)),
@@ -1509,7 +1663,9 @@ fn print_convo(rows: &[ConvoRow]) {
         };
         let survived = if row.survived { "yes" } else { "no" };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            row.class,
+            row.standby,
             row.profile,
             row.seed,
             row.fault,
@@ -1520,6 +1676,10 @@ fn print_convo(rows: &[ConvoRow]) {
             row.engine_dials,
             row.control_streams,
             row.session_carriers,
+            row.standby_dials,
+            row.standby_bound,
+            row.standby_promotions,
+            row.swaps,
             row.impair_accepts,
             row.up_bytes,
             row.down_bytes,
@@ -1529,17 +1689,19 @@ fn print_convo(rows: &[ConvoRow]) {
     }
     println!();
     println!(
-        "session_carriers counts engine dials whose first byte was not CTRL_HELLO. control_streams counts CTRL_HELLO. engine_dials counts every dial, including a raced dial dropped before it wrote. impair_accepts is TCP connections the relay accepted. Relay byte totals include session framing and the control stream. Stalls are token inter-arrival gaps, not the planned silence. ttft_after_silence_ms is first-token arrival minus (origin has the body + silence)."
+        "session_carriers counts engine dials whose first byte was not CTRL_HELLO (a standby dial is one of these). control_streams counts CTRL_HELLO. engine_dials counts every dial, including a raced dial dropped before it wrote. standby_dials, standby_bound, promotions and swaps are the kernel dialer's counters for this run. impair_accepts is TCP connections the relay accepted. Relay byte totals include session framing and the control stream. Stalls are token inter-arrival gaps, not the planned silence. ttft_after_silence_ms is first-token arrival minus (origin has the body + silence)."
     );
     println!();
     println!(
-        "| profile | seed | fault | turn | upload_ms | ttft_after_silence_ms | delay_p50_ms | delay_p99_ms | delay_max_ms | stalls_300 | stalls_1s | stalls_20s | longest_gap_ms |"
+        "| class | standby | profile | seed | fault | turn | upload_ms | ttft_after_silence_ms | delay_p50_ms | delay_p99_ms | delay_max_ms | stalls_300 | stalls_1s | stalls_20s | longest_gap_ms |"
     );
-    println!("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for row in rows {
         for turn in &row.turns {
             println!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                row.class,
+                row.standby,
                 row.profile,
                 row.seed,
                 row.fault,
@@ -1562,6 +1724,8 @@ fn convo_json(rows: &[ConvoRow], spec: (u64, u64, u64, u64)) -> Value {
     let (n_turns, upload, silence_ms, tokens) = spec;
     json!({
         "scenario": "conversation",
+        "class": class_name(),
+        "standby": u8::from(standby_enabled()),
         "turns": n_turns,
         "upload_bytes": upload,
         "silence_ms": silence_ms,
@@ -1575,6 +1739,8 @@ fn convo_json(rows: &[ConvoRow], spec: (u64, u64, u64, u64)) -> Value {
 
 fn convo_run_json(row: &ConvoRow) -> Value {
     json!({
+        "class": row.class,
+        "standby": row.standby,
         "profile": row.profile,
         "seed": row.seed,
         "fault": row.fault,
@@ -1585,6 +1751,10 @@ fn convo_run_json(row: &ConvoRow) -> Value {
         "engine_dials": row.engine_dials,
         "control_streams": row.control_streams,
         "session_carriers": row.session_carriers,
+        "standby_dials": row.standby_dials,
+        "standby_bound": row.standby_bound,
+        "promotions": row.standby_promotions,
+        "swaps": row.swaps,
         "impair_accepts": row.impair_accepts,
         "up_bytes": row.up_bytes,
         "down_bytes": row.down_bytes,
@@ -1628,15 +1798,35 @@ fn assert_convo(rows: &[ConvoRow]) {
                 end.unwrap_or_else(|| "no end recorded".to_owned())
             );
             assert_eq!(
-                row.session_carriers, 1,
-                "rtt170 seed {} session carriers {} (control streams {}, engine dials {}). A session carrier is an engine dial whose first byte was not CTRL_HELLO; the control stream is counted separately.",
-                row.seed, row.session_carriers, row.control_streams, row.engine_dials
-            );
-            assert_eq!(
                 row.control_streams, 1,
                 "rtt170 seed {} control streams {} (session carriers {}). The control stream is the dial whose first byte is CTRL_HELLO.",
                 row.seed, row.control_streams, row.session_carriers
             );
+            // Overseas, and AI with the standby switch off, dial one session
+            // carrier. AI with standby on also dials the spare: two session
+            // carriers, one of them the standby.
+            let expect_standby = exit_is_ai() && standby_enabled();
+            let expect_carriers = if expect_standby { 2 } else { 1 };
+            assert_eq!(
+                row.session_carriers, expect_carriers,
+                "rtt170 seed {} session carriers {} (standby dials {}, bound {}, control {}, engine dials {}). A session carrier is an engine dial whose first byte was not CTRL_HELLO; the control stream is counted separately.",
+                row.seed, row.session_carriers, row.standby_dials, row.standby_bound, row.control_streams, row.engine_dials
+            );
+            if expect_standby {
+                assert!(
+                    row.standby_dials >= 1 && row.standby_bound >= 1,
+                    "rtt170 seed {} did not bind a standby (dials {}, bound {})",
+                    row.seed,
+                    row.standby_dials,
+                    row.standby_bound
+                );
+            } else {
+                assert_eq!(
+                    row.standby_dials, 0,
+                    "rtt170 seed {} dialled a standby with class {} standby {}",
+                    row.seed, row.class, row.standby
+                );
+            }
             for turn in &row.turns {
                 assert_eq!(
                     turn.stalls_300, 0,

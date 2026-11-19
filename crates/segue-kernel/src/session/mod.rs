@@ -433,6 +433,8 @@ pub struct KernelDialer {
     pub(crate) standby_bound: Arc<AtomicU64>,
     /// Times a standby was promoted to the current carrier.
     pub(crate) standby_promotions: Arc<AtomicU64>,
+    /// Stall swaps: the spare became current and the old carrier stayed bound.
+    pub(crate) standby_swaps: Arc<AtomicU64>,
     /// Standby dials that failed, or spares that died without promotion.
     pub(crate) standby_lost: Arc<AtomicU64>,
     /// Test hook: standby dials fail before touching the engine.
@@ -484,6 +486,7 @@ impl KernelDialer {
             standby_dials: Arc::new(AtomicU64::new(0)),
             standby_bound: Arc::new(AtomicU64::new(0)),
             standby_promotions: Arc::new(AtomicU64::new(0)),
+            standby_swaps: Arc::new(AtomicU64::new(0)),
             standby_lost: Arc::new(AtomicU64::new(0)),
             standby_fail: Arc::new(AtomicBool::new(false)),
         }
@@ -494,6 +497,32 @@ impl KernelDialer {
     pub fn with_standby_ai(mut self, on: bool) -> Self {
         self.standby_ai = on;
         self
+    }
+
+    /// Standby dials started since this dialer was built. One per dial, not
+    /// per raced attempt.
+    pub fn standby_dials(&self) -> u64 {
+        self.standby_dials
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Standby carriers that reached `REDUNDANT_OK`.
+    pub fn standby_bound(&self) -> u64 {
+        self.standby_bound
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Times a standby became the current carrier, including stall swaps.
+    pub fn standby_promotions(&self) -> u64 {
+        self.standby_promotions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Stall swaps. A hard loss that promotes the spare is a promotion and
+    /// not a swap.
+    pub fn standby_swaps(&self) -> u64 {
+        self.standby_swaps
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -776,6 +805,7 @@ impl KernelDialer {
         let bound = Arc::clone(&self.standby_bound);
         let promotions = Arc::clone(&self.standby_promotions);
         let lost = Arc::clone(&self.standby_lost);
+        let swaps = Arc::clone(&self.standby_swaps);
         let state = Arc::clone(&self.state);
         Some(StandbyCtl {
             connect: self.connector_for(i, false),
@@ -792,6 +822,7 @@ impl KernelDialer {
                 };
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }),
+            swaps: Some(swaps),
         })
     }
 

@@ -120,10 +120,11 @@ handshake flight, so their TTFB stays next to `rtt170`.
 ## Standby carrier
 
 `SEGUE_STANDBY=0|1` (default 1, the product default) is the `standby` column.
-The harness route is overseas, so an AI standby is not dialled in either mode.
-The impairment is TCP loss recovery on one carrier, not a carrier being
-replaced, which is the only stall a standby can skip. There is no
-`SEGUE_SCENARIO=convo` in this script.
+`SEGUE_EXIT_CLASS=ai|overseas` (default `ai`) is the `class` column. The
+tables in this section were recorded before that switch, on an overseas
+route, so an AI standby was not dialled in either mode. The impairment is
+TCP loss recovery on one carrier, not a carrier being replaced, which is
+the only stall a standby can skip. The conversation scenario is below.
 
 `SEGUE_TOKEN_SECONDS=10`, same seeds, debug test binary, 2026-11-18.
 
