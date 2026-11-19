@@ -992,6 +992,9 @@ struct StandbyKeep {
     backoff: std::time::Duration,
     next_at: Option<tokio::time::Instant>,
     cid: Option<u64>,
+    /// Spare cid seen while `REDUNDANT_OK` had not arrived. A demoted
+    /// carrier shows up already bound, so it does not match this.
+    unbound: Option<u64>,
     bound_at: Option<tokio::time::Instant>,
 }
 
@@ -1005,6 +1008,7 @@ impl StandbyKeep {
             backoff: STANDBY_BACKOFF_MIN,
             next_at: None,
             cid: None,
+            unbound: None,
             bound_at: None,
         }
     }
@@ -1017,9 +1021,17 @@ impl StandbyKeep {
     fn observe(&mut self, s: &ClientSession) {
         let now = tokio::time::Instant::now();
         let cid = s.redundant_carrier();
-        if s.redundant_bound() && self.bound_at.is_none() {
-            self.bound_at = Some(now);
-            self.emit(StandbyEvent::Bound);
+        // Bound only on the rising edge of one spare: seen unbound, then
+        // `REDUNDANT_OK`. A stall swap installs the old carrier as the spare
+        // already bound; that is not another bind.
+        if let Some(id) = cid {
+            if !s.redundant_bound() {
+                self.unbound = Some(id);
+            } else if self.bound_at.is_none() && self.unbound == Some(id) {
+                self.bound_at = Some(now);
+                self.unbound = None;
+                self.emit(StandbyEvent::Bound);
+            }
         }
         if self.cid.is_some() && cid != self.cid {
             let prev = self.cid.take().expect("cid was some");

@@ -2747,6 +2747,11 @@ async fn ai_standby_promotes_without_waiting_for_a_dial() {
         l.d.standby_swaps.load(Ordering::Relaxed) >= 1,
         "the stall did not swap"
     );
+    assert_eq!(
+        l.d.standby_bound.load(Ordering::Relaxed),
+        1,
+        "a swap was counted as another bind"
+    );
     // The old carrier is the spare now. It is dropped after 10 s with no
     // frame, and the replacement dial waits out the backoff that schedule
     // armed (1 s, then 2 s because the swap itself scheduled once).
