@@ -151,6 +151,9 @@ struct RawExit {
     name: String,
     /// Engine outbound that carries sessions to this node (Reality / Hy2).
     carrier: String,
+    /// Optional separate engine outbound for background standby dials.
+    #[serde(default)]
+    redundant_carrier: Option<String>,
     /// The relay address as the carrier's server sees it.
     relay: SocketAddr,
     #[serde(default)]
@@ -420,6 +423,18 @@ impl KernelConfig {
                     "exits[{i}]: carrier must not be a home-role outbound"
                 ));
             }
+            if let Some(rc) = &e.redundant_carrier {
+                if !outbounds.contains_key(rc) {
+                    return Err(format!(
+                        "exits[{i}]: unknown redundant_carrier outbound {rc:?}"
+                    ));
+                }
+                if home.contains(rc) {
+                    return Err(format!(
+                        "exits[{i}]: redundant_carrier must not be a home-role outbound"
+                    ));
+                }
+            }
             let egress_group = match &e.egress_group {
                 None => String::new(),
                 Some(g)
@@ -439,6 +454,7 @@ impl KernelConfig {
             exits.push(Exit {
                 name: e.name.clone(),
                 carrier: e.carrier.clone(),
+                redundant_carrier: e.redundant_carrier.clone(),
                 relay: e.relay,
                 node_id: e.node_id,
                 egress_group,
@@ -1163,5 +1179,38 @@ mod tests {
             Ok(_) => panic!("utun address inside the fake-ip range was accepted"),
         };
         assert!(err.contains("fake_ip"), "{err}");
+    }
+
+    #[test]
+    fn exit_redundant_carrier_must_exist_and_not_be_home() {
+        let valid = KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+                "outbounds":{
+                    "main":{"type":"direct"},
+                    "alt":{"type":"direct"},
+                    "h":{"type":"direct","role":"home"}
+                },
+                "exits":[{"name":"la","carrier":"main","redundant_carrier":"alt","relay":"127.0.0.1:7443"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(valid.exits[0].redundant_carrier.as_deref(), Some("alt"));
+
+        let err = KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+                "outbounds":{"main":{"type":"direct"}},
+                "exits":[{"name":"la","carrier":"main","redundant_carrier":"missing","relay":"127.0.0.1:7443"}]}"#,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("redundant_carrier"), "{err}");
+
+        let err_home = KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+                "outbounds":{"main":{"type":"direct"},"h":{"type":"direct","role":"home"}},
+                "exits":[{"name":"la","carrier":"main","redundant_carrier":"h","relay":"127.0.0.1:7443"}]}"#,
+        )
+        .err()
+        .unwrap();
+        assert!(err_home.contains("redundant_carrier"), "{err_home}");
     }
 }

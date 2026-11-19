@@ -427,6 +427,7 @@ mod tests {
             .map(|(i, n)| Exit {
                 name: n.to_string(),
                 carrier: format!("c-{n}"),
+                redundant_carrier: None,
                 relay: "127.0.0.1:7443".parse().unwrap(),
                 node_id: i as u64 + 1,
                 egress_group: String::new(),
@@ -595,6 +596,7 @@ mod tests {
             vec![crate::session::Exit {
                 name: "la".into(),
                 carrier: "c".into(),
+                redundant_carrier: None,
                 relay: "127.0.0.1:1".parse().unwrap(),
                 node_id: 1,
                 egress_group: String::new(),

@@ -309,7 +309,7 @@ fn control_stream_answers_ping_and_carries_stall_and_revoked() {
     // the control stream (B1), and the client acts on it.
     r.site_data(&SID, &[7u8; 1000]);
     while r.poll_transmit(1, t0).is_some() {}
-    let t = t0 + Config::default().timing.t_live;
+    let t = t0 + Config::default().timing.t_live_ai;
     r.handle_timeout(t);
     let stall = r.poll_transmit(9, t).expect("STALL");
     let Frame::Stall(entries) = stall else {
@@ -501,7 +501,7 @@ fn spins(r: &mut RelayTable, mut t: Instant, span: Duration) -> usize {
 fn a_held_fin_keepalive_is_no_deadline_while_detached() {
     let t0 = Instant::now();
     let mut r = held_fin_relay(t0, Config::default(), Config::default());
-    let t = t0 + Config::default().timing.t_live;
+    let t = t0 + Config::default().timing.t_live_ai;
     r.handle_timeout(t);
     assert_eq!(
         r.state(&SID),
@@ -526,8 +526,8 @@ fn deadlines_served_by_sending_wait_for_a_writable_carrier() {
         blocked > t,
         "a blocked carrier's keepalive kept a due deadline"
     );
-    // Still bounded by the session's own timers (t_live here).
-    assert!(blocked <= t0 + Config::default().timing.t_live);
+    // Still bounded by the session's own timers (t_live_ai here).
+    assert!(blocked <= t0 + Config::default().timing.t_live_ai);
 }
 
 /// r9 (keepalive assumption): the relay keeps alive at half the shorter
@@ -540,6 +540,7 @@ fn relay_keepalive_follows_the_shorter_stall_bound() {
         rc.timing.t_stall = Duration::from_millis(relay_ms);
         let mut cc = Config::default();
         cc.timing.t_stall = Duration::from_millis(client_ms);
+        cc.timing.t_stall_ai = Duration::from_millis(client_ms);
         held_fin_relay(t0, rc, cc).keepalive(&SID).unwrap()
     };
     assert_eq!(with(4000, 1000), Duration::from_millis(500));
@@ -727,10 +728,10 @@ fn a_stall_after_success_reports_failed_and_progress_refreshes_up() {
     let t = t0 + HEALTH_REFRESH;
     c.on_frame(1, data(100), t).unwrap();
     assert_eq!(c.take_health(), Some(Health::Up), "no refreshed proof");
-    // Upload, never acknowledged, nothing received: a stall.
+    // Upload, never acknowledged, nothing received: a stall (AI waits `t_stall_ai`).
     assert_eq!(c.write(b"hello"), 5);
     while c.poll_transmit(1, t).is_some() {}
-    let t = t + Config::default().timing.t_stall + Duration::from_millis(1);
+    let t = t + Config::default().timing.t_stall_ai + Duration::from_millis(1);
     c.handle_timeout(t);
     assert_eq!(
         c.take_health(),
@@ -903,10 +904,10 @@ fn liveness_neither_resets_the_budget_nor_hides_a_failure() {
     )
     .unwrap();
     assert_eq!(c.take_health(), Some(Health::Up));
-    // An upload nobody acknowledges: the carrier stalls, moved nothing.
+    // An upload nobody acknowledges: the carrier stalls, moved nothing (`t_stall_ai`).
     assert_eq!(c.write(b"hello"), 5);
     while c.poll_transmit(1, t0).is_some() {}
-    let mut t = t0 + Config::default().timing.t_stall + Duration::from_millis(1);
+    let mut t = t0 + Config::default().timing.t_stall_ai + Duration::from_millis(1);
     c.handle_timeout(t);
     assert_eq!(c.take_health(), Some(Health::Failed));
     assert_eq!(c.fruitless_carriers(), 1);
@@ -1207,4 +1208,151 @@ fn ai_session_does_not_end_on_fruitless_count_alone() {
     assert_eq!(c.close_reason(), Some(CloseReason::Reset(LOCAL_GIVE_UP)));
     assert!(r.state(&sid).is_none());
     assert_eq!(close_code(&mut r), Some(code::IDLE));
+}
+
+#[test]
+fn ai_idle_keepalive_fires_on_primary_and_standby_at_20s() {
+    use segue_session::codec::{Open, RedundantAttach, VERSION};
+    use segue_session::EXIT_CLASS_AI;
+    let t0 = Instant::now();
+    let cfg = Config::default();
+    let cp = Pool::new(1 << 20);
+    let rp = Pool::new(1 << 20);
+    let params = OpenParams {
+        ticket: vec![1],
+        kind: Kind::Tcp,
+        target: Target::Domain("ai.example".into(), 443),
+        exit_class: EXIT_CLASS_AI,
+        anchor_node_id: 1,
+        instance_hint: 0,
+    };
+    let mut c = ClientSession::new(cfg.clone(), &cp, params, t0).unwrap();
+    let mut r = RelayTable::new(cfg.clone(), rp, Box::new(AllowAll), INSTANCE);
+    c.attach(1, t0);
+    let open = c.poll_transmit(1, t0).unwrap();
+    r.add_carrier(1);
+    r.on_frame(1, open, t0);
+    r.connect_done(&c.session_id(), Ok(()), t0);
+    let opened = r.poll_transmit(1, t0).unwrap();
+    c.on_frame(1, opened, t0).unwrap();
+
+    c.request_redundant();
+    c.attach_redundant(2, t0);
+    let red_att = c.poll_transmit(2, t0).unwrap();
+    r.add_carrier(2);
+    r.on_frame(2, red_att, t0);
+    let red_ok = r.poll_transmit(2, t0).unwrap();
+    c.on_frame(2, red_ok, t0).unwrap();
+
+    // Advance by `t_keepalive_ai` (20 s) on an idle AI session: both primary
+    // (1) and bound standby (2) emit a keepalive ACK on both client and relay.
+    let ka_at = t0 + cfg.timing.t_keepalive_ai;
+    assert!(c.poll_timeout().is_some_and(|d| d <= ka_at));
+    c.handle_timeout(ka_at);
+    assert!(matches!(c.poll_transmit(1, ka_at), Some(Frame::Ack { .. })));
+    assert!(matches!(c.poll_transmit(2, ka_at), Some(Frame::Ack { .. })));
+
+    assert!(r.poll_timeout().is_some_and(|d| d <= ka_at));
+    r.handle_timeout(ka_at);
+    assert!(matches!(r.poll_transmit(1, ka_at), Some(Frame::Ack { .. })));
+    assert!(matches!(r.poll_transmit(2, ka_at), Some(Frame::Ack { .. })));
+    let _ = (
+        Open {
+            version: VERSION,
+            ticket: vec![],
+            session_id: [0; 16],
+            resume_secret: [0; 32],
+            attach_gen: 0,
+            retry: false,
+            anchor_instance_id: 0,
+            kind: Kind::Tcp,
+            target: Target::Domain(String::new(), 1),
+            exit_class: 0,
+            t_stall_ms: None,
+            first_data: vec![],
+        },
+        RedundantAttach {
+            session_id: [0; 16],
+            resume_secret: [0; 32],
+            attach_gen: 0,
+            recv_offset: 0,
+            max_offset: 0,
+        },
+    );
+}
+
+#[test]
+fn post_swap_stall_hint_honored_with_nothing_unacked() {
+    use segue_session::EXIT_CLASS_AI;
+    let t0 = Instant::now();
+    let cfg = Config::default();
+    let cp = Pool::new(1 << 20);
+    let mut c = ClientSession::new(
+        cfg.clone(),
+        &cp,
+        OpenParams {
+            ticket: vec![1],
+            kind: Kind::Tcp,
+            target: Target::Domain("ai.example".into(), 443),
+            exit_class: EXIT_CLASS_AI,
+            anchor_node_id: 1,
+            instance_hint: 0,
+        },
+        t0,
+    )
+    .unwrap();
+    c.attach(1, t0);
+    let _ = c.poll_transmit(1, t0);
+    c.on_frame(
+        1,
+        Frame::Opened(segue_session::codec::Opened {
+            instance_id: INSTANCE,
+            attach_gen: 0,
+            recv_offset: 0,
+            max_offset: 16 * 1024,
+            window_cap: 1 << 20,
+            ack_bytes: 0,
+        }),
+        t0,
+    )
+    .unwrap();
+    c.request_redundant();
+    c.attach_redundant(2, t0);
+    let _ = c.poll_transmit(2, t0);
+    c.on_frame(
+        2,
+        Frame::RedundantOk(segue_session::codec::RedundantOk {
+            attach_gen: 0,
+            recv_offset: 0,
+            max_offset: 16 * 1024,
+        }),
+        t0,
+    )
+    .unwrap();
+    // Simulate carrier 1 dying -> promotes spare 2 cleanly at same gen 0.
+    c.on_carrier_closed(1, t0 + Duration::from_millis(10));
+    assert_eq!(c.carrier(), Some(2));
+    assert!(!c.send_half().unacked());
+
+    // Deliver fresh byte on carrier 2 so `last_rx = t1`.
+    let t1 = t0 + Duration::from_millis(20);
+    c.on_frame(
+        2,
+        Frame::Data {
+            offset: 0,
+            data: b"hi".to_vec(),
+            pad: 0,
+        },
+        t1,
+    )
+    .unwrap();
+    // Relay STALL hint arrives while nothing is unacked and within t_stall_ai.
+    c.on_stall(0, t1 + Duration::from_millis(100));
+    assert_eq!(c.carrier(), Some(2), "remembered until quiet");
+
+    // Once `t_stall_ai` elapses since `last_rx`, the remembered STALL fires.
+    let due = t1 + cfg.timing.t_stall_ai;
+    assert!(c.poll_timeout().is_some_and(|d| d <= due));
+    c.handle_timeout(due);
+    assert!(c.wants_attach(due + segue_session::client::RECONNECT_BACKOFF));
 }

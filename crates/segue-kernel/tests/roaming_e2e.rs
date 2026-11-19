@@ -487,6 +487,7 @@ fn session_dialer(engine: Arc<dyn Dialer>, proxy: SocketAddr, ticket: Vec<u8>) -
         vec![Exit {
             name: "ov".into(),
             carrier: "tcp".into(),
+            redundant_carrier: None,
             relay: proxy,
             node_id: 1,
             egress_group: String::new(),

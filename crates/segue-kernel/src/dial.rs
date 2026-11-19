@@ -364,6 +364,7 @@ mod tests {
             vec![Exit {
                 name: "test".into(),
                 carrier: "carrier".into(),
+                redundant_carrier: None,
                 relay: "127.0.0.1:9000".parse().unwrap(),
                 node_id: 1,
                 egress_group: String::new(),

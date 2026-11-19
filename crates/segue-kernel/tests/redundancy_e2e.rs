@@ -47,6 +47,7 @@ use segue_relay::server::{serve as serve_relay, Relay};
 use segue_relay::system_clock;
 use segue_relay::ticket::{generate_pkcs8, Claims, ExitClass, Signer};
 use segue_session::pool::Pool;
+use segue_session::{RedundancyConfig, RedundancyMode};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -100,6 +101,67 @@ fn route_tag() -> &'static str {
     } else {
         "ov"
     }
+}
+
+/// Stage 2 small-frame duplication switch (`off` | `dup` | `hedge`, default `dup`).
+fn redundancy_name() -> &'static str {
+    match std::env::var("SEGUE_REDUNDANCY").as_deref() {
+        Err(_) | Ok("dup") => "dup",
+        Ok("off") => "off",
+        Ok("hedge") => "hedge",
+        Ok(v) => panic!("SEGUE_REDUNDANCY={v} is not off, dup, or hedge"),
+    }
+}
+
+fn redundancy_cfg() -> RedundancyConfig {
+    let mode = match redundancy_name() {
+        "off" => RedundancyMode::Off,
+        "dup" => RedundancyMode::Dup {
+            delay: Duration::from_millis(30),
+        },
+        "hedge" => RedundancyMode::Hedge {
+            delay: Duration::from_millis(120),
+        },
+        other => unreachable!("validated redundancy_name: {other}"),
+    };
+    RedundancyConfig {
+        mode,
+        ..Default::default()
+    }
+}
+
+fn selected_profiles(all: &[&'static str]) -> Vec<&'static str> {
+    let Ok(raw) = std::env::var("SEGUE_PROFILES") else {
+        return all.to_vec();
+    };
+    let mut out = Vec::new();
+    for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let matched = all
+            .iter()
+            .copied()
+            .find(|p| *p == item)
+            .unwrap_or_else(|| panic!("SEGUE_PROFILES: unknown profile {item:?}"));
+        out.push(matched);
+    }
+    assert!(!out.is_empty(), "SEGUE_PROFILES selected zero profiles");
+    out
+}
+
+fn selected_seeds() -> Vec<u64> {
+    let Ok(raw) = std::env::var("SEGUE_SEEDS") else {
+        return SEEDS.to_vec();
+    };
+    let out: Vec<u64> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<u64>()
+                .unwrap_or_else(|_| panic!("SEGUE_SEEDS: {s:?} is not an integer"))
+        })
+        .collect();
+    assert!(!out.is_empty(), "SEGUE_SEEDS selected zero seeds");
+    out
 }
 
 fn token_seconds() -> u64 {
@@ -198,7 +260,8 @@ fn relay_env(home: Option<SocketAddr>) -> RelayEnv {
             }}
         }}"#
     );
-    let cfg = Config::parse_in(&json, &dir.0).unwrap();
+    let mut cfg = Config::parse_in(&json, &dir.0).unwrap();
+    cfg.redundancy = redundancy_cfg();
     let guard = Guard {
         extra_blocked: vec![],
         exceptions: vec![Cidr::parse("127.0.0.1/32").unwrap()],
@@ -360,6 +423,7 @@ fn session_dialer(
         vec![Exit {
             name: "exit".into(),
             carrier: "tcp".into(),
+            redundant_carrier: None,
             relay: proxy,
             node_id: 1,
             egress_group: String::new(),
@@ -368,7 +432,8 @@ fn session_dialer(
         home,
     )
     .with_pool(Pool::new(8 << 20))
-    .with_standby_ai(standby_enabled());
+    .with_standby_ai(standby_enabled())
+    .with_redundancy(redundancy_cfg());
     if exit_is_ai() {
         // Named choice: the AI session stays on this exit.
         dialer.set_exit("exit").expect("pin the only exit");
@@ -678,6 +743,11 @@ struct TokenRow {
     ia_p999_ms: f64,
     stalls_300: u64,
     stalls_1s: u64,
+    standby_dials: u64,
+    standby_bound: u64,
+    promotions: u64,
+    swaps: u64,
+    resumes: u64,
     up_bytes: u64,
     down_bytes: u64,
     payload_bytes: u64,
@@ -691,7 +761,11 @@ struct FlowRow {
     ttfb_max_ms: f64,
 }
 
-async fn open_path(stack: &Stack, profile_name: &str, seed: u64) -> (SocketAddr, impair::TcpRelay) {
+async fn open_path(
+    stack: &Stack,
+    profile_name: &str,
+    seed: u64,
+) -> (SocketAddr, impair::TcpRelay, Arc<KernelDialer>) {
     let profile = impair::profile(profile_name).expect("profile");
     let impair = impair::serve_tcp(
         "127.0.0.1:0".parse().unwrap(),
@@ -703,13 +777,14 @@ async fn open_path(stack: &Stack, profile_name: &str, seed: u64) -> (SocketAddr,
     .await
     .expect("impair relay");
     let dialer = session_dialer(Arc::new(PlainCarrier), impair.local, stack.ticket.clone());
-    let socks = spawn_socks(dialer, route_tag()).await;
-    (socks, impair)
+    let socks_dialer: Arc<dyn Dialer> = dialer.clone();
+    let socks = spawn_socks(socks_dialer, route_tag()).await;
+    (socks, impair, dialer)
 }
 
 async fn run_token(stack: &Stack, profile: &'static str, seed: u64, seconds: u64) -> TokenRow {
     println!("run token {profile} seed {seed}");
-    let (socks, impair) = open_path(stack, profile, seed).await;
+    let (socks, impair, dialer) = open_path(stack, profile, seed).await;
     let n = event_count(seconds);
     let connect_start = Instant::now();
     let mut sock = socks_connect(socks, "echo.test", stack.origin.port()).await;
@@ -740,8 +815,14 @@ async fn run_token(stack: &Stack, profile: &'static str, seed: u64, seconds: u64
     }
     drop(sock);
     tokio::time::sleep(Duration::from_millis(50)).await;
+    let standby_dials = dialer.standby_dials();
+    let standby_bound = dialer.standby_bound();
+    let promotions = dialer.standby_promotions();
+    let swaps = dialer.standby_swaps();
+    let resumes = dialer.move_stats().resumes;
     let up_bytes = impair.up_bytes();
     let down_bytes = impair.down_bytes();
+    dialer.disconnect();
     drop(impair);
 
     let ttft_ms = round3(
@@ -777,6 +858,11 @@ async fn run_token(stack: &Stack, profile: &'static str, seed: u64, seconds: u64
         ia_p999_ms: percentile(&mut gaps, 0.999),
         stalls_300,
         stalls_1s,
+        standby_dials,
+        standby_bound,
+        promotions,
+        swaps,
+        resumes,
         up_bytes,
         down_bytes,
         payload_bytes: REQUEST.len() as u64 + n * EVENT_LEN as u64,
@@ -785,7 +871,7 @@ async fn run_token(stack: &Stack, profile: &'static str, seed: u64, seconds: u64
 
 async fn run_flows(stack: &Stack, profile: &'static str, seed: u64) -> FlowRow {
     println!("run flows {profile} seed {seed}");
-    let (socks, impair) = open_path(stack, profile, seed).await;
+    let (socks, impair, dialer) = open_path(stack, profile, seed).await;
     let mut samples = Vec::with_capacity(NEW_FLOWS);
     for i in 0..NEW_FLOWS {
         let t0 = Instant::now();
@@ -802,6 +888,7 @@ async fn run_flows(stack: &Stack, profile: &'static str, seed: u64) -> FlowRow {
         samples.push(round3(t0.elapsed().as_secs_f64() * 1000.0));
         drop(sock);
     }
+    dialer.disconnect();
     drop(impair);
     let ttfb_max_ms = samples.iter().copied().fold(0.0_f64, f64::max);
     FlowRow {
@@ -815,19 +902,21 @@ async fn run_flows(stack: &Stack, profile: &'static str, seed: u64) -> FlowRow {
 
 fn print_token_table(rows: &[TokenRow]) {
     let mode = u8::from(standby_enabled());
+    let red = redundancy_name();
     let class = class_name();
-    println!("## token stream");
+    println!("## token stream (redundancy={red})");
     println!(
-        "| class | standby | profile | seed | ttft_ms | delay_p50_ms | delay_p99_ms | delay_p99.9_ms | delay_max_ms | ia_p50_ms | ia_p99_ms | ia_p99.9_ms | stalls_300 | stalls_1s | up_bytes | down_bytes | payload_bytes |"
+        "| class | standby | redundancy | profile | seed | ttft_ms | delay_p50_ms | delay_p99_ms | delay_p99.9_ms | delay_max_ms | ia_p50_ms | ia_p99_ms | ia_p99.9_ms | stalls_300 | stalls_1s | standby_dials | standby_bound | promotions | swaps | resumes | up_bytes | down_bytes | payload_bytes |"
     );
     println!(
-        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     );
     for r in rows {
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             class,
             mode,
+            red,
             r.profile,
             r.seed,
             r.ttft_ms,
@@ -840,6 +929,11 @@ fn print_token_table(rows: &[TokenRow]) {
             r.ia_p999_ms,
             r.stalls_300,
             r.stalls_1s,
+            r.standby_dials,
+            r.standby_bound,
+            r.promotions,
+            r.swaps,
+            r.resumes,
             r.up_bytes,
             r.down_bytes,
             r.payload_bytes
@@ -849,14 +943,17 @@ fn print_token_table(rows: &[TokenRow]) {
 
 fn print_flow_table(rows: &[FlowRow]) {
     let mode = u8::from(standby_enabled());
+    let red = redundancy_name();
     let class = class_name();
-    println!("## new flows");
-    println!("| class | standby | profile | seed | ttfb_p50_ms | ttfb_p99_ms | ttfb_max_ms |");
-    println!("|---|---:|---|---:|---:|---:|---:|");
+    println!("## new flows (redundancy={red})");
+    println!(
+        "| class | standby | redundancy | profile | seed | ttfb_p50_ms | ttfb_p99_ms | ttfb_max_ms |"
+    );
+    println!("|---|---:|---|---|---:|---:|---:|---:|");
     for r in rows {
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} |",
-            class, mode, r.profile, r.seed, r.ttfb_p50_ms, r.ttfb_p99_ms, r.ttfb_max_ms
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            class, mode, red, r.profile, r.seed, r.ttfb_p50_ms, r.ttfb_p99_ms, r.ttfb_max_ms
         );
     }
 }
@@ -865,6 +962,7 @@ fn token_json(row: &TokenRow) -> Value {
     json!({
         "class": class_name(),
         "standby": u8::from(standby_enabled()),
+        "redundancy": redundancy_name(),
         "profile": row.profile,
         "seed": row.seed,
         "ttft_ms": row.ttft_ms,
@@ -877,6 +975,11 @@ fn token_json(row: &TokenRow) -> Value {
         "ia_p99_9_ms": row.ia_p999_ms,
         "stalls_300": row.stalls_300,
         "stalls_1s": row.stalls_1s,
+        "standby_dials": row.standby_dials,
+        "standby_bound": row.standby_bound,
+        "promotions": row.promotions,
+        "swaps": row.swaps,
+        "resumes": row.resumes,
         "up_bytes": row.up_bytes,
         "down_bytes": row.down_bytes,
         "payload_bytes": row.payload_bytes,
@@ -887,6 +990,7 @@ fn flow_json(row: &FlowRow) -> Value {
     json!({
         "class": class_name(),
         "standby": u8::from(standby_enabled()),
+        "redundancy": redundancy_name(),
         "profile": row.profile,
         "seed": row.seed,
         "ttfb_p50_ms": row.ttfb_p50_ms,
@@ -901,6 +1005,7 @@ fn write_json(seconds: u64, tokens: &[TokenRow], flows: &[FlowRow]) {
     };
     let body = json!({
         "token_seconds": seconds,
+        "redundancy": redundancy_name(),
         "percentile": "ceil(p * n) - 1",
         "note": "no carrier re-attach column; SessionHealth is not observable without changing the kernel",
         "token_stream": tokens.iter().map(token_json).collect::<Vec<_>>(),
@@ -912,6 +1017,8 @@ fn write_json(seconds: u64, tokens: &[TokenRow], flows: &[FlowRow]) {
 }
 
 fn assert_sane(tokens: &[TokenRow]) {
+    let check_peak_stall =
+        !exit_is_ai() || !standby_enabled() || matches!(redundancy_cfg().mode, RedundancyMode::Off);
     for row in tokens {
         if row.profile == "clean" {
             assert_eq!(
@@ -935,7 +1042,7 @@ fn assert_sane(tokens: &[TokenRow]) {
                 row.delay_p50_ms
             );
         }
-        if row.profile == "cn163-peak" {
+        if row.profile == "cn163-peak" && check_peak_stall {
             assert!(
                 row.stalls_300 >= 1,
                 "cn163-peak seed {} had no stall over 300 ms",
@@ -950,10 +1057,12 @@ fn assert_sane(tokens: &[TokenRow]) {
 async fn token_stream_baseline() {
     let seconds = token_seconds();
     let stack = stack().await;
+    let profiles = selected_profiles(PROFILES);
+    let seeds = selected_seeds();
     let mut tokens = Vec::new();
     let mut flows = Vec::new();
-    for profile in PROFILES {
-        for seed in SEEDS {
+    for &profile in &profiles {
+        for &seed in &seeds {
             tokens.push(run_token(&stack, profile, seed, seconds).await);
             flows.push(run_flows(&stack, profile, seed).await);
         }
@@ -1030,13 +1139,23 @@ fn convo_tokens() -> u64 {
 }
 
 fn convo_cases(faults_on_rtt: bool) -> Vec<(&'static str, u64, ConvoFault)> {
+    let profiles = selected_profiles(CONVO_PROFILES);
+    let seeds = selected_seeds();
+    let fault_filter: Option<BTreeSet<String>> =
+        std::env::var("SEGUE_CONVO_FAULTS").ok().map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        });
     let mut cases = Vec::new();
-    for profile in CONVO_PROFILES {
-        for seed in SEEDS {
-            cases.push((*profile, seed, ConvoFault::None));
+    for &profile in &profiles {
+        for &seed in &seeds {
+            cases.push((profile, seed, ConvoFault::None));
         }
     }
-    if faults_on_rtt {
+    if faults_on_rtt && profiles.contains(&"rtt170") {
         let faults = [
             ConvoFault::BlackoutUpload2s,
             ConvoFault::BlackoutTokens8s,
@@ -1047,10 +1166,29 @@ fn convo_cases(faults_on_rtt: bool) -> Vec<(&'static str, u64, ConvoFault)> {
             ConvoFault::SilentSilence,
         ];
         for fault in faults {
-            for seed in SEEDS {
+            for &seed in &seeds {
                 cases.push(("rtt170", seed, fault));
             }
         }
+    }
+    if let Some(allowed) = fault_filter {
+        let known = [
+            "none",
+            "blackout-upload-2s",
+            "blackout-tokens-8s",
+            "blackout-tokens-40s",
+            "blackout-tokens-120s",
+            "reset-upload",
+            "reset-tokens",
+            "silent-silence",
+        ];
+        for name in &allowed {
+            assert!(
+                known.contains(&name.as_str()),
+                "SEGUE_CONVO_FAULTS: unknown fault {name:?}"
+            );
+        }
+        cases.retain(|(_, _, f)| allowed.contains(fault_name(*f)));
     }
     cases
 }
@@ -1644,17 +1782,19 @@ async fn run_convo(
     row.impair_accepts = impair.accepted();
     row.up_bytes = impair.up_bytes();
     row.down_bytes = impair.down_bytes();
+    dialer.disconnect();
     drop(impair);
     row
 }
 
 fn print_convo(rows: &[ConvoRow]) {
-    println!("## conversation");
+    let red = redundancy_name();
+    println!("## conversation (redundancy={red})");
     println!(
-        "| class | standby | profile | seed | fault | survived | end_turn | end_phase | app_saw | engine_dials | control_streams | session_carriers | standby_dials | standby_bound | promotions | swaps | impair_accepts | up_bytes | down_bytes | payload_up | payload_down |"
+        "| class | standby | redundancy | profile | seed | fault | survived | end_turn | end_phase | app_saw | engine_dials | control_streams | session_carriers | standby_dials | standby_bound | promotions | swaps | impair_accepts | up_bytes | down_bytes | payload_up | payload_down |"
     );
     println!(
-        "|---|---:|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---:|---|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     );
     for row in rows {
         let (end_turn, end_phase, saw) = match &row.end {
@@ -1663,9 +1803,10 @@ fn print_convo(rows: &[ConvoRow]) {
         };
         let survived = if row.survived { "yes" } else { "no" };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             row.class,
             row.standby,
+            red,
             row.profile,
             row.seed,
             row.fault,
@@ -1726,6 +1867,7 @@ fn convo_json(rows: &[ConvoRow], spec: (u64, u64, u64, u64)) -> Value {
         "scenario": "conversation",
         "class": class_name(),
         "standby": u8::from(standby_enabled()),
+        "redundancy": redundancy_name(),
         "turns": n_turns,
         "upload_bytes": upload,
         "silence_ms": silence_ms,
@@ -1741,6 +1883,7 @@ fn convo_run_json(row: &ConvoRow) -> Value {
     json!({
         "class": row.class,
         "standby": row.standby,
+        "redundancy": redundancy_name(),
         "profile": row.profile,
         "seed": row.seed,
         "fault": row.fault,

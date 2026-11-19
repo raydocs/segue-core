@@ -296,10 +296,24 @@ Rules:
   on it are applied like on the current carrier. Receive dedup by offset
   makes a duplicate free. A gap or a bad offset on the spare is ignored;
   it does not reset the session. RST still resets the session.
-- This stage does **not** duplicate DATA. The relay still writes session
-  DATA only to the current carrier. ACKs (the window rides in them) may be
-  written to both, from one function (`mirror_to_redundant`) so a later
-  stage can extend it to small DATA.
+- **Stage 2 small-frame duplication & hedging:** controlled by `RedundancyConfig`
+  (`RedundancyMode::Dup { delay: 30 ms }` default, `Off`, or `Hedge { delay }`,
+  with `max_frame_bytes = 1024`, `ai_only = true`; inactive when no standby
+  carrier is bound or `exit_class != EXIT_CLASS_AI`). When active on an eligible
+  session, `DupQueue` (capacity `DUP_QUEUE_CAP = 32`) tracks primary small
+  DATA frames (`len <= max_frame_bytes`) and mirrors them to the bound,
+  non-demoted spare after `delay` unless acknowledged first. Frames above
+  `max_frame_bytes` set a non-wedging `bulk_barrier` so bulk transfers are not
+  duplicated. On bind (`REDUNDANT_OK` on client, `REDUNDANT_ATTACH` on relay),
+  `DupQueue::seed_inflight` slices up to `8 * max_frame_bytes` of unacked
+  `[acked, cursor)` backlog into `max_bytes` segments so small queued tokens
+  survive an early dial stall, while larger backlogs raise `bulk_barrier`.
+  FIN is mirrored only once `acked == offset` so an early mirrored FIN on the
+  spare cannot reset or mis-order a stream. Redundant writes on a carrier
+  charge only `Tier::Elastic` in the driver (`drop_due` clears due items
+  under pool pressure without wedging future small frames). A carrier marked
+  demoted (`demoted_at.is_some()`) stops receiving mirrored `ACK`/`FIN`/`DATA`
+  writes until a peer frame arrives on it and clears `demoted_at`.
 - A spare that closes, sticks, fails to decode, or is REJECTed is dropped
   alone: no re-attach, no `MAX_FRUITLESS` count, no `Health::Failed`, no
   quality "carrier lost".
@@ -348,9 +362,9 @@ Rules:
   retry the relay treats as resume, and a local `reattach`) **drops** the
   spare on both sides. The spare was authenticated at the old generation;
   leaving it bound would make that generation ambiguous.
-- The client asks for a spare explicitly (`request_redundant` /
-  `run_client_ctl_with_redundant`). Nothing turns it on by default, and the
-  kernel does not.
+- The session layer requires an explicit standby request
+  (`request_redundant` / `run_client_ctl_with_redundant`); `KernelDialer`
+  enables `standby_ai = true` by default for AI exits.
 
 ## 3. Auth material and the control stream (spec §3)
 
@@ -540,14 +554,18 @@ defaults (`crates/segue-session/src/lib.rs:45-135`):
 |-------|---------|------------------------|
 | `t_attach` | 2 s | client: give up one attach attempt, retry on a new carrier (`lib.rs:48-49`) |
 | `t_stall` | 1 s | client: unacked data and nothing received → re-attach (KERNEL_SPEC §7.2 数据停滞, `max(1 s, 4×SRTT)`; SRTT not modelled, `lib.rs:50-52`) |
+| `t_stall_ai` | 5 s | client: `exit_class == AI` stall bound |
 | `t_live` | 3 s | relay: unacked downlink, no ACK progress → DETACHED (`lib.rs:53-54`) |
+| `t_live_ai` | 5 s | relay: `exit_class == AI` unacked downlink live bound |
 | `t_detached` | 30 s | both: how long a non-AI session may live without a working carrier (`lib.rs`, `Timing::t_detached`) |
 | `t_detached_ai` | 150 s | both: the same bound for a session whose OPEN carried `exit_class == 1` (AI). Under the 180 s after which an AI client aborts a stream it cannot resume |
 | `t_detached_standby` | 10 s | both: a carrier demoted by a stall, with no frame since, is dropped |
+| `t_keepalive_ai` | 20 s | both: `exit_class == AI` idle session keepalive interval |
 | `t_open_retry` | 15 s | client: how long OPEN may be retried before the local connection is reset (`lib.rs:57-58`) |
 | `t_tomb` | 60 s | relay: tombstone lifetime (`lib.rs:59-60`) |
 | `ack_delay` | 20 ms | delayed-ACK floor (`lib.rs:61-62`) |
 | `idle_after` | 1 s | receive credit falls back to the floor after this idle (`lib.rs:63-64`) |
+| `idle_after_ai` | 60 s | `exit_class == AI` receive credit retention window (shortened via `pressure_idle_after` under pool pressure) |
 | `max_lifetime` | 24 h | relay: absolute lifetime from OPEN; RESUME does not extend it (§5.2 "会话超过最长寿命 → RST(max_lifetime)", `lib.rs:65-67`) |
 | `t_ctrl_idle` | 30 s | relay: control stream closed after this with no frame (`lib.rs:68-72`) |
 | `site_flush_idle` / `site_flush_max` | 30 s / 300 s | relay: bounds on handing the upload tail to the site; past either the session is reset (`site_reset`), never CLEAN (`lib.rs:73-82`) |
@@ -861,7 +879,7 @@ parse/encode, no behaviour), **hook-only** (interface exists, no producer),
 | WAKE | **not started** (M9+) | frame defined `codec.rs:684-693`; "PARK/WAKE as a whole is M9+" (`lib.rs:9-11`, `lib.rs:16-17`) |
 | Cross-instance hand-off (§9.2) | **not started** | any other `anchor_instance_id` → `unknown_session` (`relay.rs:568-571`, `relay.rs:502-504`) |
 | Cross-node forwarding | **not started** (M9+) | `crates/segue-session/src/lib.rs:16-17`, `crates/segue-relay/src/lib.rs:19-21` |
-| Redundant carrier, no DATA duplication (v0.6 draft, §2.7) | implemented, off by default | `REDUNDANT_ATTACH`/`REDUNDANT_OK`; relay binds without `switch`; a lost current carrier promotes the spare with no RESUME; a stall demotes the old carrier to the spare (`t_detached_standby` 10 s) and a hard close drops it; a move onto a third carrier drops the spare |
+| Redundant carrier & Stage 2 duplication (v0.6 draft, §2.7) | implemented (`Dup { delay: 30 ms }` default for `ai_only = true` with a bound standby; `Off`/`Hedge` configurable) | `REDUNDANT_ATTACH`/`REDUNDANT_OK`, `DupQueue` (`DUP_QUEUE_CAP = 32`, `bulk_barrier`, `seed_inflight`), `Tier::Elastic` redundant TX, `promoted_in_gen` swap guard, `Detached` rescue on redundant RX, `MoveHook`/`MoveStats` |
 | Session layer on mobile (FFI) | **not shipped** | `segue-session`/`segue-kernel` are behind the `proprietary-kernel` feature, "Deliberately not enabled in platform/build scripts yet" (`crates/segue-ffi/Cargo.toml:14-20`); no reference in `platform/android` or `platform/apple` |
 
 ## 12. What this gives an AI app that Xray/sing-box/mihomo do not

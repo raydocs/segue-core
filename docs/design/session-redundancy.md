@@ -1,6 +1,6 @@
 # Loss-resilient AI streams in the session layer
 
-Status: design, no code. Owner: session. Related:
+Status: Stages 1–3 implemented in-tree (`RedundancyMode::Dup { delay: 30 ms }` default for `ai_only = true` with a bound standby; `Off`/`Hedge` configurable). Owner: session. Related:
 [`session-v0.5.md`](../protocol/session-v0.5.md) §4, §5, §10;
 [`ai-lock.md`](./ai-lock.md); `.bees/wan-findings.md` (not in the repo).
 
@@ -208,31 +208,41 @@ carrier exists. (c) is already done below L5; do not add it at L5.
 
 ## 6. Staged plan
 
-**Stage 0 — measure.** Land the impairment proxy (bee udp-impair-proxy) and a
-synthetic SSE source. Baseline table: token inter-arrival p50/p99, stalls > 1 s,
-bytes on the wire, for clean / rtt170 / cn163-peak / cn163-offpeak.
-Acceptance: reproducible harness, baseline recorded.
+**Stage 0 — measure (done).** Reproducible impairment proxy + SSE & multi-turn
+baselines live in `crates/segue-kernel/tests/redundancy_e2e.rs` and
+`scripts/bench/session-redundancy.sh`, with per-connection `connection_seed`
+loss/jitter decorrelation in `crates/segue-bench/src/impair.rs`.
 
-**Stage 1 — redundant carrier, no duplication.** Wire:
-`REDUNDANT_ATTACH`/`REDUNDANT_OK`. Client: a `redundant: Option<CarrierId>`
-field, bind after `REDUNDANT_OK`, close on timeout. Relay: bind without
-`switch`, accept DATA/ACK/FIN/RST from it, dedup, never close the current
-carrier. Connection-level events (closed, stuck, decode error) on the redundant
-carrier drop only that carrier, never the session. Acceptance: sim test where
-either carrier dies and the session continues; relay test that a redundant
-attach does not close the current carrier; a v5 relay (no reply) falls back
-after one RTT.
+**Stage 1 — redundant carrier, no duplication (done).** Wire:
+`REDUNDANT_ATTACH`/`REDUNDANT_OK` (`0x3C`/`0x3D`, `FLAG_IGNORABLE`). Relay binds
+without `switch`, accepts DATA/ACK/FIN/RST from either carrier, rescues a
+`Detached` session on bound spare RX, and guards out-of-order swaps via
+`promoted_in_gen`. `StandbyKeep` avoids swap-backoff churn and aborts cleanly on
+`reattach`. Kernel adds non-racing `Exit.redundant_carrier` selection and
+`MoveCounters` (`resumes`, swaps, promotions).
 
-**Stage 2 — duplicate small frames.** The driver copies qualifying DATA frames
-to the redundant carrier's queue, spaced; the receiver dedups (already). The
-copy is charged separately and skipped if the charge fails. Policy: size
-threshold + `EXIT_AI`. Acceptance: cn163-peak token p99 improves by ≥50% vs
-Stage 0; overhead < 5% of bytes for an SSE stream; bulk unchanged.
+**Stage 2 — duplicate small frames (done).** `RedundancyConfig`
+(`RedundancyMode::Dup { delay: 30 ms }` default, `Off` to disable, or
+`Hedge { delay }`, `max_frame_bytes = 1024`, `ai_only = true`) wired through
+`segue-relay` and `segue-session`. `DupQueue` (`DUP_QUEUE_CAP = 32`) delays and
+duplicates small frames, raises a non-wedging `bulk_barrier` on frames above
+`max_frame_bytes`, and seeds up to `8 * max_frame_bytes` of in-flight
+`[acked, cursor)` segments at bind via `seed_inflight`. `FIN` mirrors only
+when `acked == offset`, and mirrored writes skip carriers with
+`demoted_at.is_some()`. See
+[`session-token-stream.md`](../benchmarks/session-token-stream.md) for full
+A/B (`off` vs `dup` vs `hedge`) and `conversation_baseline` measurements:
+`cn163-offpeak` seed 2 improves p50 by 31x and p99 by 12.6x while 3 MiB uploads
+add ~0.9% wire overhead, whereas `cn163-peak` still sees spare `resumes` so
+tuning `cn163-peak` remains a tracked follow-up (`RedundancyMode::Off` disables
+Stage 2 duplication when needed).
 
-**Stage 3 — shed under pressure.** Redundancy is elastic: skip the copy if the
-charge fails; drop the redundant carrier when the pool is under pressure.
-Acceptance: N sessions with redundancy under a small pool all admit and none
-fail; redundancy is shed, not the session.
+**Stage 3 — shed under pressure & compact memory (done).** Redundant writes
+charge `Tier::Elastic` only (`drop_due` clears pending dup items under pool
+pressure), `pressure_idle_after` tightens AI receive credit retention (`60 s`
+default `idle_after_ai`) on pool pressure, and `CarrierFrame` boxing inside
+`CarrierEv::Frame` keeps retained idle client memory at ~23 KiB/session (within
+the 32 KiB limit in `tests/memory.rs`) and `memory_spent.rs` peak within budget.
 
 **Stage 4 — optional parity (b) for bulk**, only if Stage 2's numbers justify
 it.
@@ -242,39 +252,45 @@ profiles.
 
 ## 7. Test plan (impairment proxy)
 
-The proxy (bee udp-impair-proxy) gives UDP and TCP relay with delay+jitter,
-uniform loss, Gilbert-Elliott bursts, bandwidth cap, reordering, deterministic
-seed, and profiles clean / rtt170 / rtt170-loss2 / cn163-peak / cn163-offpeak.
+Implemented test coverage across the workspace:
 
-- **Unit (sim, deterministic).** Extend `tests/sim.rs` with a per-frame drop
-  model (p_drop, burst length) on the pipe. Assert: with redundancy, the max
-  token gap is bounded; `assert_exact` still holds (no loss, no duplication
-  delivered); a redundant carrier dying does not end the session; a v5 relay
-  (no `REDUNDANT_OK`) falls back.
-- **Integration (proxy).** A local relay plus a synthetic SSE source (200 B
-  every 20 ms) through the proxy. Measure token inter-arrival p50/p99 and
-  stalls > 1 s for single vs redundant carrier on cn163-peak and
-  cn163-offpeak. Assert the p99 improvement and the overhead bound.
-- **Pool.** N sessions with redundancy under a small pool; assert admission
-  and shedding.
-- **Regression.** `randomized_faults_never_lose_or_duplicate`
-  (`tests/sim.rs:616`) and the driver tests pass with redundancy on.
+- **Unit & simulation (`segue-session`):** `flow.rs` unit tests (including
+  `DupQueue` and `idle_after_ai`), `tests/sim.rs` (30 tests covering
+  `stage2_dup_hides_primary_packet_loss_without_swapping`,
+  `stage2_late_bind_and_drop_due_still_protect_streaming_tokens`,
+  `stage2_mixed_bulk_and_small_frames_never_hit_data_gap`,
+  `stage2_one_sided_swap_never_resets_on_mirrored_fin_or_dup_gap`,
+  `primary_download_blackhole_self_heals_onto_live_spare_and_rst_mirrors`,
+  `relay_detached_rescued_by_frame_on_bound_spare`, and randomized faults),
+  `tests/driver.rs` (34 tests including
+  `redundant_tx_sheds_under_pool_pressure_without_blocking_primary` and
+  `reattach_aborts_in_flight_standby_dial_and_rearms`), `tests/redundant.rs`
+  (5 tests), and `tests/timers.rs` (22 tests including
+  `ai_idle_keepalive_fires_on_primary_and_standby_at_20s`).
+- **Memory (`segue-session`):** `tests/memory.rs` (`FIXED = 32 * 1024`) and
+  `tests/memory_spent.rs` (`FIXED = 24 * 1024`).
+- **Kernel & E2E (`segue-kernel`):** `segue-kernel --lib` (219 tests including
+  `exit_redundant_carrier_must_exist_and_not_be_home`,
+  `ai_standby_promotes_without_waiting_for_a_dial`, and
+  `standby_uses_redundant_carrier_without_racing`) and `tests/redundancy_e2e.rs`
+  (`token_stream_baseline` and `conversation_baseline` driven by
+  `SEGUE_REDUNDANCY=off|dup|hedge`).
 
 ## 8. Open questions
 
-- **Spacing.** 5–10 ms is a guess; measure the burst correlation on
-  cn163-peak.
-- **Second protocol.** Should the redundant carrier use a different outbound
-  (TCP vs QUIC) to decorrelate loss? Needs a second carrier per exit in config
-  and the same egress group.
-- **Trigger.** Always for `EXIT_AI`, or only after a stall? Always is simpler
-  and cheap for chat; measure the carrier-slot cost.
-- **Kill switch.** A redundant carrier's failure must not mark the exit failed;
-  needs a tagged health path.
-- **Relay capacity.** Doubling AI sessions' carriers is fine at 4096 slots, but
-  a relay full of AI sessions doubles its carrier count; measure.
-- **Correlated loss.** If both carriers share the bottleneck queue and the
-  burst is longer than the spacing, both copies are lost. The gain then comes
-  only from the second carrier's independent retransmission timing, which is
-  still better than one carrier's RTO but not free. Stage 0/2 measurement
-  decides.
+- **Spacing.** `RedundancyMode::Dup` defaults to `delay = 30 ms`
+  (`Hedge` supports arbitrary `delay`). `cn163-offpeak` gains cleanly;
+  `cn163-peak` tail behavior with spare-carrier `resumes` is tracked as a
+  follow-up.
+- **Second protocol / carrier.** `segue-kernel` now supports
+  `Exit.redundant_carrier` so standby/redundant traffic can use a separate
+  outbound in the same egress group without dial racing.
+- **Trigger.** Defaults to `RedundancyMode::Dup { delay: 30 ms }` with
+  `ai_only = true` (active when an AI session has a bound standby carrier;
+  opt-out via `RedundancyMode::Off`). Relay capacity and per-session
+  `CarrierFrame` memory remain bounded via `max_carriers` and `Tier::Elastic`
+  (`drop_due`).
+- **Correlated loss.** With `connection_seed` decorrelation on the synthetic
+  impair proxy, two carriers avoid lockstep packet drops; under heavy peak
+  bursts (`cn163-peak`), independent spare carrier stalls can still trigger
+  `resumes`, increasing tail p99 until tuned.

@@ -2900,3 +2900,205 @@ async fn client_does_not_spin_on_an_ack_it_has_no_credit_for() {
     client.abort();
     reader.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redundant_tx_sheds_under_pool_pressure_without_blocking_primary() {
+    use segue_session::driver::{run_client_standby, StandbyCtl, StandbyEvent};
+    use segue_session::pool::Tier;
+    let pool = Pool::new(256 << 10);
+    let relay_pool = Pool::new(8 << 20);
+    let mut params = params();
+    params.exit_class = segue_session::EXIT_CLASS_AI;
+    let s = ClientSession::new(Config::default(), &pool, params, Instant::now()).unwrap();
+    let table = RelayTable::new(Config::default(), relay_pool, Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(8);
+    let relay = tokio::spawn(run_relay(
+        table,
+        accept_rx,
+        Arc::new(|_t, _k| {
+            Box::pin(async {
+                let (s, mut r) = tokio::io::duplex(64 << 10);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match r.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if r.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+                Ok(Box::new(s) as BoxCarrier)
+            })
+        }),
+        None,
+    ));
+    let connector: Connector = Arc::new(move || {
+        let tx = accept_tx.clone();
+        Box::pin(async move {
+            let (a, b) = tokio::io::duplex(64 << 10);
+            tx.send(Box::new(b) as BoxCarrier).await.unwrap();
+            Ok(Box::new(a) as BoxCarrier)
+        })
+    });
+    let bound = Arc::new(AtomicBool::new(false));
+    let (mut app, far) = tokio::io::duplex(64 << 10);
+    let ctl = ClientCtl {
+        standby: Some(StandbyCtl {
+            connect: connector.clone(),
+            allowed: Arc::new(|| true),
+            on_event: Arc::new({
+                let bound = bound.clone();
+                move |ev| {
+                    if ev == StandbyEvent::Bound {
+                        bound.store(true, Ordering::SeqCst);
+                    }
+                }
+            }),
+            swaps: None,
+        }),
+        ..Default::default()
+    };
+    let client = tokio::spawn(run_client_standby(s, far, connector, ctl));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !bound.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("standby never bound");
+
+    // Exhaust the elastic region so `pool.under_pressure()` is true. Primary
+    // still progresses via Tier::Transport while redundant TX sheds cleanly.
+    let held = pool.take_blocks(1 << 20, 1, pool.limit(Tier::Elastic));
+    assert!(pool.under_pressure());
+    let msg = vec![0x55u8; 256];
+    let mut got = vec![0u8; 256];
+    for _ in 0..8 {
+        app.write_all(&msg).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), app.read_exact(&mut got))
+            .await
+            .expect("primary blocked under pool pressure with bound standby")
+            .unwrap();
+        assert_eq!(got, msg);
+    }
+    pool.give_blocks(held);
+    drop(app);
+    let reason = tokio::time::timeout(Duration::from_secs(5), client)
+        .await
+        .expect("client never finished")
+        .unwrap();
+    assert_eq!(reason, CloseReason::Clean);
+    relay.abort();
+}
+
+#[tokio::test]
+async fn reattach_aborts_in_flight_standby_dial_and_rearms() {
+    use segue_session::driver::{run_client_standby, StandbyCtl, StandbyEvent};
+    let pool = Pool::new(2 << 20);
+    let relay_pool = Pool::new(2 << 20);
+    let mut params = params();
+    params.exit_class = segue_session::EXIT_CLASS_AI;
+    let s = ClientSession::new(Config::default(), &pool, params, Instant::now()).unwrap();
+    let table = RelayTable::new(Config::default(), relay_pool, Box::new(AllowAll), INSTANCE);
+    let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(8);
+    let relay = tokio::spawn(run_relay(
+        table,
+        accept_rx,
+        Arc::new(|_t, _k| {
+            Box::pin(async {
+                let (s, _r) = tokio::io::duplex(64 << 10);
+                Ok(Box::new(s) as BoxCarrier)
+            })
+        }),
+        None,
+    ));
+    let main_conn: Connector = Arc::new({
+        let accept_tx = accept_tx.clone();
+        move || {
+            let tx = accept_tx.clone();
+            Box::pin(async move {
+                let (a, b) = tokio::io::duplex(64 << 10);
+                tx.send(Box::new(b) as BoxCarrier).await.unwrap();
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        }
+    });
+    struct AbortGuard(Arc<AtomicBool>);
+    impl Drop for AbortGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let attempt = Arc::new(AtomicUsize::new(0));
+    let aborted = Arc::new(AtomicBool::new(false));
+    let first_started = Arc::new(AtomicBool::new(false));
+    let bound = Arc::new(AtomicUsize::new(0));
+    let standby_conn: Connector = Arc::new({
+        let (accept_tx, attempt, aborted, first_started) = (
+            accept_tx,
+            attempt.clone(),
+            aborted.clone(),
+            first_started.clone(),
+        );
+        move || {
+            let k = attempt.fetch_add(1, Ordering::SeqCst);
+            let tx = accept_tx.clone();
+            let aborted = aborted.clone();
+            let first_started = first_started.clone();
+            Box::pin(async move {
+                if k == 0 {
+                    let _guard = AbortGuard(aborted);
+                    first_started.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+                let (a, b) = tokio::io::duplex(64 << 10);
+                tx.send(Box::new(b) as BoxCarrier).await.unwrap();
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        }
+    });
+    let (reattach_tx, reattach_rx) = tokio::sync::watch::channel(0u64);
+    let (_app, far) = tokio::io::duplex(64 << 10);
+    let ctl = ClientCtl {
+        reattach: Some(reattach_rx),
+        standby: Some(StandbyCtl {
+            connect: standby_conn,
+            allowed: Arc::new(|| true),
+            on_event: Arc::new({
+                let bound = bound.clone();
+                move |ev| {
+                    if ev == StandbyEvent::Bound {
+                        bound.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }),
+            swaps: None,
+        }),
+        ..Default::default()
+    };
+    let client = tokio::spawn(run_client_standby(s, far, main_conn, ctl));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !first_started.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("first standby dial never started");
+    // Trigger reattach while standby dial #1 is still in flight: dial #1 must
+    // abort cleanly and dial #2 binds right after without waiting on backoff.
+    reattach_tx.send(1).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !aborted.load(Ordering::SeqCst) || bound.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reattach did not abort hanging standby dial and rebind");
+    assert_eq!(attempt.load(Ordering::SeqCst), 2);
+    client.abort();
+    relay.abort();
+}

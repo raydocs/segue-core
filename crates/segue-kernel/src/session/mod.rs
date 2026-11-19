@@ -61,10 +61,11 @@ use segue_session::client::{ClientSession, CloseReason, Health as SessionHealth,
 use segue_session::codec::{code, CtrlHello, Kind, SessionId, Target, VERSION};
 use segue_session::driver::{
     run_client_ctl, run_client_standby, run_control, BoxCarrier, ClientCtl, Connector, ControlHint,
-    ControlTiming, StandbyCtl, StandbyEvent,
+    ControlTiming, MoveHook, StandbyCtl, StandbyEvent,
 };
 use segue_session::pool::Pool;
 use segue_session::quality::{Quality, QualityEvent, QualityTracker};
+use segue_session::{MoveStats, RedundancyConfig};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -115,6 +116,8 @@ pub struct Exit {
     pub name: String,
     /// Engine outbound that carries the session.
     pub carrier: String,
+    /// Optional separate engine outbound for background standby dials.
+    pub redundant_carrier: Option<String>,
     /// Relay address as the carrier's server sees it.
     pub relay: SocketAddr,
     /// Node id sent as `anchor_node_id`.
@@ -439,6 +442,57 @@ pub struct KernelDialer {
     pub(crate) standby_lost: Arc<AtomicU64>,
     /// Test hook: standby dials fail before touching the engine.
     standby_fail: Arc<AtomicBool>,
+    /// Sum of each session's [`MoveStats`], updated as counters change.
+    move_counters: Arc<MoveCounters>,
+}
+
+struct MoveCounters {
+    stall: AtomicU64,
+    hold: AtomicU64,
+    relay_stall: AtomicU64,
+    closed: AtomicU64,
+    io: AtomicU64,
+    reject: AtomicU64,
+    attach: AtomicU64,
+    swaps: AtomicU64,
+    promotions: AtomicU64,
+    resumes: AtomicU64,
+    bytes_replayed: AtomicU64,
+    recovery_us_sum: AtomicU64,
+    recovery_us_max: AtomicU64,
+    recoveries: AtomicU64,
+}
+
+fn add_move(atom: &AtomicU64, now: u64, was: u64) {
+    let d = now.saturating_sub(was);
+    if d > 0 {
+        atom.fetch_add(d, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn apply_move_delta(c: &MoveCounters, snap: &MoveStats, prev: &MoveStats) {
+    add_move(&c.stall, snap.stall, prev.stall);
+    add_move(&c.hold, snap.hold, prev.hold);
+    add_move(&c.relay_stall, snap.relay_stall, prev.relay_stall);
+    add_move(&c.closed, snap.closed, prev.closed);
+    add_move(&c.io, snap.io, prev.io);
+    add_move(&c.reject, snap.reject, prev.reject);
+    add_move(&c.attach, snap.attach, prev.attach);
+    add_move(&c.swaps, snap.swaps, prev.swaps);
+    add_move(&c.promotions, snap.promotions, prev.promotions);
+    add_move(&c.resumes, snap.resumes, prev.resumes);
+    add_move(&c.bytes_replayed, snap.bytes_replayed, prev.bytes_replayed);
+    add_move(
+        &c.recovery_us_sum,
+        snap.recovery_us_sum,
+        prev.recovery_us_sum,
+    );
+    add_move(&c.recoveries, snap.recoveries, prev.recoveries);
+    if snap.recovery_us_max > prev.recovery_us_max {
+        let _ = c
+            .recovery_us_max
+            .fetch_max(snap.recovery_us_max, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Drop for KernelDialer {
@@ -489,6 +543,22 @@ impl KernelDialer {
             standby_swaps: Arc::new(AtomicU64::new(0)),
             standby_lost: Arc::new(AtomicU64::new(0)),
             standby_fail: Arc::new(AtomicBool::new(false)),
+            move_counters: Arc::new(MoveCounters {
+                stall: AtomicU64::new(0),
+                hold: AtomicU64::new(0),
+                relay_stall: AtomicU64::new(0),
+                closed: AtomicU64::new(0),
+                io: AtomicU64::new(0),
+                reject: AtomicU64::new(0),
+                attach: AtomicU64::new(0),
+                swaps: AtomicU64::new(0),
+                promotions: AtomicU64::new(0),
+                resumes: AtomicU64::new(0),
+                bytes_replayed: AtomicU64::new(0),
+                recovery_us_sum: AtomicU64::new(0),
+                recovery_us_max: AtomicU64::new(0),
+                recoveries: AtomicU64::new(0),
+            }),
         }
     }
 
@@ -497,6 +567,46 @@ impl KernelDialer {
     pub fn with_standby_ai(mut self, on: bool) -> Self {
         self.standby_ai = on;
         self
+    }
+
+    /// Override Stage 2 small-frame redundancy configuration on new sessions.
+    pub fn with_redundancy(mut self, redundancy: RedundancyConfig) -> Self {
+        self.session_cfg.redundancy = redundancy;
+        self
+    }
+
+    /// Sum of move counters from sessions this dialer has run.
+    pub fn move_stats(&self) -> MoveStats {
+        let c = &self.move_counters;
+        let load = |a: &AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        MoveStats {
+            stall: load(&c.stall),
+            hold: load(&c.hold),
+            relay_stall: load(&c.relay_stall),
+            closed: load(&c.closed),
+            io: load(&c.io),
+            reject: load(&c.reject),
+            attach: load(&c.attach),
+            swaps: load(&c.swaps),
+            promotions: load(&c.promotions),
+            resumes: load(&c.resumes),
+            bytes_replayed: load(&c.bytes_replayed),
+            recovery_us_sum: load(&c.recovery_us_sum),
+            recovery_us_max: load(&c.recovery_us_max),
+            recoveries: load(&c.recoveries),
+            t_live: 0,
+            stall_hints: 0,
+        }
+    }
+
+    fn move_hook(&self) -> MoveHook {
+        let counters = Arc::clone(&self.move_counters);
+        let last = Mutex::new(MoveStats::default());
+        Arc::new(move |snap| {
+            let mut prev = last.lock().unwrap_or_else(|e| e.into_inner());
+            apply_move_delta(&counters, &snap, &prev);
+            *prev = snap;
+        })
     }
 
     /// Standby dials started since this dialer was built. One per dial, not
@@ -836,7 +946,14 @@ impl KernelDialer {
     fn connector_for(&self, i: usize, report: bool) -> Connector {
         let engine = self.engine.clone();
         let state = self.state.clone();
-        let carrier = self.exits[i].carrier.clone();
+        let carrier = if report {
+            self.exits[i].carrier.clone()
+        } else {
+            self.exits[i]
+                .redundant_carrier
+                .clone()
+                .unwrap_or_else(|| self.exits[i].carrier.clone())
+        };
         let relay = self.exits[i].relay;
         let second_started = Arc::clone(&self.race_second_started);
         let second_won = Arc::clone(&self.race_second_won);
@@ -851,10 +968,31 @@ impl KernelDialer {
             let spare = spare.clone();
             let standby_fail = Arc::clone(&standby_fail);
             Box::pin(async move {
-                // A test asks the standby dial to fail before the engine,
-                // so the exit's posture is what we assert on.
-                if !report && standby_fail.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Err(std::io::Error::other("standby dial failed"));
+                // Background standby dials never run parallel carrier racing or
+                // record exit health failures: one dial against `redundant_carrier`
+                // (or `carrier` fallback) keeps connections <= 2 per AI flow.
+                if !report {
+                    if standby_fail.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(std::io::Error::other("standby dial failed"));
+                    }
+                    let timed = tokio::time::timeout(
+                        CARRIER_TIMEOUT,
+                        engine.dial(Some(&carrier), &TargetAddr::Ip(relay.ip()), relay.port()),
+                    )
+                    .await;
+                    return match timed {
+                        Ok(Ok(stream)) => {
+                            let mut st = state.lock().unwrap();
+                            let h = &mut st.health[i];
+                            if !h.unproven {
+                                h.ks.on_event(Event::ChannelUp);
+                                h.last_fail = None;
+                            }
+                            Ok(Box::new(stream) as BoxCarrier)
+                        }
+                        Ok(Err(e)) => Err(std::io::Error::other(e.0)),
+                        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+                    };
                 }
                 // The exit's smoothed RTT, copied out so the race does not
                 // hold the state lock. Unknown until the first control PING.
@@ -901,19 +1039,15 @@ impl KernelDialer {
                                     (Ok(Box::new(stream) as BoxCarrier), loser)
                                 }
                                 Err(e) => {
-                                    if report {
-                                        mark_failed(h);
-                                        eprintln!("segue-kernel: carrier {carrier} failed: {e}");
-                                    }
+                                    mark_failed(h);
+                                    eprintln!("segue-kernel: carrier {carrier} failed: {e}");
                                     (Err(std::io::Error::other(e.0)), loser)
                                 }
                             }
                         }
                         Err(_) => {
-                            if report {
-                                mark_failed(h);
-                                eprintln!("segue-kernel: carrier {carrier} timed out");
-                            }
+                            mark_failed(h);
+                            eprintln!("segue-kernel: carrier {carrier} timed out");
                             (Err(std::io::ErrorKind::TimedOut.into()), None)
                         }
                     }
@@ -1077,6 +1211,7 @@ impl KernelDialer {
                 })
             }),
             standby: self.standby_ctl(i, r.exit_class),
+            moves: Some(self.move_hook()),
         };
         // Two driver futures. Boxed so the spawn task has one type, and so
         // a non-AI session's driver is only the plain loop.

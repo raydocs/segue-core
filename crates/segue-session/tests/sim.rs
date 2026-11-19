@@ -992,11 +992,11 @@ fn t_stall_promotes_the_spare_without_a_new_dial() {
     let fruitless = s.client.fruitless_carriers();
     s.client.take_health();
     s.client.take_quality();
-    // Quiet the current carrier. Uplink is still in flight, so `t_stall`
-    // (1s) fires before the relay's `t_live` (3s).
+    // Quiet the current carrier. Uplink is still in flight, so `t_stall_ai`
+    // (5s) fires cleanly.
     s.hold_carrier = Some(current);
     let mut promoted = false;
-    for _ in 0..3_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.client.carrier() == Some(spare) {
             promoted = true;
@@ -1045,11 +1045,11 @@ fn stall_hint_promotes_the_spare_without_a_new_dial() {
     s.client.take_health();
     s.client.take_quality();
     // No downlink reaches the client, so it sends no further ACKs. The
-    // relay's `t_live` promotes the spare and emits STALL. Uplink is fully
-    // acknowledged, so the client's own `t_stall` stays quiet.
+    // relay's `t_live_ai` (5s) promotes the spare and emits STALL. Uplink
+    // is fully acknowledged, so the client's own `t_stall_ai` stays quiet.
     s.mute_rx = Some(current);
     let mut promoted = false;
-    for _ in 0..5_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.client.carrier() == Some(spare) {
             promoted = true;
@@ -1088,27 +1088,25 @@ fn transport_hold_promotes_the_spare_without_a_new_dial() {
     s.client.on_carrier_stuck(current, s.now);
     assert_eq!(s.client.carrier(), Some(spare));
     assert_eq!(s.client.gen(), gen);
-    // A transport hold demotes the old carrier instead of closing it.
-    assert_eq!(s.client.redundant_carrier(), Some(current));
+    // A transport hold hard-drops the stuck carrier instead of demoting it so
+    // a hung writer cannot stay in `redundant` holding `tx_slot`.
+    assert_eq!(s.client.redundant_carrier(), None);
     assert_eq!(s.client.fruitless_carriers(), fruitless);
     assert!(!s.client.wants_attach(s.now));
     assert_ne!(s.client.take_health(), Some(Health::Failed));
     assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
-    // In-flight frames on the old carrier keep it from looking silent, so
-    // the relay follows on `t_live` (3s): unacked downlink and no ACK on
-    // that carrier. The old carrier stays open as the spare.
     let sid = s.client.session_id();
     let mut followed = false;
-    for _ in 0..5_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.relay.current_carrier(&sid) == Some(spare) {
             followed = true;
             break;
         }
     }
-    assert!(followed, "relay did not follow the transport-hold swap");
-    assert_eq!(s.relay.redundant_carrier(&sid), Some(current));
-    assert!(s.pipes.contains_key(&current));
+    assert!(followed, "relay did not promote the spare after hold");
+    assert_eq!(s.relay.redundant_carrier(&sid), None);
+    assert!(!s.pipes.contains_key(&current));
     assert_eq!(s.carriers_opened, opened);
     s.run(200_000);
     s.assert_exact();
@@ -1132,7 +1130,7 @@ fn stall_swaps_with_the_standby_and_swaps_back() {
 
     s.hold_carrier = Some(current);
     let mut swapped = false;
-    for _ in 0..3_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.client.carrier() == Some(spare)
             && s.client.redundant_carrier() == Some(current)
@@ -1158,7 +1156,7 @@ fn stall_swaps_with_the_standby_and_swaps_back() {
     }
     s.hold_carrier = Some(spare);
     let mut back = false;
-    for _ in 0..5_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.client.carrier() == Some(current) {
             back = true;
@@ -1170,7 +1168,7 @@ fn stall_swaps_with_the_standby_and_swaps_back() {
     assert!(back, "recovered carrier was not swapped back");
     assert_eq!(s.client.redundant_carrier(), Some(spare));
     let mut relay_back = false;
-    for _ in 0..4_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.relay.current_carrier(&sid) == Some(current)
             && s.relay.redundant_carrier(&sid) == Some(spare)
@@ -1251,6 +1249,426 @@ fn move_onto_a_third_carrier_drops_the_spare() {
     s.run(200_000);
     s.assert_exact();
     assert!(s.client.gen() > gen);
+}
+
+fn open_ai_with_bound_spare() -> (ClientSession, RelayTable, u64, u64, Instant) {
+    let cfg = Config::default();
+    let now = Instant::now();
+    let cpool = Pool::new(8 << 20);
+    let rpool = Pool::new(8 << 20);
+    let params = OpenParams {
+        ticket: b"ticket".to_vec(),
+        kind: Kind::Tcp,
+        target: Target::Domain("example.com".into(), 443),
+        exit_class: 1,
+        anchor_node_id: 5,
+        instance_hint: INSTANCE,
+    };
+    let mut client =
+        ClientSession::with_ids(cfg.clone(), &cpool, params, [7; 16], [9; 32], now).unwrap();
+    let mut relay = RelayTable::new(cfg, rpool, Box::new(AllowAll), INSTANCE);
+    let sid = client.session_id();
+
+    let c1 = 1u64;
+    relay.add_carrier(c1);
+    client.attach(c1, now);
+    while let Some(f) = client.poll_transmit(c1, now) {
+        relay.on_frame(c1, f, now);
+    }
+    while let Some(ev) = relay.take_event() {
+        if let RelayEvent::Connect { session_id, .. } = ev {
+            relay.connect_done(&session_id, Ok(()), now);
+        }
+    }
+    while let Some(f) = relay.poll_transmit(c1, now) {
+        client.on_frame(c1, f, now).unwrap();
+    }
+
+    let c2 = 2u64;
+    client.request_redundant();
+    assert!(client.wants_redundant());
+    relay.add_carrier(c2);
+    client.attach_redundant(c2, now);
+    while let Some(f) = client.poll_transmit(c2, now) {
+        relay.on_frame(c2, f, now);
+    }
+    while let Some(f) = relay.poll_transmit(c2, now) {
+        client.on_frame(c2, f, now).unwrap();
+    }
+    assert_eq!(client.carrier(), Some(c1));
+    assert_eq!(client.redundant_carrier(), Some(c2));
+    assert_eq!(relay.current_carrier(&sid), Some(c1));
+    assert_eq!(relay.redundant_carrier(&sid), Some(c2));
+    (client, relay, c1, c2, now)
+}
+
+#[test]
+fn stage2_dup_hides_primary_packet_loss_without_swapping() {
+    let (mut client, mut relay, current, spare, mut now) = open_ai_with_bound_spare();
+    let gen = client.gen();
+    let sid = client.session_id();
+    let msg_a = pattern(256, 0x11);
+    let msg_b = pattern(256, 0x22);
+    assert_eq!(client.write(&msg_a), 256);
+    assert_eq!(relay.site_data(&sid, &msg_b), 256);
+    // Poll once onto primary and drop primary's in-flight frames so only the
+    // Stage 2 30 ms duplicate on `spare` delivers both directions.
+    while client.poll_transmit(current, now).is_some() {}
+    while relay.poll_transmit(current, now).is_some() {}
+
+    let mut up_got = Vec::new();
+    let mut down_got = Vec::new();
+    for _ in 0..80 {
+        now += Duration::from_millis(1);
+        client.handle_timeout(now);
+        relay.handle_timeout(now);
+        while let Some(f) = client.poll_transmit(spare, now) {
+            relay.on_frame(spare, f, now);
+        }
+        while let Some(f) = relay.poll_transmit(spare, now) {
+            client.on_frame(spare, f, now).unwrap();
+        }
+        let mut rbuf = [0u8; 512];
+        let n = relay.read(&sid, &mut rbuf, now);
+        up_got.extend_from_slice(&rbuf[..n]);
+        let n = client.read(&mut rbuf, now);
+        down_got.extend_from_slice(&rbuf[..n]);
+    }
+    assert_eq!(up_got, msg_a);
+    assert_eq!(down_got, msg_b);
+    assert_eq!(
+        client.carrier(),
+        Some(current),
+        "Stage 2 swapped prematurely"
+    );
+    assert_eq!(client.gen(), gen, "Stage 2 triggered RESUME");
+}
+
+#[test]
+fn stage2_mixed_bulk_and_small_frames_never_hit_data_gap() {
+    let (mut client, mut relay, current, spare, mut now) = open_ai_with_bound_spare();
+    let sid = client.session_id();
+
+    // Emit small (256 B), bulk (4096 B > 1024), and small (128 B) frames onto
+    // primary, dropping all of them into the void. `p1` enters `DupQueue`,
+    // bulk `p2` stops `contig_end`, and `p3` must NOT be queued ahead of `p2`.
+    let p1 = pattern(256, 0x31);
+    let p2 = pattern(4096, 0x32);
+    let p3 = pattern(128, 0x33);
+    assert_eq!(client.write(&p1), 256);
+    while client.poll_transmit(current, now).is_some() {}
+    assert_eq!(client.write(&p2), 4096);
+    while client.poll_transmit(current, now).is_some() {}
+    assert_eq!(client.write(&p3), 128);
+    while client.poll_transmit(current, now).is_some() {}
+
+    for _ in 0..80 {
+        now += Duration::from_millis(1);
+        client.handle_timeout(now);
+        relay.handle_timeout(now);
+        while let Some(f) = client.poll_transmit(spare, now) {
+            relay.on_frame(spare, f, now);
+        }
+        while let Some(f) = relay.poll_transmit(spare, now) {
+            client.on_frame(spare, f, now).unwrap();
+        }
+    }
+    // `p1` (contiguous prefix before bulk) arrived cleanly; `p3` must NOT
+    // have jumped ahead of unacked `p2` and triggered `gap in data`.
+    let mut got = vec![0u8; 512];
+    let n = relay.read(&sid, &mut got, now);
+    assert_eq!(&got[..n], &p1[..]);
+    assert!(relay.state(&sid).is_some(), "relay killed session on gap");
+    assert_eq!(relay.redundant_carrier(&sid), Some(spare));
+
+    // Closing `current` promotes `spare`, which replays remaining `p2 + p3`.
+    client.on_carrier_closed(current, now);
+    assert_eq!(client.carrier(), Some(spare));
+    while let Some(f) = client.poll_transmit(spare, now) {
+        relay.on_frame(spare, f, now);
+    }
+    let mut rest = vec![0u8; 8192];
+    let mut acc = Vec::new();
+    loop {
+        let k = relay.read(&sid, &mut rest, now);
+        if k == 0 {
+            break;
+        }
+        acc.extend_from_slice(&rest[..k]);
+    }
+    let mut expected = p2;
+    expected.extend_from_slice(&p3);
+    assert_eq!(acc, expected);
+}
+
+#[test]
+fn relay_detached_rescued_by_frame_on_bound_spare() {
+    let (client, mut relay, current, spare, mut now) = open_ai_with_bound_spare();
+    let sid = client.session_id();
+
+    assert_eq!(relay.site_data(&sid, b"downlink"), 8);
+    while relay.poll_transmit(current, now).is_some() {}
+    // Wait `t_live_ai`: relay promotes `spare`, demotes `current`, emits STALL.
+    now += Config::default().timing.t_live_ai;
+    relay.handle_timeout(now);
+    assert_eq!(relay.current_carrier(&sid), Some(spare));
+    assert_eq!(relay.redundant_carrier(&sid), Some(current));
+    while relay.poll_transmit(spare, now).is_some() {}
+    // Wait another `t_live_ai`: demoted `current` has not heard anything yet,
+    // so relay falls back to `Detached` while `current` still sits in `redundant`.
+    now += Config::default().timing.t_live_ai;
+    relay.handle_timeout(now);
+    assert_eq!(
+        relay.state(&sid),
+        Some(segue_session::relay::SessionState::Detached)
+    );
+    assert_eq!(relay.redundant_carrier(&sid), Some(current));
+
+    // A frame now arrives on `current`: clears `demoted_at` and immediately
+    // rescues the relay from `Detached` -> `Active` on `current`!
+    relay.on_frame(
+        current,
+        Frame::Ack {
+            recv_offset: 0,
+            max_offset: 16 * 1024,
+        },
+        now,
+    );
+    assert_eq!(
+        relay.state(&sid),
+        Some(segue_session::relay::SessionState::Active)
+    );
+    assert_eq!(relay.current_carrier(&sid), Some(current));
+}
+
+#[test]
+fn primary_download_blackhole_self_heals_onto_live_spare_and_rst_mirrors() {
+    let (mut client, mut relay, current, spare, mut now) = open_ai_with_bound_spare();
+    assert!(!client.send_half().unacked(), "no uplink unacked");
+
+    // Relay promotes spare and sends fresh downlink `DATA` on `spare`; primary
+    // `current` is blackholed and client never receives `STALL` hint.
+    let sid = client.session_id();
+    let payload = pattern(1500, 0x99);
+    assert_eq!(relay.site_data(&sid, &payload), 1500);
+    while relay.poll_transmit(current, now).is_some() {}
+    now += Config::default().timing.t_live_ai;
+    relay.handle_timeout(now);
+    assert_eq!(relay.current_carrier(&sid), Some(spare));
+
+    let t_prog = now + Duration::from_millis(10);
+    while let Some(f) = relay.poll_transmit(spare, t_prog) {
+        client.on_frame(spare, f, t_prog).unwrap();
+    }
+    assert_eq!(client.carrier(), Some(current));
+    // Once `t_stall_ai` elapses from `current`'s `last_rx`, client self-heals
+    // onto `spare` purely from `r.progressed_at > self.last_rx`!
+    let t_heal = now + Config::default().timing.t_stall_ai;
+    client.handle_timeout(t_heal);
+    assert_eq!(client.carrier(), Some(spare));
+    assert_eq!(client.redundant_carrier(), Some(current));
+
+    // Closing with local reset mirrors `RST` onto both current & bound spare.
+    client.reset(segue_session::codec::code::SITE_RESET);
+    let f1 = client.poll_transmit(spare, t_heal);
+    let f2 = client.poll_transmit(current, t_heal);
+    assert!(matches!(f1, Some(Frame::Rst { .. })));
+    assert!(matches!(f2, Some(Frame::Rst { .. })));
+}
+
+#[test]
+fn stage2_late_bind_and_drop_due_still_protect_streaming_tokens() {
+    let cfg = Config::default();
+    let mut now = Instant::now();
+    let cpool = Pool::new(8 << 20);
+    let rpool = Pool::new(8 << 20);
+    let params = OpenParams {
+        ticket: b"ticket".to_vec(),
+        kind: Kind::Tcp,
+        target: Target::Domain("example.com".into(), 443),
+        exit_class: 1,
+        anchor_node_id: 5,
+        instance_hint: INSTANCE,
+    };
+    let mut client =
+        ClientSession::with_ids(cfg.clone(), &cpool, params, [7; 16], [9; 32], now).unwrap();
+    let mut relay = RelayTable::new(cfg, rpool, Box::new(AllowAll), INSTANCE);
+    let sid = client.session_id();
+    let gen = client.gen();
+
+    let c1 = 1u64;
+    relay.add_carrier(c1);
+    client.attach(c1, now);
+    while let Some(f) = client.poll_transmit(c1, now) {
+        relay.on_frame(c1, f, now);
+    }
+    while let Some(ev) = relay.take_event() {
+        if let RelayEvent::Connect { session_id, .. } = ev {
+            relay.connect_done(&session_id, Ok(()), now);
+        }
+    }
+    while let Some(f) = relay.poll_transmit(c1, now) {
+        client.on_frame(c1, f, now).unwrap();
+    }
+
+    // Send 3 small 30 B tokens on primary BEFORE binding the spare (cursor=90,
+    // acked=0) and drop them on primary to emulate in-flight streaming at bind.
+    let mut sent_down = Vec::new();
+    for i in 0..3u8 {
+        let tok = pattern(30, 0x10 + i);
+        sent_down.extend_from_slice(&tok);
+        assert_eq!(relay.site_data(&sid, &tok), 30);
+        while relay.poll_transmit(c1, now).is_some() {}
+    }
+
+    // Now bind spare carrier `c2` while those 90 B are unacked on primary.
+    let c2 = 2u64;
+    client.request_redundant();
+    assert!(client.wants_redundant());
+    relay.add_carrier(c2);
+    client.attach_redundant(c2, now);
+    while let Some(f) = client.poll_transmit(c2, now) {
+        relay.on_frame(c2, f, now);
+    }
+    while let Some(f) = relay.poll_transmit(c2, now) {
+        client.on_frame(c2, f, now).unwrap();
+    }
+
+    // Emit 3 more 30 B tokens after bind; still drop primary so only `c2` delivers.
+    for i in 3..6u8 {
+        let tok = pattern(30, 0x10 + i);
+        sent_down.extend_from_slice(&tok);
+        assert_eq!(relay.site_data(&sid, &tok), 30);
+        while relay.poll_transmit(c1, now).is_some() {}
+    }
+
+    let mut got = Vec::new();
+    for _ in 0..80 {
+        now += Duration::from_millis(1);
+        client.handle_timeout(now);
+        relay.handle_timeout(now);
+        while let Some(f) = relay.poll_transmit(c2, now) {
+            client.on_frame(c2, f, now).unwrap();
+        }
+        while let Some(f) = client.poll_transmit(c2, now) {
+            relay.on_frame(c2, f, now);
+        }
+        let mut buf = [0u8; 256];
+        let n = client.read(&mut buf, now);
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(got, sent_down);
+    assert_eq!(client.carrier(), Some(c1));
+    assert_eq!(client.gen(), gen);
+
+    // Shedding mid-stream while cursor is ahead of acked must NOT wedge
+    // future duplicates once pressure lifts.
+    let t_before = now;
+    let tok_extra = pattern(30, 0x77);
+    assert_eq!(relay.site_data(&sid, &tok_extra), 30);
+    while relay.poll_transmit(c1, t_before).is_some() {}
+    relay.drop_redundant_dups_if_busy(c2, t_before);
+
+    let tok_next = pattern(30, 0x88);
+    assert_eq!(relay.site_data(&sid, &tok_next), 30);
+    while relay.poll_transmit(c1, t_before).is_some() {}
+
+    // Advance 80 ms delivering on `c2`: `tok_extra` was shed, so `tok_next`
+    // (`offset = 210 > recv_offset = 180`) is safely ignored by the client's
+    // out-of-order guard without raising `gap in data`, and once primary `c1`
+    // later closes and rewinds `c2` delivers `tok_extra || tok_next` cleanly.
+    for _ in 0..80 {
+        now += Duration::from_millis(1);
+        client.handle_timeout(now);
+        relay.handle_timeout(now);
+        while let Some(f) = relay.poll_transmit(c2, now) {
+            client.on_frame(c2, f, now).unwrap();
+        }
+    }
+    assert_eq!(client.carrier(), Some(c1));
+    relay.on_carrier_closed(c1, now);
+    while let Some(f) = relay.poll_transmit(c2, now) {
+        client.on_frame(c2, f, now).unwrap();
+    }
+    let mut rest = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let n = client.read(&mut buf, now);
+        if n == 0 {
+            break;
+        }
+        rest.extend_from_slice(&buf[..n]);
+    }
+    let mut expected_rest = tok_extra;
+    expected_rest.extend_from_slice(&tok_next);
+    assert_eq!(rest, expected_rest);
+}
+
+#[test]
+fn stage2_one_sided_swap_never_resets_on_mirrored_fin_or_dup_gap() {
+    let (mut client, mut relay, c1, c2, mut now) = open_ai_with_bound_spare();
+    let sid = client.session_id();
+
+    let d1 = pattern(30, 0x41);
+    let d2 = pattern(30, 0x42);
+    assert_eq!(relay.site_data(&sid, &d1), 30);
+    assert_eq!(relay.site_data(&sid, &d2), 30);
+    relay.site_fin(&sid);
+    // Emit onto primary c1 and drop in flight: r.dup queues [0..60] for +30 ms
+    // and r.fin_due = Some(60) must wait until acked == 60.
+    while relay.poll_transmit(c1, now).is_some() {}
+    assert!(
+        relay.poll_transmit(c2, now).is_none(),
+        "mirrored FIN emitted on spare before acked reached 60"
+    );
+
+    // One-sided swap on client only: c2 becomes client's current carrier
+    // (`promoted_in_gen = true`) while relay still treats c2 as spare.
+    client.on_carrier_closed(c1, now);
+    assert_eq!(client.carrier(), Some(c2));
+
+    // Even if an out-of-order DATA(offset=30) or FIN(offset=60) arrives on
+    // promoted c2 while recv_offset == 0, client ignores without resetting.
+    client
+        .on_frame(
+            c2,
+            Frame::Data {
+                offset: 30,
+                data: d2.clone(),
+                pad: 0,
+            },
+            now,
+        )
+        .unwrap();
+    client.on_frame(c2, Frame::Fin { offset: 60 }, now).unwrap();
+    assert!(!client.is_closed());
+
+    // Advance past the 30 ms Stage 2 delay so `r.dup` delivers `[0..60)`,
+    // client reads and ACKs 60, then relay mirrors `FIN(60)` onto c2 and
+    // client reaches clean EOF.
+    let mut got = Vec::new();
+    let mut buf = [0u8; 128];
+    for _ in 0..80 {
+        now += Duration::from_millis(1);
+        client.handle_timeout(now);
+        relay.handle_timeout(now);
+        while let Some(f) = relay.poll_transmit(c2, now) {
+            client.on_frame(c2, f, now).unwrap();
+        }
+        let n = client.read(&mut buf, now);
+        got.extend_from_slice(&buf[..n]);
+        while let Some(f) = client.poll_transmit(c2, now) {
+            relay.on_frame(c2, f, now);
+        }
+    }
+    let mut expected = d1;
+    expected.extend_from_slice(&d2);
+    assert_eq!(got, expected);
+    assert!(client.read_eof());
+    assert!(!matches!(
+        client.close_reason(),
+        Some(CloseReason::Reset(_))
+    ));
 }
 
 #[allow(dead_code)]

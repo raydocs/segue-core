@@ -259,3 +259,46 @@ fn resume_switch_drops_the_redundant_carrier() {
     assert_eq!(relay.redundant_carrier(&sid), None);
     assert_eq!(relay.cur_gen(&sid), Some(1));
 }
+
+#[test]
+fn redundant_attach_rejected_when_connecting_or_detached() {
+    let now = Instant::now();
+    let pool = Pool::new(1 << 20);
+    let mut relay = RelayTable::new(Config::default(), pool, Box::new(AllowAll), INSTANCE);
+    let sid = [4u8; 16];
+    let secret = [8u8; 32];
+    relay.add_carrier(1);
+    relay.on_frame(
+        1,
+        Frame::Open(Open {
+            version: VERSION,
+            ticket: b"t".to_vec(),
+            session_id: sid,
+            resume_secret: secret,
+            attach_gen: 0,
+            retry: false,
+            anchor_instance_id: 0,
+            kind: Kind::Tcp,
+            target: Target::Domain("example.com".into(), 443),
+            exit_class: 0,
+            t_stall_ms: None,
+            first_data: Vec::new(),
+        }),
+        now,
+    );
+    // While Connecting (before connect_done): REDUNDANT_ATTACH is rejected.
+    relay.add_carrier(2);
+    relay.on_frame(2, attach(sid, secret), now);
+    assert!(relay.take_closed_carriers().contains(&2));
+    assert_eq!(relay.redundant_carrier(&sid), None);
+
+    relay.connect_done(&sid, Ok(()), now);
+    let _ = relay.poll_transmit(1, now);
+    // Current carrier closes -> Detached. REDUNDANT_ATTACH is also rejected.
+    relay.on_carrier_closed(1, now);
+    assert_eq!(relay.state(&sid), Some(SessionState::Detached));
+    relay.add_carrier(3);
+    relay.on_frame(3, attach(sid, secret), now);
+    assert!(relay.take_closed_carriers().contains(&3));
+    assert_eq!(relay.redundant_carrier(&sid), None);
+}
