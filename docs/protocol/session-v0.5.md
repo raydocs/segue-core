@@ -308,6 +308,21 @@ Rules:
   up (`on_carrier_stuck`), the client's `t_stall` fired, or the relay's
   `t_live` fired. Same `attach_gen`. **No RESUME and no other frame** is
   sent to announce the promotion.
+- A **stall** (client `t_stall`, a `STALL` hint, a transport hold, relay
+  `t_live`) does not close the carrier that was current. It is **demoted**
+  to the spare: still open, still authenticated at this generation. If it
+  receives a frame it is a standby again and the next stall of the new
+  current swaps back, still with no dial. A demoted carrier that receives
+  nothing for `t_detached_standby` (10 s) is dropped. If the new current
+  stalls and the demoted one has received nothing since the demotion,
+  neither moved: both are dropped and the session re-attaches with RESUME.
+  A hard loss (closed, decode error, REJECT, write error) still drops the
+  carrier. The relay follows a stall swap when an ACK or FIN arrives on a
+  spare that has never been current (the client sends those only on the
+  carrier it considers current), or when DATA arrives there after the
+  current carrier has been silent for a stall. A later swap-back is the
+  relay's `t_live`, which demotes rather than closes. A RESUME onto a third
+  carrier still drops the spare.
 - What crosses the wire is only what already did. `REDUNDANT_OK`'s
   `recv_offset` / `max_offset` is the relay's snapshot at bind time; later
   ACKs (mirrored onto the spare) move each side's acknowledged offset. On
@@ -316,10 +331,12 @@ Rules:
   already has, so the application sees neither a loss nor a duplicate.
 - The relay ends up with the spare as current because it already
   authenticated that carrier at this generation. `on_carrier_closed` of the
-  old current promotes the spare in place. `t_live` does the same instead of
-  going DETACHED, and emits `STALL` so a client that has not noticed yet
-  promotes too. The client closes the old carrier when it promotes, which is
-  the signal a relay that has not timed out yet is waiting for. A `STALL`
+  old current promotes the spare in place (a hard close: the old carrier is
+  gone). `t_live` does the same instead of going DETACHED, demotes the old
+  carrier to the spare, and emits `STALL` so a client that has not noticed
+  yet promotes too. A client `t_stall` does not close the old carrier; the
+  relay follows an ACK or FIN on that spare, or DATA on it once the current
+  carrier has been silent for a stall. A `STALL`
   that arrives after the promotion, while the spare is still receiving, is
   about the carrier already left and is ignored. If that spare later goes
   quiet, the hint is a real loss: the session promotes a newer spare or
@@ -524,7 +541,9 @@ defaults (`crates/segue-session/src/lib.rs:45-135`):
 | `t_attach` | 2 s | client: give up one attach attempt, retry on a new carrier (`lib.rs:48-49`) |
 | `t_stall` | 1 s | client: unacked data and nothing received → re-attach (KERNEL_SPEC §7.2 数据停滞, `max(1 s, 4×SRTT)`; SRTT not modelled, `lib.rs:50-52`) |
 | `t_live` | 3 s | relay: unacked downlink, no ACK progress → DETACHED (`lib.rs:53-54`) |
-| `t_detached` | 30 s | both: how long a session may live without a working carrier (`lib.rs:55-56`) |
+| `t_detached` | 30 s | both: how long a non-AI session may live without a working carrier (`lib.rs`, `Timing::t_detached`) |
+| `t_detached_ai` | 150 s | both: the same bound for a session whose OPEN carried `exit_class == 1` (AI). Under the 180 s after which an AI client aborts a stream it cannot resume |
+| `t_detached_standby` | 10 s | both: a carrier demoted by a stall, with no frame since, is dropped |
 | `t_open_retry` | 15 s | client: how long OPEN may be retried before the local connection is reset (`lib.rs:57-58`) |
 | `t_tomb` | 60 s | relay: tombstone lifetime (`lib.rs:59-60`) |
 | `ack_delay` | 20 ms | delayed-ACK floor (`lib.rs:61-62`) |
@@ -572,11 +591,17 @@ States per session (`SessionState`, `relay.rs:104-108`):
   (`crates/segue-kernel/src/session/mod.rs:17-20`) — a refused session is a
   dial error at the front end, never retried direct.
 - **DETACHED:** the carrier is gone (closed, decode error, or superseded by a
-  newer generation). The session survives `t_detached`; while DETACHED the
-  relay stops reading the site (`site_read_capacity` returns 0, `relay.rs:916-921`)
-  but keeps buffering downlink. `t_live` with unacked downlink and no ACK
-  progress also marks DETACHED and emits `RelayEvent::Stall` + STALL frames on
-  the device's control streams (B1, `relay.rs:1078-1090`).
+  newer generation). The session survives `t_detached` (or `t_detached_ai`,
+  150 s, when OPEN carried `exit_class == 1`). While DETACHED the relay
+  stops reading the site for a non-AI session (`site_read_capacity` returns
+  0) but keeps the site connection and the replay buffer. An AI session
+  keeps reading the site into that same replay buffer, up to the credit and
+  pool limits the send half already enforces, and stops only when the bound
+  is reached. `t_live` with unacked downlink and no ACK progress also marks
+  DETACHED and emits `RelayEvent::Stall` + STALL frames on the device's
+  control streams (B1). `t_tomb` and the control-stream timers are unchanged:
+  a tombstone still lives `t_tomb` after the session ends, and a control
+  stream still dies on `t_ctrl_idle` / `max_lifetime` on its own.
 - **Re-attach:** the first frame on a new carrier must be RESUME (or an OPEN
   retry); after tomb/instance/secret/ticket/generation checks the table
   performs the atomic `switch` (§4.4) and answers RESUMED (`on_first`
@@ -586,7 +611,8 @@ States per session (`SessionState`, `relay.rs:104-108`):
   session gets `REJECT(closed)` with the final offsets instead of
   `unknown_session` (`finish` `relay.rs:753-776`; `code::CLEAN` note
   `codec.rs:100-103`). Timeouts: `max_lifetime` from OPEN → `RST(max_lifetime)`
-  ("RESUME does not extend it"); DETACHED longer than `t_detached` →
+  ("RESUME does not extend it"); DETACHED longer than `t_detached`
+  (`t_detached_ai` when `exit_class == 1`) →
   `close(idle)`; site reset → tombstone `site_reset` (`handle_timeout`
   `relay.rs:1056-1112`, `site_reset` `relay.rs:936-942`).
 - **Upload drain honesty:** with `confirm_site_flush(true)` (the driver's
@@ -634,15 +660,16 @@ Transitions:
   stall timer `t_stall`, STALL hint, unanswered attach after `t_attach`):
   redial. A carrier lost "while something was expected on it and nothing
   moved" counts against `MAX_FRUITLESS` = 8 with exponential backoff
-  200 ms → 2 s (`client.rs:101-112`, `carrier_lost` `client.rs:555-597`);
-  end-to-end progress or the one OPENED resets the count. The 8th fruitless
-  carrier closes the session with `LOCAL_GIVE_UP` = `connect_timeout`
-  (`client.rs:101`, `client.rs:585-590`).
-- Timeouts (`handle_timeout`, `client.rs:1030-1075`): OPEN not answered within
-  `t_open_retry` → local reset; detached longer than `t_detached` → local
-  reset; attach unanswered within `t_attach` → new carrier (counts as
-  expected-loss); confirmed + unacked + silent for `t_stall` → re-attach;
-  receive idle → recompute credit.
+  200 ms → 2 s; end-to-end progress or the one OPENED resets the count. The
+  8th fruitless carrier closes a non-AI session with `LOCAL_GIVE_UP` =
+  `connect_timeout`. An AI session keeps the count for backoff but does not
+  end on it: it ends only when `t_detached_ai` has elapsed since it last had
+  a carrier, with the same `LOCAL_GIVE_UP`.
+- Timeouts (`handle_timeout`): OPEN not answered within
+  `t_open_retry` → local reset; detached longer than `t_detached`
+  (`t_detached_ai` for `exit_class == 1`) → local reset; attach unanswered
+  within `t_attach` → new carrier (counts as expected-loss); confirmed +
+  unacked + silent for `t_stall` → re-attach; receive idle → recompute credit.
 - Clean end: both FINs acked and all data delivered → `Closed(Clean)`
   (`check_done` `client.rs:842-848`).
 
@@ -834,7 +861,7 @@ parse/encode, no behaviour), **hook-only** (interface exists, no producer),
 | WAKE | **not started** (M9+) | frame defined `codec.rs:684-693`; "PARK/WAKE as a whole is M9+" (`lib.rs:9-11`, `lib.rs:16-17`) |
 | Cross-instance hand-off (§9.2) | **not started** | any other `anchor_instance_id` → `unknown_session` (`relay.rs:568-571`, `relay.rs:502-504`) |
 | Cross-node forwarding | **not started** (M9+) | `crates/segue-session/src/lib.rs:16-17`, `crates/segue-relay/src/lib.rs:19-21` |
-| Redundant carrier, no DATA duplication (v0.6 draft, §2.7) | implemented, off by default | `REDUNDANT_ATTACH`/`REDUNDANT_OK`; relay binds without `switch`; a lost current carrier (close, hold, `t_stall`, `t_live`/`STALL`) promotes the spare with no RESUME; a move onto a third carrier drops the spare |
+| Redundant carrier, no DATA duplication (v0.6 draft, §2.7) | implemented, off by default | `REDUNDANT_ATTACH`/`REDUNDANT_OK`; relay binds without `switch`; a lost current carrier promotes the spare with no RESUME; a stall demotes the old carrier to the spare (`t_detached_standby` 10 s) and a hard close drops it; a move onto a third carrier drops the spare |
 | Session layer on mobile (FFI) | **not shipped** | `segue-session`/`segue-kernel` are behind the `proprietary-kernel` feature, "Deliberately not enabled in platform/build scripts yet" (`crates/segue-ffi/Cargo.toml:14-20`); no reference in `platform/android` or `platform/apple` |
 
 ## 12. What this gives an AI app that Xray/sing-box/mihomo do not

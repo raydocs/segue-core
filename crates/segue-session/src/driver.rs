@@ -1273,9 +1273,13 @@ where
                     }
                     Some(CarrierEv::Stuck(cid)) => {
                         s.on_carrier_stuck(cid, t);
-                        if let Some(io) = carriers.remove(&cid) {
-                            io.reader.abort();
-                            io.writer.abort();
+                        // A stall demotes the carrier to the spare instead of
+                        // closing it. Abort only when the session let it go.
+                        if !s.carrier_live(cid) {
+                            if let Some(io) = carriers.remove(&cid) {
+                                io.reader.abort();
+                                io.writer.abort();
+                            }
                         }
                     }
                     None => {}
@@ -1410,9 +1414,13 @@ where
                 if let Some(TxHold { cid, .. }) = tx_hold.take() {
                     if tx_slot.load(Ordering::Acquire) {
                         s.on_carrier_stuck(cid, now());
-                        if let Some(io) = carriers.remove(&cid) {
-                            io.reader.abort();
-                            io.writer.abort();
+                        // A stall demotes the carrier to the spare instead of
+                        // closing it. Abort only when the session let it go.
+                        if !s.carrier_live(cid) {
+                            if let Some(io) = carriers.remove(&cid) {
+                                io.reader.abort();
+                                io.writer.abort();
+                            }
                         }
                     }
                 }
@@ -1730,9 +1738,13 @@ where
                     }
                     Some(CarrierEv::Stuck(cid)) => {
                         s.on_carrier_stuck(cid, t);
-                        if let Some(io) = carriers.remove(&cid) {
-                            io.reader.abort();
-                            io.writer.abort();
+                        // A stall demotes the carrier to the spare instead of
+                        // closing it. Abort only when the session let it go.
+                        if !s.carrier_live(cid) {
+                            if let Some(io) = carriers.remove(&cid) {
+                                io.reader.abort();
+                                io.writer.abort();
+                            }
                         }
                     }
                     None => {}
@@ -1867,9 +1879,13 @@ where
                 if let Some(TxHold { cid, .. }) = tx_hold.take() {
                     if tx_slot.load(Ordering::Acquire) {
                         s.on_carrier_stuck(cid, now());
-                        if let Some(io) = carriers.remove(&cid) {
-                            io.reader.abort();
-                            io.writer.abort();
+                        // A stall demotes the carrier to the spare instead of
+                        // closing it. Abort only when the session let it go.
+                        if !s.carrier_live(cid) {
+                            if let Some(io) = carriers.remove(&cid) {
+                                io.reader.abort();
+                                io.writer.abort();
+                            }
                         }
                     }
                 }

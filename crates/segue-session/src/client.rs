@@ -102,11 +102,15 @@ impl std::fmt::Debug for OpenParams {
 pub const LOCAL_GIVE_UP: u8 = code::CONNECT_TIMEOUT;
 
 /// Carriers that may be lost in a row, each while something was expected
-/// on it and nothing moved, before the session gives up (r8 N5, r9 F2):
+/// on it and nothing moved, before a non-AI session gives up (r8 N5, r9 F2):
 /// the session ends when the `MAX_FRUITLESS`th is lost, so it dials at
 /// most this many carriers after its last progress. With the backoff
 /// below that is about 9 s of waiting between attempts (and `t_detached`
 /// bounds the time detached in any case).
+///
+/// An AI session ([`crate::EXIT_CLASS_AI`]) keeps the count for backoff but
+/// does not end on it. It ends only when [`crate::Timing::t_detached_ai`]
+/// has elapsed since the session last had a carrier.
 pub const MAX_FRUITLESS: u32 = 8;
 /// Wait before redialling after the first such loss; doubles per loss.
 pub const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
@@ -181,6 +185,11 @@ struct RedundantCarrier {
     /// [`Frame`] here would keep every idle session above the fixed
     /// per-session heap budget.
     hello: bool,
+    /// Set when this carrier was the current one and a stall demoted it.
+    /// `None` for a spare opened with `REDUNDANT_ATTACH`.
+    demoted_at: Option<Instant>,
+    /// A frame arrived after [`Self::demoted_at`].
+    rx_since_demote: bool,
 }
 
 pub struct ClientSession {
@@ -408,6 +417,8 @@ impl ClientSession {
             bound: false,
             started: now,
             hello: true,
+            demoted_at: None,
+            rx_since_demote: false,
         }));
     }
 
@@ -433,10 +444,24 @@ impl ClientSession {
     /// session, make the spare current at the same generation, and replay
     /// unacked uplink from the last acknowledged offset. Not a RESUME, so
     /// it does not count against [`MAX_FRUITLESS`] and reports no failure.
-    /// The carrier left is abandoned so the relay sees it close and promotes
-    /// on its side (no frame is sent to announce the promotion).
-    fn promote_redundant(&mut self, now: Instant) -> bool {
+    ///
+    /// `demote_old` is a stall (client `t_stall`, a `STALL` hint, a transport
+    /// hold). The carrier left stays open and becomes the spare: if it
+    /// receives a frame it can be swapped back, with no dial. A hard loss
+    /// passes `false` and the carrier left is closed. Returns false when no
+    /// spare is bound, or when `demote_old` and that spare was itself demoted
+    /// and has received nothing since: neither carrier moved, and the caller
+    /// re-attaches with RESUME. No frame is sent to announce the promotion.
+    fn promote_redundant(&mut self, now: Instant, demote_old: bool) -> bool {
         if !self.redundant_bound() {
+            return false;
+        }
+        if demote_old
+            && self
+                .redundant
+                .as_ref()
+                .is_some_and(|r| r.demoted_at.is_some() && !r.rx_since_demote)
+        {
             return false;
         }
         let Some(r) = self.redundant.take() else {
@@ -444,7 +469,19 @@ impl ClientSession {
         };
         if let Some(old) = self.carrier {
             if old != r.cid {
-                self.abandoned.push(old);
+                if demote_old {
+                    self.redundant = Some(Box::new(RedundantCarrier {
+                        cid: old,
+                        gen: self.gen,
+                        bound: true,
+                        started: now,
+                        hello: false,
+                        demoted_at: Some(now),
+                        rx_since_demote: false,
+                    }));
+                } else {
+                    self.abandoned.push(old);
+                }
             }
         }
         self.carrier = Some(r.cid);
@@ -662,7 +699,7 @@ impl ClientSession {
             }
             self.promoted_in_gen = false;
         }
-        if self.promote_redundant(now) {
+        if self.promote_redundant(now, true) {
             return;
         }
         // The relay holds unacknowledged data for us: something was
@@ -734,9 +771,10 @@ impl ClientSession {
     /// The current carrier is being given up (closed, stalled, or held a
     /// frame too long). Losing one that moved nothing while something was
     /// expected on it backs off the next attempt, exponentially, and the
-    /// [`MAX_FRUITLESS`]th in a row ends the session: a path that cannot
-    /// move data is not redialled without bound (r8 N5). A carrier that
-    /// made progress is replaced at once.
+    /// [`MAX_FRUITLESS`]th in a row ends a non-AI session: a path that cannot
+    /// move data is not redialled without bound (r8 N5). An AI session keeps
+    /// backing off but ends only at [`crate::Timing::t_detached_ai`]. A
+    /// carrier that made progress is replaced at once.
     ///
     /// "Expected" does not depend on the upload (r9 F2): `expected` is set
     /// by the callers that know the carrier owed us something (a stall
@@ -782,7 +820,10 @@ impl ClientSession {
             return;
         }
         self.fruitless += 1;
-        if self.fruitless >= MAX_FRUITLESS {
+        // AI sessions do not end on the count. The caller is still waiting
+        // on a stream it cannot resume; [`crate::Timing::t_detached_ai`] is
+        // the give-up. The count still backs off the next dial.
+        if self.fruitless >= MAX_FRUITLESS && self.params.exit_class != crate::EXIT_CLASS_AI {
             self.close(CloseReason::Reset(LOCAL_GIVE_UP));
             return;
         }
@@ -805,7 +846,18 @@ impl ClientSession {
     fn carrier_gone(&mut self, cid: CarrierId, now: Instant, stuck: bool) {
         // The spare dying (closed, stuck) drops only that carrier: no
         // re-attach, no [`MAX_FRUITLESS`] count, no health or quality event.
+        // A stall demotion leaves the old carrier here; a transport hold that
+        // is still reporting it is not a new failure. It stays until
+        // `t_detached_standby` with no frame. A hard close still drops it.
         if self.redundant.as_ref().is_some_and(|r| r.cid == cid) {
+            if stuck
+                && self
+                    .redundant
+                    .as_ref()
+                    .is_some_and(|r| r.demoted_at.is_some())
+            {
+                return;
+            }
             self.drop_redundant();
             return;
         }
@@ -826,9 +878,10 @@ impl ClientSession {
             self.drop_redundant();
             return;
         }
-        // A bound spare becomes the current carrier. An unbound one is
+        // A bound spare becomes the current carrier. A stall demotes the
+        // one that stuck; a hard close drops it. An unbound spare is
         // dropped; the session re-attaches the ordinary way.
-        if self.promote_redundant(now) {
+        if self.promote_redundant(now, stuck) {
             return;
         }
         self.drop_redundant();
@@ -934,6 +987,11 @@ impl ClientSession {
     /// are free). Anything that fails parsing of the stream, a REJECT, or
     /// a generation mismatch drops only this carrier.
     fn on_redundant(&mut self, frame: Frame, now: Instant) -> Result<(), ProtoError> {
+        if let Some(r) = self.redundant.as_mut() {
+            if r.demoted_at.is_some() {
+                r.rx_since_demote = true;
+            }
+        }
         let bound = self.redundant_bound();
         let gen = self.redundant.as_ref().map(|r| r.gen);
         match frame {
@@ -1323,13 +1381,17 @@ impl ClientSession {
         if !self.ever_opened {
             put(self.open_started.map(|s| s + t.t_open_retry));
         }
-        put(self.detached_since.map(|s| s + t.t_detached));
+        put(self
+            .detached_since
+            .map(|s| s + t.detach_for(self.params.exit_class)));
         if self.carrier.is_some() && !self.confirmed {
             put(self.attach_started.map(|s| s + t.t_attach));
         }
         if let Some(r) = &self.redundant {
             if !r.bound {
                 put(Some(r.started + t.t_attach));
+            } else if let Some(at) = r.demoted_at.filter(|_| !r.rx_since_demote) {
+                put(Some(at + t.t_detached_standby));
             }
         }
         if self.need_attach {
@@ -1357,7 +1419,8 @@ impl ClientSession {
             self.close(CloseReason::Reset(LOCAL_GIVE_UP));
             return;
         }
-        if self.detached_since.is_some_and(|s| now >= s + t.t_detached) {
+        let detach = t.detach_for(self.params.exit_class);
+        if self.detached_since.is_some_and(|s| now >= s + detach) {
             self.close(CloseReason::Reset(LOCAL_GIVE_UP));
             return;
         }
@@ -1385,9 +1448,18 @@ impl ClientSession {
         {
             self.drop_redundant();
         }
+        if self.redundant.as_ref().is_some_and(|r| {
+            r.demoted_at
+                .is_some_and(|at| !r.rx_since_demote && now >= at + t.t_detached_standby)
+        }) {
+            self.drop_redundant();
+        }
         if self.confirmed && self.send.unacked() && now >= self.last_rx + t.t_stall {
-            // A bound spare becomes current. No RESUME, no failure report.
-            if !self.promote_redundant(now) {
+            // A bound spare becomes current. A stall keeps the old carrier
+            // as the spare. No RESUME, no failure report. A spare that was
+            // demoted and has been silent is not promoted: neither side
+            // moved, so this re-attaches.
+            if !self.promote_redundant(now, true) {
                 self.carrier_lost(now, true);
                 self.move_carrier(now);
             }

@@ -947,3 +947,264 @@ fn liveness_neither_resets_the_budget_nor_hides_a_failure() {
     assert!(alive >= 4, "{alive} Alive reports");
     assert_eq!(c.fruitless_carriers(), 1, "liveness reset the budget");
 }
+
+fn params_class(exit_class: u8) -> OpenParams {
+    let mut p = params();
+    p.exit_class = exit_class;
+    p
+}
+
+/// Move every frame both ways and drain what the app and the site can read.
+fn exchange(
+    c: &mut ClientSession,
+    r: &mut RelayTable,
+    cid: u64,
+    now: Instant,
+    down: &mut Vec<u8>,
+    up: &mut Vec<u8>,
+) {
+    let mut buf = [0u8; 8192];
+    for _ in 0..64 {
+        let mut moved = false;
+        while let Some(f) = c.poll_transmit(cid, now) {
+            r.on_frame(cid, f, now);
+            moved = true;
+        }
+        while let Some(f) = r.poll_transmit(cid, now) {
+            c.on_frame(cid, f, now).expect("session frame");
+            moved = true;
+        }
+        loop {
+            let n = c.read(&mut buf, now);
+            if n == 0 {
+                break;
+            }
+            down.extend_from_slice(&buf[..n]);
+            moved = true;
+        }
+        loop {
+            let n = r.read(&SID, &mut buf, now);
+            if n == 0 {
+                break;
+            }
+            up.extend_from_slice(&buf[..n]);
+            moved = true;
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
+fn open_class(exit_class: u8, t0: Instant) -> (RelayTable, ClientSession) {
+    let mut c = ClientSession::with_ids(
+        Config::default(),
+        &Pool::new(1 << 20),
+        params_class(exit_class),
+        SID,
+        SECRET,
+        t0,
+    )
+    .unwrap();
+    c.attach(1, t0);
+    let mut r = RelayTable::new(
+        Config::default(),
+        Pool::new(1 << 20),
+        Box::new(AllowAll),
+        INSTANCE,
+    );
+    r.add_carrier(1);
+    let open = c.poll_transmit(1, t0).expect("OPEN");
+    r.on_frame(1, open, t0);
+    assert!(
+        matches!(r.take_event(), Some(RelayEvent::Connect { .. })),
+        "OPEN did not ask for a site connect"
+    );
+    r.connect_done(&SID, Ok(()), t0);
+    let mut down = Vec::new();
+    let mut up = Vec::new();
+    exchange(&mut c, &mut r, 1, t0, &mut down, &mut up);
+    assert_eq!(c.state(), State::Active, "OPEN did not complete");
+    (r, c)
+}
+
+fn close_code(r: &mut RelayTable) -> Option<u8> {
+    let mut code = None;
+    while let Some(ev) = r.take_event() {
+        if let RelayEvent::Closed { close_code, .. } = ev {
+            code = Some(close_code);
+        }
+    }
+    code
+}
+
+/// AI detach is 150 s, not 30 s: 40 s of blackout still resumes, and every
+/// byte the site wrote meanwhile arrives once. A non-AI session still ends
+/// at 30 s. 160 s of silence is the give-up on both sides.
+#[test]
+fn ai_session_waits_out_a_blackout_and_delivers_site_bytes_once() {
+    use segue_session::client::LOCAL_GIVE_UP;
+    use segue_session::EXIT_CLASS_AI;
+
+    let t0 = Instant::now();
+    let (mut r, mut c) = open_class(EXIT_CLASS_AI, t0);
+    let up_body = vec![0x11u8; 4000];
+    let down_body = vec![0x22u8; 4000];
+    assert_eq!(c.write(&up_body), up_body.len());
+    let sid = c.session_id();
+    let cap = r.site_read_capacity(&sid);
+    assert!(cap >= down_body.len());
+    assert_eq!(r.site_data(&sid, &down_body), down_body.len());
+    let mut down = Vec::new();
+    let mut up = Vec::new();
+    exchange(&mut c, &mut r, 1, t0, &mut down, &mut up);
+    assert_eq!(down, down_body);
+    assert_eq!(up, up_body);
+
+    let t_cut = t0 + Duration::from_secs(1);
+    c.on_carrier_closed(1, t_cut);
+    r.on_carrier_closed(1, t_cut);
+    assert_eq!(
+        r.state(&sid),
+        Some(segue_session::relay::SessionState::Detached)
+    );
+
+    // 2 KB/s for 20 s while detached. The site is never blocked: each
+    // second's write fits in the replay buffer the send half already has.
+    let mut extra = Vec::new();
+    for i in 0..20 {
+        let t = t_cut + Duration::from_secs(i);
+        c.handle_timeout(t);
+        r.handle_timeout(t);
+        assert!(!c.is_closed(), "AI session ended {i}s into the outage");
+        assert!(
+            r.state(&sid).is_some(),
+            "relay dropped the AI session at {i}s"
+        );
+        let chunk = vec![0x30 + (i as u8); 2048];
+        let cap = r.site_read_capacity(&sid);
+        assert!(cap >= chunk.len(), "site blocked at {i}s: capacity {cap}");
+        assert_eq!(r.site_data(&sid, &chunk), chunk.len());
+        extra.extend_from_slice(&chunk);
+    }
+    let later = c.write(&[0x44; 1000]);
+    assert_eq!(later, 1000);
+
+    let t_back = t_cut + Duration::from_secs(40);
+    c.handle_timeout(t_back);
+    r.handle_timeout(t_back);
+    assert!(!c.is_closed(), "40s blackout ended an AI session");
+    assert!(r.state(&sid).is_some());
+    assert!(c.wants_attach(t_back));
+    c.attach(2, t_back);
+    r.add_carrier(2);
+    exchange(&mut c, &mut r, 2, t_back, &mut down, &mut up);
+    assert_eq!(c.state(), State::Active);
+    assert_eq!(down, {
+        let mut all = down_body.clone();
+        all.extend_from_slice(&extra);
+        all
+    });
+    assert_eq!(up, {
+        let mut all = up_body.clone();
+        all.extend_from_slice(&[0x44; 1000]);
+        all
+    });
+
+    // 160 s with no carrier: client give-up, relay IDLE.
+    let (mut r, mut c) = open_class(EXIT_CLASS_AI, t0);
+    let sid = c.session_id();
+    let t_cut = t0 + Duration::from_secs(1);
+    c.on_carrier_closed(1, t_cut);
+    r.on_carrier_closed(1, t_cut);
+    let t_still = t_cut + Duration::from_secs(149);
+    c.handle_timeout(t_still);
+    r.handle_timeout(t_still);
+    assert!(!c.is_closed());
+    assert!(r.state(&sid).is_some());
+    let t_gone = t_cut + Duration::from_secs(160);
+    c.handle_timeout(t_gone);
+    r.handle_timeout(t_gone);
+    assert_eq!(c.close_reason(), Some(CloseReason::Reset(LOCAL_GIVE_UP)));
+    assert!(r.state(&sid).is_none());
+    assert_eq!(close_code(&mut r), Some(code::IDLE));
+
+    // Non-AI still ends at 30 s, and the relay does not read the site
+    // while that session is detached.
+    let (mut r, mut c) = open_class(0, t0);
+    let sid = c.session_id();
+    let t_cut = t0 + Duration::from_secs(1);
+    c.on_carrier_closed(1, t_cut);
+    r.on_carrier_closed(1, t_cut);
+    assert_eq!(r.site_read_capacity(&sid), 0);
+    let t_still = t_cut + Duration::from_secs(29);
+    c.handle_timeout(t_still);
+    r.handle_timeout(t_still);
+    assert!(!c.is_closed());
+    assert!(r.state(&sid).is_some());
+    let t_gone = t_cut + Duration::from_secs(30);
+    c.handle_timeout(t_gone);
+    r.handle_timeout(t_gone);
+    assert_eq!(c.close_reason(), Some(CloseReason::Reset(LOCAL_GIVE_UP)));
+    assert!(r.state(&sid).is_none());
+    assert_eq!(close_code(&mut r), Some(code::IDLE));
+}
+
+/// Eight fruitless carriers inside a minute do not end an AI session.
+/// It ends when `t_detached_ai` has elapsed since the carrier was lost,
+/// not when the count hits [`MAX_FRUITLESS`].
+#[test]
+fn ai_session_does_not_end_on_fruitless_count_alone() {
+    use segue_session::client::{LOCAL_GIVE_UP, MAX_FRUITLESS};
+
+    let t0 = Instant::now();
+    let (mut r, mut c) = open_class(segue_session::EXIT_CLASS_AI, t0);
+    let sid = c.session_id();
+    assert_eq!(c.write(b"pending"), 7);
+    let t_cut = t0 + Duration::from_secs(1);
+    c.on_carrier_closed(1, t_cut);
+    r.on_carrier_closed(1, t_cut);
+    assert!(
+        c.fruitless_carriers() <= 1,
+        "the opened carrier must not by itself exhaust the budget"
+    );
+
+    let mut t = t_cut;
+    let mut cid = 1u64;
+    let mut losses = 0u32;
+    let mut spins = 0u32;
+    while losses < MAX_FRUITLESS + 2 {
+        spins += 1;
+        assert!(spins < 10_000, "stopped attaching");
+        t += Duration::from_millis(50);
+        c.handle_timeout(t);
+        assert!(!c.is_closed(), "ended while backing off");
+        if !c.wants_attach(t) {
+            continue;
+        }
+        cid += 1;
+        c.attach(cid, t);
+        t += Duration::from_millis(10);
+        c.on_carrier_closed(cid, t);
+        losses += 1;
+        assert!(
+            !c.is_closed(),
+            "AI session ended on fruitless loss {losses}"
+        );
+    }
+    assert!(c.fruitless_carriers() >= MAX_FRUITLESS);
+    assert!(t < t_cut + Duration::from_secs(60), "losses took {t:?}");
+    c.handle_timeout(t_cut + Duration::from_secs(60));
+    r.handle_timeout(t_cut + Duration::from_secs(60));
+    assert!(!c.is_closed(), "ended inside 60s");
+    assert!(
+        r.state(&sid).is_some(),
+        "relay ended an AI session inside 60s"
+    );
+    let t_gone = t_cut + Config::default().timing.t_detached_ai;
+    c.handle_timeout(t_gone);
+    r.handle_timeout(t_gone);
+    assert_eq!(c.close_reason(), Some(CloseReason::Reset(LOCAL_GIVE_UP)));
+    assert!(r.state(&sid).is_none());
+    assert_eq!(close_code(&mut r), Some(code::IDLE));
+}
