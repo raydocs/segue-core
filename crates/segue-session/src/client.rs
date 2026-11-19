@@ -17,8 +17,8 @@ use std::time::Instant;
 use rand::RngCore;
 
 use crate::codec::{
-    code, Frame, Kind, Open, Reject, Resume, Secret, SessionId, Target, MAX_PAYLOAD, STALL_MS_MAX,
-    VERSION,
+    code, Frame, Kind, Open, RedundantAttach, Reject, Resume, Secret, SessionId, Target,
+    MAX_PAYLOAD, STALL_MS_MAX, VERSION,
 };
 use crate::flow::{RecvHalf, SendHalf};
 use crate::park::{ParkDecision, ParkTracker};
@@ -163,8 +163,24 @@ pub enum Tx {
 
 enum TxNext {
     Hello,
+    /// REDUNDANT_ATTACH, the only frame written before REDUNDANT_OK.
+    RedundantHello,
     Frame(Frame),
     Send,
+}
+
+/// A second live carrier (v0.6 draft). Not current until
+/// [`ClientSession`] promotes it because the current carrier died.
+struct RedundantCarrier {
+    cid: CarrierId,
+    /// `attach_gen` sent in REDUNDANT_ATTACH: the session generation then.
+    gen: u32,
+    bound: bool,
+    started: Instant,
+    /// REDUNDANT_ATTACH not yet written. Built at send time: storing a
+    /// [`Frame`] here would keep every idle session above the fixed
+    /// per-session heap budget.
+    hello: bool,
 }
 
 pub struct ClientSession {
@@ -178,6 +194,16 @@ pub struct ClientSession {
     ever_opened: bool,
     instance_id: u64,
     carrier: Option<CarrierId>,
+    /// Spare carrier (v0.6 draft). `None` unless the caller asked.
+    /// Boxed so an idle session does not carry the spare state inline.
+    redundant: Option<Box<RedundantCarrier>>,
+    /// Latched by [`request_redundant`](Self::request_redundant) until a
+    /// spare is attached or the dial fails. Off by default.
+    want_redundant: bool,
+    /// The current carrier was replaced by promoting a bound spare, and the
+    /// generation did not change. A `STALL` hint that arrives while this
+    /// carrier is still receiving is about the carrier already left.
+    promoted_in_gen: bool,
     /// The current carrier's OPEN/RESUME has been answered.
     confirmed: bool,
     hello: Option<Frame>,
@@ -239,6 +265,7 @@ impl std::fmt::Debug for ClientSession {
             .field("gen", &self.gen)
             .field("instance_id", &self.instance_id)
             .field("carrier", &self.carrier)
+            .field("redundant", &self.redundant.as_ref().map(|r| r.cid))
             .field("confirmed", &self.confirmed)
             .field("rst", &self.rst)
             .finish_non_exhaustive()
@@ -279,6 +306,9 @@ impl ClientSession {
             ever_opened: false,
             instance_id: 0,
             carrier: None,
+            redundant: None,
+            want_redundant: false,
+            promoted_in_gen: false,
             confirmed: false,
             hello: None,
             rst: None,
@@ -329,6 +359,114 @@ impl ClientSession {
     pub fn carrier(&self) -> Option<CarrierId> {
         self.carrier
     }
+
+    /// Spare carrier, bound or still waiting for `REDUNDANT_OK`.
+    pub fn redundant_carrier(&self) -> Option<CarrierId> {
+        self.redundant.as_ref().map(|r| r.cid)
+    }
+
+    /// `true` after `REDUNDANT_OK` with the generation we sent.
+    pub fn redundant_bound(&self) -> bool {
+        self.redundant.as_ref().is_some_and(|r| r.bound)
+    }
+
+    /// Ask for a second carrier. Does nothing if one already exists or the
+    /// session is closed. The caller dials when [`wants_redundant`](Self::wants_redundant)
+    /// is set (only once the session is established). Off unless this is called.
+    pub fn request_redundant(&mut self) {
+        if self.is_closed() || self.redundant.is_some() {
+            return;
+        }
+        self.want_redundant = true;
+    }
+
+    /// The caller should open a carrier and pass it to
+    /// [`attach_redundant`](Self::attach_redundant).
+    pub fn wants_redundant(&self) -> bool {
+        self.want_redundant
+            && !self.is_closed()
+            && self.redundant.is_none()
+            && self.state == State::Active
+    }
+
+    /// The spare dial failed. One request is one attempt.
+    pub fn redundant_dial_failed(&mut self) {
+        self.want_redundant = false;
+    }
+
+    /// Queue `REDUNDANT_ATTACH` on `cid`. Nothing else is written there
+    /// until `REDUNDANT_OK` with the same `attach_gen`.
+    pub fn attach_redundant(&mut self, cid: CarrierId, now: Instant) {
+        if !self.wants_redundant() || self.carrier == Some(cid) {
+            self.abandoned.push(cid);
+            return;
+        }
+        self.want_redundant = false;
+        self.redundant = Some(Box::new(RedundantCarrier {
+            cid,
+            gen: self.gen,
+            bound: false,
+            started: now,
+            hello: true,
+        }));
+    }
+
+    fn redundant_attach_frame(&self, gen: u32) -> Frame {
+        Frame::RedundantAttach(RedundantAttach {
+            session_id: self.session_id,
+            resume_secret: self.secret,
+            attach_gen: gen,
+            recv_offset: self.recv.recv_offset(),
+            max_offset: self.recv.max_offset(),
+        })
+    }
+
+    fn drop_redundant(&mut self) {
+        if let Some(r) = self.redundant.take() {
+            if self.carrier != Some(r.cid) {
+                self.abandoned.push(r.cid);
+            }
+        }
+    }
+
+    /// The current carrier was lost and a spare is already bound: keep the
+    /// session, make the spare current at the same generation, and replay
+    /// unacked uplink from the last acknowledged offset. Not a RESUME, so
+    /// it does not count against [`MAX_FRUITLESS`] and reports no failure.
+    /// The carrier left is abandoned so the relay sees it close and promotes
+    /// on its side (no frame is sent to announce the promotion).
+    fn promote_redundant(&mut self, now: Instant) -> bool {
+        if !self.redundant_bound() {
+            return false;
+        }
+        let Some(r) = self.redundant.take() else {
+            return false;
+        };
+        if let Some(old) = self.carrier {
+            if old != r.cid {
+                self.abandoned.push(old);
+            }
+        }
+        self.carrier = Some(r.cid);
+        self.confirmed = true;
+        self.confirmed_at = Some(now);
+        self.state = State::Active;
+        self.need_attach = false;
+        self.hello = None;
+        self.attach_started = None;
+        self.detached_since = None;
+        self.rx_partial = false;
+        self.ka_due = false;
+        self.last_rx = now;
+        self.promoted_in_gen = true;
+        // This carrier has not moved data yet. The one that died is not
+        // charged: a live spare means the path did not fail.
+        self.progressed = false;
+        let acked = self.send.acked();
+        let max = self.send.peer_max();
+        let _ = self.send.rewind(acked, max);
+        true
+    }
     pub fn is_closed(&self) -> bool {
         matches!(self.state, State::Closed(_))
     }
@@ -359,7 +497,8 @@ impl ClientSession {
     /// caller flushes what [`poll_transmit`](Self::poll_transmit) returned
     /// and closes it.
     pub fn carrier_live(&self, cid: CarrierId) -> bool {
-        self.carrier == Some(cid) && !self.is_closed()
+        !self.is_closed()
+            && (self.carrier == Some(cid) || self.redundant.as_ref().is_some_and(|r| r.cid == cid))
     }
 
     /// Bind a new carrier and queue OPEN / OPEN retry / RESUME on it.
@@ -367,6 +506,13 @@ impl ClientSession {
         if self.is_closed() {
             self.abandoned.push(cid);
             return;
+        }
+        // A new current carrier is a move. The spare was authenticated at
+        // the old generation; keeping it would make that generation
+        // ambiguous, so it is dropped (rule 6).
+        self.promoted_in_gen = false;
+        if self.carrier != Some(cid) {
+            self.drop_redundant();
         }
         if let Some(old) = self.carrier.replace(cid) {
             if old != cid {
@@ -485,6 +631,9 @@ impl ClientSession {
         if self.is_closed() || self.need_attach {
             return;
         }
+        // Same as [`attach`](Self::attach): a move drops the spare.
+        self.promoted_in_gen = false;
+        self.drop_redundant();
         if let Some(old) = self.carrier.take() {
             self.abandoned.push(old);
         }
@@ -497,13 +646,29 @@ impl ClientSession {
     }
 
     /// `STALL{session_id, attach_gen}` from the control stream (B1).
+    ///
+    /// A bound spare is promoted instead of dialing: the relay emits this
+    /// when it gives the current carrier up, and promotes the same spare on
+    /// its side. A hint that arrives after that promotion, while the spare
+    /// is still receiving, is about the carrier already left and is ignored.
     pub fn on_stall(&mut self, gen: u32, now: Instant) {
-        if gen == self.gen && self.state == State::Active {
-            // The relay holds unacknowledged data for us: something was
-            // expected, whether or not we have anything to send (r9 F2).
-            self.carrier_lost(now, true);
-            self.move_carrier(now);
+        if gen != self.gen || self.state != State::Active {
+            return;
         }
+        if self.promoted_in_gen {
+            let quiet = self.send.unacked() && now >= self.last_rx + self.cfg.timing.t_stall;
+            if !quiet {
+                return;
+            }
+            self.promoted_in_gen = false;
+        }
+        if self.promote_redundant(now) {
+            return;
+        }
+        // The relay holds unacknowledged data for us: something was
+        // expected, whether or not we have anything to send (r9 F2).
+        self.carrier_lost(now, true);
+        self.move_carrier(now);
     }
 
     /// Bytes of a frame not yet complete arrived on carrier `cid` (the
@@ -533,6 +698,11 @@ impl ClientSession {
     /// the last of them, so a hello that takes long to cross a slow
     /// carrier is not given up while it is still moving (r8 N5).
     pub fn on_carrier_sent(&mut self, cid: CarrierId, at: Instant) {
+        if let Some(r) = self.redundant.as_mut() {
+            if r.cid == cid && !r.bound {
+                r.started = r.started.max(at);
+            }
+        }
         if self.carrier != Some(cid) || self.confirmed || self.is_closed() {
             return;
         }
@@ -633,6 +803,12 @@ impl ClientSession {
     }
 
     fn carrier_gone(&mut self, cid: CarrierId, now: Instant, stuck: bool) {
+        // The spare dying (closed, stuck) drops only that carrier: no
+        // re-attach, no [`MAX_FRUITLESS`] count, no health or quality event.
+        if self.redundant.as_ref().is_some_and(|r| r.cid == cid) {
+            self.drop_redundant();
+            return;
+        }
         if self.carrier != Some(cid) {
             return;
         }
@@ -647,8 +823,15 @@ impl ClientSession {
         // whenever the app drained slower than the peer's final frames.
         if self.send.done() && self.recv.fin_acked() {
             self.carrier = None;
+            self.drop_redundant();
             return;
         }
+        // A bound spare becomes the current carrier. An unbound one is
+        // dropped; the session re-attaches the ordinary way.
+        if self.promote_redundant(now) {
+            return;
+        }
+        self.drop_redundant();
         self.carrier_lost(now, stuck);
         self.carrier = None;
         if self.is_closed() {
@@ -670,6 +853,8 @@ impl ClientSession {
             self.state = State::Closed(reason);
             self.need_attach = false;
             self.hello = None;
+            self.want_redundant = false;
+            self.drop_redundant();
         }
     }
 
@@ -703,6 +888,12 @@ impl ClientSession {
         rx_at: Instant,
         now: Instant,
     ) -> Result<(), ProtoError> {
+        if self.redundant.as_ref().is_some_and(|r| r.cid == cid) {
+            if self.is_closed() {
+                return Ok(());
+            }
+            return self.on_redundant(frame, now);
+        }
         if self.carrier != Some(cid) {
             // Superseded carrier: only DATA, deduplicated by offset.
             if let Frame::Data { offset, data, .. } = frame {
@@ -729,9 +920,59 @@ impl ClientSession {
 
     /// Bytes on carrier `cid` could not be decoded.
     pub fn on_decode_error(&mut self, cid: CarrierId, e: ProtoError) {
+        if self.redundant.as_ref().is_some_and(|r| r.cid == cid) {
+            self.drop_redundant();
+            return;
+        }
         if self.carrier == Some(cid) && !self.is_closed() {
             let _ = self.fatal(e);
         }
+    }
+
+    /// A frame from the spare carrier. `REDUNDANT_OK` binds it. Session
+    /// frames are applied like the current carrier once bound (duplicates
+    /// are free). Anything that fails parsing of the stream, a REJECT, or
+    /// a generation mismatch drops only this carrier.
+    fn on_redundant(&mut self, frame: Frame, now: Instant) -> Result<(), ProtoError> {
+        let bound = self.redundant_bound();
+        let gen = self.redundant.as_ref().map(|r| r.gen);
+        match frame {
+            Frame::RedundantOk(ok) => {
+                if gen == Some(ok.attach_gen) && !bound {
+                    if let Some(r) = self.redundant.as_mut() {
+                        r.bound = true;
+                        r.hello = false;
+                    }
+                    // The relay's snapshot. Never fatal: the spare is optional.
+                    let _ = self.send.on_ack(ok.recv_offset, ok.max_offset);
+                } else {
+                    self.drop_redundant();
+                }
+            }
+            Frame::Reject(_) => self.drop_redundant(),
+            Frame::Rst { code } => self.close(CloseReason::Reset(code)),
+            Frame::Data { offset, data, .. } if bound => {
+                if let Ok(n) = self.recv.on_data(offset, &data, now) {
+                    if n > 0 {
+                        self.made_progress(now);
+                    }
+                }
+                self.check_done();
+            }
+            Frame::Ack {
+                recv_offset,
+                max_offset,
+            } if bound => {
+                if self.send.on_ack(recv_offset, max_offset).ok() == Some(true) {
+                    self.made_progress(now);
+                }
+            }
+            Frame::Fin { offset } if bound && self.recv.on_fin(offset, now).is_ok() => {
+                self.check_done();
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn on_current(&mut self, frame: Frame, now: Instant) -> Result<(), ProtoError> {
@@ -811,6 +1052,8 @@ impl ClientSession {
                 }
             }
             Frame::Rst { code } => self.close(CloseReason::Reset(code)),
+            // After the spare is promoted these can still be in flight.
+            Frame::RedundantOk(_) | Frame::RedundantAttach(_) => {}
             Frame::Pad(_) | Frame::Dgram { .. } => {}
             Frame::Data { offset, data, .. } if self.confirmed => {
                 if self.recv.on_data(offset, &data, now)? > 0 {
@@ -885,6 +1128,13 @@ impl ClientSession {
 
     /// What goes out next on carrier `cid`.
     fn next_tx(&mut self, cid: CarrierId, now: Instant) -> Option<TxNext> {
+        if self.redundant.as_ref().is_some_and(|r| r.cid == cid) {
+            return self
+                .redundant
+                .as_ref()
+                .filter(|r| r.hello)
+                .map(|_| TxNext::RedundantHello);
+        }
         if self.carrier != Some(cid) {
             return None;
         }
@@ -920,6 +1170,9 @@ impl ClientSession {
     /// Whether [`poll_transmit`](Self::poll_transmit) would return a
     /// frame now (so a driver only takes memory for one when it would).
     pub fn has_transmit(&self, cid: CarrierId, now: Instant) -> bool {
+        if self.redundant.as_ref().is_some_and(|r| r.cid == cid) {
+            return self.redundant.as_ref().is_some_and(|r| r.hello);
+        }
         if self.carrier != Some(cid) {
             return false;
         }
@@ -941,7 +1194,7 @@ impl ClientSession {
     /// Next frame for carrier `cid`, if any.
     pub fn poll_transmit(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
         let f = self.poll_transmit_inner(cid, now);
-        if f.is_some() {
+        if f.is_some() && self.carrier == Some(cid) {
             self.last_sent = now;
         }
         f
@@ -955,6 +1208,13 @@ impl ClientSession {
                     o.first_data = self.send.first_data(self.hello_first).concat();
                 }
                 Some(h)
+            }
+            TxNext::RedundantHello => {
+                let gen = self.redundant.as_ref().filter(|r| r.hello).map(|r| r.gen)?;
+                if let Some(r) = self.redundant.as_mut() {
+                    r.hello = false;
+                }
+                Some(self.redundant_attach_frame(gen))
             }
             TxNext::Frame(f) => Some(f),
             TxNext::Send => self.send.poll_frame(),
@@ -973,7 +1233,7 @@ impl ClientSession {
         room: usize,
     ) -> Tx {
         let r = self.poll_transmit_into_inner(cid, now, out, room);
-        if r == Tx::Wrote {
+        if r == Tx::Wrote && self.carrier == Some(cid) {
             self.last_sent = now;
         }
         r
@@ -1005,6 +1265,23 @@ impl ClientSession {
                 out.reserve_exact(need);
                 h.encode_with(out, tail);
                 self.hello = None;
+                Tx::Wrote
+            }
+            Some(TxNext::RedundantHello) => {
+                let Some(gen) = self.redundant.as_ref().filter(|r| r.hello).map(|r| r.gen) else {
+                    return Tx::Idle;
+                };
+                let h = self.redundant_attach_frame(gen);
+                let mut hdr = Vec::new();
+                h.encode(&mut hdr);
+                if hdr.len() > room {
+                    return Tx::NeedRoom(hdr.len());
+                }
+                out.reserve_exact(hdr.len());
+                h.encode(out);
+                if let Some(r) = self.redundant.as_mut() {
+                    r.hello = false;
+                }
                 Tx::Wrote
             }
             Some(TxNext::Frame(f)) => {
@@ -1050,6 +1327,11 @@ impl ClientSession {
         if self.carrier.is_some() && !self.confirmed {
             put(self.attach_started.map(|s| s + t.t_attach));
         }
+        if let Some(r) = &self.redundant {
+            if !r.bound {
+                put(Some(r.started + t.t_attach));
+            }
+        }
         if self.need_attach {
             put(self.backoff_until);
         }
@@ -1094,9 +1376,21 @@ impl ClientSession {
             self.need_attach = true;
             self.detached_since.get_or_insert(now);
         }
+        // No REDUNDANT_OK within t_attach: drop the spare only. The session
+        // stays on its current carrier (an old relay never answers).
+        if self
+            .redundant
+            .as_ref()
+            .is_some_and(|r| !r.bound && now >= r.started + t.t_attach)
+        {
+            self.drop_redundant();
+        }
         if self.confirmed && self.send.unacked() && now >= self.last_rx + t.t_stall {
-            self.carrier_lost(now, true);
-            self.move_carrier(now);
+            // A bound spare becomes current. No RESUME, no failure report.
+            if !self.promote_redundant(now) {
+                self.carrier_lost(now, true);
+                self.move_carrier(now);
+            }
         }
         if self.recv.idle_deadline().is_some_and(|d| now >= d) {
             self.recv.update_credit(now);
