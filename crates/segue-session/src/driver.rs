@@ -929,6 +929,15 @@ pub struct ClientCtl {
     /// Path-quality evidence (see [`QualityEvent`]): called from the
     /// driver task when the session loses a carrier or replays bytes.
     pub quality: Option<QualityHook>,
+    /// Keep one standby carrier for the life of the session. `None` leaves
+    /// the session single-carrier unless [`run_client_ctl_with_redundant`]
+    /// is asked. The first dial waits until the session is active, so OPEN
+    /// is not delayed. After a promotion, a spare death, a rejected spare,
+    /// or a failed dial, another is requested on a backoff (1 s, doubling
+    /// to 30 s; back to 1 s after a spare stayed bound for 10 s). At most
+    /// one standby dial is in flight. A full pool skips the dial and uses
+    /// the same backoff. The standby does not reserve pool blocks.
+    pub standby: Option<StandbyCtl>,
 }
 
 /// Receives a session's [`Health`] reports.
@@ -936,6 +945,113 @@ pub type HealthHook = Arc<dyn Fn(Health) + Send + Sync>;
 
 /// Receives a session's [`QualityEvent`]s.
 pub type QualityHook = Arc<dyn Fn(QualityEvent) + Send + Sync>;
+
+/// What the standby carrier did, for the caller's counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandbyEvent {
+    /// A standby dial was started. One event per dial, not per raced attempt.
+    DialStarted,
+    /// `REDUNDANT_OK` bound the spare.
+    Bound,
+    /// The current carrier was lost and the spare became current.
+    Promoted,
+    /// The spare dial failed, was rejected, or died without a promotion.
+    Lost,
+}
+
+/// How to dial and account for [`ClientCtl::standby`].
+pub struct StandbyCtl {
+    /// Dial the spare with this connector, not the session's. The caller
+    /// uses that to keep a spare failure off the exit's health.
+    pub connect: Connector,
+    /// `false` skips a request (the user is disconnected, or the device
+    /// was revoked). Checked when a dial would start.
+    pub allowed: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Called on the driver task for each [`StandbyEvent`].
+    pub on_event: Arc<dyn Fn(StandbyEvent) + Send + Sync>,
+}
+
+/// First wait after a standby is lost. Doubles up to [`STANDBY_BACKOFF_MAX`].
+const STANDBY_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const STANDBY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+/// A spare that stayed bound this long resets the backoff to the minimum.
+const STANDBY_RESET_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Backoff state for [`ClientCtl::standby`]. The clock is tokio's, so a
+/// paused test clock sees the waits.
+struct StandbyKeep {
+    connect: Connector,
+    allowed: Arc<dyn Fn() -> bool + Send + Sync>,
+    on_event: Arc<dyn Fn(StandbyEvent) + Send + Sync>,
+    backoff: std::time::Duration,
+    next_at: Option<tokio::time::Instant>,
+    cid: Option<u64>,
+    bound_at: Option<tokio::time::Instant>,
+}
+
+impl StandbyKeep {
+    fn new(ctl: StandbyCtl) -> Self {
+        Self {
+            connect: ctl.connect,
+            allowed: ctl.allowed,
+            on_event: ctl.on_event,
+            backoff: STANDBY_BACKOFF_MIN,
+            next_at: None,
+            cid: None,
+            bound_at: None,
+        }
+    }
+
+    fn emit(&self, ev: StandbyEvent) {
+        (self.on_event)(ev);
+    }
+
+    /// The spare appeared, bound, or went away since the last look.
+    fn observe(&mut self, s: &ClientSession) {
+        let now = tokio::time::Instant::now();
+        let cid = s.redundant_carrier();
+        if s.redundant_bound() && self.bound_at.is_none() {
+            self.bound_at = Some(now);
+            self.emit(StandbyEvent::Bound);
+        }
+        if self.cid.is_some() && cid != self.cid {
+            let prev = self.cid.take().expect("cid was some");
+            let promoted = s.carrier() == Some(prev);
+            if promoted {
+                self.emit(StandbyEvent::Promoted);
+            } else {
+                self.emit(StandbyEvent::Lost);
+            }
+            self.schedule(now);
+        }
+        if self.cid.is_none() {
+            self.cid = cid;
+        }
+    }
+
+    /// Wait `backoff`, then double it. A spare that was bound for 10 s
+    /// starts again at the minimum.
+    fn schedule(&mut self, now: tokio::time::Instant) {
+        let long = self
+            .bound_at
+            .is_some_and(|t| now.saturating_duration_since(t) >= STANDBY_RESET_AFTER);
+        if long {
+            self.backoff = STANDBY_BACKOFF_MIN;
+        }
+        self.next_at = Some(now + self.backoff);
+        let doubled = self.backoff.saturating_mul(2);
+        self.backoff = if doubled > STANDBY_BACKOFF_MAX {
+            STANDBY_BACKOFF_MAX
+        } else {
+            doubled
+        };
+        self.bound_at = None;
+    }
+
+    fn due(&self, now: tokio::time::Instant) -> bool {
+        self.next_at.is_none_or(|t| now >= t)
+    }
+}
 
 /// Dial state for one optional spare carrier. Allocated only when the caller
 /// asks for one, so the default driver task stays inside the idle-memory budget.
@@ -946,6 +1062,9 @@ struct SpareCtl {
     dial: Option<Task>,
     bridge: Option<Task>,
     connecting: bool,
+    /// Set when the session keeps a standby on its own. `None` only dials
+    /// what `notes` asks for, with the session connector.
+    keep: Option<StandbyKeep>,
 }
 
 /// [`run_client_ctl`] with an optional redundant-carrier request.
@@ -980,6 +1099,7 @@ where
         mut cancel,
         health,
         quality,
+        standby,
     } = ctl;
     let report = |s: &mut ClientSession| {
         if let Some(h) = s.take_health() {
@@ -1006,24 +1126,30 @@ where
     // Present only when the caller passed `add_redundant`. The bridge turns
     // that receiver into notes and wakes `writable`, so the loop can
     // `try_recv` without a select arm (an arm would bloat every session).
-    let mut spare: Option<Box<SpareCtl>> = add_redundant.take().map(|mut requests| {
-        let (note_tx, notes) = mpsc::unbounded_channel();
-        let wake = writable.clone();
-        let bridge = spawn(async move {
-            while requests.recv().await.is_some() {
-                let _ = note_tx.send(());
-                wake.notify_one();
-            }
-        });
-        Box::new(SpareCtl {
-            notes,
-            tx: None,
-            rx: None,
-            dial: None,
-            bridge: Some(bridge),
-            connecting: false,
-        })
-    });
+    let mut spare: Option<Box<SpareCtl>> = match (add_redundant.take(), standby) {
+        (None, None) => None,
+        (requests, standby) => {
+            let (note_tx, notes) = mpsc::unbounded_channel();
+            let wake = writable.clone();
+            let bridge = requests.map(move |mut requests| {
+                spawn(async move {
+                    while requests.recv().await.is_some() {
+                        let _ = note_tx.send(());
+                        wake.notify_one();
+                    }
+                })
+            });
+            Some(Box::new(SpareCtl {
+                notes,
+                tx: None,
+                rx: None,
+                dial: None,
+                bridge,
+                connecting: false,
+                keep: standby.map(StandbyKeep::new),
+            }))
+        }
+    };
     let mut carriers: HashMap<u64, CarrierIo> = HashMap::new();
     let mut tasks = Tasks::default();
     let mut dial: Option<Task> = None;
@@ -1102,7 +1228,33 @@ where
                             );
                             s.attach_redundant(cid, now());
                         }
-                        Err(_) => s.redundant_dial_failed(),
+                        Err(_) => {
+                            s.redundant_dial_failed();
+                            if let Some(keep) = spare.keep.as_mut() {
+                                keep.emit(StandbyEvent::Lost);
+                                keep.schedule(tokio::time::Instant::now());
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(keep) = spare.keep.as_mut() {
+                keep.observe(&s);
+                let now_tk = tokio::time::Instant::now();
+                let idle = !spare.connecting
+                    && s.redundant_carrier().is_none()
+                    && !s.wants_redundant()
+                    && !s.is_closed()
+                    && s.state() == State::Active
+                    && keep.due(now_tk)
+                    && (keep.allowed)();
+                if idle {
+                    // No pool reservation for a spare. Under pressure, skip
+                    // and try again on the same backoff as a failed dial.
+                    if pool.under_pressure() {
+                        keep.schedule(now_tk);
+                    } else {
+                        s.request_redundant();
                     }
                 }
             }
@@ -1115,7 +1267,13 @@ where
                 spare.connecting = true;
                 next_cid += 1;
                 let cid = next_cid;
-                let fut = connect();
+                let fut = match spare.keep.as_ref() {
+                    Some(keep) => {
+                        keep.emit(StandbyEvent::DialStarted);
+                        (keep.connect)()
+                    }
+                    None => connect(),
+                };
                 let tx = spare.tx.clone().expect("just set");
                 let wake = writable.clone();
                 spare.dial = Some(spawn(async move {
@@ -1252,6 +1410,18 @@ where
         let hold_at = tx_hold
             .as_ref()
             .map(|h| h.deadline(carriers.get(&h.cid).and_then(|io| io.tx_at.get()), &pool));
+        // Wake when a standby backoff elapses. Absent while one is in
+        // flight, bound, or the caller has asked us not to dial.
+        let spare_due = spare.as_ref().and_then(|sp| {
+            let keep = sp.keep.as_ref()?;
+            if sp.connecting || s.redundant_carrier().is_some() || s.is_closed() {
+                return None;
+            }
+            if s.state() != State::Active || !(keep.allowed)() {
+                return None;
+            }
+            keep.next_at
+        });
         tokio::select! {
             ev = ev_rx.recv() => {
                 let t = now();
@@ -1393,6 +1563,7 @@ where
             }
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
             _ = tokio::time::sleep_until(backoff.unwrap_or_else(tokio::time::Instant::now)), if backoff.is_some() => {}
+            _ = tokio::time::sleep_until(spare_due.unwrap_or_else(tokio::time::Instant::now)), if spare_due.is_some() => {}
             _ = tokio::time::sleep_until(drain.unwrap_or_else(tokio::time::Instant::now)), if drain.is_some() => {}
             // A frame held the transport region past the hold: its carrier
             // stopped moving. Give the carrier up (the frame's blocks go
@@ -1501,6 +1672,23 @@ where
     reason
 }
 
+/// [`run_client_ctl`] for a session that keeps a standby carrier
+/// ([`ClientCtl::standby`]). Separate from [`run_client_ctl`] so a
+/// session that does not ask for one does not carry this loop in its
+/// driver future.
+pub async fn run_client_standby<A>(
+    s: ClientSession,
+    app: A,
+    connect: Connector,
+    ctl: ClientCtl,
+) -> CloseReason
+where
+    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (_tx, rx) = mpsc::unbounded_channel();
+    run_client_loop(s, app, connect, ctl, Some(rx)).await
+}
+
 /// [`run_client`] with hooks.
 pub async fn run_client_ctl<A>(
     mut s: ClientSession,
@@ -1519,6 +1707,7 @@ where
         mut cancel,
         health,
         quality,
+        standby: _,
     } = ctl;
     let report = |s: &mut ClientSession| {
         if let Some(h) = s.take_health() {
