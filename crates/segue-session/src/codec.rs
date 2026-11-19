@@ -78,9 +78,9 @@ pub mod ty {
     pub const REFRESHED: u8 = 0x3A;
     pub const REVOKED: u8 = 0x3B;
     /// First frame on a redundant carrier (v0.6 draft). Always encoded with
-    /// [`FLAG_IGNORABLE`].
+    /// [`super::FLAG_IGNORABLE`].
     pub const REDUNDANT_ATTACH: u8 = 0x3C;
-    /// Answer to [`REDUNDANT_ATTACH`]. Always encoded with [`FLAG_IGNORABLE`].
+    /// Answer to [`REDUNDANT_ATTACH`]. Always encoded with [`super::FLAG_IGNORABLE`].
     pub const REDUNDANT_OK: u8 = 0x3D;
 }
 

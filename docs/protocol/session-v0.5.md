@@ -303,15 +303,34 @@ Rules:
 - A spare that closes, sticks, fails to decode, or is REJECTed is dropped
   alone: no re-attach, no `MAX_FRUITLESS` count, no `Health::Failed`, no
   quality "carrier lost".
-- If the **current** carrier closes or is given up as stuck while a spare
-  is bound, both sides **promote** it. Same `attach_gen`, no RESUME. Each
-  side replays unacked bytes from its last acknowledged offset (the relay's
-  `recv_offset` in `REDUNDANT_OK` is that snapshot at bind time; later ACKs
-  move it). Dedup keeps the replay from being delivered twice.
-- A move of the current carrier (RESUME on another carrier, including an
-  OPEN retry treated as resume) **drops** the spare. The spare was
-  authenticated at the old generation; leaving it bound would make that
-  generation ambiguous.
+- If the **current** carrier is lost while a spare is bound, both sides
+  **promote** it. Loss means the carrier closed, the transport hold gave it
+  up (`on_carrier_stuck`), the client's `t_stall` fired, or the relay's
+  `t_live` fired. Same `attach_gen`. **No RESUME and no other frame** is
+  sent to announce the promotion.
+- What crosses the wire is only what already did. `REDUNDANT_OK`'s
+  `recv_offset` / `max_offset` is the relay's snapshot at bind time; later
+  ACKs (mirrored onto the spare) move each side's acknowledged offset. On
+  promotion each side replays unacked bytes from that offset
+  (`SendHalf::rewind`). Receive dedup by offset drops a replay the peer
+  already has, so the application sees neither a loss nor a duplicate.
+- The relay ends up with the spare as current because it already
+  authenticated that carrier at this generation. `on_carrier_closed` of the
+  old current promotes the spare in place. `t_live` does the same instead of
+  going DETACHED, and emits `STALL` so a client that has not noticed yet
+  promotes too. The client closes the old carrier when it promotes, which is
+  the signal a relay that has not timed out yet is waiting for. A `STALL`
+  that arrives after the promotion, while the spare is still receiving, is
+  about the carrier already left and is ignored. If that spare later goes
+  quiet, the hint is a real loss: the session promotes a newer spare or
+  re-attaches with RESUME, the ordinary way.
+- After a promotion the client may ask again (`request_redundant`).
+  `wants_redundant` is true once the session is active and no spare is
+  attached. Nothing asks on its own.
+- A move of the current carrier onto a third one (RESUME, including an OPEN
+  retry the relay treats as resume, and a local `reattach`) **drops** the
+  spare on both sides. The spare was authenticated at the old generation;
+  leaving it bound would make that generation ambiguous.
 - The client asks for a spare explicitly (`request_redundant` /
   `run_client_ctl_with_redundant`). Nothing turns it on by default, and the
   kernel does not.
@@ -815,7 +834,7 @@ parse/encode, no behaviour), **hook-only** (interface exists, no producer),
 | WAKE | **not started** (M9+) | frame defined `codec.rs:684-693`; "PARK/WAKE as a whole is M9+" (`lib.rs:9-11`, `lib.rs:16-17`) |
 | Cross-instance hand-off (§9.2) | **not started** | any other `anchor_instance_id` → `unknown_session` (`relay.rs:568-571`, `relay.rs:502-504`) |
 | Cross-node forwarding | **not started** (M9+) | `crates/segue-session/src/lib.rs:16-17`, `crates/segue-relay/src/lib.rs:19-21` |
-| Redundant carrier, no DATA duplication (v0.6 draft, §2.7) | implemented, off by default | `REDUNDANT_ATTACH`/`REDUNDANT_OK`; relay binds without `switch`; client promotes the spare if the current carrier dies |
+| Redundant carrier, no DATA duplication (v0.6 draft, §2.7) | implemented, off by default | `REDUNDANT_ATTACH`/`REDUNDANT_OK`; relay binds without `switch`; a lost current carrier (close, hold, `t_stall`, `t_live`/`STALL`) promotes the spare with no RESUME; a move onto a third carrier drops the spare |
 | Session layer on mobile (FFI) | **not shipped** | `segue-session`/`segue-kernel` are behind the `proprietary-kernel` feature, "Deliberately not enabled in platform/build scripts yet" (`crates/segue-ffi/Cargo.toml:14-20`); no reference in `platform/android` or `platform/apple` |
 
 ## 12. What this gives an AI app that Xray/sing-box/mihomo do not

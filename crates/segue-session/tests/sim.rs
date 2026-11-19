@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use segue_session::client::{ClientSession, CloseReason, OpenParams, State};
-use segue_session::codec::{code, Frame, FrameDecoder, Kind, SessionId, Target};
+use segue_session::client::{ClientSession, CloseReason, Health, OpenParams, State};
+use segue_session::codec::{code, Frame, FrameDecoder, Kind, RedundantOk, SessionId, Target};
 use segue_session::pool::Pool;
+use segue_session::quality::QualityEvent;
 use segue_session::relay::{AllowAll, RelayEvent, RelayTable};
-use segue_session::Config;
+use segue_session::{Config, ProtoError};
 
 const INSTANCE: u64 = 77;
 
@@ -88,6 +89,9 @@ struct Sim {
     drop_redundant_ok: bool,
     /// Drop relay→client bytes on this carrier.
     mute_rx: Option<u64>,
+    /// Leave this carrier's bytes in the pipe: neither side sees them, and
+    /// the carrier stays open. Used to fire `t_stall` without a close.
+    hold_carrier: Option<u64>,
     max_client_recv_buffered: usize,
     max_relay_send_buffered: usize,
 }
@@ -141,6 +145,7 @@ impl Sim {
             keep_redundant: false,
             drop_redundant_ok: false,
             mute_rx: None,
+            hold_carrier: None,
             max_client_recv_buffered: 0,
             max_relay_send_buffered: 0,
         }
@@ -388,6 +393,10 @@ impl Sim {
             let Some(mut p) = self.pipes.remove(&cid) else {
                 continue;
             };
+            if self.hold_carrier == Some(cid) {
+                self.pipes.insert(cid, p);
+                continue;
+            }
             self.deliver(cid, &mut p);
             if p.relay_closed && p.r2c.is_empty() {
                 self.client.on_carrier_closed(cid, now);
@@ -748,9 +757,13 @@ fn redundant_carrier_dies_session_continues_exact() {
     let gen = s.client.gen();
     let fruitless = s.client.fruitless_carriers();
     s.keep_redundant = false;
+    s.client.take_health();
+    s.client.take_quality();
     s.cut(spare);
     assert!(s.client.redundant_carrier().is_none());
     assert_eq!(s.client.fruitless_carriers(), fruitless);
+    assert_ne!(s.client.take_health(), Some(Health::Failed));
+    assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
     assert!(s.client.carrier().is_some());
     s.run(200_000);
     s.assert_exact();
@@ -796,12 +809,16 @@ fn no_redundant_ok_drops_the_spare_and_leaves_the_session() {
     // Hold the download so the session cannot finish before t_attach (2s,
     // and each step is 1ms). The spare must go; the session stays.
     s.app_reads = false;
+    s.client.take_health();
+    s.client.take_quality();
     for _ in 0..2_500 {
         s.step();
         assert!(
             !s.client.is_closed(),
             "session ended while the spare timed out"
         );
+        assert_ne!(s.client.take_health(), Some(Health::Failed));
+        assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
     }
     assert_ne!(s.client.redundant_carrier(), Some(spare));
     assert!(!s.client.redundant_bound());
@@ -867,6 +884,264 @@ fn randomized_faults_with_redundant_never_lose_or_duplicate() {
         s.assert_exact();
     }
     assert!(refused < seeds as usize, "every seed was refused");
+}
+
+#[test]
+fn redundant_is_off_unless_requested() {
+    let mut s = Sim::new(3, 80_000, 80_000);
+    assert!(!s.client.wants_redundant());
+    assert!(s.client.redundant_carrier().is_none());
+    s.run(200_000);
+    s.assert_exact();
+    // One carrier, no spare dial, no second generation: the session that
+    // never calls `request_redundant` is the single-carrier session.
+    assert_eq!(s.carriers_opened, 1);
+    assert_eq!(s.client.gen(), 0);
+    assert!(s.client.redundant_carrier().is_none());
+    assert!(!s.client.wants_redundant());
+}
+
+#[test]
+fn redundant_ok_with_the_wrong_generation_does_not_bind() {
+    let mut s = Sim::new(21, 50_000, 50_000);
+    s.keep_redundant = true;
+    let spare = wait_until_redundant(&mut s);
+    s.keep_redundant = false;
+    assert!(s.client.redundant_bound());
+    let fruitless = s.client.fruitless_carriers();
+    let gen = s.client.gen();
+    s.client.take_health();
+    s.client.take_quality();
+    s.client
+        .on_frame(
+            spare,
+            Frame::RedundantOk(RedundantOk {
+                attach_gen: gen.wrapping_add(9),
+                recv_offset: 0,
+                max_offset: 0,
+            }),
+            s.now,
+        )
+        .unwrap();
+    assert!(s.client.redundant_carrier().is_none());
+    assert!(!s.client.redundant_bound());
+    assert_eq!(s.client.fruitless_carriers(), fruitless);
+    assert_eq!(s.client.gen(), gen);
+    assert_ne!(s.client.take_health(), Some(Health::Failed));
+    assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
+    s.run(200_000);
+    s.assert_exact();
+}
+
+#[test]
+fn redundant_stuck_or_undecodable_drops_only_itself() {
+    let mut s = Sim::new(22, 80_000, 80_000);
+    s.keep_redundant = true;
+    let spare = wait_until_redundant(&mut s);
+    let current = s.client.carrier();
+    let gen = s.client.gen();
+    let fruitless = s.client.fruitless_carriers();
+    s.client.take_health();
+    s.client.take_quality();
+    s.client.on_carrier_stuck(spare, s.now);
+    assert!(s.client.redundant_carrier().is_none());
+    assert_eq!(s.client.carrier(), current);
+    assert_eq!(s.client.gen(), gen);
+    assert_eq!(s.client.fruitless_carriers(), fruitless);
+    assert_ne!(s.client.take_health(), Some(Health::Failed));
+    assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
+
+    s.keep_redundant = true;
+    let spare = wait_until_redundant(&mut s);
+    s.client.take_health();
+    s.client.take_quality();
+    s.client.on_decode_error(spare, ProtoError::Malformed);
+    assert!(s.client.redundant_carrier().is_none());
+    assert_eq!(s.client.carrier(), current);
+    assert_eq!(s.client.gen(), gen);
+    assert_eq!(s.client.fruitless_carriers(), fruitless);
+    assert_ne!(s.client.take_health(), Some(Health::Failed));
+    assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
+
+    s.keep_redundant = false;
+    s.run(200_000);
+    s.assert_exact();
+    assert_eq!(s.client.gen(), gen);
+}
+
+#[test]
+fn t_stall_promotes_the_spare_without_a_new_dial() {
+    let mut s = Sim::new(31, 200_000, 200_000);
+    s.keep_redundant = true;
+    let spare = wait_until_redundant(&mut s);
+    let current = s.client.carrier().unwrap();
+    assert_ne!(current, spare);
+    s.keep_redundant = false;
+    let opened = s.carriers_opened;
+    let gen = s.client.gen();
+    let fruitless = s.client.fruitless_carriers();
+    s.client.take_health();
+    s.client.take_quality();
+    // Quiet the current carrier. Uplink is still in flight, so `t_stall`
+    // (1s) fires before the relay's `t_live` (3s).
+    s.hold_carrier = Some(current);
+    let mut promoted = false;
+    for _ in 0..3_000 {
+        s.step();
+        if s.client.carrier() == Some(spare) {
+            promoted = true;
+            break;
+        }
+    }
+    assert!(promoted, "t_stall did not promote the spare");
+    assert_eq!(s.client.gen(), gen);
+    assert_eq!(s.carriers_opened, opened);
+    assert_eq!(s.client.fruitless_carriers(), fruitless);
+    assert!(!s.client.wants_attach(s.now));
+    assert_ne!(s.client.take_health(), Some(Health::Failed));
+    assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
+    let sid = s.client.session_id();
+    assert_eq!(s.relay.current_carrier(&sid), Some(spare));
+    s.hold_carrier = None;
+    s.run(200_000);
+    s.assert_exact();
+    assert_eq!(s.client.gen(), gen, "promotion is not a RESUME");
+}
+
+#[test]
+fn stall_hint_promotes_the_spare_without_a_new_dial() {
+    let mut s = Sim::new(32, 4_000, 500_000);
+    s.keep_redundant = true;
+    let mut ready = false;
+    for _ in 0..50_000 {
+        s.step();
+        if s.client.redundant_bound()
+            && s.up_written == s.up.len()
+            && !s.client.send_half().unacked()
+            && s.down_got.len() < s.down.len()
+        {
+            ready = true;
+            break;
+        }
+        assert!(!s.finished(), "session ended before the stall window");
+    }
+    assert!(ready, "uplink never went idle with a spare bound");
+    let spare = s.client.redundant_carrier().unwrap();
+    let current = s.client.carrier().unwrap();
+    let gen = s.client.gen();
+    let opened = s.carriers_opened;
+    let fruitless = s.client.fruitless_carriers();
+    s.keep_redundant = false;
+    s.client.take_health();
+    s.client.take_quality();
+    // No downlink reaches the client, so it sends no further ACKs. The
+    // relay's `t_live` promotes the spare and emits STALL. Uplink is fully
+    // acknowledged, so the client's own `t_stall` stays quiet.
+    s.mute_rx = Some(current);
+    let mut promoted = false;
+    for _ in 0..5_000 {
+        s.step();
+        if s.client.carrier() == Some(spare) {
+            promoted = true;
+            break;
+        }
+        assert_eq!(s.client.gen(), gen, "stall dialed a new carrier");
+    }
+    assert!(promoted, "STALL did not promote the spare");
+    assert_eq!(s.carriers_opened, opened);
+    assert_eq!(s.client.fruitless_carriers(), fruitless);
+    assert_ne!(s.client.take_health(), Some(Health::Failed));
+    assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
+    let sid = s.client.session_id();
+    assert_eq!(s.relay.current_carrier(&sid), Some(spare));
+    assert!(s.relay.redundant_carrier(&sid).is_none());
+    s.mute_rx = None;
+    s.run(200_000);
+    s.assert_exact();
+    assert_eq!(s.client.gen(), gen, "promotion is not a RESUME");
+}
+
+#[test]
+fn transport_hold_promotes_the_spare_without_a_new_dial() {
+    let mut s = Sim::new(33, 80_000, 80_000);
+    s.keep_redundant = true;
+    let spare = wait_until_redundant(&mut s);
+    let current = s.client.carrier().unwrap();
+    let gen = s.client.gen();
+    let opened = s.carriers_opened;
+    let fruitless = s.client.fruitless_carriers();
+    s.keep_redundant = false;
+    s.client.take_health();
+    s.client.take_quality();
+    s.client.on_carrier_stuck(current, s.now);
+    assert_eq!(s.client.carrier(), Some(spare));
+    assert_eq!(s.client.gen(), gen);
+    assert!(s.client.redundant_carrier().is_none());
+    assert_eq!(s.client.fruitless_carriers(), fruitless);
+    assert!(!s.client.wants_attach(s.now));
+    assert_ne!(s.client.take_health(), Some(Health::Failed));
+    assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
+    // The abandon closes the old carrier; the relay promotes on that close.
+    s.step();
+    let sid = s.client.session_id();
+    assert_eq!(s.relay.current_carrier(&sid), Some(spare));
+    assert_eq!(s.carriers_opened, opened);
+    s.run(200_000);
+    s.assert_exact();
+    assert_eq!(s.client.gen(), gen, "promotion is not a RESUME");
+}
+
+#[test]
+fn promotion_allows_another_redundant_carrier() {
+    let mut s = Sim::new(34, 80_000, 80_000);
+    s.keep_redundant = true;
+    let spare = wait_until_redundant(&mut s);
+    let gen = s.client.gen();
+    s.keep_redundant = false;
+    assert!(s.cut_current());
+    assert_eq!(s.client.carrier(), Some(spare));
+    assert!(!s.client.wants_redundant());
+    // What the driver does when the caller asks again.
+    s.client.request_redundant();
+    assert!(s.client.wants_redundant());
+    s.keep_redundant = true;
+    let spare2 = wait_until_redundant(&mut s);
+    assert_ne!(spare2, spare);
+    assert_eq!(s.client.gen(), gen);
+    s.keep_redundant = false;
+    s.run(200_000);
+    s.assert_exact();
+    assert_eq!(s.client.gen(), gen);
+}
+
+#[test]
+fn move_onto_a_third_carrier_drops_the_spare() {
+    let mut s = Sim::new(35, 80_000, 80_000);
+    s.keep_redundant = true;
+    let spare = wait_until_redundant(&mut s);
+    let gen = s.client.gen();
+    let sid = s.client.session_id();
+    assert_eq!(s.relay.redundant_carrier(&sid), Some(spare));
+    s.keep_redundant = false;
+    s.client.reattach(s.now);
+    assert!(s.client.redundant_carrier().is_none());
+    let mut moved = false;
+    for _ in 0..50 {
+        s.step();
+        if s.client.gen() == gen + 1
+            && s.client.redundant_carrier().is_none()
+            && s.relay.redundant_carrier(&sid).is_none()
+            && s.client.carrier().is_some()
+        {
+            moved = true;
+            break;
+        }
+    }
+    assert!(moved, "move did not drop the spare on both sides");
+    assert_ne!(s.client.carrier(), Some(spare));
+    s.run(200_000);
+    s.assert_exact();
+    assert!(s.client.gen() > gen);
 }
 
 #[allow(dead_code)]

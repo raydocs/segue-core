@@ -200,6 +200,10 @@ pub struct ClientSession {
     /// Latched by [`request_redundant`](Self::request_redundant) until a
     /// spare is attached or the dial fails. Off by default.
     want_redundant: bool,
+    /// The current carrier was replaced by promoting a bound spare, and the
+    /// generation did not change. A `STALL` hint that arrives while this
+    /// carrier is still receiving is about the carrier already left.
+    promoted_in_gen: bool,
     /// The current carrier's OPEN/RESUME has been answered.
     confirmed: bool,
     hello: Option<Frame>,
@@ -304,6 +308,7 @@ impl ClientSession {
             carrier: None,
             redundant: None,
             want_redundant: false,
+            promoted_in_gen: false,
             confirmed: false,
             hello: None,
             rst: None,
@@ -424,10 +429,12 @@ impl ClientSession {
         }
     }
 
-    /// The current carrier died and a spare is already bound: keep the
+    /// The current carrier was lost and a spare is already bound: keep the
     /// session, make the spare current at the same generation, and replay
     /// unacked uplink from the last acknowledged offset. Not a RESUME, so
     /// it does not count against [`MAX_FRUITLESS`] and reports no failure.
+    /// The carrier left is abandoned so the relay sees it close and promotes
+    /// on its side (no frame is sent to announce the promotion).
     fn promote_redundant(&mut self, now: Instant) -> bool {
         if !self.redundant_bound() {
             return false;
@@ -435,6 +442,11 @@ impl ClientSession {
         let Some(r) = self.redundant.take() else {
             return false;
         };
+        if let Some(old) = self.carrier {
+            if old != r.cid {
+                self.abandoned.push(old);
+            }
+        }
         self.carrier = Some(r.cid);
         self.confirmed = true;
         self.confirmed_at = Some(now);
@@ -446,6 +458,7 @@ impl ClientSession {
         self.rx_partial = false;
         self.ka_due = false;
         self.last_rx = now;
+        self.promoted_in_gen = true;
         // This carrier has not moved data yet. The one that died is not
         // charged: a live spare means the path did not fail.
         self.progressed = false;
@@ -497,6 +510,7 @@ impl ClientSession {
         // A new current carrier is a move. The spare was authenticated at
         // the old generation; keeping it would make that generation
         // ambiguous, so it is dropped (rule 6).
+        self.promoted_in_gen = false;
         if self.carrier != Some(cid) {
             self.drop_redundant();
         }
@@ -618,6 +632,7 @@ impl ClientSession {
             return;
         }
         // Same as [`attach`](Self::attach): a move drops the spare.
+        self.promoted_in_gen = false;
         self.drop_redundant();
         if let Some(old) = self.carrier.take() {
             self.abandoned.push(old);
@@ -631,13 +646,29 @@ impl ClientSession {
     }
 
     /// `STALL{session_id, attach_gen}` from the control stream (B1).
+    ///
+    /// A bound spare is promoted instead of dialing: the relay emits this
+    /// when it gives the current carrier up, and promotes the same spare on
+    /// its side. A hint that arrives after that promotion, while the spare
+    /// is still receiving, is about the carrier already left and is ignored.
     pub fn on_stall(&mut self, gen: u32, now: Instant) {
-        if gen == self.gen && self.state == State::Active {
-            // The relay holds unacknowledged data for us: something was
-            // expected, whether or not we have anything to send (r9 F2).
-            self.carrier_lost(now, true);
-            self.move_carrier(now);
+        if gen != self.gen || self.state != State::Active {
+            return;
         }
+        if self.promoted_in_gen {
+            let quiet = self.send.unacked() && now >= self.last_rx + self.cfg.timing.t_stall;
+            if !quiet {
+                return;
+            }
+            self.promoted_in_gen = false;
+        }
+        if self.promote_redundant(now) {
+            return;
+        }
+        // The relay holds unacknowledged data for us: something was
+        // expected, whether or not we have anything to send (r9 F2).
+        self.carrier_lost(now, true);
+        self.move_carrier(now);
     }
 
     /// Bytes of a frame not yet complete arrived on carrier `cid` (the
@@ -1355,8 +1386,11 @@ impl ClientSession {
             self.drop_redundant();
         }
         if self.confirmed && self.send.unacked() && now >= self.last_rx + t.t_stall {
-            self.carrier_lost(now, true);
-            self.move_carrier(now);
+            // A bound spare becomes current. No RESUME, no failure report.
+            if !self.promote_redundant(now) {
+                self.carrier_lost(now, true);
+                self.move_carrier(now);
+            }
         }
         if self.recv.idle_deadline().is_some_and(|d| now >= d) {
             self.recv.update_credit(now);

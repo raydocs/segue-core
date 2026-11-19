@@ -352,32 +352,17 @@ impl RelayTable {
         // The current carrier died. A bound spare is promoted in place:
         // same generation, no RESUME, unacked downlink replayed from the
         // last acknowledged offset. Rule 6: a later switch still drops it.
-        let promote = self.sessions.get(&sid).and_then(|s| {
-            if s.carrier == Some(cid) {
-                s.redundant
-                    .filter(|r| self.carriers.get(r).is_some_and(|c| !c.close_after))
-            } else {
-                None
-            }
-        });
+        let was_current = self
+            .sessions
+            .get(&sid)
+            .is_some_and(|s| s.carrier == Some(cid));
+        if was_current && self.promote_bound_spare(&sid, now) {
+            return;
+        }
         let Some(s) = self.sessions.get_mut(&sid) else {
             return;
         };
         if s.carrier != Some(cid) {
-            return;
-        }
-        if let Some(red) = promote {
-            s.redundant = None;
-            s.carrier = Some(red);
-            let acked = s.send.acked();
-            let max = s.send.peer_max();
-            // Replays unacked downlink on the promoted carrier. Fails only
-            // if `acked` is past `sent_hw`, which `on_ack` never allows.
-            let _ = s.send.rewind(acked, max);
-            s.detached_since = None;
-            if s.connected && s.state != SessionState::Connecting {
-                s.state = SessionState::Active;
-            }
             return;
         }
         s.carrier = None;
@@ -453,6 +438,40 @@ impl RelayTable {
                 self.check_done(&sid, now);
             }
         }
+    }
+
+    /// Make the bound spare the current carrier. Same generation, no RESUME.
+    /// Replays unacked downlink from the last acknowledged offset (the
+    /// `recv_offset` carried in `REDUNDANT_OK`, moved forward by later ACKs).
+    /// `last_progress` restarts so this carrier is not declared dead on the
+    /// same timeout that promoted it.
+    fn promote_bound_spare(&mut self, sid: &SessionId, now: Instant) -> bool {
+        let Some(red) = self.sessions.get(sid).and_then(|s| s.redundant) else {
+            return false;
+        };
+        if self
+            .sessions
+            .get(sid)
+            .is_some_and(|s| s.carrier == Some(red))
+        {
+            return false;
+        }
+        if self.carriers.get(&red).is_none_or(|c| c.close_after) {
+            return false;
+        }
+        let s = self.sessions.get_mut(sid).unwrap();
+        s.redundant = None;
+        s.carrier = Some(red);
+        let acked = s.send.acked();
+        let max = s.send.peer_max();
+        // Fails only if `acked` is past `sent_hw`, which `on_ack` never allows.
+        let _ = s.send.rewind(acked, max);
+        s.detached_since = None;
+        s.last_progress = now;
+        if s.connected && s.state != SessionState::Connecting {
+            s.state = SessionState::Active;
+        }
+        true
     }
 
     /// Close a redundant carrier and forget it. The session is untouched.
@@ -1269,6 +1288,9 @@ impl RelayTable {
         let mut expired = Vec::new();
         let mut too_old = Vec::new();
         let mut stalled: Vec<(u64, SessionId, u32)> = Vec::new();
+        // `t_live` with a spare bound promotes that spare instead of going
+        // DETACHED. Collected here: promoting needs `&mut self`.
+        let mut promote_on_live: Vec<SessionId> = Vec::new();
         for (sid, s) in self.sessions.iter_mut() {
             if now >= s.created + t.max_lifetime {
                 s.rst = Some(code::MAX_LIFETIME);
@@ -1283,6 +1305,10 @@ impl RelayTable {
                 && s.send.unacked()
                 && now >= s.last_progress + t.t_live
             {
+                if s.redundant.is_some() {
+                    promote_on_live.push(*sid);
+                    continue;
+                }
                 s.state = SessionState::Detached;
                 s.detached_since = Some(now);
                 self.events.push_back(RelayEvent::Stall {
@@ -1294,6 +1320,34 @@ impl RelayTable {
             }
             if s.recv.idle_deadline().is_some_and(|d| now >= d) {
                 s.recv.update_credit(now);
+            }
+        }
+        for sid in promote_on_live {
+            if self.promote_bound_spare(&sid, now) {
+                // The client promotes on this hint if it has not already.
+                // The spare is current here either way; no RESUME follows.
+                if let Some(s) = self.sessions.get(&sid) {
+                    self.events.push_back(RelayEvent::Stall {
+                        device: s.device,
+                        session_id: sid,
+                        attach_gen: s.cur_gen,
+                    });
+                    stalled.push((s.device, sid, s.cur_gen));
+                }
+            } else if let Some(s) = self.sessions.get_mut(&sid) {
+                if s.state == SessionState::Active
+                    && s.send.unacked()
+                    && now >= s.last_progress + t.t_live
+                {
+                    s.state = SessionState::Detached;
+                    s.detached_since = Some(now);
+                    self.events.push_back(RelayEvent::Stall {
+                        device: s.device,
+                        session_id: sid,
+                        attach_gen: s.cur_gen,
+                    });
+                    stalled.push((s.device, sid, s.cur_gen));
+                }
             }
         }
         stalled.sort_unstable_by_key(|x| x.0);
