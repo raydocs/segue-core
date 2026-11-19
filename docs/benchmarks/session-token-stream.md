@@ -116,3 +116,90 @@ the seeded burst model, not a failed run.
 A new flow on `rtt170` is about two round trips (SOCKS is local; the session
 open crosses the impaired carrier). These three lossy seeds did not lose the
 handshake flight, so their TTFB stays next to `rtt170`.
+
+## Standby carrier
+
+`SEGUE_STANDBY=0|1` (default 1, the product default) is the `standby` column.
+The harness route is overseas, so an AI standby is not dialled in either mode.
+The impairment is TCP loss recovery on one carrier, not a carrier being
+replaced, which is the only stall a standby can skip. There is no
+`SEGUE_SCENARIO=convo` in this script.
+
+`SEGUE_TOKEN_SECONDS=10`, same seeds, debug test binary, 2026-11-18.
+
+### Token stream, standby off
+
+| standby | profile | seed | ttft_ms | delay_p50_ms | delay_p99_ms | delay_p99.9_ms | delay_max_ms | ia_p50_ms | ia_p99_ms | ia_p99.9_ms | stalls_300 | stalls_1s | up_bytes | down_bytes | payload_bytes |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | clean | 1 | 3.069 | 0.199 | 0.627 | 0.657 | 0.657 | 20.199 | 22.175 | 22.578 | 0 | 0 | 3765 | 17596 | 15012 |
+| 0 | clean | 2 | 2.786 | 0.416 | 0.71 | 0.79 | 0.79 | 20.139 | 21.931 | 22.132 | 0 | 0 | 3639 | 17596 | 15012 |
+| 0 | clean | 3 | 2.251 | 0.369 | 0.844 | 1.484 | 1.484 | 20.092 | 22.324 | 22.631 | 0 | 0 | 3621 | 17585 | 15012 |
+| 0 | rtt170 | 1 | 355.887 | 87.576 | 90.457 | 90.881 | 90.881 | 20.085 | 25.307 | 26.158 | 0 | 0 | 3518 | 17588 | 15012 |
+| 0 | rtt170 | 2 | 355.279 | 87.533 | 90.707 | 95.078 | 95.078 | 20.122 | 26.468 | 29.101 | 0 | 0 | 3553 | 17588 | 15012 |
+| 0 | rtt170 | 3 | 355.13 | 87.619 | 90.837 | 91.087 | 91.087 | 20.072 | 24.788 | 26.69 | 0 | 0 | 3625 | 17588 | 15012 |
+| 0 | cn163-offpeak | 1 | 361.219 | 88.95 | 155.636 | 175.395 | 175.395 | 19.985 | 40.671 | 105.772 | 0 | 0 | 3203 | 17588 | 15012 |
+| 0 | cn163-offpeak | 2 | 354.741 | 1614.179 | 3414.544 | 3443.933 | 3443.933 | 0.003 | 29.057 | 3373.996 | 3 | 3 | 2428 | 16400 | 15012 |
+| 0 | cn163-offpeak | 3 | 344.246 | 88.812 | 95.045 | 105.047 | 105.047 | 20.137 | 32.625 | 36.538 | 0 | 0 | 3581 | 17588 | 15012 |
+| 0 | cn163-peak | 1 | 360.137 | 1183.958 | 4495.183 | 4595.418 | 4595.418 | 0.003 | 627.602 | 3393.185 | 7 | 3 | 1988 | 16793 | 15012 |
+| 0 | cn163-peak | 2 | 345.263 | 1616.414 | 3410.847 | 3441.22 | 3441.22 | 0.002 | 30.628 | 3374.008 | 3 | 3 | 2438 | 16540 | 15012 |
+| 0 | cn163-peak | 3 | 348.192 | 244.686 | 1681.143 | 1723.198 | 1723.198 | 0.006 | 31.596 | 1652.182 | 4 | 4 | 2573 | 16980 | 15012 |
+
+### Token stream, standby on
+
+| standby | profile | seed | ttft_ms | delay_p50_ms | delay_p99_ms | delay_p99.9_ms | delay_max_ms | ia_p50_ms | ia_p99_ms | ia_p99.9_ms | stalls_300 | stalls_1s | up_bytes | down_bytes | payload_bytes |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | clean | 1 | 2.881 | 0.394 | 0.698 | 1.266 | 1.266 | 20.101 | 22.457 | 22.689 | 0 | 0 | 3656 | 17596 | 15012 |
+| 1 | clean | 2 | 2.136 | 0.412 | 0.916 | 4.641 | 4.641 | 20.141 | 22.626 | 25.516 | 0 | 0 | 3639 | 17596 | 15012 |
+| 1 | clean | 3 | 1.688 | 0.296 | 0.721 | 1.577 | 1.577 | 20.089 | 22.389 | 31.138 | 0 | 0 | 3675 | 17585 | 15012 |
+| 1 | rtt170 | 1 | 357.463 | 87.411 | 90.439 | 91.042 | 91.042 | 20.147 | 25.357 | 26.482 | 0 | 0 | 3598 | 17588 | 15012 |
+| 1 | rtt170 | 2 | 353.132 | 87.523 | 90.555 | 91.04 | 91.04 | 20.12 | 25.353 | 26.143 | 0 | 0 | 3571 | 17588 | 15012 |
+| 1 | rtt170 | 3 | 352.418 | 87.269 | 90.43 | 90.846 | 90.846 | 20.049 | 25.832 | 26.867 | 0 | 0 | 3590 | 17588 | 15012 |
+| 1 | cn163-offpeak | 1 | 361.924 | 88.706 | 154.518 | 175.88 | 175.88 | 20.123 | 40.948 | 108.991 | 0 | 0 | 3203 | 17588 | 15012 |
+| 1 | cn163-offpeak | 2 | 351.484 | 1601.171 | 3413.294 | 3439.147 | 3439.147 | 0.003 | 29.799 | 3372.659 | 3 | 3 | 2455 | 16440 | 15012 |
+| 1 | cn163-offpeak | 3 | 348.216 | 88.694 | 95.284 | 104.851 | 104.851 | 20.255 | 30.834 | 37.705 | 0 | 0 | 3662 | 17588 | 15012 |
+| 1 | cn163-peak | 1 | 363.319 | 1181.433 | 4490.247 | 4590.651 | 4590.651 | 0.003 | 626.449 | 3388.69 | 7 | 3 | 1997 | 16793 | 15012 |
+| 1 | cn163-peak | 2 | 347.937 | 1610.587 | 3413.569 | 3451.751 | 3451.751 | 0.002 | 30.397 | 3384.597 | 3 | 3 | 2446 | 16085 | 15012 |
+| 1 | cn163-peak | 3 | 350.505 | 244.983 | 1681.174 | 1722.548 | 1722.548 | 0.001 | 31.259 | 1654.019 | 4 | 3 | 2717 | 16975 | 15012 |
+
+### New flows, standby off
+
+| standby | profile | seed | ttfb_p50_ms | ttfb_p99_ms | ttfb_max_ms |
+|---:|---|---:|---:|---:|---:|
+| 0 | clean | 1 | 1.181 | 1.697 | 1.697 |
+| 0 | clean | 2 | 1.873 | 3.225 | 3.225 |
+| 0 | clean | 3 | 1.318 | 1.724 | 1.724 |
+| 0 | rtt170 | 1 | 354.316 | 357.706 | 357.706 |
+| 0 | rtt170 | 2 | 353.343 | 356.577 | 356.577 |
+| 0 | rtt170 | 3 | 350.254 | 357.554 | 357.554 |
+| 0 | cn163-offpeak | 1 | 360.033 | 364.912 | 364.912 |
+| 0 | cn163-offpeak | 2 | 347.339 | 352.891 | 352.891 |
+| 0 | cn163-offpeak | 3 | 348.739 | 352.61 | 352.61 |
+| 0 | cn163-peak | 1 | 360.3 | 366.414 | 366.414 |
+| 0 | cn163-peak | 2 | 350.216 | 358.843 | 358.843 |
+| 0 | cn163-peak | 3 | 347.467 | 352.141 | 352.141 |
+
+### New flows, standby on
+
+| standby | profile | seed | ttfb_p50_ms | ttfb_p99_ms | ttfb_max_ms |
+|---:|---|---:|---:|---:|---:|
+| 1 | clean | 1 | 1.936 | 6.5 | 6.5 |
+| 1 | clean | 2 | 1.443 | 1.802 | 1.802 |
+| 1 | clean | 3 | 1.876 | 5.194 | 5.194 |
+| 1 | rtt170 | 1 | 356.43 | 359.202 | 359.202 |
+| 1 | rtt170 | 2 | 351.695 | 354.224 | 354.224 |
+| 1 | rtt170 | 3 | 352.239 | 355.619 | 355.619 |
+| 1 | cn163-offpeak | 1 | 362.746 | 367.584 | 367.584 |
+| 1 | cn163-offpeak | 2 | 349.403 | 357.691 | 357.691 |
+| 1 | cn163-offpeak | 3 | 350.303 | 353.367 | 353.367 |
+| 1 | cn163-peak | 1 | 360.462 | 367.216 | 367.216 |
+| 1 | cn163-peak | 2 | 350.643 | 353.006 | 353.006 |
+| 1 | cn163-peak | 3 | 350.104 | 357.408 | 357.408 |
+
+No token-stall row improved. Head-of-line stalls on `cn163-offpeak` seed 2 and
+`cn163-peak` (the multi-second delay and the stall counts) are the same shape
+in both modes. `rtt170` delay p50 stays about 87 ms. The clean-path p99.9 on
+seed 2 (0.79 ms to 4.6 ms) and two clean new-flow p99 samples (about 2 ms to
+5–6 ms) moved, and `cn163-peak` seed 3 lost one `stalls_1s` count (4 to 3).
+Those are single-run noise on a path that never dials the spare, not a
+standby effect. Nothing got worse in a way this harness can attribute to the
+switch.

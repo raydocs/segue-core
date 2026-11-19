@@ -6,6 +6,9 @@
 # Prints one Markdown table for the token stream and one for new flows.
 #
 #   SEGUE_TOKEN_SECONDS   origin length in seconds (default 30)
+#   SEGUE_STANDBY         0 or 1 (default 1, the product default). Printed as
+#                         the standby column. The harness route is overseas,
+#                         so the AI standby does not dial in either mode.
 #   SEGUE_BENCH_OUT       if set, the test also writes the same numbers as JSON
 #
 # Loopback only. No root, no fixed ports.

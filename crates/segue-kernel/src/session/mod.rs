@@ -16,6 +16,13 @@
 //! [`Exit::group`]. A named choice is the pin. If that exit (and its group)
 //! is down the dial is refused, not sent to a different egress.
 //!
+//! Once an AI session is OPENED it dials one standby carrier to that same
+//! exit, so a carrier loss promotes the spare with no new dial. The standby
+//! is replaced after a backoff for the life of the session. A standby dial
+//! failure or a standby death does not mark the exit failed and does not
+//! count as a carrier loss. [`KernelDialer::with_standby_ai`] turns this
+//! off (it is on by default). Other sessions do not dial a standby.
+//!
 //! The app gets success only after the relay answered OPENED, which it does
 //! only once the site connect worked: a refused session (exit_denied,
 //! home_unavailable, target_denied, ...) is a dial error, so SOCKS answers
@@ -44,7 +51,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,7 +60,8 @@ use segue_routing::TargetAddr;
 use segue_session::client::{ClientSession, CloseReason, Health as SessionHealth, OpenParams};
 use segue_session::codec::{code, CtrlHello, Kind, SessionId, Target, VERSION};
 use segue_session::driver::{
-    run_client_ctl, run_control, BoxCarrier, ClientCtl, Connector, ControlHint, ControlTiming,
+    run_client_ctl, run_client_standby, run_control, BoxCarrier, ClientCtl, Connector, ControlHint,
+    ControlTiming, StandbyCtl, StandbyEvent,
 };
 use segue_session::pool::Pool;
 use segue_session::quality::{Quality, QualityEvent, QualityTracker};
@@ -417,6 +425,18 @@ pub struct KernelDialer {
     /// is dropped. A later change can install a sender to park that stream
     /// as a warm carrier.
     spare: Option<mpsc::Sender<BoxCarrier>>,
+    /// AI sessions keep a standby carrier. Default on.
+    standby_ai: bool,
+    /// Standby dials started (one per dial, not per raced attempt).
+    pub(crate) standby_dials: Arc<AtomicU64>,
+    /// Standby carriers that reached `REDUNDANT_OK`.
+    pub(crate) standby_bound: Arc<AtomicU64>,
+    /// Times a standby was promoted to the current carrier.
+    pub(crate) standby_promotions: Arc<AtomicU64>,
+    /// Standby dials that failed, or spares that died without promotion.
+    pub(crate) standby_lost: Arc<AtomicU64>,
+    /// Test hook: standby dials fail before touching the engine.
+    standby_fail: Arc<AtomicBool>,
 }
 
 impl Drop for KernelDialer {
@@ -460,7 +480,32 @@ impl KernelDialer {
             race_second_started: Arc::new(AtomicU64::new(0)),
             race_second_won: Arc::new(AtomicU64::new(0)),
             spare: None,
+            standby_ai: true,
+            standby_dials: Arc::new(AtomicU64::new(0)),
+            standby_bound: Arc::new(AtomicU64::new(0)),
+            standby_promotions: Arc::new(AtomicU64::new(0)),
+            standby_lost: Arc::new(AtomicU64::new(0)),
+            standby_fail: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// AI sessions (`exit_class` [`EXIT_AI`]) keep a standby carrier when
+    /// `on`. Default is on. Other sessions never dial one.
+    pub fn with_standby_ai(mut self, on: bool) -> Self {
+        self.standby_ai = on;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_standby_ai(&mut self, on: bool) {
+        self.standby_ai = on;
+    }
+
+    /// Test hook: standby dials fail immediately and report nothing.
+    #[cfg(test)]
+    pub(crate) fn fail_standby_dials(&self, on: bool) {
+        self.standby_fail
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Use `cfg` for new sessions. Refused when the client timing is one
@@ -721,7 +766,43 @@ impl KernelDialer {
         self.state.lock().unwrap().health[exit].fail_marks
     }
 
+    /// Standby for an AI session when the switch is on. `None` for every
+    /// other session, and when [`Self::with_standby_ai`] turned it off.
+    fn standby_ctl(&self, i: usize, exit_class: u8) -> Option<StandbyCtl> {
+        if !self.standby_ai || exit_class != EXIT_AI {
+            return None;
+        }
+        let dials = Arc::clone(&self.standby_dials);
+        let bound = Arc::clone(&self.standby_bound);
+        let promotions = Arc::clone(&self.standby_promotions);
+        let lost = Arc::clone(&self.standby_lost);
+        let state = Arc::clone(&self.state);
+        Some(StandbyCtl {
+            connect: self.connector_for(i, false),
+            allowed: Arc::new(move || {
+                let st = state.lock().unwrap();
+                !st.user_off && st.revoked.is_none()
+            }),
+            on_event: Arc::new(move |ev| {
+                let counter = match ev {
+                    StandbyEvent::DialStarted => &dials,
+                    StandbyEvent::Bound => &bound,
+                    StandbyEvent::Promoted => &promotions,
+                    StandbyEvent::Lost => &lost,
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+        })
+    }
+
     fn connector(&self, i: usize) -> Connector {
+        self.connector_for(i, true)
+    }
+
+    /// `report` is false for a standby dial: a failure marks nothing (not
+    /// the kill switch, not `fail_marks`). A success still reports
+    /// channel-up, the same as a session dial.
+    fn connector_for(&self, i: usize, report: bool) -> Connector {
         let engine = self.engine.clone();
         let state = self.state.clone();
         let carrier = self.exits[i].carrier.clone();
@@ -729,6 +810,7 @@ impl KernelDialer {
         let second_started = Arc::clone(&self.race_second_started);
         let second_won = Arc::clone(&self.race_second_won);
         let spare = self.spare.clone();
+        let standby_fail = Arc::clone(&self.standby_fail);
         Arc::new(move || {
             let engine = engine.clone();
             let state = state.clone();
@@ -736,7 +818,13 @@ impl KernelDialer {
             let second_started = Arc::clone(&second_started);
             let second_won = Arc::clone(&second_won);
             let spare = spare.clone();
+            let standby_fail = Arc::clone(&standby_fail);
             Box::pin(async move {
+                // A test asks the standby dial to fail before the engine,
+                // so the exit's posture is what we assert on.
+                if !report && standby_fail.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(std::io::Error::other("standby dial failed"));
+                }
                 // The exit's smoothed RTT, copied out so the race does not
                 // hold the state lock. Unknown until the first control PING.
                 let srtt = state.lock().unwrap().health[i].quality.snapshot().srtt;
@@ -782,15 +870,19 @@ impl KernelDialer {
                                     (Ok(Box::new(stream) as BoxCarrier), loser)
                                 }
                                 Err(e) => {
-                                    mark_failed(h);
-                                    eprintln!("segue-kernel: carrier {carrier} failed: {e}");
+                                    if report {
+                                        mark_failed(h);
+                                        eprintln!("segue-kernel: carrier {carrier} failed: {e}");
+                                    }
                                     (Err(std::io::Error::other(e.0)), loser)
                                 }
                             }
                         }
                         Err(_) => {
-                            mark_failed(h);
-                            eprintln!("segue-kernel: carrier {carrier} timed out");
+                            if report {
+                                mark_failed(h);
+                                eprintln!("segue-kernel: carrier {carrier} timed out");
+                            }
                             (Err(std::io::ErrorKind::TimedOut.into()), None)
                         }
                     }
@@ -953,8 +1045,16 @@ impl KernelDialer {
                     state.lock().unwrap().health[i].quality.on_event(e);
                 })
             }),
+            standby: self.standby_ctl(i, r.exit_class),
         };
-        let run = run_client_ctl(s, far, self.connector(i), ctl);
+        // Two driver futures. Boxed so the spawn task has one type, and so
+        // a non-AI session's driver is only the plain loop.
+        let run: std::pin::Pin<Box<dyn std::future::Future<Output = CloseReason> + Send>> =
+            if ctl.standby.is_some() {
+                Box::pin(run_client_standby(s, far, self.connector(i), ctl))
+            } else {
+                Box::pin(run_client_ctl(s, far, self.connector(i), ctl))
+            };
         let mut off = self.off.subscribe();
         tokio::spawn(async move {
             tokio::select! {
