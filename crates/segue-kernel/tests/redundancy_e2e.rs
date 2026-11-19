@@ -11,6 +11,10 @@
 //! Carrier re-attach is not a column. `SessionHealth` is not observable from
 //! this test without changing the kernel.
 //!
+//! `SEGUE_STANDBY=0|1` (default 1, the product default) is printed as the
+//! `standby` column. The route here is overseas, so the AI standby policy
+//! does not dial either way; the column records which switch the run used.
+//!
 //! Relay, ticket and SOCKS wiring matches `roaming_e2e.rs`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,6 +56,16 @@ const PONG: &[u8] = b"pongpong";
 fn epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     *EPOCH.get_or_init(Instant::now)
+}
+
+/// Product default is on. `SEGUE_STANDBY=0` turns the AI standby off.
+fn standby_enabled() -> bool {
+    match std::env::var("SEGUE_STANDBY") {
+        Err(_) => true,
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" => false,
+        Ok(v) => panic!("SEGUE_STANDBY={v} is not 0 or 1"),
+    }
 }
 
 fn token_seconds() -> u64 {
@@ -233,7 +247,8 @@ fn session_dialer(engine: Arc<dyn Dialer>, proxy: SocketAddr, ticket: Vec<u8>) -
         routes,
         BTreeSet::new(),
     )
-    .with_pool(Pool::new(8 << 20));
+    .with_pool(Pool::new(8 << 20))
+    .with_standby_ai(standby_enabled());
     Arc::new(dialer)
 }
 
@@ -503,14 +518,16 @@ async fn run_flows(stack: &Stack, profile: &'static str, seed: u64) -> FlowRow {
 }
 
 fn print_token_table(rows: &[TokenRow]) {
+    let mode = u8::from(standby_enabled());
     println!("## token stream");
     println!(
-        "| profile | seed | ttft_ms | delay_p50_ms | delay_p99_ms | delay_p99.9_ms | delay_max_ms | ia_p50_ms | ia_p99_ms | ia_p99.9_ms | stalls_300 | stalls_1s | up_bytes | down_bytes | payload_bytes |"
+        "| standby | profile | seed | ttft_ms | delay_p50_ms | delay_p99_ms | delay_p99.9_ms | delay_max_ms | ia_p50_ms | ia_p99_ms | ia_p99.9_ms | stalls_300 | stalls_1s | up_bytes | down_bytes | payload_bytes |"
     );
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for r in rows {
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            mode,
             r.profile,
             r.seed,
             r.ttft_ms,
@@ -531,19 +548,21 @@ fn print_token_table(rows: &[TokenRow]) {
 }
 
 fn print_flow_table(rows: &[FlowRow]) {
+    let mode = u8::from(standby_enabled());
     println!("## new flows");
-    println!("| profile | seed | ttfb_p50_ms | ttfb_p99_ms | ttfb_max_ms |");
-    println!("|---|---:|---:|---:|---:|");
+    println!("| standby | profile | seed | ttfb_p50_ms | ttfb_p99_ms | ttfb_max_ms |");
+    println!("|---:|---|---:|---:|---:|---:|");
     for r in rows {
         println!(
-            "| {} | {} | {} | {} | {} |",
-            r.profile, r.seed, r.ttfb_p50_ms, r.ttfb_p99_ms, r.ttfb_max_ms
+            "| {} | {} | {} | {} | {} | {} |",
+            mode, r.profile, r.seed, r.ttfb_p50_ms, r.ttfb_p99_ms, r.ttfb_max_ms
         );
     }
 }
 
 fn token_json(row: &TokenRow) -> Value {
     json!({
+        "standby": u8::from(standby_enabled()),
         "profile": row.profile,
         "seed": row.seed,
         "ttft_ms": row.ttft_ms,
@@ -564,6 +583,7 @@ fn token_json(row: &TokenRow) -> Value {
 
 fn flow_json(row: &FlowRow) -> Value {
     json!({
+        "standby": u8::from(standby_enabled()),
         "profile": row.profile,
         "seed": row.seed,
         "ttfb_p50_ms": row.ttfb_p50_ms,
