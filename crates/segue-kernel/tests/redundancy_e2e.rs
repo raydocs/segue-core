@@ -1125,8 +1125,8 @@ fn convo_cases() -> Vec<(&'static str, u64, ConvoFault)> {
     };
     if selected_profiles(CONVO_PROFILES).contains(&"rtt170") {
         for fault in faults {
-            for seed in seeds {
-                cases.push(("rtt170", seed, *fault));
+            for seed in &seeds {
+                cases.push(("rtt170", *seed, *fault));
             }
         }
     }

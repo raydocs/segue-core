@@ -309,7 +309,7 @@ fn control_stream_answers_ping_and_carries_stall_and_revoked() {
     // the control stream (B1), and the client acts on it.
     r.site_data(&SID, &[7u8; 1000]);
     while r.poll_transmit(1, t0).is_some() {}
-    let t = t0 + Config::default().timing.t_live;
+    let t = t0 + Config::default().timing.t_live_ai;
     r.handle_timeout(t);
     let stall = r.poll_transmit(9, t).expect("STALL");
     let Frame::Stall(entries) = stall else {
@@ -317,10 +317,11 @@ fn control_stream_answers_ping_and_carries_stall_and_revoked() {
     };
     assert_eq!(entries, vec![(SID, c.gen())]);
     c.on_stall(entries[0].1, t);
-    // AI with no spare does not abandon the carrier on the hint until it
-    // has been quiet for `t_stall_solo`. A stalled carrier then counts
-    // against the redial bound (r9 F2) even with nothing to upload.
-    let t = t0 + Config::default().timing.t_stall_solo;
+    // AI does not abandon the carrier on the hint until it has been quiet
+    // for `t_stall_ai`, spare or not. The hint above arrived at that bound,
+    // so it already counted. A stalled carrier counts against the redial
+    // bound (r9 F2) even with nothing to upload.
+    let t = t0 + Config::default().timing.t_stall_ai;
     c.handle_timeout(t);
     assert_eq!(c.fruitless_carriers(), 1);
     assert!(c.wants_attach(t + segue_session::client::RECONNECT_BACKOFF));
@@ -504,7 +505,7 @@ fn spins(r: &mut RelayTable, mut t: Instant, span: Duration) -> usize {
 fn a_held_fin_keepalive_is_no_deadline_while_detached() {
     let t0 = Instant::now();
     let mut r = held_fin_relay(t0, Config::default(), Config::default());
-    let t = t0 + Config::default().timing.t_live;
+    let t = t0 + Config::default().timing.t_live_ai;
     r.handle_timeout(t);
     assert_eq!(
         r.state(&SID),
@@ -529,8 +530,8 @@ fn deadlines_served_by_sending_wait_for_a_writable_carrier() {
         blocked > t,
         "a blocked carrier's keepalive kept a due deadline"
     );
-    // Still bounded by the session's own timers (t_live here).
-    assert!(blocked <= t0 + Config::default().timing.t_live);
+    // Still bounded by the session's own timers (t_live_ai: this session is AI).
+    assert!(blocked <= t0 + Config::default().timing.t_live_ai);
 }
 
 /// r9 (keepalive assumption): the relay keeps alive at half the shorter
@@ -543,6 +544,8 @@ fn relay_keepalive_follows_the_shorter_stall_bound() {
         rc.timing.t_stall = Duration::from_millis(relay_ms);
         let mut cc = Config::default();
         cc.timing.t_stall = Duration::from_millis(client_ms);
+        // The client is AI, so the wire field is `t_stall_ai`, not `t_stall`.
+        cc.timing.t_stall_ai = Duration::from_millis(client_ms);
         held_fin_relay(t0, rc, cc).keepalive(&SID).unwrap()
     };
     assert_eq!(with(4000, 1000), Duration::from_millis(500));
@@ -731,10 +734,10 @@ fn a_stall_after_success_reports_failed_and_progress_refreshes_up() {
     c.on_frame(1, data(100), t).unwrap();
     assert_eq!(c.take_health(), Some(Health::Up), "no refreshed proof");
     // Upload, never acknowledged, nothing received: a stall. This client is
-    // AI with no spare, so the only carrier waits `t_stall_solo`.
+    // AI, so the only carrier waits `t_stall_ai`.
     assert_eq!(c.write(b"hello"), 5);
     while c.poll_transmit(1, t).is_some() {}
-    let t = t + Config::default().timing.t_stall_solo + Duration::from_millis(1);
+    let t = t + Config::default().timing.t_stall_ai + Duration::from_millis(1);
     c.handle_timeout(t);
     assert_eq!(
         c.take_health(),
@@ -908,10 +911,10 @@ fn liveness_neither_resets_the_budget_nor_hides_a_failure() {
     .unwrap();
     assert_eq!(c.take_health(), Some(Health::Up));
     // An upload nobody acknowledges: the carrier stalls, moved nothing.
-    // AI with no spare waits `t_stall_solo`, not `t_stall`.
+    // AI waits `t_stall_ai`, not `t_stall`.
     assert_eq!(c.write(b"hello"), 5);
     while c.poll_transmit(1, t0).is_some() {}
-    let mut t = t0 + Config::default().timing.t_stall_solo + Duration::from_millis(1);
+    let mut t = t0 + Config::default().timing.t_stall_ai + Duration::from_millis(1);
     c.handle_timeout(t);
     assert_eq!(c.take_health(), Some(Health::Failed));
     assert_eq!(c.fruitless_carriers(), 1);

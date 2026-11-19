@@ -209,7 +209,11 @@ fn a_stall_with_a_spare_swaps_and_does_not_resume() {
     let t0 = Instant::now();
     let mut c = with_unacked(t0);
     bind_spare(&mut c, t0);
+    // AI waits `t_stall_ai` even with a spare bound. 1 s is inside TCP recovery.
     c.handle_timeout(t0 + Duration::from_secs(1));
+    assert_eq!(c.carrier(), Some(1), "a spare must not swap at t_stall");
+    assert_eq!(c.move_stats().stall, 0);
+    c.handle_timeout(t0 + Duration::from_secs(5));
     assert_eq!(c.carrier(), Some(2));
     assert_eq!(c.redundant_carrier(), Some(1));
     let s = c.move_stats();
@@ -269,7 +273,7 @@ fn a_relay_stall_hint_counts_even_when_it_promotes() {
     assert_eq!(
         bare.move_stats().relay_stall,
         0,
-        "no spare: wait t_stall_solo"
+        "no spare: wait t_stall_ai"
     );
     assert_eq!(bare.carrier(), Some(1));
     let due = t0 + Duration::from_secs(5);
@@ -285,6 +289,13 @@ fn a_relay_stall_hint_counts_even_when_it_promotes() {
     let mut spared = with_unacked(t0);
     bind_spare(&mut spared, t0);
     spared.on_stall(spared.gen(), t0);
+    assert_eq!(
+        spared.carrier(),
+        Some(1),
+        "STALL waits t_stall_ai with a spare"
+    );
+    assert_eq!(spared.move_stats().relay_stall, 0);
+    spared.handle_timeout(t0 + Duration::from_secs(5));
     assert_eq!(spared.carrier(), Some(2));
     assert_eq!(spared.move_stats().relay_stall, 1);
     assert_eq!(spared.move_stats().swaps, 1);
@@ -327,7 +338,7 @@ fn relay_counts_t_live_and_the_stall_hint_it_queues() {
     assert_eq!(r.move_stats().stall_hints, 0);
     r.site_data(&SID, &[7u8; 1000]);
     while r.poll_transmit(1, t0).is_some() {}
-    r.handle_timeout(t0 + Config::default().timing.t_live);
+    r.handle_timeout(t0 + Config::default().timing.t_live_ai);
     let s = r.move_stats();
     assert_eq!(s.t_live, 1);
     assert_eq!(s.stall_hints, 1);

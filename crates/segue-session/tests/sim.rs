@@ -992,11 +992,12 @@ fn t_stall_promotes_the_spare_without_a_new_dial() {
     let fruitless = s.client.fruitless_carriers();
     s.client.take_health();
     s.client.take_quality();
-    // Quiet the current carrier. Uplink is still in flight, so `t_stall`
-    // (1s) fires before the relay's `t_live` (3s).
+    // Quiet the current carrier. Uplink is still in flight, so the AI
+    // stall (`t_stall_ai`, 5s) fires on the same step as the relay's
+    // `t_live_ai`. The client handles its timeout first and swaps.
     s.hold_carrier = Some(current);
     let mut promoted = false;
-    for _ in 0..3_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.client.carrier() == Some(spare) {
             promoted = true;
@@ -1049,7 +1050,7 @@ fn stall_hint_promotes_the_spare_without_a_new_dial() {
     // acknowledged, so the client's own `t_stall` stays quiet.
     s.mute_rx = Some(current);
     let mut promoted = false;
-    for _ in 0..5_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.client.carrier() == Some(spare) {
             promoted = true;
@@ -1095,11 +1096,11 @@ fn transport_hold_promotes_the_spare_without_a_new_dial() {
     assert_ne!(s.client.take_health(), Some(Health::Failed));
     assert_ne!(s.client.take_quality(), Some(QualityEvent::CarrierLost));
     // In-flight frames on the old carrier keep it from looking silent, so
-    // the relay follows on `t_live` (3s): unacked downlink and no ACK on
+    // the relay follows on `t_live_ai` (5s): unacked downlink and no ACK on
     // that carrier. The old carrier stays open as the spare.
     let sid = s.client.session_id();
     let mut followed = false;
-    for _ in 0..5_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.relay.current_carrier(&sid) == Some(spare) {
             followed = true;
@@ -1132,7 +1133,7 @@ fn stall_swaps_with_the_standby_and_swaps_back() {
 
     s.hold_carrier = Some(current);
     let mut swapped = false;
-    for _ in 0..3_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.client.carrier() == Some(spare)
             && s.client.redundant_carrier() == Some(current)
@@ -1158,7 +1159,7 @@ fn stall_swaps_with_the_standby_and_swaps_back() {
     }
     s.hold_carrier = Some(spare);
     let mut back = false;
-    for _ in 0..5_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.client.carrier() == Some(current) {
             back = true;
@@ -1170,7 +1171,7 @@ fn stall_swaps_with_the_standby_and_swaps_back() {
     assert!(back, "recovered carrier was not swapped back");
     assert_eq!(s.client.redundant_carrier(), Some(spare));
     let mut relay_back = false;
-    for _ in 0..4_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.relay.current_carrier(&sid) == Some(current)
             && s.relay.redundant_carrier(&sid) == Some(spare)
@@ -1241,7 +1242,7 @@ fn a_download_stall_after_a_swap_is_not_ignored() {
     // so once demoted it stays silent.
     s.hold_carrier = Some(first);
     let mut swapped = false;
-    for _ in 0..6_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.client.carrier() == Some(spare) && s.relay.current_carrier(&sid) == Some(spare) {
             swapped = true;
@@ -1259,7 +1260,7 @@ fn a_download_stall_after_a_swap_is_not_ignored() {
     // promote the silent demoted spare, so the relay goes DETACHED.
     s.mute_rx = Some(spare);
     let mut detached = false;
-    for _ in 0..6_000 {
+    for _ in 0..8_000 {
         s.step();
         if s.relay.state(&sid) == Some(SessionState::Detached) {
             detached = true;

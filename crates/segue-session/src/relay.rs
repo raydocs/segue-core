@@ -1360,7 +1360,7 @@ impl RelayTable {
                 }
             }
             if s.state == SessionState::Active && s.send.unacked() {
-                put(s.last_progress + t.t_live);
+                put(s.last_progress + t.live_for(s.exit_class));
             }
             let sendable = s.connected && s.carrier.is_some_and(&writable);
             // The keepalive goes out only where `poll_transmit` sends it:
@@ -1428,7 +1428,7 @@ impl RelayTable {
             }
             if s.state == SessionState::Active
                 && s.send.unacked()
-                && now >= s.last_progress + t.t_live
+                && now >= s.last_progress + t.live_for(s.exit_class)
             {
                 live += 1;
                 if s.redundant.is_some() {
@@ -1463,7 +1463,7 @@ impl RelayTable {
             } else if let Some(s) = self.sessions.get_mut(&sid) {
                 if s.state == SessionState::Active
                     && s.send.unacked()
-                    && now >= s.last_progress + t.t_live
+                    && now >= s.last_progress + t.live_for(s.exit_class)
                 {
                     s.state = SessionState::Detached;
                     s.detached_since = Some(now);
