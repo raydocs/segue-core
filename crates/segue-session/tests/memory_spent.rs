@@ -234,8 +234,10 @@ fn a_spent_pool_bounds_real_client_memory() {
         (client_peak() - base, phantom)
     });
     // As in memory.rs: state, tasks, channels, small read buffers and this
-    // test's app task, per session.
-    const FIXED: isize = 24 * 1024;
+    // test's app task, per session. Move counters on the session add a few
+    // hundred bytes; 24 KiB failed one run when the peak sat 20 KiB under
+    // the bound across 256 sessions.
+    const FIXED: isize = 25 * 1024;
     let bound = POOL as isize - phantom + SESSIONS as isize * FIXED;
     println!(
         "{SESSIONS} sessions, pool spent: peak {:.2} MiB, bound {:.2} MiB",

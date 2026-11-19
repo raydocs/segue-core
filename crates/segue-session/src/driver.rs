@@ -22,7 +22,7 @@ use crate::codec::{code, ty, CtrlHello, Frame, FrameDecoder, Kind, SessionId, Ta
 use crate::pool::{Grant as PoolGrant, Pool, Ticket, Tier, FRAME_MAX};
 use crate::quality::QualityEvent;
 use crate::relay::{Grant, RelayEvent, RelayTable};
-use crate::ProtoError;
+use crate::{MoveStats, ProtoError};
 
 /// A spawned task owned by a driver: dropping it aborts the task, so a driver
 /// future that is dropped or aborted (user disconnect, relay shutdown) takes
@@ -411,6 +411,8 @@ enum CarrierEv {
     /// stopped arriving for the transport hold or outlived the hold cap:
     /// it owed us bytes it never delivered (r9 F2).
     Stuck(u64),
+    /// A write failed. Not an EOF: the session counts it apart from a close.
+    Io(u64),
 }
 
 /// Reader task: decode frames until EOF or a decode error. With `pool`
@@ -938,7 +940,15 @@ pub struct ClientCtl {
     /// one standby dial is in flight. A full pool skips the dial and uses
     /// the same backoff. The standby does not reserve pool blocks.
     pub standby: Option<StandbyCtl>,
+    /// Called with the session's [`MoveStats`] whenever the counters change,
+    /// and once more at the end if they changed again. Each call is the full
+    /// snapshot, not a delta, so a caller that sums across sessions keeps the
+    /// previous snapshot itself.
+    pub moves: Option<MoveHook>,
 }
+
+/// Receives a session's [`MoveStats`] snapshot.
+pub type MoveHook = Arc<dyn Fn(MoveStats) + Send + Sync>;
 
 /// Receives a session's [`Health`] reports.
 pub type HealthHook = Arc<dyn Fn(Health) + Send + Sync>;
@@ -1018,7 +1028,7 @@ impl StandbyKeep {
     }
 
     /// The spare appeared, bound, or went away since the last look.
-    fn observe(&mut self, s: &ClientSession) {
+    fn observe(&mut self, s: &mut ClientSession) {
         let now = tokio::time::Instant::now();
         let cid = s.redundant_carrier();
         // Bound only on the rising edge of one spare: seen unbound, then
@@ -1036,6 +1046,9 @@ impl StandbyKeep {
         if self.cid.is_some() && cid != self.cid {
             let prev = self.cid.take().expect("cid was some");
             let promoted = s.carrier() == Some(prev);
+            // A RESUME drops a spare that did not fail. Redial it now.
+            // A spare that failed to dial or bind, or that died, waits.
+            let dropped_for_move = s.take_spare_dropped_for_move();
             if promoted {
                 self.emit(StandbyEvent::Promoted);
                 // A swap leaves the old carrier bound as the spare. A hard
@@ -1045,14 +1058,25 @@ impl StandbyKeep {
                         counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                self.schedule(now);
+            } else if dropped_for_move {
+                self.rearm_now();
             } else {
                 self.emit(StandbyEvent::Lost);
+                self.schedule(now);
             }
-            self.schedule(now);
         }
         if self.cid.is_none() {
             self.cid = cid;
         }
+    }
+
+    /// The spare was dropped by a move, not a failure: dial the next one
+    /// on the next loop, and start the failure backoff over at the minimum.
+    fn rearm_now(&mut self) {
+        self.backoff = STANDBY_BACKOFF_MIN;
+        self.next_at = None;
+        self.bound_at = None;
     }
 
     /// Wait `backoff`, then double it. A spare that was bound for 10 s
@@ -1126,8 +1150,10 @@ where
         health,
         quality,
         standby,
+        moves,
     } = ctl;
-    let report = |s: &mut ClientSession| {
+    let mut last_moves = MoveStats::default();
+    let mut report = |s: &mut ClientSession| {
         if let Some(h) = s.take_health() {
             if let Some(f) = &health {
                 f(h);
@@ -1137,6 +1163,13 @@ where
             if let Some(f) = &quality {
                 f(q);
             }
+        }
+        let snap = s.move_stats();
+        if snap != last_moves {
+            if let Some(f) = &moves {
+                f(snap);
+            }
+            last_moves = snap;
         }
     };
     let writable = Arc::new(Notify::new());
@@ -1239,7 +1272,7 @@ where
                             );
                             let etx = ev_tx.clone();
                             let (tx, writer) = spawn_writer(w, writable.clone(), async move {
-                                let _ = etx.send(CarrierEv::Closed(cid)).await;
+                                let _ = etx.send(CarrierEv::Io(cid)).await;
                             });
                             carriers.insert(
                                 cid,
@@ -1265,7 +1298,7 @@ where
                 }
             }
             if let Some(keep) = spare.keep.as_mut() {
-                keep.observe(&s);
+                keep.observe(&mut s);
                 let now_tk = tokio::time::Instant::now();
                 let idle = !spare.connecting
                     && s.redundant_carrier().is_none()
@@ -1467,6 +1500,15 @@ where
                             io.writer.abort();
                         }
                     }
+                    Some(CarrierEv::Io(cid)) => {
+                        s.on_carrier_io(cid, t);
+                        if !s.carrier_live(cid) {
+                            if let Some(io) = carriers.remove(&cid) {
+                                io.reader.abort();
+                                io.writer.abort();
+                            }
+                        }
+                    }
                     Some(CarrierEv::Stuck(cid)) => {
                         s.on_carrier_stuck(cid, t);
                         // A stall demotes the carrier to the spare instead of
@@ -1499,7 +1541,7 @@ where
                             );
                             let etx = ev_tx.clone();
                             let (tx, writer) = spawn_writer(w, writable.clone(), async move {
-                                let _ = etx.send(CarrierEv::Closed(cid)).await;
+                                let _ = etx.send(CarrierEv::Io(cid)).await;
                             });
                             carriers.insert(cid, CarrierIo { tx, reader, writer, tx_at, rx_at, _charge: None });
                             s.attach(cid, now());
@@ -1742,8 +1784,10 @@ where
         health,
         quality,
         standby: _,
+        moves,
     } = ctl;
-    let report = |s: &mut ClientSession| {
+    let mut last_moves = MoveStats::default();
+    let mut report = |s: &mut ClientSession| {
         if let Some(h) = s.take_health() {
             if let Some(f) = &health {
                 f(h);
@@ -1753,6 +1797,13 @@ where
             if let Some(f) = &quality {
                 f(q);
             }
+        }
+        let snap = s.move_stats();
+        if snap != last_moves {
+            if let Some(f) = &moves {
+                f(snap);
+            }
+            last_moves = snap;
         }
     };
     let writable = Arc::new(Notify::new());
@@ -1951,6 +2002,15 @@ where
                             io.writer.abort();
                         }
                     }
+                    Some(CarrierEv::Io(cid)) => {
+                        s.on_carrier_io(cid, t);
+                        if !s.carrier_live(cid) {
+                            if let Some(io) = carriers.remove(&cid) {
+                                io.reader.abort();
+                                io.writer.abort();
+                            }
+                        }
+                    }
                     Some(CarrierEv::Stuck(cid)) => {
                         s.on_carrier_stuck(cid, t);
                         // A stall demotes the carrier to the spare instead of
@@ -1983,7 +2043,7 @@ where
                             );
                             let etx = ev_tx.clone();
                             let (tx, writer) = spawn_writer(w, writable.clone(), async move {
-                                let _ = etx.send(CarrierEv::Closed(cid)).await;
+                                let _ = etx.send(CarrierEv::Io(cid)).await;
                             });
                             carriers.insert(cid, CarrierIo { tx, reader, writer, tx_at, rx_at, _charge: None });
                             s.attach(cid, now());
@@ -2514,7 +2574,7 @@ pub async fn run_relay_ctl(
                     Some(CarrierEv::Frame(cid, Ok(f), _)) => table.on_frame(cid, f, t),
                     Some(CarrierEv::Frame(cid, Err(e), _)) => table.on_decode_error(cid, e),
                     Some(CarrierEv::Progress(cid, _)) => table.on_carrier_progress(cid, t),
-                    Some(CarrierEv::Closed(cid) | CarrierEv::Stuck(cid)) => {
+                    Some(CarrierEv::Closed(cid) | CarrierEv::Stuck(cid) | CarrierEv::Io(cid)) => {
                         if let Some(io) = carriers.remove(&cid) {
                             io.reader.abort();
                             io.writer.abort();

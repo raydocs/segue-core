@@ -17,6 +17,8 @@
 #   SEGUE_CONVO_SILENCE_MS
 #                         silence after each upload (default 5000)
 #   SEGUE_CONVO_TOKENS    30-byte events per turn (default 500)
+#   SEGUE_PROFILES        comma-separated profile names, or all (default all)
+#   SEGUE_SEEDS           comma-separated seeds, or all (default 1,2,3)
 #   SEGUE_BENCH_OUT       if set, the test also writes JSON. When both
 #                         scenarios run, the token JSON is moved to
 #                         <path>.token.json and the conversation JSON to

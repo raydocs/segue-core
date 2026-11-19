@@ -26,7 +26,7 @@ use crate::codec::{
 };
 use crate::flow::{RecvHalf, SendHalf};
 use crate::pool::Pool;
-use crate::{ct_eq, Config, ProtoError};
+use crate::{ct_eq, Config, MoveStats, ProtoError};
 
 pub type CarrierId = u64;
 
@@ -246,6 +246,8 @@ pub struct RelayTable {
     clock: Instant,
     /// See [`RelayTable::confirm_site_flush`].
     hold_fin: bool,
+    /// `t_live` expiries and `STALL` hints queued on a control stream.
+    moves: MoveStats,
 }
 
 impl RelayTable {
@@ -262,7 +264,14 @@ impl RelayTable {
             to_close: Vec::new(),
             clock: Instant::now(),
             hold_fin: false,
+            moves: MoveStats::default(),
         }
+    }
+
+    /// `t_live` expiries and `STALL` hints this table has sent.
+    /// Client fields of the snapshot stay zero.
+    pub fn move_stats(&self) -> MoveStats {
+        self.moves
     }
 
     /// With `on`, the client's FIN is acknowledged (and a session can end
@@ -644,6 +653,7 @@ impl RelayTable {
 
     /// Queue `STALL` entries on every control stream of `device`.
     fn send_stall(&mut self, device: u64, entries: &[(SessionId, u32)]) {
+        let mut queued = 0u64;
         for slot in self.carriers.values_mut() {
             if slot.control != Some(device) || slot.close_after {
                 continue;
@@ -651,9 +661,11 @@ impl RelayTable {
             for batch in entries.chunks(STALL_BATCH) {
                 if slot.ctrl_out.len() < CTRL_QUEUE {
                     slot.ctrl_out.push_back(Frame::Stall(batch.to_vec()));
+                    queued = queued.saturating_add(batch.len() as u64);
                 }
             }
         }
+        self.moves.stall_hints = self.moves.stall_hints.saturating_add(queued);
     }
 
     fn on_first(&mut self, cid: CarrierId, frame: Frame, now: Instant) {
@@ -1348,7 +1360,7 @@ impl RelayTable {
                 }
             }
             if s.state == SessionState::Active && s.send.unacked() {
-                put(s.last_progress + t.t_live);
+                put(s.last_progress + t.live_for(s.exit_class));
             }
             let sendable = s.connected && s.carrier.is_some_and(&writable);
             // The keepalive goes out only where `poll_transmit` sends it:
@@ -1398,6 +1410,7 @@ impl RelayTable {
         let mut expired = Vec::new();
         let mut too_old = Vec::new();
         let mut stalled: Vec<(u64, SessionId, u32)> = Vec::new();
+        let mut live = 0u64;
         // `t_live` with a spare bound promotes that spare instead of going
         // DETACHED. Collected here: promoting needs `&mut self`.
         let mut promote_on_live: Vec<SessionId> = Vec::new();
@@ -1415,8 +1428,9 @@ impl RelayTable {
             }
             if s.state == SessionState::Active
                 && s.send.unacked()
-                && now >= s.last_progress + t.t_live
+                && now >= s.last_progress + t.live_for(s.exit_class)
             {
+                live += 1;
                 if s.redundant.is_some() {
                     promote_on_live.push(*sid);
                     continue;
@@ -1449,7 +1463,7 @@ impl RelayTable {
             } else if let Some(s) = self.sessions.get_mut(&sid) {
                 if s.state == SessionState::Active
                     && s.send.unacked()
-                    && now >= s.last_progress + t.t_live
+                    && now >= s.last_progress + t.live_for(s.exit_class)
                 {
                     s.state = SessionState::Detached;
                     s.detached_since = Some(now);
@@ -1478,6 +1492,7 @@ impl RelayTable {
         for (sid, cid) in standby {
             self.drop_spare(sid, cid);
         }
+        self.moves.t_live = self.moves.t_live.saturating_add(live);
         stalled.sort_unstable_by_key(|x| x.0);
         for group in stalled.chunk_by(|a, b| a.0 == b.0) {
             let entries: Vec<_> = group.iter().map(|&(_, sid, g)| (sid, g)).collect();

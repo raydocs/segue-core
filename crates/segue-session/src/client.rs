@@ -24,7 +24,7 @@ use crate::flow::{RecvHalf, SendHalf};
 use crate::park::{ParkDecision, ParkTracker};
 use crate::pool::Pool;
 use crate::quality::QualityEvent;
-use crate::{Config, ProtoError};
+use crate::{Config, MoveReason, MoveStats, ProtoError};
 
 pub type CarrierId = u64;
 
@@ -262,6 +262,19 @@ pub struct ClientSession {
     send: SendHalf,
     recv: RecvHalf,
     park: ParkTracker,
+    /// Why carriers were given up, and what a move cost.
+    moves: MoveStats,
+    /// When the current loss started, until the next byte of progress.
+    /// The first loss wins if another happens before progress.
+    loss_at: Option<Instant>,
+    /// A relay `STALL` is waiting out [`Self::stall_limit`] on the current
+    /// carrier. Set for an AI session that has not been quiet that long,
+    /// and after a promotion while the new carrier is still receiving.
+    /// Cleared by any byte received on the current carrier.
+    stall_hint: bool,
+    /// The spare was dropped because the session moved (RESUME), not because
+    /// the spare failed. The driver redials it with no backoff.
+    spare_dropped_for_move: bool,
 }
 
 // Manual so the resume secret and ticket never reach a log.
@@ -345,6 +358,10 @@ impl ClientSession {
             send,
             recv,
             park: ParkTracker::default(),
+            moves: MoveStats::default(),
+            loss_at: None,
+            stall_hint: false,
+            spare_dropped_for_move: false,
         })
     }
 
@@ -440,6 +457,33 @@ impl ClientSession {
         }
     }
 
+    /// The session is moving onto another carrier, so the spare cannot stay:
+    /// it was authenticated at this generation. Not a spare failure.
+    fn drop_spare_for_move(&mut self) {
+        if self.redundant.is_some() {
+            self.spare_dropped_for_move = true;
+        }
+        self.drop_redundant();
+    }
+
+    /// `true` once, after a move dropped a spare that had not failed.
+    /// The driver uses it to redial with no backoff.
+    pub fn take_spare_dropped_for_move(&mut self) -> bool {
+        std::mem::take(&mut self.spare_dropped_for_move)
+    }
+
+    /// How long unacked silence, and a relay `STALL`, wait before this
+    /// carrier is given up. An AI session uses `t_stall_ai` whether or not
+    /// a spare is bound (a spare is swapped, no spare re-attaches). Every
+    /// other session uses `t_stall`.
+    fn stall_limit(&self) -> std::time::Duration {
+        if self.params.exit_class == crate::EXIT_CLASS_AI {
+            self.cfg.timing.t_stall_ai
+        } else {
+            self.cfg.timing.t_stall
+        }
+    }
+
     /// The current carrier was lost and a spare is already bound: keep the
     /// session, make the spare current at the same generation, and replay
     /// unacked uplink from the last acknowledged offset. Not a RESUME, so
@@ -500,8 +544,10 @@ impl ClientSession {
         // charged: a live spare means the path did not fail.
         self.progressed = false;
         let acked = self.send.acked();
+        let replayed = self.send.sent_hw().saturating_sub(acked);
         let max = self.send.peer_max();
         let _ = self.send.rewind(acked, max);
+        self.note_promotion(demote_old, replayed);
         true
     }
     pub fn is_closed(&self) -> bool {
@@ -549,7 +595,7 @@ impl ClientSession {
         // ambiguous, so it is dropped (rule 6).
         self.promoted_in_gen = false;
         if self.carrier != Some(cid) {
-            self.drop_redundant();
+            self.drop_spare_for_move();
         }
         if let Some(old) = self.carrier.replace(cid) {
             if old != cid {
@@ -593,6 +639,8 @@ impl ClientSession {
             let sent_hw = self.send.sent_hw();
             let sent = sent_hw.saturating_sub(self.quality_sent);
             let replayed = sent_hw.saturating_sub(self.send.acked());
+            self.moves.resumes = self.moves.resumes.saturating_add(1);
+            self.moves.bytes_replayed = self.moves.bytes_replayed.saturating_add(replayed);
             if sent > 0 || replayed > 0 {
                 self.quality = Some(QualityEvent::Replay { sent, replayed });
                 self.quality_sent = sent_hw;
@@ -632,14 +680,17 @@ impl ClientSession {
     }
 
     /// This side's stall bound, told to the relay so its keepalive comes
-    /// often enough for it (r9). In the wire range ([`STALL_MS_MAX`]); a
-    /// validated configuration ([`crate::Timing::validate_client`]) is
-    /// never below [`crate::MIN_CLIENT_STALL`], so the relay serves it as
-    /// announced.
+    /// often enough for it (r9). An AI session announces [`crate::Timing::t_stall_ai`]
+    /// (5 s): that is the silence it actually waits, spare or not, and the
+    /// relay's keepalive is half of the shorter of its own `t_stall` and
+    /// this announcement (never below [`crate::MIN_CLIENT_STALL`]).
+    /// Announcing the old 1 s bound would tell the relay the client gives
+    /// the carrier up inside normal TCP recovery. In the wire range
+    /// ([`STALL_MS_MAX`]); a validated configuration
+    /// ([`crate::Timing::validate_client`]) is never below the floor, so
+    /// the relay serves it as announced.
     fn stall_ms(&self) -> u64 {
-        self.cfg
-            .timing
-            .t_stall
+        self.stall_limit()
             .as_millis()
             .clamp(1, u128::from(STALL_MS_MAX)) as u64
     }
@@ -670,7 +721,7 @@ impl ClientSession {
         }
         // Same as [`attach`](Self::attach): a move drops the spare.
         self.promoted_in_gen = false;
-        self.drop_redundant();
+        self.drop_spare_for_move();
         if let Some(old) = self.carrier.take() {
             self.abandoned.push(old);
         }
@@ -686,19 +737,49 @@ impl ClientSession {
     ///
     /// A bound spare is promoted instead of dialing: the relay emits this
     /// when it gives the current carrier up, and promotes the same spare on
-    /// its side. A hint that arrives after that promotion, while the spare
-    /// is still receiving, is about the carrier already left and is ignored.
+    /// its side. A hint that arrives after that promotion, while this
+    /// carrier is still receiving, is about the carrier already left and is
+    /// remembered. If this one then goes quiet, the hint is a real loss,
+    /// including a download that has nothing unacked upstream: the relay has
+    /// stopped sending. A byte on this carrier clears it.
     pub fn on_stall(&mut self, gen: u32, now: Instant) {
         if gen != self.gen || self.state != State::Active {
             return;
         }
-        if self.promoted_in_gen {
-            let quiet = self.send.unacked() && now >= self.last_rx + self.cfg.timing.t_stall;
-            if !quiet {
-                return;
-            }
-            self.promoted_in_gen = false;
+        // Silence is enough. Requiring unacked uplink dropped every hint
+        // after a promotion during a token stream: nothing was unacked, so
+        // the hint was forgotten, and a relay that had gone DETACHED (the
+        // demoted spare never moved, so it would not promote) sent no more
+        // downlink.
+        if self.promoted_in_gen && now < self.last_rx + self.stall_limit() {
+            self.stall_hint = true;
+            return;
         }
+        self.promoted_in_gen = false;
+        // An AI session waits out `t_stall_ai` with or without a spare. A
+        // byte received clears the hint. A non-AI session acts now: its
+        // relay already waited `t_live`. A hard loss does not come through
+        // here.
+        if self.params.exit_class == crate::EXIT_CLASS_AI && now < self.last_rx + self.stall_limit()
+        {
+            self.stall_hint = true;
+            return;
+        }
+        self.act_on_stall(now);
+    }
+
+    /// When a remembered `STALL` is acted on: one stall limit after the
+    /// last byte on this carrier.
+    fn stall_hint_at(&self) -> Option<Instant> {
+        if !self.stall_hint {
+            return None;
+        }
+        Some(self.last_rx + self.stall_limit())
+    }
+
+    fn act_on_stall(&mut self, now: Instant) {
+        self.stall_hint = false;
+        self.note_move(MoveReason::RelayStall, now);
         if self.promote_redundant(now, true) {
             return;
         }
@@ -723,6 +804,7 @@ impl ClientSession {
             return;
         }
         self.last_rx = self.last_rx.max(now);
+        self.stall_hint = false;
         self.rx_partial = true;
         if self.confirmed && now >= self.last_sent + self.keepalive() {
             self.ka_due = true;
@@ -749,13 +831,64 @@ impl ClientSession {
     }
 
     fn keepalive(&self) -> std::time::Duration {
-        (self.cfg.timing.t_stall / 2).max(std::time::Duration::from_millis(10))
+        (self.stall_limit() / 2).max(std::time::Duration::from_millis(10))
     }
 
     /// Carriers lost in a row with something expected on them and nothing
     /// moved (see [`MAX_FRUITLESS`]).
     pub fn fruitless_carriers(&self) -> u32 {
         self.fruitless
+    }
+
+    /// Why this session has given carriers up, and what the moves cost.
+    /// A copy; nothing is cleared.
+    pub fn move_stats(&self) -> MoveStats {
+        self.moves
+    }
+
+    fn bump(&mut self, reason: MoveReason) {
+        let slot = match reason {
+            MoveReason::Stall => &mut self.moves.stall,
+            MoveReason::Hold => &mut self.moves.hold,
+            MoveReason::RelayStall => &mut self.moves.relay_stall,
+            MoveReason::Closed => &mut self.moves.closed,
+            MoveReason::Io => &mut self.moves.io,
+            MoveReason::Reject => &mut self.moves.reject,
+            MoveReason::Attach => &mut self.moves.attach,
+        };
+        *slot = slot.saturating_add(1);
+    }
+
+    /// Count `reason` and start the recovery clock if one is not already
+    /// running. A session that has already ended counts nothing.
+    fn note_move(&mut self, reason: MoveReason, now: Instant) {
+        if self.is_closed() {
+            return;
+        }
+        self.bump(reason);
+        if self.loss_at.is_none() {
+            self.loss_at = Some(now);
+        }
+    }
+
+    fn note_promotion(&mut self, swapped: bool, replayed: u64) {
+        self.moves.promotions = self.moves.promotions.saturating_add(1);
+        if swapped {
+            self.moves.swaps = self.moves.swaps.saturating_add(1);
+        }
+        self.moves.bytes_replayed = self.moves.bytes_replayed.saturating_add(replayed);
+    }
+
+    fn note_recovery(&mut self, now: Instant) {
+        let Some(at) = self.loss_at.take() else {
+            return;
+        };
+        let us = u64::try_from(now.saturating_duration_since(at).as_micros()).unwrap_or(u64::MAX);
+        self.moves.recovery_us_sum = self.moves.recovery_us_sum.saturating_add(us);
+        if us > self.moves.recovery_us_max {
+            self.moves.recovery_us_max = us;
+        }
+        self.moves.recoveries = self.moves.recoveries.saturating_add(1);
     }
 
     /// The latest [`Health`] report since the last call.
@@ -833,17 +966,24 @@ impl ClientSession {
     }
 
     pub fn on_carrier_closed(&mut self, cid: CarrierId, now: Instant) {
-        self.carrier_gone(cid, now, false);
+        self.carrier_gone(cid, now, MoveReason::Closed);
     }
 
     /// The driver gave carrier `cid` up because a frame on it stopped
     /// moving for the transport hold, or outlived the hold cap (either
     /// direction): it owed us bytes, whatever else is outstanding (r9 F2).
     pub fn on_carrier_stuck(&mut self, cid: CarrierId, now: Instant) {
-        self.carrier_gone(cid, now, true);
+        self.carrier_gone(cid, now, MoveReason::Hold);
     }
 
-    fn carrier_gone(&mut self, cid: CarrierId, now: Instant, stuck: bool) {
+    /// A write on carrier `cid` failed. A hard loss, the same as a close,
+    /// counted apart from EOF so a stall can be told from a broken write.
+    pub fn on_carrier_io(&mut self, cid: CarrierId, now: Instant) {
+        self.carrier_gone(cid, now, MoveReason::Io);
+    }
+
+    fn carrier_gone(&mut self, cid: CarrierId, now: Instant, reason: MoveReason) {
+        let stuck = reason == MoveReason::Hold;
         // The spare dying (closed, stuck) drops only that carrier: no
         // re-attach, no [`MAX_FRUITLESS`] count, no health or quality event.
         // A stall demotion leaves the old carrier here; a transport hold that
@@ -880,11 +1020,13 @@ impl ClientSession {
         }
         // A bound spare becomes the current carrier. A stall demotes the
         // one that stuck; a hard close drops it. An unbound spare is
-        // dropped; the session re-attaches the ordinary way.
+        // dropped; the session re-attaches the ordinary way. A session that
+        // has already ended (a decode error closed it) is not a new move.
+        self.note_move(reason, now);
         if self.promote_redundant(now, stuck) {
             return;
         }
-        self.drop_redundant();
+        self.drop_spare_for_move();
         self.carrier_lost(now, stuck);
         self.carrier = None;
         if self.is_closed() {
@@ -960,6 +1102,7 @@ impl ClientSession {
             return Ok(());
         }
         self.last_rx = now;
+        self.stall_hint = false;
         self.rx_partial = false;
         let r = self.on_current(frame, now);
         if let Err(e) = r {
@@ -978,6 +1121,7 @@ impl ClientSession {
             return;
         }
         if self.carrier == Some(cid) && !self.is_closed() {
+            self.bump(MoveReason::Io);
             let _ = self.fatal(e);
         }
     }
@@ -1089,6 +1233,7 @@ impl ClientSession {
                 match rj.code {
                     code::STALE_GEN => {}
                     code::ANCHOR_UNREACHABLE => {
+                        self.note_move(MoveReason::Reject, now);
                         // B2: retry with backoff until T_detached.
                         if let Some(old) = self.carrier.take() {
                             self.abandoned.push(old);
@@ -1100,6 +1245,7 @@ impl ClientSession {
                         self.detached_since.get_or_insert(now);
                     }
                     _ => {
+                        self.note_move(MoveReason::Reject, now);
                         let reason = CloseReason::from_reject(
                             &rj,
                             self.send.fin_offset(),
@@ -1134,6 +1280,7 @@ impl ClientSession {
 
     /// New data moved end to end on the current carrier.
     fn made_progress(&mut self, now: Instant) {
+        self.note_recovery(now);
         if !self.progressed {
             self.progressed = true;
             self.fruitless = 0;
@@ -1399,8 +1546,9 @@ impl ClientSession {
         }
         if self.confirmed {
             if self.send.unacked() {
-                put(Some(self.last_rx + t.t_stall));
+                put(Some(self.last_rx + self.stall_limit()));
             }
+            put(self.stall_hint_at());
             if writable {
                 put(self.recv.ack_deadline());
             }
@@ -1430,6 +1578,7 @@ impl ClientSession {
         {
             // T_attach: abandon this attempt, retry on a new carrier (an
             // attempt that got no answer counts against the bound).
+            self.note_move(MoveReason::Attach, now);
             self.carrier_lost(now, true);
             if self.is_closed() {
                 return;
@@ -1454,11 +1603,21 @@ impl ClientSession {
         }) {
             self.drop_redundant();
         }
-        if self.confirmed && self.send.unacked() && now >= self.last_rx + t.t_stall {
+        if self.stall_hint_at().is_some_and(|due| now >= due) {
+            // The remembered hint is about this carrier now, not the one
+            // the promotion already left.
+            self.promoted_in_gen = false;
+            self.act_on_stall(now);
+        }
+        let stall_limit = self.stall_limit();
+        if self.confirmed && self.send.unacked() && now >= self.last_rx + stall_limit {
             // A bound spare becomes current. A stall keeps the old carrier
             // as the spare. No RESUME, no failure report. A spare that was
             // demoted and has been silent is not promoted: neither side
-            // moved, so this re-attaches.
+            // moved, so this re-attaches. An AI session waits `t_stall_ai`
+            // (see [`Self::stall_limit`]) with or without a spare; a hard
+            // loss does not.
+            self.note_move(MoveReason::Stall, now);
             if !self.promote_redundant(now, true) {
                 self.carrier_lost(now, true);
                 self.move_carrier(now);
