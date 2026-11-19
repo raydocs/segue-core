@@ -44,7 +44,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -62,6 +62,7 @@ use tokio::task::JoinHandle;
 
 mod choice;
 pub use choice::AutoChoice;
+mod race;
 
 use crate::dial::{Datagrams, DialError, Dialer};
 
@@ -175,6 +176,10 @@ struct Health {
     /// Measured path quality (RTT, replay loss, stalls) for the exit
     /// choice (see [`crate::session::ExitChoice`] and [`Quality`]).
     quality: QualityTracker,
+    /// Times [`mark_failed`] ran for this exit. Test-only: production
+    /// posture cannot tell one failure from two once the exit is `Error`.
+    #[cfg(test)]
+    fail_marks: u32,
 }
 
 /// One session's latest health on its exit.
@@ -204,6 +209,8 @@ impl Health {
             unproven: false,
             sessions: HashMap::new(),
             quality: QualityTracker::new(),
+            #[cfg(test)]
+            fail_marks: 0,
         }
     }
 
@@ -401,6 +408,15 @@ pub struct KernelDialer {
     session_cfg: segue_session::Config,
     /// TCP flows currently held in [`crate::killswitch::Verdict::Wait`].
     holds: Arc<AtomicUsize>,
+    /// Carrier races that started a second dial to the same exit.
+    pub(crate) race_second_started: Arc<AtomicU64>,
+    /// Carrier races whose second dial finished first.
+    pub(crate) race_second_won: Arc<AtomicU64>,
+    /// A finished spare carrier from a lost race. `None` drops it: a dial
+    /// still in flight is cancelled, and a stream the dial already produced
+    /// is dropped. A later change can install a sender to park that stream
+    /// as a warm carrier.
+    spare: Option<mpsc::Sender<BoxCarrier>>,
 }
 
 impl Drop for KernelDialer {
@@ -441,6 +457,9 @@ impl KernelDialer {
             control: ControlTiming::default(),
             session_cfg: segue_session::Config::default(),
             holds: Arc::new(AtomicUsize::new(0)),
+            race_second_started: Arc::new(AtomicU64::new(0)),
+            race_second_won: Arc::new(AtomicU64::new(0)),
+            spare: None,
         }
     }
 
@@ -697,44 +716,87 @@ impl KernelDialer {
         Err(last)
     }
 
+    #[cfg(test)]
+    fn fail_marks(&self, exit: usize) -> u32 {
+        self.state.lock().unwrap().health[exit].fail_marks
+    }
+
     fn connector(&self, i: usize) -> Connector {
         let engine = self.engine.clone();
         let state = self.state.clone();
         let carrier = self.exits[i].carrier.clone();
         let relay = self.exits[i].relay;
+        let second_started = Arc::clone(&self.race_second_started);
+        let second_won = Arc::clone(&self.race_second_won);
+        let spare = self.spare.clone();
         Arc::new(move || {
             let engine = engine.clone();
             let state = state.clone();
             let carrier = carrier.clone();
+            let second_started = Arc::clone(&second_started);
+            let second_won = Arc::clone(&second_won);
+            let spare = spare.clone();
             Box::pin(async move {
-                let res = tokio::time::timeout(
+                // The exit's smoothed RTT, copied out so the race does not
+                // hold the state lock. Unknown until the first control PING.
+                let srtt = state.lock().unwrap().health[i].quality.snapshot().srtt;
+                let dial_carrier = carrier.clone();
+                let raced = tokio::time::timeout(
                     CARRIER_TIMEOUT,
-                    engine.dial(Some(&carrier), &TargetAddr::Ip(relay.ip()), relay.port()),
+                    race::race(
+                        move || {
+                            let engine = engine.clone();
+                            let carrier = dial_carrier.clone();
+                            async move {
+                                engine
+                                    .dial(Some(&carrier), &TargetAddr::Ip(relay.ip()), relay.port())
+                                    .await
+                            }
+                        },
+                        race::race_delay(srtt),
+                    ),
                 )
                 .await;
-                let mut st = state.lock().unwrap();
-                let h = &mut st.health[i];
-                match res {
-                    Ok(Ok(s)) => {
-                        // While sessions are failing, the carrier being up
-                        // proves nothing (r9 F5): wait for a valid answer.
-                        if !h.unproven {
-                            h.ks.on_event(Event::ChannelUp);
-                            h.last_fail = None;
+                let (result, loser) = {
+                    let mut st = state.lock().unwrap();
+                    let h = &mut st.health[i];
+                    match raced {
+                        Ok(outcome) => {
+                            if outcome.second_started {
+                                second_started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if outcome.attempt == 2 {
+                                second_won.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            let loser = outcome.loser;
+                            match outcome.value {
+                                Ok(stream) => {
+                                    // While sessions are failing, the carrier
+                                    // being up proves nothing (r9 F5): wait
+                                    // for a valid answer. A losing attempt's
+                                    // error is not a failure.
+                                    if !h.unproven {
+                                        h.ks.on_event(Event::ChannelUp);
+                                        h.last_fail = None;
+                                    }
+                                    (Ok(Box::new(stream) as BoxCarrier), loser)
+                                }
+                                Err(e) => {
+                                    mark_failed(h);
+                                    eprintln!("segue-kernel: carrier {carrier} failed: {e}");
+                                    (Err(std::io::Error::other(e.0)), loser)
+                                }
+                            }
                         }
-                        Ok(Box::new(s) as BoxCarrier)
+                        Err(_) => {
+                            mark_failed(h);
+                            eprintln!("segue-kernel: carrier {carrier} timed out");
+                            (Err(std::io::ErrorKind::TimedOut.into()), None)
+                        }
                     }
-                    Ok(Err(e)) => {
-                        mark_failed(h);
-                        eprintln!("segue-kernel: carrier {carrier} failed: {e}");
-                        Err(std::io::Error::other(e.0))
-                    }
-                    Err(_) => {
-                        mark_failed(h);
-                        eprintln!("segue-kernel: carrier {carrier} timed out");
-                        Err(std::io::ErrorKind::TimedOut.into())
-                    }
-                }
+                };
+                on_spare(&spare, loser);
+                result
             })
         })
     }
@@ -1049,7 +1111,34 @@ impl Drop for HealthReporter {
     }
 }
 
+/// Park a finished loser, or drop it.
+///
+/// `spare` is unset today. Dropping `loser` cancels a dial still in flight
+/// and drops the stream if the dial has already produced one. A later change
+/// sets `spare` to park that stream as a warm carrier.
+fn on_spare(
+    spare: &Option<mpsc::Sender<BoxCarrier>>,
+    loser: Option<race::Attempt<crate::dial::Stream, DialError>>,
+) {
+    let Some(loser) = loser else {
+        return;
+    };
+    let Some(tx) = spare.clone() else {
+        drop(loser);
+        return;
+    };
+    tokio::spawn(async move {
+        if let Ok(stream) = loser.await {
+            let _ = tx.try_send(Box::new(stream));
+        }
+    });
+}
+
 fn mark_failed(h: &mut Health) {
+    #[cfg(test)]
+    {
+        h.fail_marks = h.fail_marks.saturating_add(1);
+    }
     match h.ks.posture() {
         Posture::Connected => {
             h.ks.on_event(Event::ChannelLost);

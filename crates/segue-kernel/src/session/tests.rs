@@ -52,6 +52,10 @@ struct Node {
     /// When non-zero, the next carrier's downlink is throttled to this
     /// many bytes per second (control streams are spared); then reset.
     slow_next: Arc<AtomicUsize>,
+    /// Dials started against this node, counted before any hang.
+    dials: Arc<AtomicUsize>,
+    /// The next dial sleeps this long before connecting, then clears it.
+    hang_next: Arc<Mutex<Option<Duration>>>,
 }
 
 /// Engine stand-in: `dial(Some(carrier), relay)` → a pipe into that
@@ -215,6 +219,11 @@ impl Dialer for Engine {
             self.other_tcp.lock().unwrap().push(tag.map(String::from));
             return Err(DialError("mock: no such outbound".into()));
         };
+        node.dials.fetch_add(1, Ordering::SeqCst);
+        let hang = node.hang_next.lock().unwrap().take();
+        if let Some(delay) = hang {
+            tokio::time::sleep(delay).await;
+        }
         if !node.up.load(Ordering::SeqCst) {
             return Err(DialError("mock: carrier down".into()));
         }
@@ -325,6 +334,8 @@ fn node(auth: Box<dyn Authorizer>, site: Option<SiteConnector>, cfg: Config) -> 
         drop_next: Arc::default(),
         drop_plan: Arc::default(),
         slow_next: Arc::default(),
+        dials: Arc::default(),
+        hang_next: Arc::default(),
     }
 }
 
@@ -342,6 +353,8 @@ struct Lab {
     la_controls: Arc<AtomicUsize>,
     la_drop_plan: Arc<Mutex<std::collections::VecDeque<bool>>>,
     la_slow_next: Arc<AtomicUsize>,
+    la_dials: Arc<AtomicUsize>,
+    la_hang_next: Arc<Mutex<Option<Duration>>>,
     engine: Arc<Engine>,
 }
 
@@ -387,6 +400,8 @@ fn lab_full(
     let la_controls = la.controls.clone();
     let la_drop_plan = la.drop_plan.clone();
     let la_slow_next = la.slow_next.clone();
+    let la_dials = la.dials.clone();
+    let la_hang_next = la.hang_next.clone();
     let (la_up, ny_up) = (la.up.clone(), ny.up.clone());
     let (la_carriers, ny_carriers) = (la.carriers.clone(), ny.carriers.clone());
     let la_sites = la.sites.clone();
@@ -443,6 +458,8 @@ fn lab_full(
         la_controls,
         la_drop_plan,
         la_slow_next,
+        la_dials,
+        la_hang_next,
         engine,
     }
 }
@@ -2424,4 +2441,66 @@ async fn the_first_request_after_idle_opens() {
             .expect("AI refused after idle");
     roundtrip(ai).await;
     roundtrip(s).await;
+}
+
+/// A lost first carrier (here, a dial that does not answer for a second)
+/// must not stall the session: the second attempt to the same exit wins,
+/// and the exit is not marked failed.
+#[tokio::test(start_paused = true)]
+async fn a_slow_first_carrier_loses_to_the_raced_second() {
+    let l = lab();
+    l.d.set_exit("la").unwrap();
+    *l.la_hang_next.lock().unwrap() = Some(Duration::from_secs(1));
+    let start = tokio::time::Instant::now();
+    let s =
+        l.d.dial(Some("overseas"), &site(), 443)
+            .await
+            .expect("session did not open");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "opened in {elapsed:?}; the slow dial was not raced"
+    );
+    assert_eq!(l.d.posture(), Posture::Connected);
+    assert_eq!(l.d.fail_marks(0), 0, "a losing attempt is not a failure");
+    assert_eq!(
+        l.d.race_second_started.load(Ordering::Relaxed),
+        1,
+        "the second attempt was not started"
+    );
+    assert_eq!(
+        l.d.race_second_won.load(Ordering::Relaxed),
+        1,
+        "the second attempt did not win"
+    );
+    assert_eq!(l.ny_carriers.load(Ordering::SeqCst), 0, "race stayed on la");
+    roundtrip(s).await;
+}
+
+/// Both attempts of one race fail: the exit is marked failed once, not
+/// once per attempt.
+#[tokio::test(start_paused = true)]
+async fn both_carrier_attempts_failing_marks_the_exit_once() {
+    let l = lab();
+    l.d.set_exit("la").unwrap();
+    l.la_up.store(false, Ordering::SeqCst);
+    assert!(l.d.probe().await.is_err());
+    assert_eq!(
+        l.la_dials.load(Ordering::SeqCst),
+        2,
+        "the race dialed twice"
+    );
+    assert_eq!(l.d.race_second_started.load(Ordering::Relaxed), 1);
+    assert_eq!(l.d.race_second_won.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        l.d.fail_marks(0),
+        1,
+        "marked failed once for the whole race"
+    );
+    assert_eq!(l.d.posture(), Posture::Error);
+    assert_eq!(
+        l.ny_carriers.load(Ordering::SeqCst),
+        0,
+        "named exit was not left"
+    );
 }
