@@ -267,8 +267,10 @@ pub struct ClientSession {
     /// When the current loss started, until the next byte of progress.
     /// The first loss wins if another happens before progress.
     loss_at: Option<Instant>,
-    /// A relay `STALL` arrived for an AI session with no spare, and
-    /// `t_stall_solo` has not elapsed yet. Cleared by any byte received.
+    /// A relay `STALL` is waiting out silence on the current carrier.
+    /// Set when an AI session has no spare yet (`t_stall_solo`), or when
+    /// this generation already promoted and the new carrier is still
+    /// receiving. Cleared by any byte received on the current carrier.
     stall_hint: bool,
     /// The spare was dropped because the session moved (RESUME), not because
     /// the spare failed. The driver redials it with no backoff.
@@ -737,19 +739,25 @@ impl ClientSession {
     ///
     /// A bound spare is promoted instead of dialing: the relay emits this
     /// when it gives the current carrier up, and promotes the same spare on
-    /// its side. A hint that arrives after that promotion, while the spare
-    /// is still receiving, is about the carrier already left and is ignored.
+    /// its side. A hint that arrives after that promotion, while this
+    /// carrier is still receiving, is about the carrier already left and is
+    /// remembered. If this one then goes quiet, the hint is a real loss,
+    /// including a download that has nothing unacked upstream: the relay has
+    /// stopped sending. A byte on this carrier clears it.
     pub fn on_stall(&mut self, gen: u32, now: Instant) {
         if gen != self.gen || self.state != State::Active {
             return;
         }
-        if self.promoted_in_gen {
-            let quiet = self.send.unacked() && now >= self.last_rx + self.cfg.timing.t_stall;
-            if !quiet {
-                return;
-            }
-            self.promoted_in_gen = false;
+        // Silence is enough. Requiring unacked uplink dropped every hint
+        // after a promotion during a token stream: nothing was unacked, so
+        // the hint was forgotten, and a relay that had gone DETACHED (the
+        // demoted spare never moved, so it would not promote) sent no more
+        // downlink.
+        if self.promoted_in_gen && now < self.last_rx + self.stall_limit() {
+            self.stall_hint = true;
+            return;
         }
+        self.promoted_in_gen = false;
         // No spare to swap onto, and the carrier has not been quiet for
         // `t_stall_solo`: remember the hint. A byte received clears it.
         // A bound spare still swaps now. A non-AI session does too.
@@ -758,6 +766,23 @@ impl ClientSession {
             return;
         }
         self.act_on_stall(now);
+    }
+
+    /// When a remembered `STALL` is acted on.
+    ///
+    /// After our own promotion the wait is this carrier's stall limit, so a
+    /// spare still swaps at `t_stall`. A hint remembered because no spare
+    /// was bound keeps waiting `t_stall_solo` even if one binds during it.
+    fn stall_hint_at(&self) -> Option<Instant> {
+        if !self.stall_hint {
+            return None;
+        }
+        let limit = if self.promoted_in_gen {
+            self.stall_limit()
+        } else {
+            self.cfg.timing.t_stall_solo
+        };
+        Some(self.last_rx + limit)
     }
 
     fn act_on_stall(&mut self, now: Instant) {
@@ -1531,9 +1556,7 @@ impl ClientSession {
             if self.send.unacked() {
                 put(Some(self.last_rx + self.stall_limit()));
             }
-            if self.stall_hint {
-                put(Some(self.last_rx + t.t_stall_solo));
-            }
+            put(self.stall_hint_at());
             if writable {
                 put(self.recv.ack_deadline());
             }
@@ -1588,7 +1611,10 @@ impl ClientSession {
         }) {
             self.drop_redundant();
         }
-        if self.stall_hint && now >= self.last_rx + t.t_stall_solo {
+        if self.stall_hint_at().is_some_and(|due| now >= due) {
+            // The remembered hint is about this carrier now, not the one
+            // the promotion already left.
+            self.promoted_in_gen = false;
             self.act_on_stall(now);
         }
         let stall_limit = self.stall_limit();

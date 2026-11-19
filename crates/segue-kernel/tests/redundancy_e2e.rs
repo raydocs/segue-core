@@ -23,6 +23,8 @@
 //! `SEGUE_CONVO_FAULTS=none|blackout|all` (default `all`) limits the
 //! conversation faults. `none` is the no-fault rows only. `blackout` adds
 //! the 2 s / 8 s / 40 s / 120 s blackouts on `rtt170`.
+//! `SEGUE_PROFILES` and `SEGUE_SEEDS` (comma-separated, or `all`) restrict
+//! which rows run. Unset runs every profile and seed.
 //!
 //! Relay, ticket and SOCKS wiring matches `roaming_e2e.rs`. An AI route also
 //! needs a home line: the relay sends a confirmed AI target there, not direct.
@@ -956,8 +958,8 @@ async fn token_stream_baseline() {
     let stack = stack().await;
     let mut tokens = Vec::new();
     let mut flows = Vec::new();
-    for profile in PROFILES {
-        for seed in SEEDS {
+    for profile in selected_profiles(PROFILES) {
+        for seed in selected_seeds() {
             tokens.push(run_token(&stack, profile, seed, seconds).await);
             flows.push(run_flows(&stack, profile, seed).await);
         }
@@ -1013,6 +1015,54 @@ fn env_u64(name: &str, default: u64) -> u64 {
     }
 }
 
+fn selected_profiles<'a>(all: &'a [&'a str]) -> Vec<&'a str> {
+    let Ok(raw) = std::env::var("SEGUE_PROFILES") else {
+        return all.to_vec();
+    };
+    if raw.is_empty() || raw == "all" {
+        return all.to_vec();
+    }
+    let mut out = Vec::new();
+    for name in raw.split(',') {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        match all.iter().copied().find(|profile| *profile == name) {
+            Some(profile) => out.push(profile),
+            None => panic!("SEGUE_PROFILES={name} is not one of {all:?}"),
+        }
+    }
+    assert!(!out.is_empty(), "SEGUE_PROFILES is empty");
+    out
+}
+
+fn selected_seeds() -> Vec<u64> {
+    let Ok(raw) = std::env::var("SEGUE_SEEDS") else {
+        return SEEDS.to_vec();
+    };
+    if raw.is_empty() || raw == "all" {
+        return SEEDS.to_vec();
+    }
+    let mut seeds = Vec::new();
+    for raw in raw.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let seed = raw
+            .parse()
+            .unwrap_or_else(|_| panic!("SEGUE_SEEDS={raw} is not an integer"));
+        assert!(
+            SEEDS.contains(&seed),
+            "SEGUE_SEEDS={seed} is not one of {SEEDS:?}"
+        );
+        seeds.push(seed);
+    }
+    assert!(!seeds.is_empty(), "SEGUE_SEEDS is empty");
+    seeds
+}
+
 fn convo_turns() -> u64 {
     let n = env_u64("SEGUE_CONVO_TURNS", 3);
     assert!(n > 0, "SEGUE_CONVO_TURNS must be > 0");
@@ -1049,9 +1099,10 @@ fn convo_fault_set() -> &'static str {
 
 fn convo_cases() -> Vec<(&'static str, u64, ConvoFault)> {
     let mut cases = Vec::new();
-    for profile in CONVO_PROFILES {
-        for seed in SEEDS {
-            cases.push((*profile, seed, ConvoFault::None));
+    let seeds = selected_seeds();
+    for profile in selected_profiles(CONVO_PROFILES) {
+        for seed in &seeds {
+            cases.push((profile, *seed, ConvoFault::None));
         }
     }
     let faults: &[ConvoFault] = match convo_fault_set() {
@@ -1072,9 +1123,11 @@ fn convo_cases() -> Vec<(&'static str, u64, ConvoFault)> {
             ConvoFault::SilentSilence,
         ],
     };
-    for fault in faults {
-        for seed in SEEDS {
-            cases.push(("rtt170", seed, *fault));
+    if selected_profiles(CONVO_PROFILES).contains(&"rtt170") {
+        for fault in faults {
+            for seed in seeds {
+                cases.push(("rtt170", seed, *fault));
+            }
         }
     }
     cases
