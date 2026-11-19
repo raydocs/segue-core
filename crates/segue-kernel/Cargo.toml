@@ -42,3 +42,5 @@ ring = "0.17.14"
 rustls.workspace = true
 # Loopback roaming test: the production relay in front of a local origin.
 segue-relay = { path = "../segue-relay" }
+# Token-stream baseline drives the in-process impairment relay.
+segue-bench = { path = "../segue-bench" }

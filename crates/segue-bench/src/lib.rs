@@ -75,6 +75,7 @@ use tokio_rustls::TlsAcceptor;
 
 pub mod chart;
 pub mod impair;
+pub mod pairprobe;
 mod process_metrics;
 #[cfg(unix)]
 pub mod protocol_bench;
@@ -89,7 +90,7 @@ pub use stream_transport::{
     StreamBenchXhttpProfile,
 };
 
-const USAGE: &str = "usage: segue-bench run|compare|route-probe|dns-policy-probe|phase2-probe|reality-matrix|chart|impair [options]\ncompare options: [--skip-sing-box]\nchart options: [--omit-sing-box-reality] [--omit-sing-box-1000-flows]\nimpair options: --listen <addr> --upstream <addr> [--profile clean|rtt170|rtt170-loss2|cn163-peak|cn163-offpeak] [--seed <n>] [--protocol udp|tcp|both] [--duration-ms <n>]";
+const USAGE: &str = "usage: segue-bench run|compare|route-probe|dns-policy-probe|phase2-probe|reality-matrix|chart|impair|pairprobe [options]\ncompare options: [--skip-sing-box]\nchart options: [--omit-sing-box-reality] [--omit-sing-box-1000-flows]\nimpair options: --listen <addr> --upstream <addr> [--profile clean|rtt170|rtt170-loss2|cn163-peak|cn163-offpeak] [--seed <n>] [--protocol udp|tcp|both] [--duration-ms <n>] [--tcp-loss off|emulate]\npairprobe server: --listen <addr> [--max-seconds <n>] [--max-bytes <n>]\npairprobe client: --server <addr> [--pps <n>] [--size <n>] [--seconds <n>] [--flows <n>] [--stagger-ms <n>] [--out <file>]";
 const TEST_VLESS_UUID: [u8; 16] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
 ];
@@ -183,6 +184,7 @@ pub enum CliArgs {
     RealityMatrix(RealityMatrixOptions),
     Chart(chart::ChartOptions),
     Impair(impair::ImpairOptions),
+    PairProbe(pairprobe::PairProbeCommand),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1545,6 +1547,9 @@ where
     }
     if command == "impair" {
         return impair::parse_impair_args(&rest).map(CliArgs::Impair);
+    }
+    if command == "pairprobe" {
+        return pairprobe::parse_args(&rest).map(CliArgs::PairProbe);
     }
 
     let mut index = 0;
@@ -8466,6 +8471,7 @@ where
         }
         CliArgs::Chart(options) => chart::run_chart(&options),
         CliArgs::Impair(options) => impair::run(options).await,
+        CliArgs::PairProbe(command) => pairprobe::run(command).await,
     }
 }
 
