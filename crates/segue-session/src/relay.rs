@@ -152,6 +152,10 @@ struct Session {
     /// (r9: with only the relay's, a client with a shorter bound took
     /// a live carrier for a stalled one).
     keepalive: std::time::Duration,
+    /// OPEN's `exit_class` hint. [`crate::EXIT_CLASS_AI`] uses
+    /// [`crate::Timing::t_detached_ai`] and keeps reading the site while
+    /// detached, into the replay buffer the send half already has.
+    exit_class: u8,
 }
 
 // Manual so the resume secret never reaches a log.
@@ -673,6 +677,7 @@ impl RelayTable {
                     last_sent: now,
                     ka_due: false,
                     keepalive: self.keepalive_for(o.t_stall_ms),
+                    exit_class: o.exit_class,
                 };
                 self.sessions.insert(sid, s);
                 self.carriers.get_mut(&cid).unwrap().session = Some(sid);
@@ -1122,12 +1127,27 @@ impl RelayTable {
 
     // ---- site side ----
 
-    /// Bytes of site data the relay may read now (0 while DETACHED: stop
-    /// reading the site, §5.2).
+    /// Bytes of site data the relay may read now.
+    ///
+    /// A non-AI session returns 0 while DETACHED: stop reading the site
+    /// (§5.2). An AI session ([`crate::EXIT_CLASS_AI`]) keeps reading while
+    /// detached, into the replay buffer, up to the credit and pool limits
+    /// [`crate::flow::SendHalf::write_capacity`] already enforces. No extra
+    /// memory and no new floor: a token stream of a few KB/s is consumed
+    /// during the outage and sent when a carrier returns; reading stops
+    /// when that bound is reached.
     pub fn site_read_capacity(&mut self, sid: &SessionId) -> usize {
-        match self.sessions.get_mut(sid) {
-            Some(s) if s.connected && s.state == SessionState::Active => s.send.write_capacity(),
-            _ => 0,
+        let Some(s) = self.sessions.get_mut(sid) else {
+            return 0;
+        };
+        if !s.connected {
+            return 0;
+        }
+        let ai_detached = s.exit_class == crate::EXIT_CLASS_AI && s.state == SessionState::Detached;
+        if s.state == SessionState::Active || ai_detached {
+            s.send.write_capacity()
+        } else {
+            0
         }
     }
 
@@ -1235,7 +1255,7 @@ impl RelayTable {
         for s in self.sessions.values() {
             put(s.created + t.max_lifetime);
             if let Some(ds) = s.detached_since {
-                put(ds + t.t_detached);
+                put(ds + t.detach_for(s.exit_class));
             }
             if s.state == SessionState::Active && s.send.unacked() {
                 put(s.last_progress + t.t_live);
@@ -1297,7 +1317,9 @@ impl RelayTable {
                 too_old.push(*sid);
                 continue;
             }
-            if s.detached_since.is_some_and(|ds| now >= ds + t.t_detached) {
+            if s.detached_since
+                .is_some_and(|ds| now >= ds + t.detach_for(s.exit_class))
+            {
                 expired.push(*sid);
                 continue;
             }

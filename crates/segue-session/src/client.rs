@@ -102,11 +102,15 @@ impl std::fmt::Debug for OpenParams {
 pub const LOCAL_GIVE_UP: u8 = code::CONNECT_TIMEOUT;
 
 /// Carriers that may be lost in a row, each while something was expected
-/// on it and nothing moved, before the session gives up (r8 N5, r9 F2):
+/// on it and nothing moved, before a non-AI session gives up (r8 N5, r9 F2):
 /// the session ends when the `MAX_FRUITLESS`th is lost, so it dials at
 /// most this many carriers after its last progress. With the backoff
 /// below that is about 9 s of waiting between attempts (and `t_detached`
 /// bounds the time detached in any case).
+///
+/// An AI session ([`crate::EXIT_CLASS_AI`]) keeps the count for backoff but
+/// does not end on it. It ends only when [`crate::Timing::t_detached_ai`]
+/// has elapsed since the session last had a carrier.
 pub const MAX_FRUITLESS: u32 = 8;
 /// Wait before redialling after the first such loss; doubles per loss.
 pub const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
@@ -734,9 +738,10 @@ impl ClientSession {
     /// The current carrier is being given up (closed, stalled, or held a
     /// frame too long). Losing one that moved nothing while something was
     /// expected on it backs off the next attempt, exponentially, and the
-    /// [`MAX_FRUITLESS`]th in a row ends the session: a path that cannot
-    /// move data is not redialled without bound (r8 N5). A carrier that
-    /// made progress is replaced at once.
+    /// [`MAX_FRUITLESS`]th in a row ends a non-AI session: a path that cannot
+    /// move data is not redialled without bound (r8 N5). An AI session keeps
+    /// backing off but ends only at [`crate::Timing::t_detached_ai`]. A
+    /// carrier that made progress is replaced at once.
     ///
     /// "Expected" does not depend on the upload (r9 F2): `expected` is set
     /// by the callers that know the carrier owed us something (a stall
@@ -782,7 +787,10 @@ impl ClientSession {
             return;
         }
         self.fruitless += 1;
-        if self.fruitless >= MAX_FRUITLESS {
+        // AI sessions do not end on the count. The caller is still waiting
+        // on a stream it cannot resume; [`crate::Timing::t_detached_ai`] is
+        // the give-up. The count still backs off the next dial.
+        if self.fruitless >= MAX_FRUITLESS && self.params.exit_class != crate::EXIT_CLASS_AI {
             self.close(CloseReason::Reset(LOCAL_GIVE_UP));
             return;
         }
@@ -1323,7 +1331,9 @@ impl ClientSession {
         if !self.ever_opened {
             put(self.open_started.map(|s| s + t.t_open_retry));
         }
-        put(self.detached_since.map(|s| s + t.t_detached));
+        put(self
+            .detached_since
+            .map(|s| s + t.detach_for(self.params.exit_class)));
         if self.carrier.is_some() && !self.confirmed {
             put(self.attach_started.map(|s| s + t.t_attach));
         }
@@ -1357,7 +1367,8 @@ impl ClientSession {
             self.close(CloseReason::Reset(LOCAL_GIVE_UP));
             return;
         }
-        if self.detached_since.is_some_and(|s| now >= s + t.t_detached) {
+        let detach = t.detach_for(self.params.exit_class);
+        if self.detached_since.is_some_and(|s| now >= s + detach) {
             self.close(CloseReason::Reset(LOCAL_GIVE_UP));
             return;
         }
