@@ -398,9 +398,56 @@ impl Progress {
     }
 }
 
+/// Compact decoded-frame carrier over the internal driver `mpsc` channel.
+/// Keeps hot `DATA` and `ACK` frames inline (zero extra allocation) while
+/// boxing rare handshake/control frames so the 32-slot Tokio channel block
+/// does not reserve `size_of::<Frame::Open>()` per slot on every idle session.
+enum CarrierFrame {
+    Data {
+        offset: u64,
+        data: Vec<u8>,
+        pad: usize,
+    },
+    Ack {
+        recv_offset: u64,
+        max_offset: u64,
+    },
+    Other(Box<Frame>),
+}
+
+impl CarrierFrame {
+    fn from_frame(f: Frame) -> Self {
+        match f {
+            Frame::Data { offset, data, pad } => Self::Data { offset, data, pad },
+            Frame::Ack {
+                recv_offset,
+                max_offset,
+            } => Self::Ack {
+                recv_offset,
+                max_offset,
+            },
+            other => Self::Other(Box::new(other)),
+        }
+    }
+
+    fn into_frame(self) -> Frame {
+        match self {
+            Self::Data { offset, data, pad } => Frame::Data { offset, data, pad },
+            Self::Ack {
+                recv_offset,
+                max_offset,
+            } => Frame::Ack {
+                recv_offset,
+                max_offset,
+            },
+            Self::Other(f) => *f,
+        }
+    }
+}
+
 enum CarrierEv {
     /// With what covers the decoded frame until it is handled.
-    Frame(u64, Result<Frame, ProtoError>, Option<Charge>),
+    Frame(u64, Result<CarrierFrame, ProtoError>, Option<Charge>),
     /// Bytes of a frame not yet complete arrived on the carrier (or are
     /// there, waiting for memory): the peer and the path are alive though
     /// no frame came in (r8 N4/N5), the last byte read at the instant
@@ -486,7 +533,15 @@ async fn read_charged<R: AsyncRead + Unpin>(
         progress.reset();
         match Frame::decode_owned(ty, flags, payload) {
             Ok(Some(f)) => {
-                if tx.send(CarrierEv::Frame(cid, Ok(f), charge)).await.is_err() {
+                if tx
+                    .send(CarrierEv::Frame(
+                        cid,
+                        Ok(CarrierFrame::from_frame(f)),
+                        charge,
+                    ))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -704,7 +759,11 @@ async fn read_frames<R: AsyncRead + Unpin>(
         loop {
             match dec.next_frame() {
                 Ok(Some(f)) => {
-                    if tx.send(CarrierEv::Frame(cid, Ok(f), None)).await.is_err() {
+                    if tx
+                        .send(CarrierEv::Frame(cid, Ok(CarrierFrame::from_frame(f)), None))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -1051,14 +1110,18 @@ impl StandbyKeep {
             let dropped_for_move = s.take_spare_dropped_for_move();
             if promoted {
                 self.emit(StandbyEvent::Promoted);
-                // A swap leaves the old carrier bound as the spare. A hard
-                // loss leaves no spare.
+                // A swap leaves the old carrier bound as the spare; do not
+                // treat a swap as a standby failure or apply failure backoff.
                 if s.redundant_carrier().is_some() {
                     if let Some(counter) = &self.swaps {
                         counter.fetch_add(1, Ordering::Relaxed);
                     }
+                    self.backoff = STANDBY_BACKOFF_MIN;
+                    self.next_at = None;
+                    self.bound_at = Some(now);
+                } else {
+                    self.schedule(now);
                 }
-                self.schedule(now);
             } else if dropped_for_move {
                 self.rearm_now();
             } else {
@@ -1152,7 +1215,7 @@ where
         standby,
         moves,
     } = ctl;
-    let mut last_moves = MoveStats::default();
+    let mut last_moves = moves.as_ref().map(|_| Box::new(MoveStats::default()));
     let mut report = |s: &mut ClientSession| {
         if let Some(h) = s.take_health() {
             if let Some(f) = &health {
@@ -1164,12 +1227,12 @@ where
                 f(q);
             }
         }
-        let snap = s.move_stats();
-        if snap != last_moves {
-            if let Some(f) = &moves {
+        if let (Some(f), Some(last)) = (&moves, &mut last_moves) {
+            let snap = s.move_stats();
+            if snap != **last {
                 f(snap);
+                **last = snap;
             }
-            last_moves = snap;
         }
     };
     let writable = Arc::new(Notify::new());
@@ -1350,13 +1413,12 @@ where
         tasks.prune();
         pool_blocked = false;
         let mut freed = None;
-        // Carrier output, generated only while the writer has room and
+        // Primary carrier output, generated only while the writer has room and
         // there is something to send. Each queued frame is charged to the
         // pool before it is built (elastic blocks, else the session's one
         // slot in the transport region), so the session progresses with a
         // full pool and no memory of its own outside it (r6 R5/R6).
-        let tx_cids = [s.carrier(), s.redundant_carrier()];
-        for cid in tx_cids.into_iter().flatten() {
+        if let Some(cid) = s.carrier() {
             if let Some(io) = carriers.get(&cid) {
                 let mut min = 1;
                 while io.tx.capacity() > 0 && s.has_transmit(cid, t) {
@@ -1390,6 +1452,37 @@ where
                             }
                             let _ = io.tx.try_send(out);
                             tx_ticket = None;
+                            min = 1;
+                        }
+                        Tx::Idle => break,
+                        Tx::NeedRoom(n) => min = n,
+                    }
+                }
+            }
+        }
+        // Redundant TX stays strictly on Tier::Elastic and never acquires
+        // tx_slot or sets pool_blocked: a congested spare never holds up the
+        // primary carrier or consumes transport-region emergency blocks.
+        if let Some(cid) = s.redundant_carrier() {
+            if let Some(io) = carriers.get(&cid) {
+                let mut min = 1;
+                while io.tx.capacity() > 0 && s.has_transmit(cid, t) {
+                    if !s.is_redundant_hello() && (pool.under_pressure() || io.tx.capacity() <= 1) {
+                        s.skip_redundant_tx(t);
+                        break;
+                    }
+                    let Some(grant) = PoolGrant::between(&pool, min, FRAME_MAX, Tier::Elastic)
+                    else {
+                        if !s.is_redundant_hello() {
+                            s.skip_redundant_tx(t);
+                        }
+                        break;
+                    };
+                    let c = Charge { _slot: None, grant };
+                    let mut v = Vec::new();
+                    match s.poll_transmit_into(cid, t, &mut v, c.grant.bytes()) {
+                        Tx::Wrote => {
+                            let _ = io.tx.try_send(charged(v, c));
                             min = 1;
                         }
                         Tx::Idle => break,
@@ -1489,7 +1582,7 @@ where
                     // read, not when it is handled (r13).
                     Some(CarrierEv::Frame(cid, Ok(f), _c)) => {
                         let at = carriers.get(&cid).and_then(|io| io.rx_at.get()).map_or(t, |a| a.into_std());
-                        let _ = s.on_frame_at(cid, f, at, t);
+                        let _ = s.on_frame_at(cid, f.into_frame(), at, t);
                     }
                     Some(CarrierEv::Frame(cid, Err(e), _)) => s.on_decode_error(cid, e),
                     Some(CarrierEv::Progress(cid, at)) => s.on_carrier_progress(cid, at, t),
@@ -1511,8 +1604,6 @@ where
                     }
                     Some(CarrierEv::Stuck(cid)) => {
                         s.on_carrier_stuck(cid, t);
-                        // A stall demotes the carrier to the spare instead of
-                        // closing it. Abort only when the session let it go.
                         if !s.carrier_live(cid) {
                             if let Some(io) = carriers.remove(&cid) {
                                 io.reader.abort();
@@ -1568,7 +1659,16 @@ where
             }
             r = async { reattach.as_mut().expect("guarded").changed().await }, if reattach.is_some() => {
                 match r {
-                    Ok(()) => s.reattach(now()),
+                    Ok(()) => {
+                        s.reattach(now());
+                        if let Some(sp) = spare.as_mut() {
+                            sp.dial = None;
+                            sp.connecting = false;
+                            if let Some(keep) = sp.keep.as_mut() {
+                                keep.rearm_now();
+                            }
+                        }
+                    }
                     Err(_) => reattach = None,
                 }
             }
@@ -1728,8 +1828,9 @@ where
         }
         drop(app_w);
     }
-    // Flush a final RST / ACK on the current carrier, then close everything.
-    if let Some(cid) = s.carrier() {
+    // Flush a final RST / ACK on both the current and bound redundant
+    // carriers, then close everything.
+    for cid in [s.carrier(), s.redundant_carrier()].into_iter().flatten() {
         if let Some(io) = carriers.get(&cid) {
             while let Some(f) = s.poll_transmit(cid, now()) {
                 if io.tx.try_send(f.to_bytes().into()).is_err() {
@@ -1786,7 +1887,7 @@ where
         standby: _,
         moves,
     } = ctl;
-    let mut last_moves = MoveStats::default();
+    let mut last_moves = moves.as_ref().map(|_| Box::new(MoveStats::default()));
     let mut report = |s: &mut ClientSession| {
         if let Some(h) = s.take_health() {
             if let Some(f) = &health {
@@ -1798,12 +1899,12 @@ where
                 f(q);
             }
         }
-        let snap = s.move_stats();
-        if snap != last_moves {
-            if let Some(f) = &moves {
+        if let (Some(f), Some(last)) = (&moves, &mut last_moves) {
+            let snap = s.move_stats();
+            if snap != **last {
                 f(snap);
+                **last = snap;
             }
-            last_moves = snap;
         }
     };
     let writable = Arc::new(Notify::new());
@@ -1991,7 +2092,7 @@ where
                     // read, not when it is handled (r13).
                     Some(CarrierEv::Frame(cid, Ok(f), _c)) => {
                         let at = carriers.get(&cid).and_then(|io| io.rx_at.get()).map_or(t, |a| a.into_std());
-                        let _ = s.on_frame_at(cid, f, at, t);
+                        let _ = s.on_frame_at(cid, f.into_frame(), at, t);
                     }
                     Some(CarrierEv::Frame(cid, Err(e), _)) => s.on_decode_error(cid, e),
                     Some(CarrierEv::Progress(cid, at)) => s.on_carrier_progress(cid, at, t),
@@ -2013,8 +2114,6 @@ where
                     }
                     Some(CarrierEv::Stuck(cid)) => {
                         s.on_carrier_stuck(cid, t);
-                        // A stall demotes the carrier to the spare instead of
-                        // closing it. Abort only when the session let it go.
                         if !s.carrier_live(cid) {
                             if let Some(io) = carriers.remove(&cid) {
                                 io.reader.abort();
@@ -2221,8 +2320,9 @@ where
         }
         drop(app_w);
     }
-    // Flush a final RST / ACK on the current carrier, then close everything.
-    if let Some(cid) = s.carrier() {
+    // Flush a final RST / ACK on both the current and bound redundant
+    // carriers, then close everything.
+    for cid in [s.carrier(), s.redundant_carrier()].into_iter().flatten() {
         if let Some(io) = carriers.get(&cid) {
             while let Some(f) = s.poll_transmit(cid, now()) {
                 if io.tx.try_send(f.to_bytes().into()).is_err() {
@@ -2492,6 +2592,9 @@ pub async fn run_relay_ctl(
             }
         }
         for (&cid, io) in &carriers {
+            if io.tx.capacity() <= 1 {
+                table.drop_redundant_dups_if_busy(cid, t);
+            }
             while io.tx.capacity() > 0 {
                 match table.poll_transmit(cid, t) {
                     Some(f) => {
@@ -2571,7 +2674,7 @@ pub async fn run_relay_ctl(
             ev = ev_rx.recv() => {
                 let t = now();
                 match ev {
-                    Some(CarrierEv::Frame(cid, Ok(f), _)) => table.on_frame(cid, f, t),
+                    Some(CarrierEv::Frame(cid, Ok(f), _)) => table.on_frame(cid, f.into_frame(), t),
                     Some(CarrierEv::Frame(cid, Err(e), _)) => table.on_decode_error(cid, e),
                     Some(CarrierEv::Progress(cid, _)) => table.on_carrier_progress(cid, t),
                     Some(CarrierEv::Closed(cid) | CarrierEv::Stuck(cid) | CarrierEv::Io(cid)) => {

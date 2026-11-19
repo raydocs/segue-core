@@ -207,6 +207,7 @@ pub struct Config {
     pub blocked_cidrs: Vec<Cidr>,
     pub dev_allow_cidrs: Vec<Cidr>,
     pub limits: Limits,
+    pub redundancy: segue_session::RedundancyConfig,
 }
 
 fn read_credentials(
@@ -404,6 +405,7 @@ impl Config {
             blocked_cidrs,
             dev_allow_cidrs,
             limits,
+            redundancy: segue_session::RedundancyConfig::default(),
         })
     }
 }

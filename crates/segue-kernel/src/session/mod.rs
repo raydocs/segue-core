@@ -65,7 +65,7 @@ use segue_session::driver::{
 };
 use segue_session::pool::Pool;
 use segue_session::quality::{Quality, QualityEvent, QualityTracker};
-use segue_session::MoveStats;
+use segue_session::{MoveStats, RedundancyConfig};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -116,6 +116,8 @@ pub struct Exit {
     pub name: String,
     /// Engine outbound that carries the session.
     pub carrier: String,
+    /// Optional separate engine outbound for background standby dials.
+    pub redundant_carrier: Option<String>,
     /// Relay address as the carrier's server sees it.
     pub relay: SocketAddr,
     /// Node id sent as `anchor_node_id`.
@@ -569,6 +571,12 @@ impl KernelDialer {
         self
     }
 
+    /// Override Stage 2 small-frame redundancy configuration on new sessions.
+    pub fn with_redundancy(mut self, redundancy: RedundancyConfig) -> Self {
+        self.session_cfg.redundancy = redundancy;
+        self
+    }
+
     /// Standby dials started since this dialer was built. One per dial, not
     /// per raced attempt.
     pub fn standby_dials(&self) -> u64 {
@@ -944,7 +952,14 @@ impl KernelDialer {
     fn connector_for(&self, i: usize, report: bool) -> Connector {
         let engine = self.engine.clone();
         let state = self.state.clone();
-        let carrier = self.exits[i].carrier.clone();
+        let carrier = if report {
+            self.exits[i].carrier.clone()
+        } else {
+            self.exits[i]
+                .redundant_carrier
+                .clone()
+                .unwrap_or_else(|| self.exits[i].carrier.clone())
+        };
         let relay = self.exits[i].relay;
         let second_started = Arc::clone(&self.race_second_started);
         let second_won = Arc::clone(&self.race_second_won);
@@ -959,10 +974,31 @@ impl KernelDialer {
             let spare = spare.clone();
             let standby_fail = Arc::clone(&standby_fail);
             Box::pin(async move {
-                // A test asks the standby dial to fail before the engine,
-                // so the exit's posture is what we assert on.
-                if !report && standby_fail.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Err(std::io::Error::other("standby dial failed"));
+                // Background standby dials never run parallel carrier racing or
+                // record exit health failures: one dial against `redundant_carrier`
+                // (or `carrier` fallback) keeps connections <= 2 per AI flow.
+                if !report {
+                    if standby_fail.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(std::io::Error::other("standby dial failed"));
+                    }
+                    let timed = tokio::time::timeout(
+                        CARRIER_TIMEOUT,
+                        engine.dial(Some(&carrier), &TargetAddr::Ip(relay.ip()), relay.port()),
+                    )
+                    .await;
+                    return match timed {
+                        Ok(Ok(stream)) => {
+                            let mut st = state.lock().unwrap();
+                            let h = &mut st.health[i];
+                            if !h.unproven {
+                                h.ks.on_event(Event::ChannelUp);
+                                h.last_fail = None;
+                            }
+                            Ok(Box::new(stream) as BoxCarrier)
+                        }
+                        Ok(Err(e)) => Err(std::io::Error::other(e.0)),
+                        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+                    };
                 }
                 // The exit's smoothed RTT, copied out so the race does not
                 // hold the state lock. Unknown until the first control PING.
@@ -1009,19 +1045,15 @@ impl KernelDialer {
                                     (Ok(Box::new(stream) as BoxCarrier), loser)
                                 }
                                 Err(e) => {
-                                    if report {
-                                        mark_failed(h);
-                                        eprintln!("segue-kernel: carrier {carrier} failed: {e}");
-                                    }
+                                    mark_failed(h);
+                                    eprintln!("segue-kernel: carrier {carrier} failed: {e}");
                                     (Err(std::io::Error::other(e.0)), loser)
                                 }
                             }
                         }
                         Err(_) => {
-                            if report {
-                                mark_failed(h);
-                                eprintln!("segue-kernel: carrier {carrier} timed out");
-                            }
+                            mark_failed(h);
+                            eprintln!("segue-kernel: carrier {carrier} timed out");
                             (Err(std::io::ErrorKind::TimedOut.into()), None)
                         }
                     }

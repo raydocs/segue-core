@@ -1166,11 +1166,11 @@ async fn accept_tcp(
                     action: "accepting on the impair TCP listener".to_owned(),
                     source,
                 })?;
-                shared.accepted.fetch_add(1, Ordering::Relaxed);
+                let idx = shared.accepted.fetch_add(1, Ordering::Relaxed);
                 let accepted_at = Instant::now();
                 let conn = ConnIn {
                     profile: shared.profile.clone(),
-                    seed: shared.seed,
+                    seed: connection_seed(shared.seed, idx),
                     tcp_loss: shared.tcp_loss,
                     bytes: Arc::clone(&shared.bytes),
                     plan: shared.plan.clone(),
@@ -1192,6 +1192,16 @@ struct ConnIn {
     bytes: Arc<RelayBytes>,
     plan: FaultPlan,
     accepted_at: Instant,
+}
+
+fn connection_seed(base_seed: u64, conn_index: u64) -> u64 {
+    if conn_index == 0 {
+        return base_seed;
+    }
+    let mut z = base_seed ^ conn_index.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 async fn relay_tcp_client(
@@ -2745,5 +2755,16 @@ mod tests {
             ["--listen", "127.0.0.1:1080", "--upstream", "127.0.0.1:9000"].map(str::to_owned);
         let options = parse_impair_args(&args).unwrap();
         assert_eq!(options.faults, FaultSchedule::default());
+    }
+
+    #[test]
+    fn connection_seed_preserves_first_and_decorrelates_additional_connections() {
+        let s0 = connection_seed(7, 0);
+        let s1 = connection_seed(7, 1);
+        let s2 = connection_seed(7, 2);
+        assert_eq!(s0, 7);
+        assert_ne!(s0, s1);
+        assert_ne!(s1, s2);
+        assert_ne!(s0, s2);
     }
 }

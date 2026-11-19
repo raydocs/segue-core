@@ -214,6 +214,7 @@ impl Relay {
         scfg.limits.replay_cap = self.cfg.limits.replay_cap;
         scfg.timing.site_flush_idle = self.cfg.limits.site_flush_idle;
         scfg.timing.site_flush_max = self.cfg.limits.site_flush_max;
+        scfg.redundancy = self.cfg.redundancy;
         let auth = TicketAuth {
             verifier: self.verifier.clone(),
             revoked: self.revoked.clone(),

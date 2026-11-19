@@ -20,7 +20,7 @@ use crate::codec::{
     code, Frame, Kind, Open, RedundantAttach, Reject, Resume, Secret, SessionId, Target,
     MAX_PAYLOAD, STALL_MS_MAX, VERSION,
 };
-use crate::flow::{RecvHalf, SendHalf};
+use crate::flow::{DupQueue, RecvHalf, SendHalf, SentFrame};
 use crate::park::{ParkDecision, ParkTracker};
 use crate::pool::Pool;
 use crate::quality::QualityEvent;
@@ -169,6 +169,8 @@ enum TxNext {
     Hello,
     /// REDUNDANT_ATTACH, the only frame written before REDUNDANT_OK.
     RedundantHello,
+    RedundantRst(u8),
+    RedundantDup(u64, usize),
     Frame(Frame),
     Send,
 }
@@ -186,10 +188,21 @@ struct RedundantCarrier {
     /// per-session heap budget.
     hello: bool,
     /// Set when this carrier was the current one and a stall demoted it.
-    /// `None` for a spare opened with `REDUNDANT_ATTACH`.
+    /// Cleared immediately when any valid frame arrives on this carrier once
+    /// bound.
     demoted_at: Option<Instant>,
-    /// A frame arrived after [`Self::demoted_at`].
-    rx_since_demote: bool,
+    /// Last TX or RX timestamp on this carrier (for AI idle keepalive).
+    last_activity: Instant,
+    /// Last RX timestamp when this bound spare delivered end-to-end progress.
+    progressed_at: Option<Instant>,
+    /// Mirrored `ACK` owed on this bound spare.
+    ack_due: bool,
+    /// Mirrored `FIN` offset owed on this bound spare.
+    fin_due: Option<u64>,
+    /// Mirrored `RST` code owed on this bound spare on local reset/fatal.
+    rst_due: Option<u8>,
+    /// Contiguous-prefix delayed duplicate queue for Stage 2 small `DATA`.
+    dup: DupQueue,
 }
 
 pub struct ClientSession {
@@ -215,7 +228,7 @@ pub struct ClientSession {
     promoted_in_gen: bool,
     /// The current carrier's OPEN/RESUME has been answered.
     confirmed: bool,
-    hello: Option<Frame>,
+    hello: Option<Box<Frame>>,
     rst: Option<u8>,
     need_attach: bool,
     abandoned: Vec<CarrierId>,
@@ -262,8 +275,9 @@ pub struct ClientSession {
     send: SendHalf,
     recv: RecvHalf,
     park: ParkTracker,
-    /// Why carriers were given up, and what a move cost.
-    moves: MoveStats,
+    /// Why carriers were given up, and what a move cost (boxed lazily so an
+    /// idle steady-state session allocates nothing).
+    moves: Option<Box<MoveStats>>,
     /// When the current loss started, until the next byte of progress.
     /// The first loss wins if another happens before progress.
     loss_at: Option<Instant>,
@@ -314,7 +328,8 @@ impl ClientSession {
         secret: Secret,
         now: Instant,
     ) -> Option<Self> {
-        let recv = RecvHalf::new(pool, &cfg.limits, &cfg.timing, now)?;
+        let idle = cfg.timing.idle_after_for(params.exit_class);
+        let recv = RecvHalf::new_with_idle(pool, &cfg.limits, &cfg.timing, idle, now)?;
         let send = SendHalf::new(pool, &cfg.limits)?;
         Some(Self {
             backoff: std::time::Duration::from_millis(200),
@@ -358,7 +373,7 @@ impl ClientSession {
             send,
             recv,
             park: ParkTracker::default(),
-            moves: MoveStats::default(),
+            moves: None,
             loss_at: None,
             stall_hint: false,
             spare_dropped_for_move: false,
@@ -428,6 +443,7 @@ impl ClientSession {
             return;
         }
         self.want_redundant = false;
+        let acked = self.send.acked();
         self.redundant = Some(Box::new(RedundantCarrier {
             cid,
             gen: self.gen,
@@ -435,7 +451,12 @@ impl ClientSession {
             started: now,
             hello: true,
             demoted_at: None,
-            rx_since_demote: false,
+            last_activity: now,
+            progressed_at: None,
+            ack_due: false,
+            fin_due: None,
+            rst_due: None,
+            dup: DupQueue::new(acked),
         }));
     }
 
@@ -472,10 +493,10 @@ impl ClientSession {
         std::mem::take(&mut self.spare_dropped_for_move)
     }
 
-    /// How long unacked silence, and a relay `STALL`, wait before this
-    /// carrier is given up. An AI session uses `t_stall_ai` whether or not
-    /// a spare is bound (a spare is swapped, no spare re-attaches). Every
-    /// other session uses `t_stall`.
+    /// How long unacked silence, a blackholed downlink with spare progress,
+    /// and a relay `STALL` wait before this carrier is given up. An AI
+    /// session uses `t_stall_ai` whether or not a spare is bound; every other
+    /// session uses `t_stall`.
     fn stall_limit(&self) -> std::time::Duration {
         if self.params.exit_class == crate::EXIT_CLASS_AI {
             self.cfg.timing.t_stall_ai
@@ -489,13 +510,13 @@ impl ClientSession {
     /// unacked uplink from the last acknowledged offset. Not a RESUME, so
     /// it does not count against [`MAX_FRUITLESS`] and reports no failure.
     ///
-    /// `demote_old` is a stall (client `t_stall`, a `STALL` hint, a transport
-    /// hold). The carrier left stays open and becomes the spare: if it
-    /// receives a frame it can be swapped back, with no dial. A hard loss
-    /// passes `false` and the carrier left is closed. Returns false when no
-    /// spare is bound, or when `demote_old` and that spare was itself demoted
-    /// and has received nothing since: neither carrier moved, and the caller
-    /// re-attaches with RESUME. No frame is sent to announce the promotion.
+    /// `demote_old` is a stall (client `t_stall`, a `STALL` hint). The carrier
+    /// left stays open and becomes the spare: once it receives a frame it
+    /// becomes a live standby again and can swap back with no dial. A hard
+    /// loss (close, I/O error, or transport hold) passes `false` and closes the
+    /// carrier left. Returns false when no spare is bound, or when
+    /// `demote_old` and that spare was itself demoted and has received
+    /// nothing since.
     fn promote_redundant(&mut self, now: Instant, demote_old: bool) -> bool {
         if !self.redundant_bound() {
             return false;
@@ -504,13 +525,14 @@ impl ClientSession {
             && self
                 .redundant
                 .as_ref()
-                .is_some_and(|r| r.demoted_at.is_some() && !r.rx_since_demote)
+                .is_some_and(|r| r.demoted_at.is_some())
         {
             return false;
         }
         let Some(r) = self.redundant.take() else {
             return false;
         };
+        let acked = self.send.acked();
         if let Some(old) = self.carrier {
             if old != r.cid {
                 if demote_old {
@@ -521,7 +543,12 @@ impl ClientSession {
                         started: now,
                         hello: false,
                         demoted_at: Some(now),
-                        rx_since_demote: false,
+                        last_activity: now,
+                        progressed_at: None,
+                        ack_due: false,
+                        fin_due: None,
+                        rst_due: None,
+                        dup: DupQueue::new(acked),
                     }));
                 } else {
                     self.abandoned.push(old);
@@ -538,12 +565,12 @@ impl ClientSession {
         self.detached_since = None;
         self.rx_partial = false;
         self.ka_due = false;
+        self.stall_hint = false;
         self.last_rx = now;
         self.promoted_in_gen = true;
         // This carrier has not moved data yet. The one that died is not
         // charged: a live spare means the path did not fail.
         self.progressed = false;
-        let acked = self.send.acked();
         let replayed = self.send.sent_hw().saturating_sub(acked);
         let max = self.send.peer_max();
         let _ = self.send.rewind(acked, max);
@@ -594,6 +621,7 @@ impl ClientSession {
         // the old generation; keeping it would make that generation
         // ambiguous, so it is dropped (rule 6).
         self.promoted_in_gen = false;
+        self.stall_hint = false;
         if self.carrier != Some(cid) {
             self.drop_spare_for_move();
         }
@@ -639,8 +667,11 @@ impl ClientSession {
             let sent_hw = self.send.sent_hw();
             let sent = sent_hw.saturating_sub(self.quality_sent);
             let replayed = sent_hw.saturating_sub(self.send.acked());
-            self.moves.resumes = self.moves.resumes.saturating_add(1);
-            self.moves.bytes_replayed = self.moves.bytes_replayed.saturating_add(replayed);
+            {
+                let m = self.moves_mut();
+                m.resumes = m.resumes.saturating_add(1);
+                m.bytes_replayed = m.bytes_replayed.saturating_add(replayed);
+            }
             if sent > 0 || replayed > 0 {
                 self.quality = Some(QualityEvent::Replay { sent, replayed });
                 self.quality_sent = sent_hw;
@@ -659,7 +690,7 @@ impl ClientSession {
             })
         };
         self.attached_once = true;
-        self.hello = Some(hello);
+        self.hello = Some(Box::new(hello));
     }
 
     fn open_frame(&self, retry: bool, first_data: Vec<u8>) -> Open {
@@ -721,6 +752,7 @@ impl ClientSession {
         }
         // Same as [`attach`](Self::attach): a move drops the spare.
         self.promoted_in_gen = false;
+        self.stall_hint = false;
         self.drop_spare_for_move();
         if let Some(old) = self.carrier.take() {
             self.abandoned.push(old);
@@ -793,12 +825,7 @@ impl ClientSession {
     /// driver's reader reports it, rate-limited), the last of them read at
     /// `rx_at`; or such a frame is here and waits for local memory: the
     /// relay and the path are alive, only slow, so the carrier is not
-    /// stalled (r8 N5). The session repeats its current ACK (no offset
-    /// moves; at most once per keepalive period) so the relay's `t_live`
-    /// sees the same. Only bytes that arrived count, never bytes this side
-    /// wrote, and as path liveness ([`Health::Alive`]) only at `rx_at`: a
-    /// local wait repeats the report with the same `rx_at`, which is no
-    /// new evidence (r12 #1).
+    /// stalled (r8 N5).
     pub fn on_carrier_progress(&mut self, cid: CarrierId, rx_at: Instant, now: Instant) {
         if self.carrier != Some(cid) || self.is_closed() {
             return;
@@ -834,33 +861,31 @@ impl ClientSession {
         (self.stall_limit() / 2).max(std::time::Duration::from_millis(10))
     }
 
-    /// Carriers lost in a row with something expected on them and nothing
-    /// moved (see [`MAX_FRUITLESS`]).
-    pub fn fruitless_carriers(&self) -> u32 {
-        self.fruitless
-    }
-
     /// Why this session has given carriers up, and what the moves cost.
     /// A copy; nothing is cleared.
     pub fn move_stats(&self) -> MoveStats {
+        self.moves.as_deref().copied().unwrap_or_default()
+    }
+
+    fn moves_mut(&mut self) -> &mut MoveStats {
         self.moves
+            .get_or_insert_with(|| Box::new(MoveStats::default()))
     }
 
     fn bump(&mut self, reason: MoveReason) {
+        let m = self.moves_mut();
         let slot = match reason {
-            MoveReason::Stall => &mut self.moves.stall,
-            MoveReason::Hold => &mut self.moves.hold,
-            MoveReason::RelayStall => &mut self.moves.relay_stall,
-            MoveReason::Closed => &mut self.moves.closed,
-            MoveReason::Io => &mut self.moves.io,
-            MoveReason::Reject => &mut self.moves.reject,
-            MoveReason::Attach => &mut self.moves.attach,
+            MoveReason::Stall => &mut m.stall,
+            MoveReason::Hold => &mut m.hold,
+            MoveReason::RelayStall => &mut m.relay_stall,
+            MoveReason::Closed => &mut m.closed,
+            MoveReason::Io => &mut m.io,
+            MoveReason::Reject => &mut m.reject,
+            MoveReason::Attach => &mut m.attach,
         };
         *slot = slot.saturating_add(1);
     }
 
-    /// Count `reason` and start the recovery clock if one is not already
-    /// running. A session that has already ended counts nothing.
     fn note_move(&mut self, reason: MoveReason, now: Instant) {
         if self.is_closed() {
             return;
@@ -872,11 +897,12 @@ impl ClientSession {
     }
 
     fn note_promotion(&mut self, swapped: bool, replayed: u64) {
-        self.moves.promotions = self.moves.promotions.saturating_add(1);
+        let m = self.moves_mut();
+        m.promotions = m.promotions.saturating_add(1);
         if swapped {
-            self.moves.swaps = self.moves.swaps.saturating_add(1);
+            m.swaps = m.swaps.saturating_add(1);
         }
-        self.moves.bytes_replayed = self.moves.bytes_replayed.saturating_add(replayed);
+        m.bytes_replayed = m.bytes_replayed.saturating_add(replayed);
     }
 
     fn note_recovery(&mut self, now: Instant) {
@@ -884,11 +910,18 @@ impl ClientSession {
             return;
         };
         let us = u64::try_from(now.saturating_duration_since(at).as_micros()).unwrap_or(u64::MAX);
-        self.moves.recovery_us_sum = self.moves.recovery_us_sum.saturating_add(us);
-        if us > self.moves.recovery_us_max {
-            self.moves.recovery_us_max = us;
+        let m = self.moves_mut();
+        m.recovery_us_sum = m.recovery_us_sum.saturating_add(us);
+        if us > m.recovery_us_max {
+            m.recovery_us_max = us;
         }
-        self.moves.recoveries = self.moves.recoveries.saturating_add(1);
+        m.recoveries = m.recoveries.saturating_add(1);
+    }
+
+    /// Carriers lost in a row with something expected on them and nothing
+    /// moved (see [`MAX_FRUITLESS`]).
+    pub fn fruitless_carriers(&self) -> u32 {
+        self.fruitless
     }
 
     /// The latest [`Health`] report since the last call.
@@ -976,28 +1009,18 @@ impl ClientSession {
         self.carrier_gone(cid, now, MoveReason::Hold);
     }
 
-    /// A write on carrier `cid` failed. A hard loss, the same as a close,
-    /// counted apart from EOF so a stall can be told from a broken write.
+    /// A write on carrier `cid` failed. A hard loss, counted apart from EOF
+    /// so a stall can be told from a broken write.
     pub fn on_carrier_io(&mut self, cid: CarrierId, now: Instant) {
         self.carrier_gone(cid, now, MoveReason::Io);
     }
 
     fn carrier_gone(&mut self, cid: CarrierId, now: Instant, reason: MoveReason) {
         let stuck = reason == MoveReason::Hold;
-        // The spare dying (closed, stuck) drops only that carrier: no
-        // re-attach, no [`MAX_FRUITLESS`] count, no health or quality event.
-        // A stall demotion leaves the old carrier here; a transport hold that
-        // is still reporting it is not a new failure. It stays until
-        // `t_detached_standby` with no frame. A hard close still drops it.
+        // Any hard failure on the spare (close, I/O error, transport hold)
+        // drops only that carrier, even if it was previously demoted by a
+        // stall: keeping a hung writer/hold carrier leaves tx_slot stuck.
         if self.redundant.as_ref().is_some_and(|r| r.cid == cid) {
-            if stuck
-                && self
-                    .redundant
-                    .as_ref()
-                    .is_some_and(|r| r.demoted_at.is_some())
-            {
-                return;
-            }
             self.drop_redundant();
             return;
         }
@@ -1006,24 +1029,17 @@ impl ClientSession {
         }
         // The peer holds everything it needs: our whole upload is
         // acknowledged and its FIN is acknowledged by us, so no new
-        // carrier can ever move a byte for this session — a carrier
-        // closing now is the peer's own clean end of it (§5.1 "通道判死"
-        // does not apply: the path is not being judged, the session is
-        // over). The session ends locally once the app has taken what is
-        // buffered ([`Self::check_done`]); redialling here could only
-        // fetch the peer's tombstone, and did so on a loaded machine
-        // whenever the app drained slower than the peer's final frames.
+        // carrier can ever move a byte for this session.
         if self.send.done() && self.recv.fin_acked() {
             self.carrier = None;
             self.drop_redundant();
             return;
         }
-        // A bound spare becomes the current carrier. A stall demotes the
-        // one that stuck; a hard close drops it. An unbound spare is
-        // dropped; the session re-attaches the ordinary way. A session that
-        // has already ended (a decode error closed it) is not a new move.
+        // A bound spare becomes the current carrier. Hard losses (close,
+        // I/O error, or transport hold) close the carrier left rather than
+        // demoting it; only stalls (`t_stall`/`STALL`) demote.
         self.note_move(reason, now);
-        if self.promote_redundant(now, stuck) {
+        if self.promote_redundant(now, false) {
             return;
         }
         self.drop_spare_for_move();
@@ -1049,7 +1065,17 @@ impl ClientSession {
             self.need_attach = false;
             self.hello = None;
             self.want_redundant = false;
-            self.drop_redundant();
+            let rst = self.rst;
+            let acked = self.send.acked();
+            if let (Some(code), Some(r)) = (rst, self.redundant.as_mut().filter(|r| r.bound)) {
+                r.hello = false;
+                r.ack_due = false;
+                r.fin_due = None;
+                r.dup.drop_due(acked);
+                r.rst_due = Some(code);
+            } else {
+                self.drop_redundant();
+            }
         }
     }
 
@@ -1131,31 +1157,67 @@ impl ClientSession {
     /// are free). Anything that fails parsing of the stream, a REJECT, or
     /// a generation mismatch drops only this carrier.
     fn on_redundant(&mut self, frame: Frame, now: Instant) -> Result<(), ProtoError> {
-        if let Some(r) = self.redundant.as_mut() {
-            if r.demoted_at.is_some() {
-                r.rx_since_demote = true;
-            }
-        }
-        let bound = self.redundant_bound();
         let gen = self.redundant.as_ref().map(|r| r.gen);
-        match frame {
-            Frame::RedundantOk(ok) => {
-                if gen == Some(ok.attach_gen) && !bound {
-                    if let Some(r) = self.redundant.as_mut() {
-                        r.bound = true;
-                        r.hello = false;
-                    }
-                    // The relay's snapshot. Never fatal: the spare is optional.
-                    let _ = self.send.on_ack(ok.recv_offset, ok.max_offset);
-                } else {
-                    self.drop_redundant();
+        if let Frame::RedundantOk(ok) = frame {
+            let bound = self.redundant_bound();
+            if gen == Some(ok.attach_gen) && !bound {
+                if let Some(r) = self.redundant.as_mut() {
+                    r.bound = true;
+                    r.hello = false;
+                    r.demoted_at = None;
+                    r.last_activity = now;
                 }
+                // The relay's snapshot. Never fatal: the spare is optional.
+                let _ = self.send.on_ack(ok.recv_offset, ok.max_offset);
+                let acked = self.send.acked();
+                let cursor = self.send.cursor();
+                let fin_in_flight = self
+                    .send
+                    .fin_offset()
+                    .filter(|&f| self.send.sent_hw() > f && !self.send.done());
+                let dup_delay = self.cfg.redundancy.dup_delay_for(self.params.exit_class);
+                let max_dup = self.cfg.redundancy.max_frame_bytes;
+                if let Some(r) = self.redundant.as_mut() {
+                    r.dup.reset(acked);
+                    if cursor > acked {
+                        if let Some(delay) = dup_delay {
+                            r.dup.seed_inflight(acked, cursor, max_dup, delay, now);
+                        }
+                    }
+                    r.fin_due = fin_in_flight;
+                }
+            } else {
+                self.drop_redundant();
             }
-            Frame::Reject(_) => self.drop_redundant(),
-            Frame::Rst { code } => self.close(CloseReason::Reset(code)),
-            Frame::Data { offset, data, .. } if bound => {
+            return Ok(());
+        }
+        match &frame {
+            Frame::Reject(_) => {
+                self.drop_redundant();
+                return Ok(());
+            }
+            Frame::Rst { code } => {
+                self.close(CloseReason::Reset(*code));
+                return Ok(());
+            }
+            _ => {}
+        }
+        let Some(r) = self.redundant.as_mut().filter(|r| r.bound) else {
+            return Ok(());
+        };
+        r.demoted_at = None;
+        r.last_activity = now;
+        match frame {
+            Frame::Data { offset, data, .. } => {
+                if offset > self.recv.recv_offset() {
+                    return Ok(());
+                }
                 if let Ok(n) = self.recv.on_data(offset, &data, now) {
                     if n > 0 {
+                        if let Some(r) = self.redundant.as_mut() {
+                            r.progressed_at = Some(now);
+                            r.ack_due = true;
+                        }
                         self.made_progress(now);
                     }
                 }
@@ -1164,13 +1226,34 @@ impl ClientSession {
             Frame::Ack {
                 recv_offset,
                 max_offset,
-            } if bound => {
+            } => {
                 if self.send.on_ack(recv_offset, max_offset).ok() == Some(true) {
+                    let acked = self.send.acked();
+                    if let Some(r) = self.redundant.as_mut() {
+                        r.dup.prune_acked(acked);
+                        r.progressed_at = Some(now);
+                    }
                     self.made_progress(now);
+                    self.check_done();
                 }
             }
-            Frame::Fin { offset } if bound && self.recv.on_fin(offset, now).is_ok() => {
-                self.check_done();
+            Frame::Fin { offset } => {
+                if offset > self.recv.recv_offset() {
+                    return Ok(());
+                }
+                let was_fin = self.recv.fin_received();
+                if self.recv.on_fin(offset, now).is_ok() {
+                    if let Some(r) = self.redundant.as_mut() {
+                        if !was_fin {
+                            r.progressed_at = Some(now);
+                        }
+                        r.ack_due = true;
+                    }
+                    if !was_fin {
+                        self.made_progress(now);
+                    }
+                    self.check_done();
+                }
             }
             _ => {}
         }
@@ -1260,6 +1343,9 @@ impl ClientSession {
             Frame::RedundantOk(_) | Frame::RedundantAttach(_) => {}
             Frame::Pad(_) | Frame::Dgram { .. } => {}
             Frame::Data { offset, data, .. } if self.confirmed => {
+                if self.promoted_in_gen && offset > self.recv.recv_offset() {
+                    return Ok(());
+                }
                 if self.recv.on_data(offset, &data, now)? > 0 {
                     self.made_progress(now);
                 }
@@ -1269,10 +1355,19 @@ impl ClientSession {
                 max_offset,
             } if self.confirmed => {
                 if self.send.on_ack(recv_offset, max_offset)? {
+                    let acked = self.send.acked();
+                    if let Some(r) = self.redundant.as_mut() {
+                        r.dup.prune_acked(acked);
+                    }
                     self.made_progress(now);
                 }
             }
-            Frame::Fin { offset } if self.confirmed => self.recv.on_fin(offset, now)?,
+            Frame::Fin { offset } if self.confirmed => {
+                if self.promoted_in_gen && offset > self.recv.recv_offset() {
+                    return Ok(());
+                }
+                self.recv.on_fin(offset, now)?;
+            }
             _ => return Err(ProtoError::Violation("unexpected frame on session carrier")),
         }
         Ok(())
@@ -1331,14 +1426,90 @@ impl ClientSession {
         }
     }
 
+    fn mirror_primary_send(&mut self, meta: SentFrame, now: Instant) {
+        let Some(r) = self
+            .redundant
+            .as_mut()
+            .filter(|r| r.bound && r.demoted_at.is_none())
+        else {
+            return;
+        };
+        match meta {
+            SentFrame::Fin(offset) => r.fin_due = Some(offset),
+            SentFrame::Data { offset, len } => {
+                if let Some(delay) = self.cfg.redundancy.dup_delay_for(self.params.exit_class) {
+                    r.dup.on_primary_data(
+                        self.send.acked(),
+                        offset,
+                        len,
+                        self.cfg.redundancy.max_frame_bytes,
+                        delay,
+                        now,
+                    );
+                }
+            }
+        }
+    }
+
+    fn redundant_next_tx(&mut self, now: Instant) -> Option<TxNext> {
+        let closed = self.is_closed();
+        let acked = self.send.acked();
+        let recv_offset = self.recv.recv_offset();
+        let max_offset = self.recv.max_offset();
+        let r = self.redundant.as_mut()?;
+        if r.hello {
+            return Some(TxNext::RedundantHello);
+        }
+        if let Some(code) = r.rst_due {
+            return Some(TxNext::RedundantRst(code));
+        }
+        if closed || !r.bound {
+            return None;
+        }
+        if r.ack_due {
+            r.ack_due = false;
+            return Some(TxNext::Frame(Frame::Ack {
+                recv_offset,
+                max_offset,
+            }));
+        }
+        r.dup.prune_acked(acked);
+        if let Some(offset) = r.fin_due {
+            if acked > offset {
+                r.fin_due = None;
+            } else if acked == offset {
+                r.fin_due = None;
+                return Some(TxNext::Frame(Frame::Fin { offset }));
+            }
+        }
+        r.dup
+            .peek_due(now)
+            .map(|(offset, len)| TxNext::RedundantDup(offset, len))
+    }
+
+    /// `true` while the spare carrier still needs to send `REDUNDANT_ATTACH`
+    /// (never shed under elastic pressure).
+    pub fn is_redundant_hello(&self) -> bool {
+        self.redundant.as_ref().is_some_and(|r| r.hello)
+    }
+
+    /// Drop queued Stage 2 duplicates and mirrored control frames on the spare
+    /// carrier when its writer queue or the elastic pool is busy. Preserves
+    /// `REDUNDANT_ATTACH` and terminal `RST`.
+    pub fn skip_redundant_tx(&mut self, now: Instant) {
+        let acked = self.send.acked();
+        if let Some(r) = self.redundant.as_mut() {
+            r.dup.drop_due(acked);
+            r.ack_due = false;
+            r.fin_due = None;
+            r.last_activity = now;
+        }
+    }
+
     /// What goes out next on carrier `cid`.
     fn next_tx(&mut self, cid: CarrierId, now: Instant) -> Option<TxNext> {
         if self.redundant.as_ref().is_some_and(|r| r.cid == cid) {
-            return self
-                .redundant
-                .as_ref()
-                .filter(|r| r.hello)
-                .map(|_| TxNext::RedundantHello);
+            return self.redundant_next_tx(now);
         }
         if self.carrier != Some(cid) {
             return None;
@@ -1361,6 +1532,13 @@ impl ClientSession {
             let piggyback = self.send.has_sendable();
             if let Some(ack) = self.recv.poll_ack(now, piggyback) {
                 self.ka_due = false;
+                if let Some(r) = self
+                    .redundant
+                    .as_mut()
+                    .filter(|r| r.bound && r.demoted_at.is_none())
+                {
+                    r.ack_due = true;
+                }
                 self.check_done();
                 return Some(TxNext::Frame(ack));
             }
@@ -1376,7 +1554,16 @@ impl ClientSession {
     /// frame now (so a driver only takes memory for one when it would).
     pub fn has_transmit(&self, cid: CarrierId, now: Instant) -> bool {
         if self.redundant.as_ref().is_some_and(|r| r.cid == cid) {
-            return self.redundant.as_ref().is_some_and(|r| r.hello);
+            let acked = self.send.acked();
+            return self.redundant.as_ref().is_some_and(|r| {
+                r.hello
+                    || r.rst_due.is_some()
+                    || (!self.is_closed()
+                        && r.bound
+                        && (r.ack_due
+                            || r.fin_due.is_some_and(|off| acked == off)
+                            || r.dup.has_due_unacked(acked, now)))
+            });
         }
         if self.carrier != Some(cid) {
             return false;
@@ -1399,8 +1586,12 @@ impl ClientSession {
     /// Next frame for carrier `cid`, if any.
     pub fn poll_transmit(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
         let f = self.poll_transmit_inner(cid, now);
-        if f.is_some() && self.carrier == Some(cid) {
-            self.last_sent = now;
+        if f.is_some() {
+            if self.carrier == Some(cid) {
+                self.last_sent = now;
+            } else if let Some(r) = self.redundant.as_mut().filter(|r| r.cid == cid) {
+                r.last_activity = now;
+            }
         }
         f
     }
@@ -1408,7 +1599,7 @@ impl ClientSession {
     fn poll_transmit_inner(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
         match self.next_tx(cid, now)? {
             TxNext::Hello => {
-                let mut h = self.hello.take().expect("checked");
+                let mut h = *self.hello.take().expect("checked");
                 if let Frame::Open(o) = &mut h {
                     o.first_data = self.send.first_data(self.hello_first).concat();
                 }
@@ -1421,8 +1612,22 @@ impl ClientSession {
                 }
                 Some(self.redundant_attach_frame(gen))
             }
+            TxNext::RedundantRst(code) => {
+                self.drop_redundant();
+                Some(Frame::Rst { code })
+            }
+            TxNext::RedundantDup(offset, len) => {
+                if let Some(r) = self.redundant.as_mut() {
+                    r.dup.pop_due(now);
+                }
+                self.send.dup_frame(offset, len)
+            }
             TxNext::Frame(f) => Some(f),
-            TxNext::Send => self.send.poll_frame(),
+            TxNext::Send => {
+                let (f, meta) = self.send.poll_frame_meta()?;
+                self.mirror_primary_send(meta, now);
+                Some(f)
+            }
         }
     }
 
@@ -1438,8 +1643,12 @@ impl ClientSession {
         room: usize,
     ) -> Tx {
         let r = self.poll_transmit_into_inner(cid, now, out, room);
-        if r == Tx::Wrote && self.carrier == Some(cid) {
-            self.last_sent = now;
+        if r == Tx::Wrote {
+            if self.carrier == Some(cid) {
+                self.last_sent = now;
+            } else if let Some(red) = self.redundant.as_mut().filter(|red| red.cid == cid) {
+                red.last_activity = now;
+            }
         }
         r
     }
@@ -1454,7 +1663,7 @@ impl ClientSession {
         match self.next_tx(cid, now) {
             None => Tx::Idle,
             Some(TxNext::Hello) => {
-                let h = self.hello.as_ref().expect("checked");
+                let h = self.hello.as_deref().expect("checked");
                 let tail = match h {
                     Frame::Open(_) => self.send.first_data(self.hello_first),
                     _ => [&[][..], &[][..]],
@@ -1489,13 +1698,39 @@ impl ClientSession {
                 }
                 Tx::Wrote
             }
+            Some(TxNext::RedundantRst(code)) => {
+                let f = Frame::Rst { code };
+                let need = f.size_hint();
+                if need > room {
+                    return Tx::NeedRoom(need);
+                }
+                out.reserve_exact(need);
+                f.encode(out);
+                self.drop_redundant();
+                Tx::Wrote
+            }
+            Some(TxNext::RedundantDup(offset, len)) => {
+                let need = 18 + len;
+                if need > room {
+                    return Tx::NeedRoom(need);
+                }
+                if let Some(r) = self.redundant.as_mut() {
+                    r.dup.pop_due(now);
+                }
+                if self.send.dup_frame_into(out, room, offset, len) {
+                    Tx::Wrote
+                } else {
+                    Tx::Idle
+                }
+            }
             Some(TxNext::Frame(f)) => {
                 out.reserve_exact(f.size_hint());
                 f.encode(out);
                 Tx::Wrote
             }
             Some(TxNext::Send) => {
-                if self.send.poll_frame_into(out, room) {
+                if let Some(meta) = self.send.poll_frame_into_meta(out, room) {
+                    self.mirror_primary_send(meta, now);
                     Tx::Wrote
                 } else {
                     Tx::Idle
@@ -1534,11 +1769,26 @@ impl ClientSession {
         if self.carrier.is_some() && !self.confirmed {
             put(self.attach_started.map(|s| s + t.t_attach));
         }
+        let acked = self.send.acked();
+        let ka_ai = t.keepalive_ai_for(self.params.exit_class);
         if let Some(r) = &self.redundant {
             if !r.bound {
                 put(Some(r.started + t.t_attach));
-            } else if let Some(at) = r.demoted_at.filter(|_| !r.rx_since_demote) {
-                put(Some(at + t.t_detached_standby));
+            } else {
+                if let Some(at) = r.demoted_at {
+                    put(Some(at + t.t_detached_standby));
+                }
+                if self.confirmed && self.state == State::Active {
+                    if r.demoted_at.is_none() && r.progressed_at.is_some_and(|p| p > self.last_rx) {
+                        put(Some(self.last_rx + self.stall_limit()));
+                    }
+                    put(r.dup.next_due_unacked(acked));
+                    if !r.ack_due && r.rst_due.is_none() {
+                        if let Some(ka) = ka_ai {
+                            put(Some(r.last_activity + ka));
+                        }
+                    }
+                }
             }
         }
         if self.need_attach {
@@ -1551,6 +1801,11 @@ impl ClientSession {
             put(self.stall_hint_at());
             if writable {
                 put(self.recv.ack_deadline());
+                if self.state == State::Active && !self.ka_due {
+                    if let Some(ka) = ka_ai {
+                        put(Some(self.last_sent.max(self.last_rx) + ka));
+                    }
+                }
             }
         }
         put(self.recv.idle_deadline());
@@ -1599,7 +1854,7 @@ impl ClientSession {
         }
         if self.redundant.as_ref().is_some_and(|r| {
             r.demoted_at
-                .is_some_and(|at| !r.rx_since_demote && now >= at + t.t_detached_standby)
+                .is_some_and(|at| now >= at + t.t_detached_standby)
         }) {
             self.drop_redundant();
         }
@@ -1610,17 +1865,38 @@ impl ClientSession {
             self.act_on_stall(now);
         }
         let stall_limit = self.stall_limit();
-        if self.confirmed && self.send.unacked() && now >= self.last_rx + stall_limit {
-            // A bound spare becomes current. A stall keeps the old carrier
-            // as the spare. No RESUME, no failure report. A spare that was
-            // demoted and has been silent is not promoted: neither side
-            // moved, so this re-attaches. An AI session waits `t_stall_ai`
-            // (see [`Self::stall_limit`]) with or without a spare; a hard
-            // loss does not.
+        let spare_ahead = self.confirmed
+            && self.state == State::Active
+            && self.redundant.as_ref().is_some_and(|r| {
+                r.bound
+                    && r.demoted_at.is_none()
+                    && r.progressed_at.is_some_and(|p| p > self.last_rx)
+            });
+        // A bound spare becomes current. A stall keeps the old carrier as the
+        // spare. No RESUME, no failure report. A spare that was demoted and has
+        // been silent is not promoted: neither side moved, so this
+        // re-attaches. An AI session waits `t_stall_ai` (see [`Self::stall_limit`])
+        // with or without a spare; a hard loss does not.
+        if self.confirmed
+            && (self.send.unacked() || spare_ahead)
+            && now >= self.last_rx + stall_limit
+        {
             self.note_move(MoveReason::Stall, now);
             if !self.promote_redundant(now, true) {
                 self.carrier_lost(now, true);
                 self.move_carrier(now);
+            }
+        }
+        if self.confirmed && self.state == State::Active {
+            if let Some(ka_ai) = t.keepalive_ai_for(self.params.exit_class) {
+                if now >= self.last_sent.max(self.last_rx) + ka_ai {
+                    self.ka_due = true;
+                }
+                if let Some(r) = self.redundant.as_mut() {
+                    if r.bound && r.rst_due.is_none() && now >= r.last_activity + ka_ai {
+                        r.ack_due = true;
+                    }
+                }
             }
         }
         if self.recv.idle_deadline().is_some_and(|d| now >= d) {

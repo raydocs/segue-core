@@ -258,10 +258,9 @@ fn client_memory_is_bounded_by_the_pool_and_released_when_idle() {
     assert!(pool_used > POOL / 2, "pool barely used: {pool_used}");
     // The heap follows the pool: what the pool charges plus a fixed cost
     // per session (state, tasks, channels, small read buffers, this test's
-    // app task and its 4 KiB read buffer: 31.7–32.1 KiB measured with the
-    // redundant-carrier state, 31.3–31.6 KiB before it) — not a 64 KiB
-    // pipe, a 256 KiB window and 16 KiB buffers per session outside it.
-    const FIXED: isize = 34 * 1024;
+    // app task and its 4 KiB read buffer), restoring the pre-redundancy
+    // 32 KiB bound via boxed hello/moves/last_moves state.
+    const FIXED: isize = 32 * 1024;
     let bound = POOL as isize + SESSIONS as isize * FIXED;
     assert!(
         peak <= bound,

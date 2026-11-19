@@ -76,6 +76,11 @@ pub struct Timing {
     /// frame received, then it is dropped. A frame resets the wait: the
     /// carrier is a live standby again.
     pub t_detached_standby: Duration,
+    /// Both, AI sessions only: send a lightweight keepalive ACK when a live
+    /// carrier has had no traffic in either direction for this long, keeping
+    /// underlying Hysteria2/TUIC/HTTP2 carriers below their 30 s idle timeout
+    /// during long LLM thinking pauses. [`Duration::ZERO`] disables it.
+    pub t_keepalive_ai: Duration,
     /// Client: how long OPEN may be retried before the local connection is reset.
     pub t_open_retry: Duration,
     /// Relay: tombstone lifetime.
@@ -84,6 +89,9 @@ pub struct Timing {
     pub ack_delay: Duration,
     /// Receive credit falls back to the floor after this long without data.
     pub idle_after: Duration,
+    /// Receive credit retention across LLM thinking pauses on AI sessions
+    /// ([`EXIT_CLASS_AI`]) when the global pool is not under pressure.
+    pub idle_after_ai: Duration,
     /// Relay: absolute session lifetime from OPEN; RESUME does not extend
     /// it (§5.2 "会话超过最长寿命 → RST(max_lifetime)").
     pub max_lifetime: Duration,
@@ -161,6 +169,25 @@ impl Timing {
             self.t_detached
         }
     }
+
+    /// How long receive credit stays elevated without data for `exit_class`.
+    pub fn idle_after_for(&self, exit_class: u8) -> Duration {
+        if exit_class == EXIT_CLASS_AI {
+            self.idle_after_ai
+        } else {
+            self.idle_after
+        }
+    }
+
+    /// Carrier keepalive interval for an idle active session of `exit_class`,
+    /// or `None` when disabled.
+    pub fn keepalive_ai_for(&self, exit_class: u8) -> Option<Duration> {
+        if exit_class == EXIT_CLASS_AI && !self.t_keepalive_ai.is_zero() {
+            Some(self.t_keepalive_ai)
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for Timing {
@@ -174,10 +201,12 @@ impl Default for Timing {
             t_detached: Duration::from_secs(30),
             t_detached_ai: Duration::from_secs(150),
             t_detached_standby: Duration::from_secs(10),
+            t_keepalive_ai: Duration::from_secs(20),
             t_open_retry: Duration::from_secs(15),
             t_tomb: Duration::from_secs(60),
             ack_delay: Duration::from_millis(20),
             idle_after: Duration::from_secs(1),
+            idle_after_ai: Duration::from_secs(60),
             max_lifetime: Duration::from_secs(24 * 3600),
             t_ctrl_idle: Duration::from_secs(30),
             site_flush_idle: Duration::from_secs(30),
@@ -214,10 +243,65 @@ impl Default for Limits {
     }
 }
 
+/// Stage 2 small-frame duplication policy on a bound redundant carrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedundancyMode {
+    /// Stage 1 only: keep the standby bound and swap on stall, with no `DATA` duplication.
+    Off,
+    /// Staggered proactive duplication of small unacked frames (`<= max_frame_bytes`).
+    Dup { delay: Duration },
+    /// Delayed tail hedge when primary acknowledgement has not arrived after `delay`.
+    Hedge { delay: Duration },
+}
+
+impl Default for RedundancyMode {
+    fn default() -> Self {
+        Self::Dup {
+            delay: Duration::from_millis(30),
+        }
+    }
+}
+
+/// Configuration for Stage 2 small-frame redundancy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RedundancyConfig {
+    pub mode: RedundancyMode,
+    /// Maximum `DATA` payload length eligible for redundant queuing.
+    pub max_frame_bytes: usize,
+    /// When `true` (default), Stage 2 `DATA` duplication applies only to AI
+    /// sessions ([`EXIT_CLASS_AI`]).
+    pub ai_only: bool,
+}
+
+impl Default for RedundancyConfig {
+    fn default() -> Self {
+        Self {
+            mode: RedundancyMode::default(),
+            max_frame_bytes: 1024,
+            ai_only: true,
+        }
+    }
+}
+
+impl RedundancyConfig {
+    /// Delay before duplicating a small unacked frame for `exit_class`, or
+    /// `None` when Stage 2 `DATA` duplication is disabled for that class.
+    pub fn dup_delay_for(&self, exit_class: u8) -> Option<Duration> {
+        if self.ai_only && exit_class != EXIT_CLASS_AI {
+            return None;
+        }
+        match self.mode {
+            RedundancyMode::Off => None,
+            RedundancyMode::Dup { delay } | RedundancyMode::Hedge { delay } => Some(delay),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     pub timing: Timing,
     pub limits: Limits,
+    pub redundancy: RedundancyConfig,
 }
 
 /// Why the client gave up the carrier it was using.
@@ -278,7 +362,7 @@ pub struct MoveStats {
     pub recovery_us_max: u64,
     /// How many waits `recovery_us_sum` includes.
     pub recoveries: u64,
-    /// Relay: `t_live` fired, whether or not a spare was promoted.
+    /// Relay: `t_live` expiries, whether or not a spare was promoted.
     pub t_live: u64,
     /// Relay: `STALL` entries actually queued on a control stream.
     pub stall_hints: u64,

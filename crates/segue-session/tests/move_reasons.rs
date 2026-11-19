@@ -229,10 +229,16 @@ fn a_hold_swaps_and_a_close_promotes_without_a_swap() {
     let t0 = Instant::now();
     let mut held = with_unacked(t0);
     bind_spare(&mut held, t0);
+    // A transport hold hard-drops the stuck carrier rather than demoting it
+    // so a hung writer/hold carrier cannot stay in `redundant` holding `tx_slot`.
     held.on_carrier_stuck(1, t0);
     assert_eq!(held.carrier(), Some(2));
+    assert!(
+        held.redundant_carrier().is_none(),
+        "a transport hold drops the stuck carrier"
+    );
     assert_eq!(held.move_stats().hold, 1);
-    assert_eq!(held.move_stats().swaps, 1);
+    assert_eq!(held.move_stats().swaps, 0);
     assert_eq!(held.move_stats().promotions, 1);
     assert_eq!(held.move_stats().stall, 0);
 

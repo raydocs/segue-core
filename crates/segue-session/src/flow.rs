@@ -16,7 +16,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::codec::{max_data_len, Frame};
 use crate::pool::{Grant, Pool, Tier, BLOCK};
@@ -285,13 +285,21 @@ impl SendHalf {
 
     /// Next DATA or FIN for the current carrier, within the peer's window.
     pub fn poll_frame(&mut self) -> Option<Frame> {
+        self.poll_frame_meta().map(|(f, _)| f)
+    }
+
+    /// Next DATA or FIN plus metadata for Stage 2 standby duplication.
+    pub fn poll_frame_meta(&mut self) -> Option<(Frame, SentFrame)> {
         Some(match self.poll_next(usize::MAX)? {
-            Next::Data { offset, start, n } => Frame::Data {
-                offset,
-                data: self.buf.range(start..start + n).copied().collect(),
-                pad: 0,
-            },
-            Next::Fin(offset) => Frame::Fin { offset },
+            Next::Data { offset, start, n } => (
+                Frame::Data {
+                    offset,
+                    data: self.buf.range(start..start + n).copied().collect(),
+                    pad: 0,
+                },
+                SentFrame::Data { offset, len: n },
+            ),
+            Next::Fin(offset) => (Frame::Fin { offset }, SentFrame::Fin(offset)),
         })
     }
 
@@ -300,10 +308,16 @@ impl SendHalf {
     /// the wire buffer in one copy, and `out` grows exactly once (r6 N13).
     /// Returns whether a frame was written.
     pub fn poll_frame_into(&mut self, out: &mut Vec<u8>, room: usize) -> bool {
+        self.poll_frame_into_meta(out, room).is_some()
+    }
+
+    /// Like [`poll_frame_into`](Self::poll_frame_into), returning the emitted
+    /// frame metadata when a frame was written.
+    pub fn poll_frame_into_meta(&mut self, out: &mut Vec<u8>, room: usize) -> Option<SentFrame> {
         // Type, flags, length and offset varints: at most 18 bytes.
         let max = room.saturating_sub(18).max(1);
         match self.poll_next(max) {
-            None => false,
+            None => None,
             Some(Next::Data { offset, start, n }) => {
                 let f = Frame::Data {
                     offset,
@@ -312,13 +326,55 @@ impl SendHalf {
                 };
                 out.reserve_exact(6 + crate::codec::varint_len(offset) + n);
                 f.encode_with(out, deque_range(&self.buf, start, n));
-                true
+                Some(SentFrame::Data { offset, len: n })
             }
             Some(Next::Fin(offset)) => {
                 Frame::Fin { offset }.encode(out);
-                true
+                Some(SentFrame::Fin(offset))
             }
         }
+    }
+
+    fn dup_slice_bounds(&self, offset: u64, len: usize) -> Option<(u64, usize, usize)> {
+        let end = offset.checked_add(len as u64)?.min(self.data_end());
+        let start_off = offset.max(self.acked);
+        if start_off >= end {
+            return None;
+        }
+        let start = (start_off - self.acked) as usize;
+        let n = (end - start_off) as usize;
+        Some((start_off, start, n))
+    }
+
+    /// Materialize an unacked duplicate `DATA` frame from the replay buffer.
+    pub fn dup_frame(&self, offset: u64, len: usize) -> Option<Frame> {
+        let (start_off, start, n) = self.dup_slice_bounds(offset, len)?;
+        Some(Frame::Data {
+            offset: start_off,
+            data: self.buf.range(start..start + n).copied().collect(),
+            pad: 0,
+        })
+    }
+
+    /// Encode an unacked duplicate `DATA` frame straight from the replay
+    /// buffer into `out`, respecting `room` (single-copy path).
+    pub fn dup_frame_into(&self, out: &mut Vec<u8>, room: usize, offset: u64, len: usize) -> bool {
+        let Some((start_off, start, n)) = self.dup_slice_bounds(offset, len) else {
+            return false;
+        };
+        let max = room.saturating_sub(18);
+        let n = n.min(max);
+        if n == 0 {
+            return false;
+        }
+        let f = Frame::Data {
+            offset: start_off,
+            data: Vec::new(),
+            pad: 0,
+        };
+        out.reserve_exact(6 + crate::codec::varint_len(start_off) + n);
+        f.encode_with(out, deque_range(&self.buf, start, n));
+        true
     }
 
     /// Something could be sent now (window permitting).
@@ -343,9 +399,204 @@ impl SendHalf {
     }
 }
 
+/// Frame metadata returned by [`SendHalf::poll_frame_meta`] and
+/// [`SendHalf::poll_frame_into_meta`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SentFrame {
+    Data { offset: u64, len: usize },
+    Fin(u64),
+}
+
 enum Next {
     Data { offset: u64, start: usize, n: usize },
     Fin(u64),
+}
+
+/// Hard cap on pending Stage 2 duplicates per redundant carrier.
+const DUP_QUEUE_CAP: usize = 32;
+
+#[derive(Clone, Copy, Debug)]
+struct DupItem {
+    offset: u64,
+    len: u32,
+    due: Instant,
+}
+
+/// Per-spare queue of delayed small-frame `DATA` duplicates referencing slices
+/// in [`SendHalf`]'s replay buffer.
+///
+/// Tracks an active `bulk_barrier`: when a frame larger than `max_bytes` is
+/// transmitted on the primary carrier, `bulk_barrier` advances to its end so
+/// subsequent small frames wait until `acked >= bulk_barrier` instead of
+/// leaping ahead of unacked bulk bytes. Once cleared (or on a streaming link
+/// where small frames run ahead of `acked`), incoming small frames never wedge.
+#[derive(Clone, Debug)]
+pub struct DupQueue {
+    items: VecDeque<DupItem>,
+    bulk_barrier: u64,
+}
+
+impl DupQueue {
+    /// Start an empty queue anchored after `acked`.
+    pub fn new(_acked: u64) -> Self {
+        Self {
+            items: VecDeque::new(),
+            bulk_barrier: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn next_due(&self) -> Option<Instant> {
+        self.items.front().map(|it| it.due)
+    }
+
+    pub fn has_due(&self, now: Instant) -> bool {
+        self.items.front().is_some_and(|it| now >= it.due)
+    }
+
+    pub fn has_due_unacked(&self, acked: u64, now: Instant) -> bool {
+        self.items
+            .iter()
+            .any(|it| now >= it.due && it.offset.saturating_add(u64::from(it.len)) > acked)
+    }
+
+    pub fn next_due_unacked(&self, acked: u64) -> Option<Instant> {
+        self.items
+            .iter()
+            .find(|it| it.offset.saturating_add(u64::from(it.len)) > acked)
+            .map(|it| it.due)
+    }
+
+    pub fn peek_due(&self, now: Instant) -> Option<(u64, usize)> {
+        let it = self.items.front()?;
+        if now >= it.due {
+            Some((it.offset, it.len as usize))
+        } else {
+            None
+        }
+    }
+
+    pub fn pop_due(&mut self, now: Instant) -> Option<(u64, usize)> {
+        if !self.has_due(now) {
+            return None;
+        }
+        let it = self.items.pop_front()?;
+        Some((it.offset, it.len as usize))
+    }
+
+    /// Drop items already acknowledged by `acked` and clear `bulk_barrier` once
+    /// peer acknowledgement reaches or passes it.
+    pub fn prune_acked(&mut self, acked: u64) {
+        while self
+            .items
+            .front()
+            .is_some_and(|it| it.offset.saturating_add(u64::from(it.len)) <= acked)
+        {
+            self.items.pop_front();
+        }
+        if acked >= self.bulk_barrier {
+            self.bulk_barrier = 0;
+        }
+    }
+
+    /// Consider queuing a primary `DATA` frame `[offset, offset + len)` for
+    /// delayed standby transmission if it fits `max_bytes` and does not jump
+    /// past an unacked bulk frame (`bulk_barrier`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_primary_data(
+        &mut self,
+        acked: u64,
+        offset: u64,
+        len: usize,
+        max_bytes: usize,
+        delay: Duration,
+        now: Instant,
+    ) {
+        self.prune_acked(acked);
+        if len == 0 {
+            return;
+        }
+        let Some(end) = offset.checked_add(len as u64) else {
+            return;
+        };
+        if end <= acked {
+            return;
+        }
+        if len > max_bytes {
+            self.bulk_barrier = self.bulk_barrier.max(end);
+            return;
+        }
+        if acked < self.bulk_barrier {
+            return;
+        }
+        let start = offset.max(acked);
+        let Ok(slice_len) = u32::try_from(end - start) else {
+            return;
+        };
+        if self
+            .items
+            .back()
+            .is_some_and(|last| last.offset.saturating_add(u64::from(last.len)) >= end)
+        {
+            return;
+        }
+        if self.items.len() >= DUP_QUEUE_CAP {
+            self.items.pop_front();
+        }
+        self.items.push_back(DupItem {
+            offset: start,
+            len: slice_len,
+            due: now + delay,
+        });
+    }
+
+    /// Clear queued duplicates under writer/pool pressure without wedging
+    /// future small frames once pressure lifts.
+    pub fn drop_due(&mut self, acked: u64) {
+        self.items.clear();
+        if acked >= self.bulk_barrier {
+            self.bulk_barrier = 0;
+        }
+    }
+
+    /// Reset queue state cleanly on promotion or rebind.
+    pub fn reset(&mut self, _acked: u64) {
+        self.items.clear();
+        self.bulk_barrier = 0;
+    }
+
+    /// Seed small in-flight `[acked, cursor)` segments when a spare carrier binds.
+    /// Chunks up to `8 * max_bytes` into `max_bytes` slices so queued token bursts
+    /// survive a stalled primary dial; larger backlogs set `bulk_barrier` instead.
+    pub fn seed_inflight(
+        &mut self,
+        acked: u64,
+        cursor: u64,
+        max_bytes: usize,
+        delay: Duration,
+        now: Instant,
+    ) {
+        let in_flight = cursor.saturating_sub(acked);
+        if in_flight == 0 || max_bytes == 0 {
+            return;
+        }
+        let max_seed = (max_bytes as u64).saturating_mul(8);
+        if in_flight > max_seed {
+            self.bulk_barrier = self.bulk_barrier.max(cursor);
+            return;
+        }
+        let mut offset = acked;
+        while offset < cursor {
+            let chunk = usize::try_from(cursor - offset)
+                .unwrap_or(max_bytes)
+                .min(max_bytes);
+            self.on_primary_data(offset, acked, chunk, max_bytes, delay, now);
+            offset += chunk as u64;
+        }
+    }
 }
 
 /// `[start, start + n)` of `buf` as at most two slices.
@@ -542,8 +793,9 @@ pub struct RecvHalf {
     /// floor, whichever is larger, in whole blocks (as grants are taken).
     /// Any `Limits` keep the growth ledger consistent with it.
     grow_base: usize,
-    idle_after: std::time::Duration,
-    ack_delay: std::time::Duration,
+    idle_after: Duration,
+    pressure_idle_after: Duration,
+    ack_delay: Duration,
     last_ack: (u64, u64),
     pending_since: Option<Instant>,
     last_data: Instant,
@@ -553,6 +805,19 @@ impl RecvHalf {
     /// Takes the protocol's initial credit from the pool; `None` when the
     /// pool cannot cover it (→ `REJECT(capacity)` / local REFUSE).
     pub fn new(pool: &Arc<Pool>, limits: &Limits, timing: &Timing, now: Instant) -> Option<Self> {
+        Self::new_with_idle(pool, limits, timing, timing.idle_after, now)
+    }
+
+    /// Variant of [`Self::new`] overriding the idle window-retention bound
+    /// (for AI sessions using [`Timing::idle_after_ai`] while falling back to
+    /// [`Timing::idle_after`] when the global pool is under pressure).
+    pub fn new_with_idle(
+        pool: &Arc<Pool>,
+        limits: &Limits,
+        timing: &Timing,
+        idle_after: Duration,
+        now: Instant,
+    ) -> Option<Self> {
         let mut grant = Grant::new(pool, true);
         if !grant.try_resize(limits.initial_credit) {
             return None;
@@ -574,7 +839,8 @@ impl RecvHalf {
             grown: 0,
             grow_base: crate::pool::blocks_for(limits.initial_credit.max(limits.min_credit))
                 * BLOCK,
-            idle_after: timing.idle_after,
+            idle_after,
+            pressure_idle_after: timing.idle_after,
             ack_delay: timing.ack_delay,
             last_ack: (0, initial),
             pending_since: None,
@@ -716,8 +982,9 @@ impl RecvHalf {
         }
         self.now_hint = self.now_hint.max(now);
         let outstanding = (self.adv_max - self.consumed) as usize;
+        let idle_after = self.effective_idle_after();
         let active =
-            !self.buf.is_empty() || now.saturating_duration_since(self.last_data) < self.idle_after;
+            !self.buf.is_empty() || now.saturating_duration_since(self.last_data) < idle_after;
         if !active {
             self.win = self.win_init;
             self.est.restart(self.consumed, now);
@@ -859,6 +1126,14 @@ impl RecvHalf {
         self.est.new_path(self.consumed, now);
     }
 
+    fn effective_idle_after(&self) -> Duration {
+        if self.grant.pool().under_pressure() {
+            self.idle_after.min(self.pressure_idle_after)
+        } else {
+            self.idle_after
+        }
+    }
+
     /// Idle check for timeouts: lets credit fall back when no data arrives.
     pub fn idle_deadline(&self) -> Option<Instant> {
         // Buffered data keeps the flow active (`update_credit` would not
@@ -871,7 +1146,7 @@ impl RecvHalf {
         {
             return None;
         }
-        Some(self.last_data + self.idle_after)
+        Some(self.last_data + self.effective_idle_after())
     }
 }
 
@@ -1131,5 +1406,87 @@ mod tests {
         );
         assert_eq!(r.held_bytes(), 0);
         assert_eq!(pool.used_bytes(), s.grant_bytes() + r.grant_bytes());
+    }
+
+    #[test]
+    fn dup_queue_preserves_contiguous_prefix_and_resets_on_drop() {
+        let now = Instant::now();
+        let delay = Duration::from_millis(30);
+        let mut q = DupQueue::new(100);
+
+        // Small contiguous frames starting at acked=100 enqueue in order.
+        q.on_primary_data(100, 100, 128, 1024, delay, now);
+        q.on_primary_data(100, 228, 256, 1024, delay, now);
+        assert_eq!(q.peek_due(now), None);
+        assert_eq!(q.pop_due(now + delay), Some((100, 128)));
+
+        // A bulk frame > 1024 sets `bulk_barrier`; trailing small frames wait
+        // until peer ACK catches up past the bulk frame.
+        q.on_primary_data(100, 484, 4096, 1024, delay, now);
+        q.on_primary_data(100, 4580, 64, 1024, delay, now);
+        assert_eq!(q.pop_due(now + delay), Some((228, 256)));
+        assert!(q.is_empty());
+
+        // Once peer ACK passes 4580, small frames resume cleanly even when
+        // primary cursor is already ahead of `acked` (streaming RTT case).
+        q.on_primary_data(4580, 4610, 64, 1024, delay, now);
+        assert_eq!(q.peek_due(now + delay), Some((4610, 64)));
+
+        // Shedding via `drop_due(4580)` clears pending items without wedging
+        // future small frames sent ahead of `acked`.
+        q.drop_due(4580);
+        assert!(q.is_empty());
+        q.on_primary_data(4580, 4674, 64, 1024, delay, now);
+        assert_eq!(q.pop_due(now + delay), Some((4674, 64)));
+
+        // Exceeding `DUP_QUEUE_CAP` (32) evicts oldest and retains newest 32.
+        for i in 0..40u64 {
+            q.on_primary_data(4738, 4738 + i * 16, 16, 1024, delay, now);
+        }
+        let mut items = Vec::new();
+        while let Some(it) = q.pop_due(now + delay) {
+            items.push(it);
+        }
+        assert_eq!(items.len(), DUP_QUEUE_CAP);
+        assert_eq!(items.first().copied(), Some((4738 + 8 * 16, 16)));
+        assert_eq!(items.last().copied(), Some((4738 + 39 * 16, 16)));
+    }
+
+    #[test]
+    fn recv_ai_retains_window_until_idle_after_ai_or_pool_pressure() {
+        let pool = Pool::new(8 << 20);
+        let l = Limits::default();
+        let timing = Timing::default();
+        let mut t = Instant::now();
+        let mut s = SendHalf::new(&pool, &l).unwrap();
+        let mut r = RecvHalf::new_with_idle(&pool, &l, &timing, timing.idle_after_ai, t).unwrap();
+        let mut out = vec![0u8; 64 * 1024];
+        let mut sent = 0;
+        while sent < 256 * 1024 {
+            let cap = s.write_capacity_for(16 * 1024);
+            let n = s.write(&vec![5u8; cap.min(16 * 1024)]);
+            sent += n;
+            t += Duration::from_millis(1);
+            pump(&mut s, &mut r, t);
+            while r.read(&mut out, t) > 0 {}
+            pump(&mut s, &mut r, t);
+        }
+        let grown_win = r.target_window();
+        assert!(grown_win > l.initial_credit);
+
+        // After 10 s (< idle_after_ai = 60 s) with no pool pressure, the AI
+        // receive window remains elevated.
+        let idle_10s = t + Duration::from_secs(10);
+        r.update_credit(idle_10s);
+        assert_eq!(r.target_window(), grown_win);
+        assert_eq!(r.idle_deadline(), Some(t + timing.idle_after_ai));
+
+        // Putting the pool under pressure switches idle fallback back to 1 s
+        // so idle memory is returned immediately.
+        let _hog = Grant::between(&pool, 7 << 20, 7 << 20, Tier::Elastic);
+        assert!(pool.under_pressure());
+        assert_eq!(r.idle_deadline(), Some(t + timing.idle_after));
+        r.update_credit(idle_10s);
+        assert_eq!(r.target_window(), l.initial_credit);
     }
 }

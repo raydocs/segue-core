@@ -431,6 +431,7 @@ fn lab_full(
         Exit {
             name: "la".into(),
             carrier: "reality-la".into(),
+            redundant_carrier: None,
             relay: "127.0.0.1:7443".parse().unwrap(),
             node_id: 1,
             egress_group: String::new(),
@@ -438,6 +439,7 @@ fn lab_full(
         Exit {
             name: "ny".into(),
             carrier: "hy2-ny".into(),
+            redundant_carrier: None,
             relay: "127.0.0.1:7444".parse().unwrap(),
             node_id: 2,
             egress_group: String::new(),
@@ -2722,7 +2724,15 @@ async fn standby_backoff_resets_to_one_second_after_ten_seconds_bound() {
 /// and the replacement standby is dialled only after data has resumed.
 #[tokio::test(start_paused = true)]
 async fn ai_standby_promotes_without_waiting_for_a_dial() {
-    let l = lab_parts(Box::new(AllowAll), Some(endless_download()));
+    let mut off_cfg = Config::default();
+    off_cfg.redundancy.mode = segue_session::RedundancyMode::Off;
+    let l = lab_full(
+        Box::new(AllowAll),
+        Some(endless_download()),
+        off_cfg.clone(),
+        None,
+        Some(off_cfg),
+    );
     l.d.set_exit("la").unwrap();
     let mut s = l.d.dial(Some("ai"), &site(), 443).await.unwrap();
     let mut at = 0u64;
@@ -2827,4 +2837,110 @@ async fn no_standby_dials_while_disconnected_or_revoked() {
         "revoked session dialled a standby"
     );
     assert_eq!(l.d.status().revoked, Some(code::REVOKED));
+}
+
+/// Under default Stage 2 duplication, a blackholed primary carrier still
+/// delivers 1024-byte SSE tokens through the bound standby immediately (< 2 s)
+/// before the 5 s `t_live_ai` swap fires, then swaps once `5 s` elapses.
+#[tokio::test(start_paused = true)]
+async fn ai_stage2_dup_delivers_through_blackhole_immediately_then_swaps() {
+    let l = lab_parts(Box::new(AllowAll), Some(endless_download()));
+    l.d.set_exit("la").unwrap();
+    let mut s = l.d.dial(Some("ai"), &site(), 443).await.unwrap();
+    let mut at = 0u64;
+    read_pattern(&mut s, &mut at, 8192, Duration::from_secs(5)).await;
+    spin_until(|| {
+        l.d.standby_bound.load(Ordering::Relaxed) >= 1 && l.la_controls.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    {
+        let holes = l.la_holes.lock().unwrap();
+        for (hole, is_control, _) in holes.iter() {
+            if !is_control.load(Ordering::SeqCst) {
+                hole.store(true, Ordering::SeqCst);
+                break;
+            }
+        }
+    }
+    // Delivered rapidly via Stage 2 dup before `t_live_ai` = 5 s swaps.
+    read_pattern(&mut s, &mut at, 128 * 1024, Duration::from_secs(2)).await;
+    assert_eq!(
+        l.d.standby_promotions.load(Ordering::Relaxed),
+        0,
+        "swapped before t_live_ai while Stage 2 dup was still flowing"
+    );
+    // Keep reading across the 5 s threshold so swap still triggers and cleans up.
+    read_pattern(&mut s, &mut at, 1024 * 1024, Duration::from_secs(8)).await;
+    assert!(l.d.standby_promotions.load(Ordering::Relaxed) >= 1);
+    assert!(l.d.standby_swaps.load(Ordering::Relaxed) >= 1);
+}
+
+/// Standby dials route through `Exit::redundant_carrier` when configured and
+/// never run parallel carrier racing even across a slow handshake.
+#[tokio::test(start_paused = true)]
+async fn standby_uses_redundant_carrier_without_racing() {
+    let main = node(Box::new(AllowAll), None, Config::default());
+    // Second outbound reaching the same exit relay (`main.accept`).
+    let alt = Node {
+        accept: main.accept.clone(),
+        up: Arc::new(AtomicBool::new(true)),
+        carriers: Arc::default(),
+        controls: Arc::default(),
+        holes: Holes::default(),
+        sites: main.sites.clone(),
+        ctrl: main.ctrl.clone(),
+        cut: Arc::default(),
+        drop_next: Arc::default(),
+        drop_plan: Arc::default(),
+        slow_next: Arc::default(),
+        dials: Arc::default(),
+        hang_next: Arc::default(),
+    };
+    let main_carriers = main.carriers.clone();
+    let alt_dials = alt.dials.clone();
+    let alt_carriers = alt.carriers.clone();
+    let alt_hang = alt.hang_next.clone();
+    let engine = Arc::new(Engine {
+        nodes: [("la-main".to_string(), main), ("la-alt".to_string(), alt)].into(),
+        ..Default::default()
+    });
+    let exits = vec![Exit {
+        name: "la".into(),
+        carrier: "la-main".into(),
+        redundant_carrier: Some("la-alt".into()),
+        relay: "127.0.0.1:7443".parse().unwrap(),
+        node_id: 1,
+        egress_group: String::new(),
+    }];
+    let routes = [(
+        "ai".to_string(),
+        SegueRoute {
+            ticket: b"ticket".to_vec(),
+            exit_class: EXIT_AI,
+        },
+    )]
+    .into();
+    let dialer = KernelDialer::new(engine, exits, routes, ["ai".to_string()].into());
+    // Establish an SRTT sample via control PING first so `race_delay(srtt)` is finite (~200 ms),
+    // then force a 400 ms handshake delay on `la-alt` before the standby dial runs.
+    *alt_hang.lock().unwrap() = Some(Duration::from_millis(400));
+    let s = dialer.dial(Some("ai"), &site(), 443).await.unwrap();
+    spin_until(|| dialer.standby_bound() >= 1).await;
+    assert_eq!(
+        alt_dials.load(Ordering::SeqCst),
+        1,
+        "standby did not use redundant_carrier"
+    );
+    assert_eq!(alt_carriers.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        main_carriers.load(Ordering::SeqCst),
+        1,
+        "main outbound received extra standby carrier"
+    );
+    assert_eq!(
+        dialer.race_second_started.load(Ordering::Relaxed),
+        0,
+        "standby dial started parallel carrier race"
+    );
+    roundtrip(s).await;
 }
