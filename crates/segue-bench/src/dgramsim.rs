@@ -3,7 +3,7 @@
 //! No sockets. One 30–60 byte frame every 20 ms for 60 s, one-way delay 85 ms
 //! (RTT 170 ms). Loss is drawn per packet per direction, either independent
 //! Bernoulli at 7.5% or a Gilbert-Elliott chain with that same marginal and
-//! the short bursts measured on the Beijing evening peak (see [`GE_BAD_TO_GOOD`]).
+//! the short bursts measured on the Beijing evening peak (see `GE_BAD_TO_GOOD`).
 //!
 //! The reliable baseline follows the TCP recovery rules in `impair`'s module
 //! docs: fast retransmit when at least three later segments sit inside one
@@ -11,7 +11,7 @@
 //! `max(200 ms, 3 × RTT)` doubling per lost retransmission and capped at 8 s.
 //! Head-of-line applies. The first frame is not treated as a SYN: the carrier
 //! is already up. Retransmission losses are drawn up front, as in
-//! [`crate::impair`].
+//! `crate::impair`.
 //!
 //! Datagram schemes deliver by offset, so a later frame does not wait on the
 //! wire. The app still releases tokens in order (a gap holds everything after
