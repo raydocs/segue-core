@@ -1,0 +1,4 @@
+**Testing**
+
+- The impair relay can black out, reset, or silently drop TCP when a run asks (`--blackout`, `--reset-at`, `--silent-drop-at`, or the same arms on an in-process relay). Off by default. A blackout holds bytes and then forwards them; a reset closes connections that already exist, once; a silent drop stops forwarding without closing. Connections accepted after a reset or silent drop still work.
+- `SEGUE_SCENARIO=convo` runs a conversation on one app connection (upload, silence, then 30-byte token events, repeated) and reports whether that connection survived, how many carriers were dialled, and the token stalls. Defaults are 1 MiB, 5 s and 500 tokens for three turns. `SEGUE_CONVO_UPLOAD`, `SEGUE_CONVO_SILENCE_MS` and `SEGUE_CONVO_TOKENS` select the longer 4 MiB / 45 s / 3000 run.

@@ -1,17 +1,27 @@
 #!/usr/bin/env bash
-# Stage 0 token-stream baseline.
+# Token-stream and conversation baselines.
 #
-# Runs the ignored kernel test that drives an SSE-like origin through the
-# session stack and the impairment relay (TCP loss-recovery emulation).
-# Prints one Markdown table for the token stream and one for new flows.
+# The token stream is one 30-byte event every 20 ms. The conversation is
+# several upload / silence / token turns on one app connection, with optional
+# impair faults during turn 2. Both are ignored cargo tests. Loopback only.
 #
-#   SEGUE_TOKEN_SECONDS   origin length in seconds (default 30)
+#   SEGUE_SCENARIO        token, convo, or both (default both)
+#   SEGUE_TOKEN_SECONDS   token-stream length in seconds (default 30)
 #   SEGUE_STANDBY         0 or 1 (default 1, the product default). Printed as
-#                         the standby column. The harness route is overseas,
-#                         so the AI standby does not dial in either mode.
-#   SEGUE_BENCH_OUT       if set, the test also writes the same numbers as JSON
+#                         the standby column.
+#   SEGUE_CONVO_TURNS     conversation turns (default 3)
+#   SEGUE_CONVO_UPLOAD    upload bytes per turn (default 1 MiB)
+#   SEGUE_CONVO_SILENCE_MS
+#                         silence after each upload (default 5000)
+#   SEGUE_CONVO_TOKENS    30-byte events per turn (default 500)
+#   SEGUE_BENCH_OUT       if set, the test also writes JSON. When both
+#                         scenarios run, the token JSON is moved to
+#                         <path>.token.json and the conversation JSON to
+#                         <path>.convo.json.
 #
-# Loopback only. No root, no fixed ports.
+# The long conversation is 4 MiB / 45 s / 3000 tokens:
+#   SEGUE_CONVO_UPLOAD=$((4 * 1024 * 1024)) SEGUE_CONVO_SILENCE_MS=45000 \
+#     SEGUE_CONVO_TOKENS=3000 SEGUE_SCENARIO=convo bash scripts/bench/session-redundancy.sh
 
 set -euo pipefail
 
@@ -26,5 +36,40 @@ export PATH="${CARGO_HOME}/bin:${PATH}"
 seconds="${SEGUE_TOKEN_SECONDS:-30}"
 export SEGUE_TOKEN_SECONDS="$seconds"
 
-cargo +1.96.0 test -j 4 -p segue-kernel --test redundancy_e2e -- \
-    --ignored --nocapture token_stream_baseline
+scenario="${SEGUE_SCENARIO:-both}"
+
+run_token() {
+    cargo +1.96.0 test -j 4 -p segue-kernel --test redundancy_e2e -- \
+        --ignored --nocapture token_stream_baseline
+}
+
+run_convo() {
+    cargo +1.96.0 test -j 4 -p segue-kernel --test redundancy_e2e -- \
+        --ignored --nocapture conversation_baseline
+}
+
+stash_json() {
+    local suffix="$1"
+    if [[ -n "${SEGUE_BENCH_OUT:-}" && -f "$SEGUE_BENCH_OUT" ]]; then
+        mv "$SEGUE_BENCH_OUT" "${SEGUE_BENCH_OUT}.${suffix}.json"
+    fi
+}
+
+case "$scenario" in
+    token | tokens | stream)
+        run_token
+        ;;
+    convo | conversation)
+        run_convo
+        ;;
+    both | all)
+        run_token
+        stash_json token
+        run_convo
+        stash_json convo
+        ;;
+    *)
+        echo "SEGUE_SCENARIO must be token, convo or both (got ${scenario})" >&2
+        exit 2
+        ;;
+esac

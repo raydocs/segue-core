@@ -1767,6 +1767,7 @@ mod tests {
                 tcp: true,
                 duration: Some(Duration::from_secs(30)),
                 tcp_loss: crate::impair::TcpLoss::Off,
+                faults: crate::impair::FaultSchedule::default(),
             };
             let task = tokio::spawn(crate::impair::run(options));
             if wait_impair(listen, &task).await {

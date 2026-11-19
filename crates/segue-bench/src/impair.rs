@@ -43,6 +43,23 @@
 //! reorder extra and bandwidth cap. A lost segment's recovery delay replaces
 //! that one-way delay (the round trip already includes it), and it does not
 //! consume the bandwidth cap.
+//!
+//! # TCP faults
+//!
+//! Three extra TCP faults, off unless a run asks for one. They apply to both
+//! [`TcpLoss`] modes and never to UDP. Times on the CLI are milliseconds from
+//! when the TCP listener starts; [`TcpRelay`] can arm the same faults mid-run.
+//!
+//! - **Blackout** (`--blackout <t0_ms>:<duration_ms>`, [`TcpRelay::arm_blackout`]):
+//!   between `t0` and `t0 + duration` the relay forwards nothing in either
+//!   direction and keeps the sockets open. Bytes read during the window are
+//!   held and written after it (delayed, never dropped).
+//! - **Reset** (`--reset-at <t0_ms>`, [`TcpRelay::arm_reset`]): at `t0`, close
+//!   both directions of every relayed connection that already exists, once.
+//!   Connections accepted afterwards are left alone.
+//! - **Silent drop** (`--silent-drop-at <t0_ms>`, [`TcpRelay::arm_silent_drop`]):
+//!   at `t0`, stop forwarding on the connections that exist then, forever,
+//!   without closing them (a dead NAT mapping). Later connections work.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -453,6 +470,9 @@ pub struct ImpairOptions {
     pub tcp_loss: TcpLoss,
     /// Stop after this long; `None` runs until Ctrl-C.
     pub duration: Option<Duration>,
+    /// TCP blackout / reset / silent-drop. Default is off: the relay forwards
+    /// exactly as it did before these faults existed.
+    pub faults: FaultSchedule,
 }
 
 /// How the TCP relay treats the profile's loss model.
@@ -465,6 +485,219 @@ pub enum TcpLoss {
     /// Delay a lost segment by the recovery model in the module docs.
     /// Bytes are never dropped.
     Emulate,
+}
+
+/// One blackout window, relative to TCP-listener start on the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlackoutSpec {
+    /// When the blackout starts.
+    pub after: Duration,
+    /// How long it lasts. Zero is rejected by the parser.
+    pub duration: Duration,
+}
+
+/// TCP faults for one impair run. Every field `None` leaves the relay unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FaultSchedule {
+    /// Hold bytes in both directions for `duration`, starting `after` from
+    /// listener start.
+    pub blackout: Option<BlackoutSpec>,
+    /// Close connections that exist at this offset from listener start, once.
+    pub reset_after: Option<Duration>,
+    /// Stop forwarding on connections that exist at this offset, forever,
+    /// without closing them.
+    pub silent_drop_after: Option<Duration>,
+}
+
+/// What to do with bytes on one relayed connection at `now`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultEffect {
+    /// Write them now.
+    Forward,
+    /// Keep them until `until`, then write them. Sockets stay open.
+    HoldUntil(Instant),
+    /// Close both directions. Only a connection that existed at the reset.
+    Close,
+    /// Discard them and leave the sockets open.
+    Silent,
+}
+
+/// Shared switches for every connection on one TCP relay.
+#[derive(Clone)]
+struct FaultPlan {
+    blackout: watch::Sender<Option<(Instant, Instant)>>,
+    reset_at: watch::Sender<Option<Instant>>,
+    silent_at: watch::Sender<Option<Instant>>,
+}
+
+/// One connection's view of a [`FaultPlan`].
+struct FaultWatch {
+    blackout: watch::Receiver<Option<(Instant, Instant)>>,
+    reset_at: watch::Receiver<Option<Instant>>,
+    silent_at: watch::Receiver<Option<Instant>>,
+}
+
+impl FaultPlan {
+    fn new() -> Self {
+        let (blackout, _) = watch::channel(None);
+        let (reset_at, _) = watch::channel(None);
+        let (silent_at, _) = watch::channel(None);
+        Self {
+            blackout,
+            reset_at,
+            silent_at,
+        }
+    }
+
+    fn subscribe(&self) -> FaultWatch {
+        FaultWatch {
+            blackout: self.blackout.subscribe(),
+            reset_at: self.reset_at.subscribe(),
+            silent_at: self.silent_at.subscribe(),
+        }
+    }
+
+    fn install(&self, origin: Instant, schedule: &FaultSchedule) {
+        // `send` drops the value when nothing is subscribed yet (the listener
+        // starts before any connection). `send_replace` keeps it for the
+        // receivers that subscribe afterwards.
+        if let Some(spec) = schedule.blackout {
+            let start = origin + spec.after;
+            let _ = self
+                .blackout
+                .send_replace(Some((start, start + spec.duration)));
+        }
+        if let Some(after) = schedule.reset_after {
+            let _ = self.reset_at.send_replace(Some(origin + after));
+        }
+        if let Some(after) = schedule.silent_drop_after {
+            let _ = self.silent_at.send_replace(Some(origin + after));
+        }
+    }
+
+    fn arm_blackout(&self, duration: Duration) {
+        let start = Instant::now();
+        let _ = self.blackout.send_replace(Some((start, start + duration)));
+    }
+
+    fn arm_reset(&self) {
+        let _ = self.reset_at.send_replace(Some(Instant::now()));
+    }
+
+    fn arm_silent_drop(&self) {
+        let _ = self.silent_at.send_replace(Some(Instant::now()));
+    }
+}
+
+impl FaultWatch {
+    fn snapshot(&self) -> (Option<(Instant, Instant)>, Option<Instant>, Option<Instant>) {
+        (
+            *self.blackout.borrow(),
+            *self.reset_at.borrow(),
+            *self.silent_at.borrow(),
+        )
+    }
+
+    fn effect(&self, now: Instant, accepted_at: Instant, reset_done: bool) -> FaultEffect {
+        let (blackout, reset_at, silent_at) = self.snapshot();
+        fault_effect(now, accepted_at, blackout, reset_at, silent_at, reset_done)
+    }
+
+    /// Next instant strictly after `now` at which [`Self::effect`] might change.
+    fn next_wake(&self, now: Instant, accepted_at: Instant) -> Option<Instant> {
+        let (blackout, reset_at, silent_at) = self.snapshot();
+        let mut wake = None;
+        let mut consider = |instant: Instant| {
+            if instant > now {
+                wake = Some(match wake {
+                    Some(earlier) if earlier < instant => earlier,
+                    _ => instant,
+                });
+            }
+        };
+        if let Some((start, end)) = blackout {
+            consider(start);
+            consider(end);
+        }
+        if let Some(t0) = reset_at {
+            if accepted_at <= t0 {
+                consider(t0);
+            }
+        }
+        if let Some(t0) = silent_at {
+            if accepted_at <= t0 {
+                consider(t0);
+            }
+        }
+        wake
+    }
+}
+
+/// `accepted_at <= reset_at` / `silent_at` means the connection existed when
+/// the fault fired. A blackout holds every connection, including new ones.
+fn fault_effect(
+    now: Instant,
+    accepted_at: Instant,
+    blackout: Option<(Instant, Instant)>,
+    reset_at: Option<Instant>,
+    silent_at: Option<Instant>,
+    reset_done: bool,
+) -> FaultEffect {
+    if let Some(t0) = reset_at {
+        if !reset_done && accepted_at <= t0 && now >= t0 {
+            return FaultEffect::Close;
+        }
+    }
+    if let Some(t0) = silent_at {
+        if accepted_at <= t0 && now >= t0 {
+            return FaultEffect::Silent;
+        }
+    }
+    if let Some((start, end)) = blackout {
+        if now >= start && now < end {
+            return FaultEffect::HoldUntil(end);
+        }
+    }
+    FaultEffect::Forward
+}
+
+async fn fault_changed(watch: &mut FaultWatch) {
+    tokio::select! {
+        biased;
+        result = watch.blackout.changed() => {
+            let _ = result;
+        }
+        result = watch.reset_at.changed() => {
+            let _ = result;
+        }
+        result = watch.silent_at.changed() => {
+            let _ = result;
+        }
+    }
+}
+
+async fn sleep_or_pending(at: Option<Instant>) {
+    match at {
+        Some(instant) => sleep_until(instant).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn earliest(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Per-direction counters and the fault watch for one connection.
+struct DirCtl<'a> {
+    bytes: &'a RelayBytes,
+    toward_upstream: bool,
+    watch: &'a mut FaultWatch,
+    accepted_at: Instant,
 }
 
 /// Bytes the TCP relay has written, per direction.
@@ -481,6 +714,8 @@ pub struct TcpRelay {
     pub local: SocketAddr,
     pub bytes: Arc<RelayBytes>,
     stop: watch::Sender<bool>,
+    plan: FaultPlan,
+    accepted: Arc<AtomicU64>,
 }
 
 impl Drop for TcpRelay {
@@ -497,6 +732,29 @@ impl TcpRelay {
     pub fn down_bytes(&self) -> u64 {
         self.bytes.down.load(Ordering::Relaxed)
     }
+
+    /// TCP connections this relay has accepted, including ones later dropped.
+    pub fn accepted(&self) -> u64 {
+        self.accepted.load(Ordering::Relaxed)
+    }
+
+    /// Hold every TCP byte in both directions for `duration`, starting now.
+    /// Sockets stay open. Bytes read in the window are written after it.
+    pub fn arm_blackout(&self, duration: Duration) {
+        self.plan.arm_blackout(duration);
+    }
+
+    /// Close both directions of every connection that exists now, once.
+    /// Connections accepted after this call are not closed.
+    pub fn arm_reset(&self) {
+        self.plan.arm_reset();
+    }
+
+    /// Stop forwarding on connections that exist now, forever, without closing
+    /// them. Connections accepted after this call forward normally.
+    pub fn arm_silent_drop(&self) {
+        self.plan.arm_silent_drop();
+    }
 }
 
 impl Eq for ImpairOptions {}
@@ -510,6 +768,7 @@ pub fn parse_impair_args(args: &[String]) -> Result<ImpairOptions, BenchError> {
     let mut tcp = true;
     let mut tcp_loss = TcpLoss::Off;
     let mut duration = None;
+    let mut faults = FaultSchedule::default();
 
     let mut index = 0;
     while index < args.len() {
@@ -572,6 +831,23 @@ pub fn parse_impair_args(args: &[String]) -> Result<ImpairOptions, BenchError> {
                     )))
                 }
             },
+            "--blackout" => {
+                let raw = required_value(args, &mut index, flag)?;
+                let (after, duration) = parse_blackout(raw)?;
+                faults.blackout = Some(BlackoutSpec { after, duration });
+            }
+            "--reset-at" => {
+                faults.reset_after = Some(Duration::from_millis(parse_u64(
+                    required_value(args, &mut index, flag)?,
+                    flag,
+                )?));
+            }
+            "--silent-drop-at" => {
+                faults.silent_drop_after = Some(Duration::from_millis(parse_u64(
+                    required_value(args, &mut index, flag)?,
+                    flag,
+                )?));
+            }
             other => {
                 return Err(BenchError::InvalidArguments(format!(
                     "unknown argument `{other}`\n{}",
@@ -602,7 +878,30 @@ pub fn parse_impair_args(args: &[String]) -> Result<ImpairOptions, BenchError> {
         tcp,
         tcp_loss,
         duration,
+        faults,
     })
+}
+
+/// `--blackout <t0_ms>:<duration_ms>`. Both numbers are milliseconds.
+fn parse_blackout(raw: &str) -> Result<(Duration, Duration), BenchError> {
+    let Some((start, dur)) = raw.split_once(':') else {
+        return Err(BenchError::InvalidArguments(format!(
+            "invalid --blackout `{raw}` (expected <t0_ms>:<duration_ms>)"
+        )));
+    };
+    if dur.contains(':') {
+        return Err(BenchError::InvalidArguments(format!(
+            "invalid --blackout `{raw}` (expected <t0_ms>:<duration_ms>)"
+        )));
+    }
+    let after = Duration::from_millis(parse_u64(start, "--blackout")?);
+    let duration = Duration::from_millis(parse_u64(dur, "--blackout")?);
+    if duration.is_zero() {
+        return Err(BenchError::InvalidArguments(
+            "--blackout duration must be > 0".to_owned(),
+        ));
+    }
+    Ok((after, duration))
 }
 
 /// Run the relay until the duration elapses or Ctrl-C is received.
@@ -780,21 +1079,19 @@ async fn run_tcp(options: ImpairOptions) -> Result<(), BenchError> {
             action: format!("binding TCP {}", options.listen),
             source,
         })?;
-    let bytes = Arc::new(RelayBytes::default());
-    loop {
-        let (client, _) = listener.accept().await.map_err(|source| BenchError::Io {
-            action: "accepting on the impair TCP listener".to_owned(),
-            source,
-        })?;
-        let upstream_addr = options.upstream;
-        let profile = options.profile.clone();
-        let seed = options.seed;
-        let tcp_loss = options.tcp_loss;
-        let bytes = Arc::clone(&bytes);
-        tokio::spawn(async move {
-            let _ = relay_tcp_client(client, upstream_addr, profile, seed, tcp_loss, bytes).await;
-        });
-    }
+    let plan = FaultPlan::new();
+    plan.install(Instant::now(), &options.faults);
+    let shared = TcpShared {
+        upstream: options.upstream,
+        profile: options.profile,
+        seed: options.seed,
+        tcp_loss: options.tcp_loss,
+        bytes: Arc::new(RelayBytes::default()),
+        plan,
+        accepted: Arc::new(AtomicU64::new(0)),
+    };
+    let (_stop_tx, stop_rx) = watch::channel(false);
+    accept_tcp(listener, shared, stop_rx).await
 }
 
 /// Bind a TCP impairment relay. `listen` may be port 0; [`TcpRelay::local`] is
@@ -818,27 +1115,43 @@ pub async fn serve_tcp(
     })?;
     let bytes = Arc::new(RelayBytes::default());
     let (stop_tx, stop_rx) = watch::channel(false);
-    let bytes_task = Arc::clone(&bytes);
+    let plan = FaultPlan::new();
+    let accepted = Arc::new(AtomicU64::new(0));
+    let shared = TcpShared {
+        upstream,
+        profile,
+        seed,
+        tcp_loss,
+        bytes: Arc::clone(&bytes),
+        plan: plan.clone(),
+        accepted: Arc::clone(&accepted),
+    };
     tokio::spawn(async move {
-        let _ = accept_tcp(
-            listener, upstream, profile, seed, tcp_loss, bytes_task, stop_rx,
-        )
-        .await;
+        let _ = accept_tcp(listener, shared, stop_rx).await;
     });
     Ok(TcpRelay {
         local,
         bytes,
         stop: stop_tx,
+        plan,
+        accepted,
     })
 }
 
-async fn accept_tcp(
-    listener: TcpListener,
+/// State shared by every connection on one TCP listener.
+struct TcpShared {
     upstream: SocketAddr,
     profile: ImpairProfile,
     seed: u64,
     tcp_loss: TcpLoss,
     bytes: Arc<RelayBytes>,
+    plan: FaultPlan,
+    accepted: Arc<AtomicU64>,
+}
+
+async fn accept_tcp(
+    listener: TcpListener,
+    shared: TcpShared,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), BenchError> {
     loop {
@@ -853,24 +1166,47 @@ async fn accept_tcp(
                     action: "accepting on the impair TCP listener".to_owned(),
                     source,
                 })?;
-                let profile = profile.clone();
-                let bytes = Arc::clone(&bytes);
+                shared.accepted.fetch_add(1, Ordering::Relaxed);
+                let accepted_at = Instant::now();
+                let conn = ConnIn {
+                    profile: shared.profile.clone(),
+                    seed: shared.seed,
+                    tcp_loss: shared.tcp_loss,
+                    bytes: Arc::clone(&shared.bytes),
+                    plan: shared.plan.clone(),
+                    accepted_at,
+                };
+                let upstream = shared.upstream;
                 tokio::spawn(async move {
-                    let _ = relay_tcp_client(client, upstream, profile, seed, tcp_loss, bytes).await;
+                    let _ = relay_tcp_client(client, upstream, conn).await;
                 });
             }
         }
     }
 }
 
-async fn relay_tcp_client(
-    client: TcpStream,
-    upstream_addr: SocketAddr,
+struct ConnIn {
     profile: ImpairProfile,
     seed: u64,
     tcp_loss: TcpLoss,
     bytes: Arc<RelayBytes>,
+    plan: FaultPlan,
+    accepted_at: Instant,
+}
+
+async fn relay_tcp_client(
+    client: TcpStream,
+    upstream_addr: SocketAddr,
+    conn: ConnIn,
 ) -> Result<(), BenchError> {
+    let ConnIn {
+        profile,
+        seed,
+        tcp_loss,
+        bytes,
+        plan,
+        accepted_at,
+    } = conn;
     let upstream = TcpStream::connect(upstream_addr)
         .await
         .map_err(|source| BenchError::Io {
@@ -888,7 +1224,15 @@ async fn relay_tcp_client(
     let up_bytes = Arc::clone(&bytes);
     let down_bytes = bytes;
     let up_profile = profile.clone();
+    let up_plan = plan.clone();
     let up = tokio::spawn(async move {
+        let mut watch = up_plan.subscribe();
+        let mut ctl = DirCtl {
+            bytes: &up_bytes,
+            toward_upstream: true,
+            watch: &mut watch,
+            accepted_at,
+        };
         match tcp_loss {
             TcpLoss::Off => {
                 relay_tcp_direction(
@@ -896,8 +1240,7 @@ async fn relay_tcp_client(
                     upstream_write,
                     up_profile,
                     direction_seed(seed, false),
-                    up_bytes,
-                    true,
+                    &mut ctl,
                 )
                 .await
             }
@@ -907,14 +1250,20 @@ async fn relay_tcp_client(
                     upstream_write,
                     up_profile,
                     direction_seed(seed, false),
-                    up_bytes,
-                    true,
+                    &mut ctl,
                 )
                 .await
             }
         }
     });
     let down = tokio::spawn(async move {
+        let mut watch = plan.subscribe();
+        let mut ctl = DirCtl {
+            bytes: &down_bytes,
+            toward_upstream: false,
+            watch: &mut watch,
+            accepted_at,
+        };
         match tcp_loss {
             TcpLoss::Off => {
                 relay_tcp_direction(
@@ -922,8 +1271,7 @@ async fn relay_tcp_client(
                     client_write,
                     profile,
                     direction_seed(seed, true),
-                    down_bytes,
-                    false,
+                    &mut ctl,
                 )
                 .await
             }
@@ -933,8 +1281,7 @@ async fn relay_tcp_client(
                     client_write,
                     profile,
                     direction_seed(seed, true),
-                    down_bytes,
-                    false,
+                    &mut ctl,
                 )
                 .await
             }
@@ -947,13 +1294,16 @@ async fn relay_tcp_client(
 
 /// TCP is reliable, so only delay, jitter and the bandwidth cap apply here.
 /// A loss draw skips the delay (the historical path) and still forwards the bytes.
+///
+/// With no fault armed, a read still takes the shaper delay and is written
+/// immediately afterwards. A fault only changes what happens after that delay,
+/// or wakes a read that is blocked when the fault fires.
 async fn relay_tcp_direction<R, W>(
     mut reader: R,
     mut writer: W,
     profile: ImpairProfile,
     seed: u64,
-    bytes: Arc<RelayBytes>,
-    toward_upstream: bool,
+    ctl: &mut DirCtl<'_>,
 ) -> Result<(), BenchError>
 where
     R: AsyncRead + Unpin,
@@ -961,31 +1311,242 @@ where
 {
     let mut shaper = Shaper::new(profile, seed);
     let mut buffer = vec![0u8; 16 * 1024];
+    let mut held = Vec::<u8>::new();
+    let mut eof = false;
     loop {
-        let len = reader
-            .read(&mut buffer)
-            .await
-            .map_err(|source| BenchError::Io {
-                action: "reading from the impair TCP relay".to_owned(),
-                source,
-            })?;
-        if len == 0 {
+        if eof && held.is_empty() {
             let _ = writer.shutdown().await;
             return Ok(());
         }
         let now = Instant::now();
-        if let Some(release) = shaper.schedule(now, len) {
-            sleep_until(release).await;
+        match ctl.watch.effect(now, ctl.accepted_at, false) {
+            FaultEffect::Close => {
+                let _ = writer.shutdown().await;
+                return Ok(());
+            }
+            FaultEffect::Silent => {
+                held.clear();
+                if eof {
+                    let _ = writer.shutdown().await;
+                    return Ok(());
+                }
+                if read_discard(&mut reader, &mut buffer, ctl).await? {
+                    eof = true;
+                }
+            }
+            FaultEffect::HoldUntil(end) => {
+                if eof {
+                    sleep_until(end).await;
+                    continue;
+                }
+                match read_hold(&mut reader, &mut buffer, &mut held, ctl, end).await? {
+                    ReadHold::Eof => eof = true,
+                    ReadHold::Buffered | ReadHold::Woke => {}
+                }
+            }
+            FaultEffect::Forward => {
+                if !held.is_empty() {
+                    let closed = flush_held(&mut writer, &mut shaper, &mut held, ctl).await?;
+                    if closed {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                if eof {
+                    let _ = writer.shutdown().await;
+                    return Ok(());
+                }
+                match read_forward(
+                    &mut reader,
+                    &mut writer,
+                    &mut buffer,
+                    &mut shaper,
+                    &mut held,
+                    ctl,
+                )
+                .await?
+                {
+                    ForwardRead::Eof => return Ok(()),
+                    ForwardRead::Again => {}
+                }
+            }
         }
-        writer
-            .write_all(&buffer[..len])
-            .await
-            .map_err(|source| BenchError::Io {
-                action: "writing to the impair TCP relay".to_owned(),
-                source,
-            })?;
-        add_bytes(&bytes, toward_upstream, len);
     }
+}
+
+enum ReadHold {
+    Eof,
+    Buffered,
+    Woke,
+}
+
+enum ForwardRead {
+    Eof,
+    Again,
+}
+
+async fn read_discard<R>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    ctl: &mut DirCtl<'_>,
+) -> Result<bool, BenchError>
+where
+    R: AsyncRead + Unpin,
+{
+    let wake = ctl.watch.next_wake(Instant::now(), ctl.accepted_at);
+    tokio::select! {
+        biased;
+        result = reader.read(buffer) => {
+            let len = read_len(result)?;
+            Ok(len == 0)
+        }
+        _ = sleep_or_pending(wake) => Ok(false),
+        _ = fault_changed(ctl.watch) => Ok(false),
+    }
+}
+
+async fn read_hold<R>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    held: &mut Vec<u8>,
+    ctl: &mut DirCtl<'_>,
+    end: Instant,
+) -> Result<ReadHold, BenchError>
+where
+    R: AsyncRead + Unpin,
+{
+    tokio::select! {
+        biased;
+        result = reader.read(buffer) => {
+            let len = read_len(result)?;
+            if len == 0 {
+                return Ok(ReadHold::Eof);
+            }
+            held.extend_from_slice(&buffer[..len]);
+            Ok(ReadHold::Buffered)
+        }
+        _ = sleep_until(end) => Ok(ReadHold::Woke),
+        _ = fault_changed(ctl.watch) => Ok(ReadHold::Woke),
+    }
+}
+
+/// `Ok(true)` means this direction was closed and the caller must stop.
+async fn flush_held<W>(
+    writer: &mut W,
+    shaper: &mut Shaper,
+    held: &mut Vec<u8>,
+    ctl: &mut DirCtl<'_>,
+) -> Result<bool, BenchError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let n = held.len();
+    if let Some(release) = shaper.schedule(Instant::now(), n) {
+        sleep_until(release).await;
+    }
+    let now = Instant::now();
+    match ctl.watch.effect(now, ctl.accepted_at, false) {
+        FaultEffect::Forward => {
+            write_chunk(writer, held, ctl).await?;
+            held.clear();
+            Ok(false)
+        }
+        FaultEffect::Close => {
+            let _ = writer.shutdown().await;
+            held.clear();
+            Ok(true)
+        }
+        FaultEffect::Silent => {
+            held.clear();
+            Ok(false)
+        }
+        FaultEffect::HoldUntil(_) => Ok(false),
+    }
+}
+
+/// One historical read: shaper delay, then write, unless a fault now says
+/// otherwise. An idle fault plan takes the same delay-then-write path as before.
+async fn read_forward<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    buffer: &mut [u8],
+    shaper: &mut Shaper,
+    held: &mut Vec<u8>,
+    ctl: &mut DirCtl<'_>,
+) -> Result<ForwardRead, BenchError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let wake = ctl.watch.next_wake(Instant::now(), ctl.accepted_at);
+    let read = tokio::select! {
+        biased;
+        result = reader.read(buffer) => Some(read_len(result)?),
+        _ = sleep_or_pending(wake) => None,
+        _ = fault_changed(ctl.watch) => None,
+    };
+    let Some(len) = read else {
+        return Ok(ForwardRead::Again);
+    };
+    if len == 0 {
+        let _ = writer.shutdown().await;
+        return Ok(ForwardRead::Eof);
+    }
+    let chunk_at = Instant::now();
+    match ctl.watch.effect(chunk_at, ctl.accepted_at, false) {
+        FaultEffect::Close => {
+            let _ = writer.shutdown().await;
+            return Ok(ForwardRead::Eof);
+        }
+        FaultEffect::Silent => return Ok(ForwardRead::Again),
+        FaultEffect::HoldUntil(_) => {
+            held.extend_from_slice(&buffer[..len]);
+            return Ok(ForwardRead::Again);
+        }
+        FaultEffect::Forward => {}
+    }
+    if let Some(release) = shaper.schedule(chunk_at, len) {
+        sleep_until(release).await;
+    }
+    let now = Instant::now();
+    match ctl.watch.effect(now, ctl.accepted_at, false) {
+        FaultEffect::Forward => {
+            write_chunk(writer, &buffer[..len], ctl).await?;
+        }
+        FaultEffect::HoldUntil(_) => held.extend_from_slice(&buffer[..len]),
+        FaultEffect::Silent => {}
+        FaultEffect::Close => {
+            let _ = writer.shutdown().await;
+            return Ok(ForwardRead::Eof);
+        }
+    }
+    Ok(ForwardRead::Again)
+}
+
+fn read_len(result: std::io::Result<usize>) -> Result<usize, BenchError> {
+    result.map_err(|source| BenchError::Io {
+        action: "reading from the impair TCP relay".to_owned(),
+        source,
+    })
+}
+
+async fn write_chunk<W>(
+    writer: &mut W,
+    bytes: &[u8],
+    ctl: &mut DirCtl<'_>,
+) -> Result<(), BenchError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(bytes)
+        .await
+        .map_err(|source| BenchError::Io {
+            action: "writing to the impair TCP relay".to_owned(),
+            source,
+        })?;
+    add_bytes(ctl.bytes, ctl.toward_upstream, bytes.len());
+    Ok(())
 }
 
 fn add_bytes(bytes: &RelayBytes, toward_upstream: bool, len: usize) {
@@ -1002,29 +1563,20 @@ async fn relay_tcp_direction_emulate<R, W>(
     writer: W,
     profile: ImpairProfile,
     seed: u64,
-    bytes: Arc<RelayBytes>,
-    toward_upstream: bool,
+    ctl: &mut DirCtl<'_>,
 ) -> Result<(), BenchError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    relay_tcp_emulate_with(
-        reader,
-        writer,
-        TcpDirection::new(profile, seed),
-        bytes,
-        toward_upstream,
-    )
-    .await
+    relay_tcp_emulate_with(reader, writer, TcpDirection::new(profile, seed), ctl).await
 }
 
 async fn relay_tcp_emulate_with<R, W>(
     mut reader: R,
     mut writer: W,
     mut direction: TcpDirection,
-    bytes: Arc<RelayBytes>,
-    toward_upstream: bool,
+    ctl: &mut DirCtl<'_>,
 ) -> Result<(), BenchError>
 where
     R: AsyncRead + Unpin,
@@ -1033,7 +1585,19 @@ where
     let mut buffer = vec![0u8; TCP_SEGMENT_CAP];
     loop {
         let now = Instant::now();
-        let deadline = direction.next_deadline(now);
+        let effect = ctl.watch.effect(now, ctl.accepted_at, false);
+        if matches!(effect, FaultEffect::Close) {
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+        // A past segment deadline must stay past so a ready segment still
+        // flushes. A blackout or silent drop must not spin on that deadline:
+        // the queue is held or discarded, and the fault's own wake is enough.
+        let segment_due = match effect {
+            FaultEffect::HoldUntil(_) | FaultEffect::Silent => None,
+            FaultEffect::Forward | FaultEffect::Close => direction.next_deadline(now),
+        };
+        let deadline = earliest(segment_due, ctl.watch.next_wake(now, ctl.accepted_at));
         let sleep = async {
             match deadline {
                 Some(instant) => sleep_until(instant).await,
@@ -1043,10 +1607,7 @@ where
         tokio::select! {
             biased;
             read = reader.read(&mut buffer), if !direction.eof => {
-                let len = read.map_err(|source| BenchError::Io {
-                    action: "reading from the impair TCP relay".to_owned(),
-                    source,
-                })?;
+                let len = read_len(read)?;
                 if len == 0 {
                     direction.mark_eof(Instant::now());
                 } else {
@@ -1054,22 +1615,25 @@ where
                 }
             }
             _ = sleep, if deadline.is_some() => {}
+            _ = fault_changed(ctl.watch) => {}
         }
         let now = Instant::now();
-        while let Some(payload) = direction.pop_ready(now) {
-            let len = payload.len();
-            writer
-                .write_all(&payload)
-                .await
-                .map_err(|source| BenchError::Io {
-                    action: "writing to the impair TCP relay".to_owned(),
-                    source,
-                })?;
-            add_bytes(&bytes, toward_upstream, len);
-        }
-        if direction.finished() {
-            let _ = writer.shutdown().await;
-            return Ok(());
+        match ctl.watch.effect(now, ctl.accepted_at, false) {
+            FaultEffect::Close => {
+                let _ = writer.shutdown().await;
+                return Ok(());
+            }
+            FaultEffect::Silent => direction.discard(),
+            FaultEffect::HoldUntil(_) => {}
+            FaultEffect::Forward => {
+                while let Some(payload) = direction.pop_ready(now) {
+                    write_chunk(&mut writer, &payload, ctl).await?;
+                }
+                if direction.finished() {
+                    let _ = writer.shutdown().await;
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -1129,6 +1693,12 @@ impl TcpDirection {
 
     fn finished(&self) -> bool {
         self.eof && self.queue.is_empty()
+    }
+
+    /// Drop every queued segment without writing it. Silent drop uses this so
+    /// a dead mapping does not deliver bytes and does not close the socket.
+    fn discard(&mut self) {
+        self.queue.clear();
     }
 
     fn push(&mut self, now: Instant, data: &[u8]) {
@@ -1248,6 +1818,8 @@ impl TcpDirection {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
 
     fn empirical_loss(profile: &ImpairProfile, seed: u64, packets: usize) -> f64 {
@@ -1710,16 +2282,57 @@ mod tests {
         (input_w, input_r, output_w, output_r)
     }
 
+    fn spawn_off(
+        profile: ImpairProfile,
+        plan: FaultPlan,
+        accepted_at: Instant,
+        reader: tokio::io::DuplexStream,
+        writer: tokio::io::DuplexStream,
+    ) -> Arc<RelayBytes> {
+        let bytes = Arc::new(RelayBytes::default());
+        let task_bytes = Arc::clone(&bytes);
+        tokio::spawn(async move {
+            let mut watch = plan.subscribe();
+            let mut ctl = DirCtl {
+                bytes: &task_bytes,
+                toward_upstream: true,
+                watch: &mut watch,
+                accepted_at,
+            };
+            let _ = relay_tcp_direction(reader, writer, profile, 1, &mut ctl).await;
+        });
+        bytes
+    }
+
+    fn spawn_emulate(
+        profile: ImpairProfile,
+        plan: FaultPlan,
+        accepted_at: Instant,
+        reader: tokio::io::DuplexStream,
+        writer: tokio::io::DuplexStream,
+    ) -> Arc<RelayBytes> {
+        let bytes = Arc::new(RelayBytes::default());
+        let task_bytes = Arc::clone(&bytes);
+        tokio::spawn(async move {
+            let mut watch = plan.subscribe();
+            let mut ctl = DirCtl {
+                bytes: &task_bytes,
+                toward_upstream: true,
+                watch: &mut watch,
+                accepted_at,
+            };
+            let _ = relay_tcp_direction_emulate(reader, writer, profile, 1, &mut ctl).await;
+        });
+        bytes
+    }
+
     #[tokio::test(start_paused = true)]
     async fn tcp_off_still_forwards_bytes_the_loss_model_would_drop() {
         let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
         let mut profile = profile("clean").unwrap();
         profile.loss = 1.0;
         profile.delay = Duration::from_millis(85);
-        let bytes = Arc::new(RelayBytes::default());
-        tokio::spawn(async move {
-            let _ = relay_tcp_direction(input_r, output_w, profile, 1, bytes, true).await;
-        });
+        spawn_off(profile, FaultPlan::new(), Instant::now(), input_r, output_w);
         input_w.write_all(b"hello").await.unwrap();
         let mut buf = [0u8; 5];
         // Historical path: a loss draw skips the delay and still writes.
@@ -1733,10 +2346,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn tcp_off_applies_one_way_delay_when_nothing_is_lost() {
         let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
-        let bytes = Arc::new(RelayBytes::default());
-        tokio::spawn(async move {
-            let _ = relay_tcp_direction(input_r, output_w, quiet(85), 1, bytes, true).await;
-        });
+        spawn_off(
+            quiet(85),
+            FaultPlan::new(),
+            Instant::now(),
+            input_r,
+            output_w,
+        );
         input_w.write_all(b"hello").await.unwrap();
         let mut buf = [0u8; 5];
         let early =
@@ -1749,10 +2365,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn tcp_emulate_applies_one_way_delay_when_nothing_is_lost() {
         let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
-        let bytes = Arc::new(RelayBytes::default());
-        tokio::spawn(async move {
-            let _ = relay_tcp_direction_emulate(input_r, output_w, quiet(85), 1, bytes, true).await;
-        });
+        spawn_emulate(
+            quiet(85),
+            FaultPlan::new(),
+            Instant::now(),
+            input_r,
+            output_w,
+        );
         input_w.write_all(b"hello").await.unwrap();
         let mut buf = [0u8; 5];
         let early =
@@ -1765,12 +2384,21 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn tcp_emulate_fast_retransmit_releases_after_one_rtt() {
         let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
-        let bytes = Arc::new(RelayBytes::default());
         // SYN clean, then a lost segment with three clean followers. No jitter.
         let script = vec![(false, 0), (true, 0), (false, 0), (false, 0), (false, 0)];
         let direction = TcpDirection::scripted(quiet(85), script);
+        let plan = FaultPlan::new();
+        let accepted_at = Instant::now();
         tokio::spawn(async move {
-            let _ = relay_tcp_emulate_with(input_r, output_w, direction, bytes, true).await;
+            let bytes = Arc::new(RelayBytes::default());
+            let mut watch = plan.subscribe();
+            let mut ctl = DirCtl {
+                bytes: &bytes,
+                toward_upstream: true,
+                watch: &mut watch,
+                accepted_at,
+            };
+            let _ = relay_tcp_emulate_with(input_r, output_w, direction, &mut ctl).await;
         });
         // One write would be one segment. Yields do not advance the paused clock,
         // so each byte is its own segment at the same instant.
@@ -1796,5 +2424,326 @@ mod tests {
         assert!(held.is_err(), "hole was filled before one rtt");
         output_r.read_exact(&mut buf[1..]).await.unwrap();
         assert_eq!(&buf, b"sABCD");
+    }
+
+    #[test]
+    fn fault_off_always_forwards() {
+        let now = test_now();
+        assert_eq!(
+            fault_effect(now, now, None, None, None, false),
+            FaultEffect::Forward
+        );
+    }
+
+    #[test]
+    fn blackout_holds_until_the_window_ends() {
+        let t0 = test_now();
+        let start = t0 + Duration::from_secs(1);
+        let end = start + Duration::from_secs(2);
+        let window = Some((start, end));
+        assert_eq!(
+            fault_effect(
+                start - Duration::from_millis(1),
+                t0,
+                window,
+                None,
+                None,
+                false
+            ),
+            FaultEffect::Forward
+        );
+        assert_eq!(
+            fault_effect(start, t0, window, None, None, false),
+            FaultEffect::HoldUntil(end)
+        );
+        assert_eq!(
+            fault_effect(
+                end - Duration::from_millis(1),
+                t0,
+                window,
+                None,
+                None,
+                false
+            ),
+            FaultEffect::HoldUntil(end)
+        );
+        assert_eq!(
+            fault_effect(end, t0, window, None, None, false),
+            FaultEffect::Forward
+        );
+    }
+
+    #[test]
+    fn reset_closes_an_existing_connection_once_and_spares_a_new_one() {
+        let t0 = test_now();
+        let reset_at = t0 + Duration::from_secs(5);
+        let existing = t0;
+        let fresh = reset_at + Duration::from_millis(1);
+        assert_eq!(
+            fault_effect(
+                reset_at - Duration::from_millis(1),
+                existing,
+                None,
+                Some(reset_at),
+                None,
+                false
+            ),
+            FaultEffect::Forward
+        );
+        assert_eq!(
+            fault_effect(reset_at, existing, None, Some(reset_at), None, false),
+            FaultEffect::Close
+        );
+        assert_eq!(
+            fault_effect(reset_at, existing, None, Some(reset_at), None, true),
+            FaultEffect::Forward,
+            "a reset closes each existing connection once"
+        );
+        assert_eq!(
+            fault_effect(
+                reset_at + Duration::from_secs(1),
+                fresh,
+                None,
+                Some(reset_at),
+                None,
+                false
+            ),
+            FaultEffect::Forward
+        );
+    }
+
+    #[test]
+    fn silent_drop_stops_an_existing_connection_and_spares_a_new_one() {
+        let t0 = test_now();
+        let silent_at = t0 + Duration::from_secs(5);
+        let existing = t0;
+        let fresh = silent_at + Duration::from_millis(1);
+        assert_eq!(
+            fault_effect(
+                silent_at - Duration::from_millis(1),
+                existing,
+                None,
+                None,
+                Some(silent_at),
+                false
+            ),
+            FaultEffect::Forward
+        );
+        assert_eq!(
+            fault_effect(silent_at, existing, None, None, Some(silent_at), false),
+            FaultEffect::Silent
+        );
+        assert_eq!(
+            fault_effect(
+                silent_at + Duration::from_secs(30),
+                existing,
+                None,
+                None,
+                Some(silent_at),
+                false
+            ),
+            FaultEffect::Silent
+        );
+        assert_eq!(
+            fault_effect(silent_at, fresh, None, None, Some(silent_at), false),
+            FaultEffect::Forward
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_off_blackout_delays_bytes_then_delivers_them() {
+        let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
+        let plan = FaultPlan::new();
+        plan.arm_blackout(Duration::from_secs(2));
+        let bytes = spawn_off(
+            profile("clean").unwrap(),
+            plan,
+            Instant::now(),
+            input_r,
+            output_w,
+        );
+        input_w.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        let early =
+            tokio::time::timeout(Duration::from_millis(1999), output_r.read_exact(&mut buf)).await;
+        assert!(early.is_err(), "blackout forwarded bytes early");
+        output_r.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        assert_eq!(bytes.up.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_emulate_blackout_delays_bytes_then_delivers_them() {
+        let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
+        let plan = FaultPlan::new();
+        plan.arm_blackout(Duration::from_secs(2));
+        let bytes = spawn_emulate(
+            profile("clean").unwrap(),
+            plan,
+            Instant::now(),
+            input_r,
+            output_w,
+        );
+        input_w.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        let early =
+            tokio::time::timeout(Duration::from_millis(1999), output_r.read_exact(&mut buf)).await;
+        assert!(early.is_err(), "emulate blackout forwarded bytes early");
+        output_r.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        assert_eq!(bytes.up.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_off_reset_closes_existing_and_lets_a_later_connection_through() {
+        let plan = FaultPlan::new();
+        let existing = Instant::now();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        plan.arm_reset();
+
+        let (mut old_in, old_r, old_w, mut old_out) = duplex_pair();
+        spawn_off(
+            profile("clean").unwrap(),
+            plan.clone(),
+            existing,
+            old_r,
+            old_w,
+        );
+        old_in.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        let n = old_out.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "reset did not close the existing connection");
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let fresh = Instant::now();
+        let (mut new_in, new_r, new_w, mut new_out) = duplex_pair();
+        spawn_off(profile("clean").unwrap(), plan, fresh, new_r, new_w);
+        new_in.write_all(b"hello").await.unwrap();
+        new_out.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_emulate_reset_closes_without_delivering() {
+        let plan = FaultPlan::new();
+        let existing = Instant::now();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        plan.arm_reset();
+        let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
+        spawn_emulate(profile("clean").unwrap(), plan, existing, input_r, output_w);
+        input_w.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        let n = output_r.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "emulate reset did not close the connection");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_off_silent_drop_discards_without_closing() {
+        let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
+        let plan = FaultPlan::new();
+        let bytes = spawn_off(
+            profile("clean").unwrap(),
+            plan.clone(),
+            Instant::now(),
+            input_r,
+            output_w,
+        );
+        input_w.write_all(b"A").await.unwrap();
+        let mut buf = [0u8; 1];
+        output_r.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf[0], b'A');
+        plan.arm_silent_drop();
+        input_w.write_all(b"B").await.unwrap();
+        let hung =
+            tokio::time::timeout(Duration::from_secs(5), output_r.read_exact(&mut buf)).await;
+        assert!(
+            hung.is_err(),
+            "silent drop closed the socket or forwarded the byte"
+        );
+        assert_eq!(bytes.up.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_emulate_silent_drop_discards_without_closing() {
+        let (mut input_w, input_r, output_w, mut output_r) = duplex_pair();
+        let plan = FaultPlan::new();
+        spawn_emulate(
+            profile("clean").unwrap(),
+            plan.clone(),
+            Instant::now(),
+            input_r,
+            output_w,
+        );
+        input_w.write_all(b"A").await.unwrap();
+        let mut buf = [0u8; 1];
+        output_r.read_exact(&mut buf).await.unwrap();
+        plan.arm_silent_drop();
+        input_w.write_all(b"B").await.unwrap();
+        let hung =
+            tokio::time::timeout(Duration::from_secs(5), output_r.read_exact(&mut buf)).await;
+        assert!(
+            hung.is_err(),
+            "emulate silent drop closed the socket or forwarded the byte"
+        );
+    }
+
+    #[test]
+    fn parse_impair_args_accepts_tcp_faults() {
+        let args = [
+            "--listen",
+            "127.0.0.1:1080",
+            "--upstream",
+            "127.0.0.1:9000",
+            "--blackout",
+            "1000:2000",
+            "--reset-at",
+            "1500",
+            "--silent-drop-at",
+            "2500",
+        ]
+        .map(str::to_owned);
+        let options = parse_impair_args(&args).unwrap();
+        assert_eq!(
+            options.faults.blackout,
+            Some(BlackoutSpec {
+                after: Duration::from_millis(1000),
+                duration: Duration::from_millis(2000),
+            })
+        );
+        assert_eq!(
+            options.faults.reset_after,
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            options.faults.silent_drop_after,
+            Some(Duration::from_millis(2500))
+        );
+    }
+
+    #[test]
+    fn parse_impair_args_rejects_a_bad_blackout() {
+        for raw in ["1000", "1000:0", "1000:2000:1", ":2000"] {
+            let args = [
+                "--listen",
+                "127.0.0.1:1080",
+                "--upstream",
+                "127.0.0.1:9000",
+                "--blackout",
+                raw,
+            ]
+            .map(str::to_owned);
+            assert!(
+                parse_impair_args(&args).is_err(),
+                "accepted --blackout {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_impair_args_leaves_faults_off_by_default() {
+        let args =
+            ["--listen", "127.0.0.1:1080", "--upstream", "127.0.0.1:9000"].map(str::to_owned);
+        let options = parse_impair_args(&args).unwrap();
+        assert_eq!(options.faults, FaultSchedule::default());
     }
 }
