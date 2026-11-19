@@ -563,7 +563,9 @@ impl FaultPlan {
         // receivers that subscribe afterwards.
         if let Some(spec) = schedule.blackout {
             let start = origin + spec.after;
-            let _ = self.blackout.send_replace(Some((start, start + spec.duration)));
+            let _ = self
+                .blackout
+                .send_replace(Some((start, start + spec.duration)));
         }
         if let Some(after) = schedule.reset_after {
             let _ = self.reset_at.send_replace(Some(origin + after));
