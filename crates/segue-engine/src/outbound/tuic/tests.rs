@@ -345,3 +345,121 @@ async fn connect_header_leaves_alone_when_no_payload_follows() {
     assert_eq!(writes.len(), 1, "the header left on its own");
     assert_eq!(writes[0], header);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn happy_eyeballs_races_past_silent_first_candidate() {
+    struct MultiDns(Vec<SocketAddr>);
+    #[async_trait::async_trait]
+    impl DnsResolver for MultiDns {
+        async fn resolve(&self, _domain: &str, _port: u16) -> Result<SocketAddr, TransportError> {
+            Ok(self.0[0])
+        }
+        async fn resolve_all(
+            &self,
+            _domain: &str,
+            _port: u16,
+        ) -> Result<segue_transport::DnsLookup, TransportError> {
+            Ok(segue_transport::DnsLookup::new(
+                self.0.iter().copied(),
+                None,
+            ))
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        // Candidate 0 silently absorbs UDP packets without responding.
+        let silent = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let drain_silent = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while silent.recv_from(&mut buf).await.is_ok() {}
+        });
+
+        let live = server(TuicUdpRelayMode::Native).await;
+        let outbound =
+            TuicOutbound::new(&configured(live.address.port(), TuicUdpRelayMode::Native)).unwrap();
+        let dns = MultiDns(vec![silent_addr, live.address]);
+        let dialer = TransportDialer::with_tls_connector(live.tls.connector.clone());
+
+        let target = Target::new(
+            RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            443,
+            RoutingNetwork::Tcp,
+        );
+        let mut stream = outbound.open_tcp(&target, &dns, &dialer).await.unwrap();
+        stream.write_all(b"loopback").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut reply = [0; 8];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"loopback");
+
+        outbound.close();
+        live.task.abort();
+        drain_silent.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_uni_stream_does_not_block_later_quic_udp_packets() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let tls = tls(&[b"h3"]);
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(128));
+        let mut server_config = tls.server.clone();
+        server_config.transport_config(Arc::new(transport));
+        let endpoint =
+            quinn::Endpoint::server(server_config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            let mut auth = connection.accept_uni().await.unwrap();
+            let _ = auth.read_to_end(MAX_STREAM_IN).await.unwrap();
+
+            // First uni-stream stays open without FIN.
+            let mut stalled = connection.open_uni().await.unwrap();
+            stalled.write_all(&[0u8; 4]).await.unwrap();
+
+            // Second uni-stream delivers a complete Packet right away.
+            let mut complete = connection.open_uni().await.unwrap();
+            let target = Target::new(
+                RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                53,
+                RoutingNetwork::Udp,
+            );
+            let encoded = wire::encode(&Command::Packet(Packet {
+                association_id: 0,
+                packet_id: 1,
+                fragment_total: 1,
+                fragment_id: 0,
+                address: Some(wire::Address::from_target(&target).unwrap()),
+                payload: b"unblocked".to_vec(),
+            }))
+            .unwrap();
+            complete.write_all(&encoded).await.unwrap();
+            complete.finish().unwrap();
+
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(stalled);
+        });
+
+        let outbound = TuicOutbound::new(&configured(addr.port(), TuicUdpRelayMode::Quic)).unwrap();
+        let dialer = TransportDialer::with_tls_connector(tls.connector);
+        let udp = outbound
+            .open_udp(&segue_transport::SystemDnsResolver, &dialer)
+            .await
+            .unwrap();
+        let (source, payload) = udp.recv().await.unwrap();
+        assert_eq!(source.port, 53);
+        assert_eq!(payload, b"unblocked");
+
+        outbound.close();
+        server_task.abort();
+    })
+    .await
+    .unwrap();
+}

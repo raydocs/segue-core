@@ -945,6 +945,22 @@ impl StreamsState {
         self.stream_receive_window = window;
     }
 
+    /// Returns `(remaining, open)` for locally-initiated bidirectional streams:
+    /// `remaining` is how many additional streams the peer's `MAX_STREAMS`
+    /// currently allows without blocking, and `open` is how many locally-
+    /// initiated bidirectional streams still have an open send or receive half.
+    pub(crate) fn local_bidi_stream_budget(&self) -> (u64, usize) {
+        let remaining = self.max[Dir::Bi as usize].saturating_sub(self.next[Dir::Bi as usize]);
+        let is_local_bidi = |id: StreamId| id.initiator() == self.side && id.dir() == Dir::Bi;
+        let open_send = self.send.keys().filter(|id| is_local_bidi(**id)).count();
+        let open_recv_only = self
+            .recv
+            .keys()
+            .filter(|id| is_local_bidi(**id) && !self.send.contains_key(id))
+            .count();
+        (remaining, open_send + open_recv_only)
+    }
+
     /// Set the receive_window and returns whether the receive_window has been
     /// expanded or shrunk: true if expanded, false if shrunk.
     pub(crate) fn set_receive_window(&mut self, receive_window: VarInt) -> bool {

@@ -105,11 +105,33 @@ impl DeferredRuntimeRealityConnection {
             fingerprint: &config.fingerprint,
         })?;
         session.set_spider_x(&config.spider_x);
-        let prepared_client_hello = session.prepared_client_hello()?;
         let context = context_provider.context();
+        let mldsa65_verify = config.mldsa65_verify.take();
+
+        if session.supports_direct_finalization() {
+            let params = connector.prepare_handshake_params(context)?;
+            return match carrier {
+                Carrier::Tcp(tcp_stream) => {
+                    session
+                        .complete_direct(tcp_stream, params, mldsa65_verify)
+                        .await
+                }
+                Carrier::Fragmented(tcp_stream, fragment) => {
+                    session
+                        .complete_direct_fragmented(tcp_stream, params, mldsa65_verify, fragment)
+                        .await
+                }
+                Carrier::Masked(stream) => {
+                    session
+                        .complete_direct_over_stream(stream, params, mldsa65_verify)
+                        .await
+                }
+            };
+        }
+
+        let prepared_client_hello = session.prepared_client_hello()?;
         let prepared_handshake =
             connector.prepare_handshake_with_client_hello(prepared_client_hello, context)?;
-        let mldsa65_verify = config.mldsa65_verify.take();
 
         match carrier {
             Carrier::Tcp(tcp_stream) => {

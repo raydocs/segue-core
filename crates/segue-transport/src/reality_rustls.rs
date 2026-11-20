@@ -2,7 +2,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
 };
 
@@ -28,7 +28,10 @@ use crate::{
         validate_reality_fingerprint, verify_reality_certificate_der_with_mldsa65, RealityError,
         RealityHandshakeInput, RealityMldsa65CertificateInput, RealityPreparedClientHello,
     },
-    reality_connector::{RealityClientHelloRequest, RealityTlsSession, RealityTlsSessionProvider},
+    reality_connector::{
+        RealityClientHelloRequest, RealityHandshakeParams, RealityTlsSession,
+        RealityTlsSessionProvider,
+    },
     reality_spider::{spider, RealitySpider},
     utls_profiles::{reality_profile_for_fingerprint, UtlsClientHelloProfile},
     utls_shaping::{apply_utls_profile, retain_profile_certificate_decompressors, HelloDraws},
@@ -51,25 +54,41 @@ impl RustlsRealityTlsSessionProvider {
     }
 }
 
+fn cached_ring_provider() -> &'static CryptoProvider {
+    static RING_PROVIDER: OnceLock<CryptoProvider> = OnceLock::new();
+    RING_PROVIDER.get_or_init(crypto::ring::default_provider)
+}
+
+fn cached_reality_crypto_provider() -> Arc<CryptoProvider> {
+    static REALITY_PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
+    REALITY_PROVIDER
+        .get_or_init(|| Arc::new(reality_crypto_provider()))
+        .clone()
+}
+
 impl RealityTlsSessionProvider for RustlsRealityTlsSessionProvider {
     fn create_session(
         &self,
         request: RealityClientHelloRequest<'_>,
     ) -> Result<Box<dyn RealityTlsSession>, RealityError> {
         validate_reality_fingerprint(request.fingerprint)?;
+        let _ = ServerName::try_from(request.server_name).map_err(|_| {
+            RealityError::ClientHelloGenerationFailed(
+                TransportError::InvalidTlsServerName(request.server_name.to_owned()).to_string(),
+            )
+        })?;
 
         let plan = RustlsRealityPlan::random().map_err(|_| {
             RealityError::ClientHelloGenerationFailed(
                 "failed to fill REALITY handshake entropy".to_owned(),
             )
         })?;
-        let prepared = plan.prepare_client_hello(request)?;
 
         Ok(Box::new(RustlsRealityTlsSession {
             server_name: request.server_name.to_owned(),
             fingerprint: request.fingerprint.to_owned(),
             plan,
-            prepared_client_hello: prepared,
+            prepared_client_hello: Mutex::new(None),
             spider: RealitySpider::parse(""),
             roots: None,
         }))
@@ -102,7 +121,7 @@ impl RustlsRealityPlan {
     fn random() -> Result<Self, GetRandomFailed> {
         let mut hello_random = [0; 32];
         let mut local_x25519_private_key = [0; 32];
-        let secure_random = crypto::ring::default_provider().secure_random;
+        let secure_random = cached_ring_provider().secure_random;
 
         secure_random.fill(&mut hello_random)?;
         secure_random.fill(&mut local_x25519_private_key)?;
@@ -393,24 +412,27 @@ struct RustlsRealityClientHelloFinalizer {
     short_id: Vec<u8>,
     server_public_key: [u8; 32],
     finalized_state: Arc<RealityFinalizedClientHelloState>,
+    finalization_error: Arc<Mutex<Option<RealityError>>>,
 }
 
 impl RustlsRealityClientHelloFinalizer {
     fn new(
         plan: &RustlsRealityPlan,
         fingerprint: &str,
-        prepared: &crate::reality::RealityPreparedHandshake,
+        params: &RealityHandshakeParams,
         finalized_state: Arc<RealityFinalizedClientHelloState>,
+        finalization_error: Arc<Mutex<Option<RealityError>>>,
     ) -> Self {
         Self {
             fingerprint: fingerprint.to_owned(),
             hello_random: plan.hello_random,
             local_x25519_private_key: plan.local_x25519_private_key,
-            version: prepared.version,
-            unix_time: prepared.unix_time,
-            short_id: prepared.short_id.clone(),
-            server_public_key: prepared.server_public_key,
+            version: params.version,
+            unix_time: params.unix_time,
+            short_id: params.short_id.clone(),
+            server_public_key: params.server_public_key,
             finalized_state,
+            finalization_error,
         }
     }
 }
@@ -453,7 +475,11 @@ impl FinalizesClientHello for RustlsRealityClientHelloFinalizer {
             },
         })
         .map_err(|error| {
-            RustlsError::General(format!("REALITY ClientHello finalization failed: {error}"))
+            let message = format!("REALITY ClientHello finalization failed: {error}");
+            if let Ok(mut slot) = self.finalization_error.lock() {
+                *slot = Some(error);
+            }
+            RustlsError::General(message)
         })?;
 
         if prepared.patched_client_hello.len() != bytes.len() {
@@ -476,7 +502,7 @@ struct RustlsRealityTlsSession {
     server_name: String,
     fingerprint: String,
     plan: RustlsRealityPlan,
-    prepared_client_hello: RealityPreparedClientHello,
+    prepared_client_hello: Mutex<Option<RealityPreparedClientHello>>,
     spider: RealitySpider,
     /// Trust anchors for a server that answers with a real certificate;
     /// `None` is the bundled Web PKI roots. Tests substitute their own.
@@ -495,20 +521,49 @@ impl fmt::Debug for RustlsRealityTlsSession {
     }
 }
 
+fn clone_prepared_client_hello(
+    prepared: &RealityPreparedClientHello,
+    local_x25519_private_key: [u8; 32],
+) -> RealityPreparedClientHello {
+    RealityPreparedClientHello {
+        fingerprint: prepared.fingerprint.clone(),
+        raw_client_hello: prepared.raw_client_hello.clone(),
+        hello_random: prepared.hello_random,
+        session_id_offset: prepared.session_id_offset,
+        local_x25519_private_key,
+    }
+}
+
 #[async_trait]
 impl RealityTlsSession for RustlsRealityTlsSession {
+    fn supports_direct_finalization(&self) -> bool {
+        true
+    }
+
     fn set_spider_x(&mut self, spider_x: &str) {
         self.spider = RealitySpider::parse(spider_x);
     }
 
     fn prepared_client_hello(&self) -> Result<RealityPreparedClientHello, RealityError> {
-        Ok(RealityPreparedClientHello {
-            fingerprint: self.prepared_client_hello.fingerprint.clone(),
-            raw_client_hello: self.prepared_client_hello.raw_client_hello.clone(),
-            hello_random: self.prepared_client_hello.hello_random,
-            session_id_offset: self.prepared_client_hello.session_id_offset,
-            local_x25519_private_key: self.plan.local_x25519_private_key,
-        })
+        let mut cached = self.prepared_client_hello.lock().map_err(|_| {
+            RealityError::ClientHelloGenerationFailed(
+                "REALITY ClientHello cache lock was poisoned".to_owned(),
+            )
+        })?;
+        if let Some(prepared) = cached.as_ref() {
+            return Ok(clone_prepared_client_hello(
+                prepared,
+                self.plan.local_x25519_private_key,
+            ));
+        }
+
+        let prepared = self.plan.prepare_client_hello(RealityClientHelloRequest {
+            server_name: &self.server_name,
+            fingerprint: &self.fingerprint,
+        })?;
+        let copy = clone_prepared_client_hello(&prepared, self.plan.local_x25519_private_key);
+        *cached = Some(prepared);
+        Ok(copy)
     }
 
     async fn complete(
@@ -538,12 +593,63 @@ impl RealityTlsSession for RustlsRealityTlsSession {
     ) -> Result<BoxedTransportStream, TransportError> {
         self.complete_over(stream, prepared, mldsa65_verify).await
     }
+
+    async fn complete_direct(
+        self: Box<Self>,
+        tcp_stream: TcpStream,
+        params: RealityHandshakeParams,
+        mldsa65_verify: Option<Vec<u8>>,
+    ) -> Result<BoxedTransportStream, TransportError> {
+        self.complete_over_params(tcp_stream, params, mldsa65_verify)
+            .await
+    }
+
+    async fn complete_direct_fragmented(
+        self: Box<Self>,
+        tcp_stream: TcpStream,
+        params: RealityHandshakeParams,
+        mldsa65_verify: Option<Vec<u8>>,
+        fragment: Arc<crate::TcpFragmentConfig>,
+    ) -> Result<BoxedTransportStream, TransportError> {
+        let stream = crate::fragment::FragmentStream::new(Box::new(tcp_stream), fragment);
+        self.complete_over_params(stream, params, mldsa65_verify)
+            .await
+    }
+
+    async fn complete_direct_over_stream(
+        self: Box<Self>,
+        stream: BoxedTransportStream,
+        params: RealityHandshakeParams,
+        mldsa65_verify: Option<Vec<u8>>,
+    ) -> Result<BoxedTransportStream, TransportError> {
+        self.complete_over_params(stream, params, mldsa65_verify)
+            .await
+    }
 }
 impl RustlsRealityTlsSession {
     async fn complete_over<S>(
         self: Box<Self>,
         tcp_stream: S,
         prepared: crate::reality::RealityPreparedHandshake,
+        mldsa65_verify: Option<Vec<u8>>,
+    ) -> Result<BoxedTransportStream, TransportError>
+    where
+        S: crate::Carrier + 'static,
+    {
+        let params = RealityHandshakeParams {
+            version: prepared.version,
+            unix_time: prepared.unix_time,
+            short_id: prepared.short_id.clone(),
+            server_public_key: prepared.server_public_key,
+        };
+        self.complete_over_params(tcp_stream, params, mldsa65_verify)
+            .await
+    }
+
+    async fn complete_over_params<S>(
+        self: Box<Self>,
+        tcp_stream: S,
+        params: RealityHandshakeParams,
         mldsa65_verify: Option<Vec<u8>>,
     ) -> Result<BoxedTransportStream, TransportError>
     where
@@ -556,11 +662,13 @@ impl RustlsRealityTlsSession {
             ))
         })?;
         let finalized_state = Arc::new(RealityFinalizedClientHelloState::default());
+        let finalization_error = Arc::new(Mutex::new(None));
         let finalizer = Arc::new(RustlsRealityClientHelloFinalizer::new(
             &self.plan,
             &self.fingerprint,
-            &prepared,
+            &params,
             finalized_state.clone(),
+            finalization_error.clone(),
         ));
 
         let server_read_log = mldsa65_verify
@@ -596,7 +704,17 @@ impl RustlsRealityTlsSession {
         let connector = TokioTlsConnector::from(config);
         let tcp_stream = CapturedStream::new(tcp_stream, server_read_log);
         let connect = connector.connect(server_name, tcp_stream);
-        let stream = connect.await.map_err(TransportError::Tls)?;
+        let stream = match connect.await {
+            Ok(stream) => stream,
+            Err(error) => {
+                if let Ok(mut recorded) = finalization_error.lock() {
+                    if let Some(reality_error) = recorded.take() {
+                        return Err(TransportError::Reality(reality_error));
+                    }
+                }
+                return Err(TransportError::Tls(error));
+            }
+        };
 
         if real_certificate.accepted.load(Ordering::Acquire) {
             // Xray-core finishes this handshake and crawls the real site
@@ -617,7 +735,7 @@ fn reality_client_config(
     client_hello_customizer: Option<Arc<dyn ClientHelloCustomizer>>,
     profile: &'static UtlsClientHelloProfile,
 ) -> Result<ClientConfig, TransportError> {
-    let provider = Arc::new(reality_crypto_provider());
+    let provider = cached_reality_crypto_provider();
     let builder = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|error| TransportError::TlsConfig(error.to_string()))?;
@@ -931,7 +1049,7 @@ impl ServerCertVerifier for RealityServerVerifier {
                 CertificateError::ApplicationVerificationFailure,
             ));
         }
-        let provider = crypto::ring::default_provider();
+        let provider = cached_ring_provider();
         crypto::verify_tls12_signature(
             message,
             cert,
@@ -946,7 +1064,7 @@ impl ServerCertVerifier for RealityServerVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        let provider = crypto::ring::default_provider();
+        let provider = cached_ring_provider();
         crypto::verify_tls13_signature(
             message,
             cert,
@@ -956,7 +1074,7 @@ impl ServerCertVerifier for RealityServerVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        crypto::ring::default_provider()
+        cached_ring_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -1006,21 +1124,20 @@ mod tests {
             .expect("REALITY ClientHello plan should get random material");
         let server_secret = X25519StaticSecret::from([7u8; 32]);
         let server_public_key = X25519PublicKey::from(&server_secret).to_bytes();
-        let prepared = crate::reality::RealityPreparedHandshake {
-            patched_client_hello: Vec::new(),
-            auth_key: [0; 32],
-            session_id: [0; REALITY_SESSION_ID_LEN],
+        let params = RealityHandshakeParams {
             version: [0, 0, 1],
             unix_time: 1_700_000_000,
             short_id: vec![0xaa, 0xbb, 0xcc],
             server_public_key,
         };
         let finalized_state = Arc::new(RealityFinalizedClientHelloState::default());
+        let finalization_error = Arc::new(Mutex::new(None));
         let finalizer = Arc::new(RustlsRealityClientHelloFinalizer::new(
             &plan,
             "chrome",
-            &prepared,
+            &params,
             finalized_state.clone(),
+            finalization_error,
         ));
 
         let captured = plan
@@ -1117,17 +1234,11 @@ mod tests {
         crate::reality::RealityPreparedHandshake,
     ) {
         let plan = RustlsRealityPlan::random().expect("REALITY entropy");
-        let prepared_client_hello = plan
-            .prepare_client_hello(RealityClientHelloRequest {
-                server_name: SPIDER_SERVER_NAME,
-                fingerprint: "chrome",
-            })
-            .expect("prepared ClientHello");
         let session = RustlsRealityTlsSession {
             server_name: SPIDER_SERVER_NAME.to_owned(),
             fingerprint: "chrome".to_owned(),
             plan,
-            prepared_client_hello,
+            prepared_client_hello: Mutex::new(None),
             spider: RealitySpider::parse("/probe?c=1&t=1"),
             roots,
         };
@@ -1221,5 +1332,28 @@ mod tests {
         );
         server.await.expect("server task");
         assert!(requests.recv().await.is_none(), "nothing is crawled");
+    }
+
+    #[test]
+    fn session_creation_defers_client_hello_and_caches_providers() {
+        let provider = RustlsRealityTlsSessionProvider::new();
+        let session = provider
+            .create_session(RealityClientHelloRequest {
+                server_name: "example.com",
+                fingerprint: "chrome",
+            })
+            .expect("create session");
+        assert!(session.supports_direct_finalization());
+
+        let first = session.prepared_client_hello().expect("lazy ClientHello");
+        let second = session.prepared_client_hello().expect("cached ClientHello");
+        assert_eq!(first.raw_client_hello, second.raw_client_hello);
+        assert_eq!(first.hello_random, second.hello_random);
+
+        assert!(Arc::ptr_eq(
+            &cached_reality_crypto_provider(),
+            &cached_reality_crypto_provider(),
+        ));
+        assert!(std::ptr::eq(cached_ring_provider(), cached_ring_provider()));
     }
 }

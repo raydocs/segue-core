@@ -10,6 +10,12 @@ use tokio::sync::Mutex as AsyncMutex;
 /// connect attempt. It is the default policy `handshake`, which also bounds
 /// each open that waits on a dial.
 const DIAL_DEADLINE: Duration = Duration::from_secs(10);
+/// Stagger delay between Happy Eyeballs candidate connect attempts.
+const HAPPY_EYEBALLS_STAGGER: Duration = Duration::from_millis(250);
+/// Maximum concurrent candidate connect attempts during Happy Eyeballs.
+const MAX_CONCURRENT_DIALS: usize = 3;
+
+type RaceAttemptOutcome = (Result<HysteriaClient, HysteriaError>, u64);
 /// A connect attempt's share while other server addresses are still to be
 /// tried, so a dead address leaves time for the next.
 const CANDIDATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -362,7 +368,7 @@ impl HysteriaOutbound {
         };
         let attempts = candidates.len().min(attempts);
         let realm_budget = self.realm_budget();
-        for (index, candidate) in candidates.into_iter().take(attempts).enumerate() {
+        let build_config = |candidate: SocketAddr| {
             let mut config = HysteriaConfig::new(candidate, self.inner.tls.clone(), String::new());
             config.auth = self.inner.auth.auth.clone();
             config.limits = self.inner.limits;
@@ -370,6 +376,22 @@ impl HysteriaOutbound {
             config.quic = self.inner.quic.clone();
             config.receive_bytes_per_second = self.inner.receive_bytes_per_second;
             config.realm = realm.clone();
+            config
+        };
+
+        if realm.is_none() && self.inner.carrier.xicmp.is_none() && attempts >= 2 {
+            return self
+                .race_candidates(
+                    candidates.into_iter().take(attempts).collect(),
+                    build_config,
+                    dialer,
+                    deadline,
+                )
+                .await;
+        }
+
+        for (index, candidate) in candidates.into_iter().take(attempts).enumerate() {
+            let config = build_config(candidate);
             // Give later DNS candidates a chance within the total operation
             // deadline, and the last one what is left of it.
             let generation = self.inner.network_generation.load(Ordering::Acquire);
@@ -381,21 +403,7 @@ impl HysteriaOutbound {
             .await;
             match attempt.unwrap_or(Err(HysteriaError::Timeout)) {
                 Ok(client) => {
-                    let mut cached = self.inner.session.lock().unwrap_or_else(|e| e.into_inner());
-                    if self.inner.closed.load(Ordering::Acquire) {
-                        client.close();
-                        return Err(HysteriaError::Closed.into());
-                    }
-                    // A usable-path update during auth/socket creation must
-                    // also reach a client that was not cached at that instant.
-                    if self.inner.network_generation.load(Ordering::Acquire) != generation {
-                        client.rebind();
-                    }
-                    *cached = Some(CachedSession {
-                        client: client.clone(),
-                        connector: dialer.tls_connector().clone(),
-                    });
-                    return Ok(client);
+                    return self.finish_connected(client, dialer, generation);
                 }
                 Err(
                     error @ (HysteriaError::SocketProtection
@@ -408,6 +416,154 @@ impl HysteriaOutbound {
             }
         }
         Err(last.into())
+    }
+
+    async fn race_candidates<F>(
+        &self,
+        candidates: Vec<SocketAddr>,
+        build_config: F,
+        dialer: &TransportDialer,
+        deadline: tokio::time::Instant,
+    ) -> Result<HysteriaClient, CoreError>
+    where
+        F: Fn(SocketAddr) -> HysteriaConfig,
+    {
+        let total = candidates.len();
+        let connector = dialer.tls_connector().clone();
+        let mut iter = candidates.into_iter().enumerate();
+        let mut in_flight = tokio::task::JoinSet::new();
+        let mut last = HysteriaError::Connect;
+
+        let spawn_next =
+            |iter: &mut std::iter::Enumerate<std::vec::IntoIter<SocketAddr>>,
+             in_flight: &mut tokio::task::JoinSet<RaceAttemptOutcome>| {
+                let Some((index, candidate)) = iter.next() else {
+                    return false;
+                };
+                let config = build_config(candidate);
+                let connector = connector.clone();
+                let generation = self.inner.network_generation.load(Ordering::Acquire);
+                let per_attempt_timeout =
+                    (index + MAX_CONCURRENT_DIALS < total).then_some(CANDIDATE_ATTEMPT_TIMEOUT);
+                in_flight.spawn(async move {
+                    let outcome = match per_attempt_timeout {
+                        Some(limit) => {
+                            tokio::time::timeout(limit, HysteriaClient::connect(config, &connector))
+                                .await
+                                .unwrap_or(Err(HysteriaError::Timeout))
+                        }
+                        None => HysteriaClient::connect(config, &connector).await,
+                    };
+                    (outcome, generation)
+                });
+                true
+            };
+
+        spawn_next(&mut iter, &mut in_flight);
+
+        let race_loop = async {
+            loop {
+                if in_flight.is_empty() && !spawn_next(&mut iter, &mut in_flight) {
+                    return Err(last.into());
+                }
+
+                let has_more = iter.len() > 0 && in_flight.len() < MAX_CONCURRENT_DIALS;
+                if has_more {
+                    let stagger = tokio::time::sleep(HAPPY_EYEBALLS_STAGGER);
+                    tokio::pin!(stagger);
+                    tokio::select! {
+                        biased;
+                        res = in_flight.join_next() => {
+                            if let Some(result) = self.handle_race_outcome(
+                                res,
+                                &mut in_flight,
+                                dialer,
+                                &mut last,
+                            )? {
+                                return Ok(result);
+                            }
+                        }
+                        () = &mut stagger => {
+                            spawn_next(&mut iter, &mut in_flight);
+                        }
+                    }
+                } else {
+                    let res = in_flight.join_next().await;
+                    if in_flight.is_empty() && res.is_none() {
+                        return Err(last.into());
+                    }
+                    if let Some(result) =
+                        self.handle_race_outcome(res, &mut in_flight, dialer, &mut last)?
+                    {
+                        return Ok(result);
+                    }
+                }
+            }
+        };
+
+        match tokio::time::timeout_at(deadline, race_loop).await {
+            Ok(result) => result,
+            Err(_) => {
+                in_flight.abort_all();
+                Err(HysteriaError::Timeout.into())
+            }
+        }
+    }
+
+    fn handle_race_outcome(
+        &self,
+        joined: Option<Result<RaceAttemptOutcome, tokio::task::JoinError>>,
+        in_flight: &mut tokio::task::JoinSet<RaceAttemptOutcome>,
+        dialer: &TransportDialer,
+        last: &mut HysteriaError,
+    ) -> Result<Option<HysteriaClient>, CoreError> {
+        match joined {
+            Some(Ok((Ok(client), generation))) => {
+                in_flight.abort_all();
+                self.finish_connected(client, dialer, generation).map(Some)
+            }
+            Some(Ok((
+                Err(
+                    error @ (HysteriaError::SocketProtection
+                    | HysteriaError::Authentication
+                    | HysteriaError::AuthenticationHeaders
+                    | HysteriaError::Configuration
+                    | HysteriaError::TlsConfiguration),
+                ),
+                _,
+            ))) => {
+                in_flight.abort_all();
+                Err(error.into())
+            }
+            Some(Ok((Err(error), _))) => {
+                *last = error;
+                Ok(None)
+            }
+            Some(Err(_)) | None => Ok(None),
+        }
+    }
+
+    fn finish_connected(
+        &self,
+        client: HysteriaClient,
+        dialer: &TransportDialer,
+        generation: u64,
+    ) -> Result<HysteriaClient, CoreError> {
+        let mut cached = self.inner.session.lock().unwrap_or_else(|e| e.into_inner());
+        if self.inner.closed.load(Ordering::Acquire) {
+            client.close();
+            return Err(HysteriaError::Closed.into());
+        }
+        // A usable-path update during auth/socket creation must
+        // also reach a client that was not cached at that instant.
+        if self.inner.network_generation.load(Ordering::Acquire) != generation {
+            client.rebind();
+        }
+        *cached = Some(CachedSession {
+            client: client.clone(),
+            connector: dialer.tls_connector().clone(),
+        });
+        Ok(client)
     }
 
     pub(crate) async fn open_tcp(

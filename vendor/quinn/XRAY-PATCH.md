@@ -16,6 +16,9 @@ The quantum remains finite; socket backpressure and the congestion controller
 still bound sends. This reduces connection-lock and task scheduling handoffs.
 `Connection::set_stream_receive_window` forwards to quinn-proto's setter of the
 same name, which sets the window every receive stream offers.
+`Connection::local_bidi_stream_budget` forwards to quinn-proto's getter of the
+same name, returning `(remaining, open)` locally-initiated bidirectional stream
+credits so multiplexed HTTP/3 pools can check peer capacity directly.
 
 `AsyncUdpSocket::max_receive_batch` lets a socket ask its endpoint for fewer
 receive slots than quinn-udp's `BATCH_SIZE`, 32 on Linux and Android. The

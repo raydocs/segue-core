@@ -5,11 +5,13 @@
 use quinn::{udp, AsyncUdpSocket, UdpPoller};
 use std::{
     fmt,
-    future::Future,
     io::{self, IoSliceMut},
-    net::{SocketAddr, UdpSocket},
+    net::{IpAddr, SocketAddr, UdpSocket},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
     task::{ready, Context, Poll},
     time::{Duration, Instant},
 };
@@ -18,6 +20,7 @@ use tokio::io::Interest;
 pub(crate) fn wrap(socket: UdpSocket, peer: SocketAddr) -> io::Result<Arc<dyn AsyncUdpSocket>> {
     // The caller protects the descriptor before opening its route to the peer.
     socket.connect(peer)?;
+    let local_ip = socket.local_addr()?.ip();
     let inner = udp::UdpSocketState::new((&socket).into())?;
     let options = socket2::SockRef::from(&socket);
     let traffic_class = if peer.is_ipv6() {
@@ -29,6 +32,8 @@ pub(crate) fn wrap(socket: UdpSocket, peer: SocketAddr) -> io::Result<Arc<dyn As
         io: tokio::net::UdpSocket::from_std(socket)?,
         inner,
         peer,
+        local_ip,
+        traffic_class_cached: AtomicU32::new(traffic_class),
         traffic_class: Mutex::new(traffic_class),
         last_send_error: Mutex::new(None),
     }))
@@ -39,18 +44,52 @@ struct ConnectedSocket {
     io: tokio::net::UdpSocket,
     inner: udp::UdpSocketState,
     peer: SocketAddr,
+    local_ip: IpAddr,
+    // Low two bits mirror the active kernel ECN marking for lock-free fast path.
+    traffic_class_cached: AtomicU32,
     // Serialize the cached ECN option and its send; concurrent callers cannot
     // change a packet's marking between setsockopt and send. Preserve DSCP bits.
     traffic_class: Mutex<u32>,
     last_send_error: Mutex<Option<Instant>>,
 }
 
+impl ConnectedSocket {
+    fn send_connected(&self, contents: &[u8]) -> io::Result<()> {
+        self.io.try_io(Interest::WRITABLE, || {
+            let socket = socket2::SockRef::from(&self.io);
+            // Match Quinn UDP: failed datagrams are loss, not a connection
+            // failure. In particular a PMTU probe may exceed the route's MTU.
+            // WouldBlock still clears Tokio readiness and schedules a retry.
+            loop {
+                match socket.send(contents) {
+                    Ok(sent) if sent == contents.len() => return Ok(()),
+                    Ok(_) => return Ok(()), // A partial datagram is lost.
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
+                    Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => return Ok(()),
+                    Err(error) => {
+                        let now = Instant::now();
+                        let mut last = self
+                            .last_send_error
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if last.is_none_or(|last| {
+                            now.saturating_duration_since(last) >= Duration::from_secs(60)
+                        }) {
+                            tracing::warn!(%error, peer = %self.peer, "connected QUIC UDP send failed");
+                            *last = Some(now);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        })
+    }
+}
+
 impl AsyncUdpSocket for ConnectedSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(Poller {
-            socket: self,
-            ready: None,
-        })
+        Box::pin(Poller { socket: self })
     }
 
     fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
@@ -65,48 +104,31 @@ impl AsyncUdpSocket for ConnectedSocket {
             ));
         }
         if let Some(source) = transmit.src_ip {
-            if source != self.io.local_addr()?.ip() {
+            if source != self.local_ip {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "source address differs from connected UDP route",
                 ));
             }
         }
+        let marking = transmit.ecn.map_or(0, |ecn| ecn as u32);
+        if (self.traffic_class_cached.load(Ordering::Acquire) & 3) == marking {
+            return self.send_connected(transmit.contents);
+        }
+
         let mut traffic_class = self.traffic_class.lock().unwrap_or_else(|e| e.into_inner());
-        self.io.try_io(Interest::WRITABLE, || {
-            let marking = transmit.ecn.map_or(0, |ecn| ecn as u32);
-            let desired = (*traffic_class & !3) | marking;
+        let desired = (*traffic_class & !3) | marking;
+        if desired != *traffic_class {
             let socket = socket2::SockRef::from(&self.io);
-            if desired != *traffic_class {
-                if self.peer.is_ipv6() {
-                    socket.set_tclass_v6(desired)?;
-                } else {
-                    socket.set_tos_v4(desired)?;
-                }
-                *traffic_class = desired;
+            if self.peer.is_ipv6() {
+                socket.set_tclass_v6(desired)?;
+            } else {
+                socket.set_tos_v4(desired)?;
             }
-            // Match Quinn UDP: failed datagrams are loss, not a connection
-            // failure. In particular a PMTU probe may exceed the route's MTU.
-            // WouldBlock still clears Tokio readiness and schedules a retry.
-            loop {
-                match socket.send(transmit.contents) {
-                    Ok(sent) if sent == transmit.contents.len() => return Ok(()),
-                    Ok(_) => return Ok(()), // A partial datagram is lost.
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
-                    Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => return Ok(()),
-                    Err(error) => {
-                        let now = Instant::now();
-                        let mut last = self.last_send_error.lock().unwrap_or_else(|e| e.into_inner());
-                        if last.is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(60)) {
-                            tracing::warn!(%error, peer = %self.peer, "connected QUIC UDP send failed");
-                            *last = Some(now);
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-        })
+            *traffic_class = desired;
+            self.traffic_class_cached.store(desired, Ordering::Release);
+        }
+        self.send_connected(transmit.contents)
     }
 
     fn poll_recv(
@@ -150,10 +172,8 @@ impl AsyncUdpSocket for ConnectedSocket {
     }
 }
 
-type Writable = Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>;
 struct Poller {
     socket: Arc<ConnectedSocket>,
-    ready: Option<Writable>,
 }
 impl fmt::Debug for Poller {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -164,18 +184,7 @@ impl fmt::Debug for Poller {
 }
 impl UdpPoller for Poller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if this.ready.is_none() {
-            let socket = this.socket.clone();
-            this.ready = Some(Box::pin(async move { socket.io.writable().await }));
-        }
-        match this.ready.as_mut().unwrap().as_mut().poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                this.ready = None;
-                Poll::Ready(result)
-            }
-        }
+        self.socket.io.poll_send_ready(cx)
     }
 }
 
@@ -244,7 +253,10 @@ mod tests {
         let mut poller = client.clone().create_io_poller();
         for marking in [
             Some(udp::EcnCodepoint::Ect0),
+            Some(udp::EcnCodepoint::Ect0),
             None,
+            None,
+            Some(udp::EcnCodepoint::Ect1),
             Some(udp::EcnCodepoint::Ect1),
             Some(udp::EcnCodepoint::Ce),
             None,
@@ -369,5 +381,30 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn poller_reports_writable_and_rejects_mismatched_source_ip() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = server.local_addr().unwrap();
+        let local = UdpSocket::bind("127.0.0.1:0").unwrap();
+        local.set_nonblocking(true).unwrap();
+        let socket = wrap(local, peer).unwrap();
+        let mut poller = socket.clone().create_io_poller();
+        poll_fn(|cx| poller.as_mut().poll_writable(cx))
+            .await
+            .unwrap();
+
+        let bad_src = udp::Transmit {
+            destination: peer,
+            ecn: None,
+            contents: b"mismatch",
+            segment_size: None,
+            src_ip: Some(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2))),
+        };
+        assert_eq!(
+            socket.try_send(&bad_src).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }

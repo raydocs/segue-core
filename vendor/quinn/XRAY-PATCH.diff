@@ -1,6 +1,7 @@
---- a/src/connection.rs
-+++ b/src/connection.rs
-@@ -661,6 +661,13 @@
+diff -ruN a/src/connection.rs b/src/connection.rs
+--- a/src/connection.rs	2006-07-23 18:21:28
++++ b/src/connection.rs	2026-11-19 16:27:28
+@@ -661,6 +661,19 @@
          conn.wake();
      }
  
@@ -11,10 +12,16 @@
 +        conn.wake();
 +    }
 +
++    /// Returns `(remaining, open)` for locally-initiated bidirectional streams.
++    pub fn local_bidi_stream_budget(&self) -> (u64, usize) {
++        let conn = self.0.state.lock("local_bidi_stream_budget");
++        conn.inner.local_bidi_stream_budget()
++    }
++
      /// Modify the number of remotely initiated bidirectional streams that may be concurrently open
      ///
      /// No streams may be opened by the peer unless fewer than `count` are already open. Large
-@@ -1331,7 +1338,7 @@
+@@ -1331,7 +1344,7 @@
  ///
  /// This limits the amount of CPU resources consumed by datagram generation,
  /// and allows other tasks (like receiving ACKs) to run in between.
@@ -23,8 +30,9 @@
  
  /// The maximum amount of datagrams that are sent in a single transmit
  ///
---- a/src/endpoint.rs
-+++ b/src/endpoint.rs
+diff -ruN a/src/endpoint.rs b/src/endpoint.rs
+--- a/src/endpoint.rs	2006-07-23 18:21:28
++++ b/src/endpoint.rs	2026-11-19 16:27:28
 @@ -18,7 +18,7 @@
  #[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring")))]
  use crate::runtime::default_runtime;
@@ -206,8 +214,9 @@
                  Poll::Ready(Ok(msgs)) => {
                      self.recv_limiter.record_work(msgs);
                      for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
---- a/src/runtime.rs
-+++ b/src/runtime.rs
+diff -ruN a/src/runtime.rs b/src/runtime.rs
+--- a/src/runtime.rs	2006-07-23 18:21:28
++++ b/src/runtime.rs	2026-11-19 16:27:28
 @@ -79,6 +79,16 @@
          1
      }

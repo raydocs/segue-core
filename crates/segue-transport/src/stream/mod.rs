@@ -41,7 +41,9 @@ pub(crate) mod xhttp;
 
 /// Raw protected QUIC used by non-HTTP clients, such as TUIC v5.
 pub mod quic {
-    pub use super::xhttp::{H3ConnectConfig, H3Error};
+    pub use super::xhttp::{
+        H3ConnectConfig, H3Error, QuicSendWindow, QUIC_SEND_WINDOW_SAMPLE_BYTES,
+    };
     pub struct Connected {
         pub endpoint: quinn::Endpoint,
         pub connection: quinn::Connection,

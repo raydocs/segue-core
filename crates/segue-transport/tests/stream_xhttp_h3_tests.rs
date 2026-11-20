@@ -2081,8 +2081,8 @@ async fn xhttp_h3_stream_up_uses_one_session_for_get_and_post() {
     assert_eq!(down_path, up_path);
     assert_eq!(
         dials.load(Ordering::Acquire),
-        2,
-        "the conservative H3 pool gives persistent GET and POST separate connections"
+        1,
+        "persistent GET and POST multiplex onto one H3 connection when peer stream budget permits"
     );
 }
 

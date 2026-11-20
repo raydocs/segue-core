@@ -32,6 +32,9 @@ use crate::{
 };
 
 pub(crate) const SALT_LEN: usize = 8;
+const MAX_RECV_BATCH: usize = 32;
+const MAX_RECV_SCRATCH_BYTES: usize = 256 * 1024;
+const MIN_RECV_SLOT_BYTES: usize = 65_536;
 
 /// Xray Salamander and UDP-hop options. Empty options preserve the native path.
 #[derive(Clone, Default)]
@@ -572,16 +575,19 @@ fn carrier_socket(
     wire_peer: SocketAddr,
     config: &HysteriaCarrierConfig,
 ) -> Arc<dyn AsyncUdpSocket> {
+    let password_hasher = config
+        .salamander_password
+        .as_deref()
+        .map(|password| password_prefix(password));
     Arc::new(CarrierSocket {
         inner,
         logical_peer,
         wire_peer,
-        password: config.salamander_password.clone(),
-        send_buffer: Mutex::new(Vec::with_capacity(1500)),
-        receive_buffer: config
-            .salamander_password
+        receive_scratch: password_hasher
             .as_ref()
-            .map(|_| Mutex::new(vec![0; 65_536].into_boxed_slice())),
+            .map(|_| Mutex::new(vec![0; MIN_RECV_SLOT_BYTES])),
+        password_hasher,
+        send_buffer: Mutex::new(Vec::with_capacity(1500)),
         gecko: config
             .gecko
             .filter(|_| config.salamander_password.is_some())
@@ -593,9 +599,9 @@ struct CarrierSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     logical_peer: SocketAddr,
     wire_peer: SocketAddr,
-    password: Option<Arc<Zeroizing<String>>>,
+    password_hasher: Option<Blake2b<U32>>,
     send_buffer: Mutex<Vec<u8>>,
-    receive_buffer: Option<Mutex<Box<[u8]>>>,
+    receive_scratch: Option<Mutex<Vec<u8>>>,
     gecko: Option<GeckoState>,
 }
 
@@ -687,30 +693,62 @@ impl fmt::Debug for CarrierSocket {
         f.debug_struct("HysteriaCarrierSocket")
             .field("logical_peer", &self.logical_peer)
             .field("wire_peer", &self.wire_peer)
-            .field("salamander", &self.password.is_some())
+            .field("salamander", &self.password_hasher.is_some())
             .finish_non_exhaustive()
     }
 }
 
-pub(crate) fn key(password: &str, salt: &[u8]) -> [u8; 32] {
+fn password_prefix(password: &str) -> Blake2b<U32> {
     let mut hasher = Blake2b::<U32>::new();
     hasher.update(password.as_bytes());
+    hasher
+}
+
+fn key_from_prefix(prefix: &Blake2b<U32>, salt: &[u8]) -> [u8; 32] {
+    let mut hasher = prefix.clone();
     hasher.update(salt);
     hasher.finalize().into()
 }
 
-fn encode(password: &str, salt: [u8; SALT_LEN], input: &[u8], output: &mut [u8]) {
-    let mut mask = key(password, &salt);
-    output[..SALT_LEN].copy_from_slice(&salt);
-    for (i, byte) in input.iter().enumerate() {
-        output[SALT_LEN + i] = byte ^ mask[i % mask.len()];
+pub(crate) fn key(password: &str, salt: &[u8]) -> [u8; 32] {
+    key_from_prefix(&password_prefix(password), salt)
+}
+
+#[inline]
+fn xor_in_place(data: &mut [u8], mask: &[u8; 32]) {
+    let mut chunks = data.chunks_exact_mut(32);
+    for chunk in &mut chunks {
+        for (dst, &m) in chunk.iter_mut().zip(mask.iter()) {
+            *dst ^= m;
+        }
     }
+    for (dst, &m) in chunks.into_remainder().iter_mut().zip(mask.iter()) {
+        *dst ^= m;
+    }
+}
+
+fn encode_with_prefix(
+    prefix: &Blake2b<U32>,
+    salt: [u8; SALT_LEN],
+    input: &[u8],
+    output: &mut [u8],
+) {
+    let mut mask = key_from_prefix(prefix, &salt);
+    output[..SALT_LEN].copy_from_slice(&salt);
+    let dst = &mut output[SALT_LEN..SALT_LEN + input.len()];
+    dst.copy_from_slice(input);
+    xor_in_place(dst, &mask);
     mask.zeroize();
+}
+
+#[cfg(test)]
+fn encode(password: &str, salt: [u8; SALT_LEN], input: &[u8], output: &mut [u8]) {
+    encode_with_prefix(&password_prefix(password), salt, input, output);
 }
 
 // Compact each GRO segment separately. Removing only the first salt would
 // corrupt coalesced datagrams on Linux/Android.
-fn decode(password: &str, buffer: &mut [u8], meta: &mut udp::RecvMeta) {
+fn decode_with_prefix(prefix: &Blake2b<U32>, buffer: &mut [u8], meta: &mut udp::RecvMeta) {
     if meta.stride <= SALT_LEN
         || meta.len > buffer.len()
         || !meta.len.is_multiple_of(meta.stride) && meta.len % meta.stride <= SALT_LEN
@@ -722,15 +760,20 @@ fn decode(password: &str, buffer: &mut [u8], meta: &mut udp::RecvMeta) {
     let mut written = 0;
     for offset in (0..meta.len).step_by(meta.stride) {
         let end = (offset + meta.stride).min(meta.len);
-        let mut mask = key(password, &buffer[offset..offset + SALT_LEN]);
-        for i in 0..end - offset - SALT_LEN {
-            buffer[written + i] = buffer[offset + SALT_LEN + i] ^ mask[i % mask.len()];
-        }
-        written += end - offset - SALT_LEN;
+        let payload_len = end - offset - SALT_LEN;
+        let mut mask = key_from_prefix(prefix, &buffer[offset..offset + SALT_LEN]);
+        buffer.copy_within(offset + SALT_LEN..end, written);
+        xor_in_place(&mut buffer[written..written + payload_len], &mask);
+        written += payload_len;
         mask.zeroize();
     }
     meta.len = written;
     meta.stride -= SALT_LEN;
+}
+
+#[cfg(test)]
+fn decode(password: &str, buffer: &mut [u8], meta: &mut udp::RecvMeta) {
+    decode_with_prefix(&password_prefix(password), buffer, meta);
 }
 
 impl AsyncUdpSocket for CarrierSocket {
@@ -749,7 +792,7 @@ impl AsyncUdpSocket for CarrierSocket {
             destination: self.wire_peer,
             ..*transmit
         };
-        let Some(password) = &self.password else {
+        let Some(prefix) = &self.password_hasher else {
             return self.inner.try_send(&rewritten);
         };
         if transmit.contents.len() > 65_507 - SALT_LEN
@@ -780,7 +823,7 @@ impl AsyncUdpSocket for CarrierSocket {
                 buffer.resize(frame.len() + SALT_LEN, 0);
                 let mut salt = [0; SALT_LEN];
                 rand::thread_rng().fill_bytes(&mut salt);
-                encode(password, salt, frame, &mut buffer);
+                encode_with_prefix(prefix, salt, frame, &mut buffer);
                 let fragment = udp::Transmit {
                     contents: &buffer,
                     ..rewritten
@@ -801,7 +844,7 @@ impl AsyncUdpSocket for CarrierSocket {
         buffer.resize(transmit.contents.len() + SALT_LEN, 0);
         let mut salt = [0; SALT_LEN];
         rand::thread_rng().fill_bytes(&mut salt);
-        encode(password, salt, transmit.contents, &mut buffer);
+        encode_with_prefix(prefix, salt, transmit.contents, &mut buffer);
         rewritten.contents = &buffer;
         self.inner.try_send(&rewritten)
     }
@@ -812,21 +855,82 @@ impl AsyncUdpSocket for CarrierSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        if let (Some(password), Some(scratch)) = (&self.password, &self.receive_buffer) {
+        if let (Some(prefix), Some(scratch)) = (&self.password_hasher, &self.receive_scratch) {
             if let Some(count) = self.gecko.as_ref().and_then(|g| g.deliver(bufs, meta)) {
                 return Poll::Ready(Ok(count));
+            }
+            let cap = bufs.len().min(meta.len());
+            if cap == 0 {
+                return self.inner.poll_recv(cx, bufs, meta);
             }
             // Quinn allocates receive buffers from its advertised QUIC payload
             // limit, which excludes the salt. Reserve wire overhead separately,
             // including for GRO aggregates, before copying decoded bytes back.
             let mut scratch = scratch.lock().unwrap_or_else(|e| e.into_inner());
-            let mut wire = [IoSliceMut::new(&mut scratch)];
-            let count = std::task::ready!(self.inner.poll_recv(cx, &mut wire, &mut meta[..1]))?;
+            if self.gecko.is_none() && cap > 1 {
+                let max_gro = self.inner.max_receive_segments().max(1);
+                let max_buf_len = bufs.iter().take(cap).map(|b| b.len()).max().unwrap_or(0);
+                let slot_stride = max_buf_len
+                    .saturating_add(max_gro.saturating_mul(SALT_LEN))
+                    .clamp(2048, 65_536 + SALT_LEN * 64);
+                let batch =
+                    (MAX_RECV_SCRATCH_BYTES / slot_stride).clamp(1, cap.min(MAX_RECV_BATCH));
+                let needed = batch * slot_stride;
+                if scratch.len() < needed {
+                    scratch.resize(needed, 0);
+                }
+                let count = {
+                    let mut wire: [IoSliceMut<'_>; MAX_RECV_BATCH] =
+                        std::array::from_fn(|_| IoSliceMut::new(&mut []));
+                    for (slot, chunk) in wire[..batch]
+                        .iter_mut()
+                        .zip(scratch[..needed].chunks_exact_mut(slot_stride))
+                    {
+                        *slot = IoSliceMut::new(chunk);
+                    }
+                    std::task::ready!(self.inner.poll_recv(
+                        cx,
+                        &mut wire[..batch],
+                        &mut meta[..batch],
+                    ))?
+                };
+                if count == 0 {
+                    return Poll::Ready(Ok(0));
+                }
+                for (i, chunk) in scratch[..needed]
+                    .chunks_exact_mut(slot_stride)
+                    .enumerate()
+                    .take(count)
+                {
+                    if meta[i].addr == self.wire_peer {
+                        decode_with_prefix(prefix, chunk, &mut meta[i]);
+                        meta[i].addr = self.logical_peer;
+                        if meta[i].len <= bufs[i].len() {
+                            bufs[i][..meta[i].len].copy_from_slice(&chunk[..meta[i].len]);
+                        } else {
+                            meta[i].len = 0;
+                            meta[i].stride = 1;
+                        }
+                    } else {
+                        meta[i].len = 0;
+                        meta[i].stride = 1;
+                    }
+                }
+                return Poll::Ready(Ok(count));
+            }
+            if scratch.len() < MIN_RECV_SLOT_BYTES {
+                scratch.resize(MIN_RECV_SLOT_BYTES, 0);
+            }
+            let slot_len = scratch.len().min(MIN_RECV_SLOT_BYTES);
+            let count = {
+                let mut wire = [IoSliceMut::new(&mut scratch[..slot_len])];
+                std::task::ready!(self.inner.poll_recv(cx, &mut wire, &mut meta[..1]))?
+            };
             if count == 0 {
                 return Poll::Ready(Ok(0));
             }
             if meta[0].addr == self.wire_peer {
-                decode(password, &mut scratch, &mut meta[0]);
+                decode_with_prefix(prefix, &mut scratch[..slot_len], &mut meta[0]);
                 meta[0].addr = self.logical_peer;
                 if let Some(gecko) = &self.gecko {
                     // Frames travel only during the handshake; afterwards
@@ -860,8 +964,8 @@ impl AsyncUdpSocket for CarrierSocket {
                 continue;
             }
             meta.addr = self.logical_peer;
-            if let Some(password) = &self.password {
-                decode(password, buffer, meta);
+            if let Some(prefix) = &self.password_hasher {
+                decode_with_prefix(prefix, buffer, meta);
             }
         }
         Poll::Ready(Ok(count))
@@ -873,7 +977,7 @@ impl AsyncUdpSocket for CarrierSocket {
         self.inner.may_fragment()
     }
     fn max_transmit_segments(&self) -> usize {
-        if self.password.is_some() {
+        if self.password_hasher.is_some() {
             1
         } else {
             self.inner.max_transmit_segments()
@@ -1930,5 +2034,133 @@ mod tests {
             &bufs[0][..meta[0].len],
             [[b'c'; 35].as_slice(), b"d"].concat()
         );
+    }
+
+    #[test]
+    fn batched_salamander_poll_recv_decodes_multiple_slots_and_filters_peers() {
+        #[derive(Debug)]
+        struct MultiSlotSocket {
+            local: SocketAddr,
+            packets: Mutex<VecDeque<(Vec<u8>, udp::RecvMeta)>>,
+        }
+
+        #[derive(Debug)]
+        struct ReadyPoller;
+        impl UdpPoller for ReadyPoller {
+            fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncUdpSocket for MultiSlotSocket {
+            fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+                Box::pin(ReadyPoller)
+            }
+            fn try_send(&self, _transmit: &udp::Transmit) -> io::Result<()> {
+                Ok(())
+            }
+            fn poll_recv(
+                &self,
+                _cx: &mut Context<'_>,
+                bufs: &mut [IoSliceMut<'_>],
+                meta: &mut [udp::RecvMeta],
+            ) -> Poll<io::Result<usize>> {
+                let mut queue = self.packets.lock().unwrap();
+                let mut count = 0;
+                for (dst, dst_meta) in bufs.iter_mut().zip(meta.iter_mut()) {
+                    let Some((pkt, pkt_meta)) = queue.pop_front() else {
+                        break;
+                    };
+                    dst[..pkt.len()].copy_from_slice(&pkt);
+                    *dst_meta = pkt_meta;
+                    count += 1;
+                }
+                if count == 0 {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok(count))
+                }
+            }
+            fn local_addr(&self) -> io::Result<SocketAddr> {
+                Ok(self.local)
+            }
+        }
+
+        let wire_peer: SocketAddr = "198.51.100.10:443".parse().unwrap();
+        let logical_peer: SocketAddr = "198.51.100.11:443".parse().unwrap();
+        let rogue_peer: SocketAddr = "198.51.100.99:9999".parse().unwrap();
+        let password = "batched-synthetic-password";
+
+        let payload0 = vec![0x11u8; 70];
+        let payload2 = vec![0x22u8; 45];
+        let mut wire0 = vec![0u8; SALT_LEN + payload0.len()];
+        let mut wire2 = vec![0u8; SALT_LEN + payload2.len()];
+        encode(password, [1; SALT_LEN], &payload0, &mut wire0);
+        encode(password, [2; SALT_LEN], &payload2, &mut wire2);
+
+        let packets = VecDeque::from([
+            (
+                wire0.clone(),
+                udp::RecvMeta {
+                    addr: wire_peer,
+                    len: wire0.len(),
+                    stride: wire0.len(),
+                    ecn: Some(udp::EcnCodepoint::Ect0),
+                    dst_ip: None,
+                },
+            ),
+            (
+                vec![0x99; 24],
+                udp::RecvMeta {
+                    addr: rogue_peer,
+                    len: 24,
+                    stride: 24,
+                    ecn: None,
+                    dst_ip: None,
+                },
+            ),
+            (
+                wire2.clone(),
+                udp::RecvMeta {
+                    addr: wire_peer,
+                    len: wire2.len(),
+                    stride: wire2.len(),
+                    ecn: None,
+                    dst_ip: None,
+                },
+            ),
+        ]);
+
+        let inner = Arc::new(MultiSlotSocket {
+            local: "127.0.0.1:12345".parse().unwrap(),
+            packets: Mutex::new(packets),
+        });
+        let config = HysteriaCarrierConfig {
+            salamander_password: Some(Arc::new(Zeroizing::new(password.to_owned()))),
+            ..Default::default()
+        };
+        let carrier = carrier_socket(inner, logical_peer, wire_peer, &config);
+
+        let mut b0 = [0u8; 1500];
+        let mut b1 = [0u8; 1500];
+        let mut b2 = [0u8; 1500];
+        let mut bufs = [
+            IoSliceMut::new(&mut b0),
+            IoSliceMut::new(&mut b1),
+            IoSliceMut::new(&mut b2),
+        ];
+        let mut meta = [udp::RecvMeta::default(); 3];
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let Poll::Ready(Ok(count)) = carrier.poll_recv(&mut cx, &mut bufs, &mut meta) else {
+            panic!("expected ready batch");
+        };
+        assert_eq!(count, 3);
+        assert_eq!(meta[0].addr, logical_peer);
+        assert_eq!(meta[0].ecn, Some(udp::EcnCodepoint::Ect0));
+        assert_eq!(&bufs[0][..meta[0].len], payload0.as_slice());
+        assert_eq!(meta[1].len, 0);
+        assert_eq!(meta[2].addr, logical_peer);
+        assert_eq!(&bufs[2][..meta[2].len], payload2.as_slice());
     }
 }
