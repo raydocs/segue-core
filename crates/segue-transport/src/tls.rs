@@ -3,7 +3,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
 };
 
@@ -254,7 +254,7 @@ impl TlsConnector {
 
         let mut client_config = match &*self.source {
             ConfigSource::Cached(_) => client_config_with_provider(
-                Arc::new(rustls::crypto::ring::default_provider()),
+                Arc::clone(aws_lc_provider()),
                 config.allow_insecure,
                 &config.pinned_peer_cert_sha256,
                 &config.verify_peer_cert_by_name,
@@ -1138,6 +1138,16 @@ fn reject_unnegotiable_fingerprint(
     ))
 }
 
+fn aws_lc_provider() -> &'static Arc<crypto::CryptoProvider> {
+    static PROVIDER: OnceLock<Arc<crypto::CryptoProvider>> = OnceLock::new();
+    PROVIDER.get_or_init(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+}
+
+fn ring_provider() -> &'static Arc<crypto::CryptoProvider> {
+    static PROVIDER: OnceLock<Arc<crypto::CryptoProvider>> = OnceLock::new();
+    PROVIDER.get_or_init(|| Arc::new(rustls::crypto::ring::default_provider()))
+}
+
 /// Builds the client config for a handshake that sends rustls' own
 /// ClientHello, on the *ring* provider plain TLS has always used. Keeping this
 /// branch on *ring* is what makes "no shaping" reproduce the pre-shaping
@@ -1148,7 +1158,7 @@ fn unshaped_client_config(
     verify_peer_cert_by_name: &[String],
 ) -> Result<rustls::ClientConfig, TransportError> {
     client_config_with_provider(
-        Arc::new(rustls::crypto::ring::default_provider()),
+        Arc::clone(ring_provider()),
         allow_insecure,
         pinned_peer_cert_sha256,
         verify_peer_cert_by_name,

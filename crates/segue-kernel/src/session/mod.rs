@@ -66,7 +66,7 @@ use segue_session::driver::{
 use segue_session::pool::Pool;
 use segue_session::quality::{Quality, QualityEvent, QualityTracker};
 use segue_session::{MoveStats, RedundancyConfig};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
 mod choice;
@@ -174,6 +174,7 @@ impl ExitChoice {
 #[derive(Clone, Debug)]
 struct Health {
     ks: KillSwitch,
+    posture_notify: Arc<Notify>,
     last_fail: Option<Instant>,
     /// The exit was judged down on session evidence (r9 F5) and no
     /// session has had a valid answer since. A carrier connect alone does
@@ -213,9 +214,15 @@ struct SessionMark {
 pub const PROOF_FRESH: Duration = Duration::from_secs(5);
 
 impl Health {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_notify(Arc::new(Notify::new()))
+    }
+
+    fn with_notify(posture_notify: Arc<Notify>) -> Self {
         Self {
             ks: KillSwitch::new(),
+            posture_notify,
             last_fail: None,
             unproven: false,
             sessions: HashMap::new(),
@@ -223,6 +230,11 @@ impl Health {
             #[cfg(test)]
             fail_marks: 0,
         }
+    }
+
+    fn ks_event(&mut self, ev: Event) {
+        self.ks.on_event(ev);
+        self.posture_notify.notify_waiters();
     }
 
     fn recently_failed(&self) -> bool {
@@ -444,6 +456,7 @@ pub struct KernelDialer {
     standby_fail: Arc<AtomicBool>,
     /// Sum of each session's [`MoveStats`], updated as the counters change.
     move_counters: Arc<MoveCounters>,
+    posture_notify: Arc<Notify>,
 }
 
 /// Dialer-level sums of [`MoveStats`]. One session's snapshot is diffed
@@ -513,7 +526,10 @@ impl KernelDialer {
         home: BTreeSet<String>,
     ) -> Self {
         let exits_len = exits.len();
-        let health = (0..exits.len()).map(|_| Health::new()).collect();
+        let posture_notify = Arc::new(Notify::new());
+        let health = (0..exits.len())
+            .map(|_| Health::with_notify(posture_notify.clone()))
+            .collect();
         Self {
             engine,
             exits,
@@ -561,6 +577,7 @@ impl KernelDialer {
                 recovery_us_max: AtomicU64::new(0),
                 recoveries: AtomicU64::new(0),
             }),
+            posture_notify,
         }
     }
 
@@ -858,7 +875,7 @@ impl KernelDialer {
             *c.rejected.lock().unwrap() = None;
         }
         for h in &mut st.health {
-            h.ks.on_event(Event::UserConnect);
+            h.ks_event(Event::UserConnect);
             h.last_fail = None;
             h.unproven = false;
         }
@@ -871,7 +888,7 @@ impl KernelDialer {
         let mut st = self.state.lock().unwrap();
         st.user_off = true;
         for h in &mut st.health {
-            h.ks.on_event(Event::UserDisconnect);
+            h.ks_event(Event::UserDisconnect);
         }
         self.off.send_replace(true);
         for c in &self.channels {
@@ -991,7 +1008,7 @@ impl KernelDialer {
                             let mut st = state.lock().unwrap();
                             let h = &mut st.health[i];
                             if !h.unproven {
-                                h.ks.on_event(Event::ChannelUp);
+                                h.ks_event(Event::ChannelUp);
                                 h.last_fail = None;
                             }
                             Ok(Box::new(stream) as BoxCarrier)
@@ -1039,7 +1056,7 @@ impl KernelDialer {
                                     // for a valid answer. A losing attempt's
                                     // error is not a failure.
                                     if !h.unproven {
-                                        h.ks.on_event(Event::ChannelUp);
+                                        h.ks_event(Event::ChannelUp);
                                         h.last_fail = None;
                                     }
                                     (Ok(Box::new(stream) as BoxCarrier), loser)
@@ -1318,7 +1335,7 @@ fn session_health(h: &mut Health, id: u64, r: SessionHealth, now: Instant) {
             m.ok_at = Some(now);
             h.unproven = false;
             h.last_fail = None;
-            h.ks.on_event(Event::ChannelUp);
+            h.ks_event(Event::ChannelUp);
         }
         // Liveness keeps the session's path counted for the exit (another
         // session's failure does not take it down), but restores nothing:
@@ -1413,11 +1430,11 @@ fn mark_failed(h: &mut Health) {
     }
     match h.ks.posture() {
         Posture::Connected => {
-            h.ks.on_event(Event::ChannelLost);
+            h.ks_event(Event::ChannelLost);
         }
         // Never had a carrier on this exit: no channel can be established.
         Posture::Connecting => {
-            h.ks.on_event(Event::Failed);
+            h.ks_event(Event::Failed);
         }
         _ => {}
     }
@@ -1494,6 +1511,10 @@ impl FlowPosture for KernelDialer {
 
     fn try_hold(&self) -> Option<HoldGuard> {
         HoldGuard::try_acquire(&self.holds, WAIT_CAP)
+    }
+
+    fn posture_notify(&self) -> Option<Arc<Notify>> {
+        Some(self.posture_notify.clone())
     }
 }
 

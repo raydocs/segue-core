@@ -30,6 +30,8 @@ pub struct ClientStream<S> {
     body: crate::record_buffer::RecordBuffer,
     plain_len: usize,
     plain_pos: usize,
+    bulk_read_remaining: usize,
+    read_error: Option<io::Error>,
     phase: Phase,
     failed: bool,
     eof: bool,
@@ -78,6 +80,8 @@ impl<S> ClientStream<S> {
             body: crate::record_buffer::RecordBuffer::new(method.cipher.key_len(), 2 + TAG_LENGTH),
             plain_len: 0,
             plain_pos: 0,
+            bulk_read_remaining: crate::record_buffer::BULK_READ_THRESHOLD,
+            read_error: None,
             phase: Phase::Salt,
             failed: false,
             eof: false,
@@ -121,12 +125,63 @@ impl<S> ClientStream<S> {
             }
             Phase::Payload => {
                 self.plain_len = self.reader.as_mut().unwrap().open(self.body.frame())?;
+                self.body
+                    .note_bulk_read(&mut self.bulk_read_remaining, self.plain_len);
                 self.plain_pos = 0;
                 self.phase = Phase::Plain;
             }
             Phase::Plain => unreachable!(),
         }
         Ok(())
+    }
+}
+
+impl<S: AsyncRead + Unpin> ClientStream<S> {
+    fn poll_read_one(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<bool>> {
+        if self.failed {
+            return Poll::Ready(Err(invalid("Shadowsocks AEAD stream failed")));
+        }
+        if out.remaining() == 0 || self.eof {
+            return Poll::Ready(Ok(false));
+        }
+        for _ in 0..16 {
+            if matches!(self.phase, Phase::Plain) {
+                if self.plain_pos < self.plain_len {
+                    let n = out.remaining().min(self.plain_len - self.plain_pos);
+                    out.put_slice(&self.body.frame()[self.plain_pos..self.plain_pos + n]);
+                    crate::erase::erase(&mut self.body.frame()[self.plain_pos..self.plain_pos + n]);
+                    self.plain_pos += n;
+                    return Poll::Ready(Ok(true));
+                }
+                self.require_body(2 + TAG_LENGTH, Phase::Length);
+            }
+            match ready!(self.body.poll_frame(&mut self.inner, cx)) {
+                Ok(true) => {}
+                Ok(false) if matches!(self.phase, Phase::Length) => {
+                    self.eof = true;
+                    return Poll::Ready(Ok(false));
+                }
+                result => {
+                    self.failed = true;
+                    return Poll::Ready(Err(result
+                        .err()
+                        .unwrap_or_else(|| io::ErrorKind::UnexpectedEof.into())));
+                }
+            }
+            if let Err(e) = self.process_body() {
+                self.failed = true;
+                return Poll::Ready(Err(e));
+            }
+            if self.eof {
+                return Poll::Ready(Ok(false));
+            }
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -161,6 +216,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ClientStream<S> {
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Some(error) = this.read_error.take() {
+            return Poll::Ready(Err(error));
+        }
         if this.failed {
             return Poll::Ready(Err(invalid("Shadowsocks AEAD stream failed")));
         }
@@ -172,40 +230,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ClientStream<S> {
         if let Poll::Ready(result) = this.drain(cx) {
             result?;
         }
-        for _ in 0..16 {
-            if matches!(this.phase, Phase::Plain) {
-                if this.plain_pos < this.plain_len {
-                    let n = out.remaining().min(this.plain_len - this.plain_pos);
-                    out.put_slice(&this.body.frame()[this.plain_pos..this.plain_pos + n]);
-                    crate::erase::erase(&mut this.body.frame()[this.plain_pos..this.plain_pos + n]);
-                    this.plain_pos += n;
-                    return Poll::Ready(Ok(()));
-                }
-                this.require_body(2 + TAG_LENGTH, Phase::Length);
-            }
-            match ready!(this.body.poll_frame(&mut this.inner, cx)) {
-                Ok(true) => {}
-                Ok(false) if matches!(this.phase, Phase::Length) => {
-                    this.eof = true;
-                    return Poll::Ready(Ok(()));
-                }
-                result => {
-                    this.failed = true;
-                    return Poll::Ready(Err(result
-                        .err()
-                        .unwrap_or_else(|| io::ErrorKind::UnexpectedEof.into())));
-                }
-            }
-            if let Err(e) = this.process_body() {
-                this.failed = true;
-                return Poll::Ready(Err(e));
-            }
-            if this.eof {
-                return Poll::Ready(Ok(()));
-            }
-        }
-        cx.waker().wake_by_ref();
-        Poll::Pending
+        let mut read_error = this.read_error.take();
+        let res = crate::record_buffer::poll_read_batched(out, &mut read_error, |buf| {
+            this.poll_read_one(cx, buf)
+        });
+        this.read_error = read_error;
+        res
     }
 }
 

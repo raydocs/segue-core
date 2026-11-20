@@ -3,7 +3,7 @@ use std::io;
 use aes::Aes256;
 use aws_lc_rs::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ctr::cipher::{KeyIvInit, StreamCipher};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{crypto_error, invalid_data};
 
@@ -74,10 +74,29 @@ impl Aead {
     }
 
     pub(crate) fn seal(&mut self, data: &mut Vec<u8>, aad: &[u8]) -> io::Result<()> {
+        self.seal_from(data, 0, aad)
+    }
+
+    pub(crate) fn seal_from(
+        &mut self,
+        data: &mut Vec<u8>,
+        start: usize,
+        aad: &[u8],
+    ) -> io::Result<()> {
         let nonce = self.advance();
-        self.key
-            .seal_in_place_append_tag(nonce, Aad::from(aad), data)
-            .map_err(|_| crypto_error())
+        match self
+            .key
+            .seal_in_place_separate_tag(nonce, Aad::from(aad), &mut data[start..])
+        {
+            Ok(tag) => {
+                data.extend_from_slice(tag.as_ref());
+                Ok(())
+            }
+            Err(_) => {
+                data[start..].zeroize();
+                Err(crypto_error())
+            }
+        }
     }
 
     pub(crate) fn open(&mut self, data: &mut [u8], aad: &[u8]) -> io::Result<usize> {

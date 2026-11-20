@@ -325,3 +325,153 @@ mod redundant_frames {
         assert_eq!(d.buffered(), 0);
     }
 }
+
+#[test]
+fn to_bytes_allocates_exact_capacity_and_encode_with_round_trips() {
+    use segue_session::codec::{
+        ty, Kind, Open, Opened, ParkAckEntry, ParkEntry, RedundantAttach, RedundantOk, Reject,
+        Resume, Resumed, Target, WakeEntry, VERSION,
+    };
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let frames = vec![
+        Frame::Open(Open {
+            version: VERSION,
+            ticket: vec![0xaa; 70],
+            session_id: [1; 16],
+            resume_secret: [2; 32],
+            attach_gen: 3,
+            retry: true,
+            anchor_instance_id: 16_384,
+            kind: Kind::Udp,
+            target: Target::Ip(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8443)),
+            exit_class: 2,
+            t_stall_ms: Some(1_000),
+            first_data: b"hello".to_vec(),
+        }),
+        Frame::Opened(Opened {
+            instance_id: 9,
+            attach_gen: 3,
+            recv_offset: 64,
+            max_offset: 16_384,
+            window_cap: 65_536,
+            ack_bytes: 128,
+        }),
+        Frame::Resume(Resume {
+            version: VERSION,
+            ticket: b"tik".to_vec(),
+            anchor_node_id: 5,
+            anchor_instance_id: 6,
+            session_id: [3; 16],
+            resume_secret: [4; 32],
+            attach_gen: 7,
+            recv_offset: 8,
+            max_offset: 9,
+            t_stall_ms: None,
+        }),
+        Frame::Resumed(Resumed {
+            instance_id: 6,
+            attach_gen: 7,
+            recv_offset: 8,
+            max_offset: 64,
+        }),
+        Frame::Reject(Reject {
+            code: 2,
+            attach_gen: 7,
+            closed: None,
+        }),
+        Frame::Data {
+            offset: 16_384,
+            data: vec![0x5a; 128],
+            pad: 0,
+        },
+        Frame::Data {
+            offset: 64,
+            data: vec![0x5b; 70],
+            pad: 11,
+        },
+        Frame::Ack {
+            recv_offset: 64,
+            max_offset: 16_384,
+        },
+        Frame::Fin { offset: 16_384 },
+        Frame::Rst { code: 4 },
+        Frame::Pad(70),
+        Frame::Dgram {
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 53),
+            data: b"dns".to_vec(),
+        },
+        Frame::Ping { nonce: 42 },
+        Frame::Pong {
+            nonce: 42,
+            extra: b"rtt".to_vec(),
+        },
+        Frame::Wake {
+            full: true,
+            entries: vec![WakeEntry {
+                anchor_node_id: 10,
+                session_id: [5; 16],
+                park_gen: 11,
+            }],
+        },
+        Frame::Park(vec![ParkEntry {
+            session_id: [6; 16],
+            req_id: 12,
+            attach_gen: 1,
+            c_recv_offset: 64,
+            c_sent_offset: 16_384,
+        }]),
+        Frame::ParkAck(vec![ParkAckEntry {
+            session_id: [6; 16],
+            req_id: 12,
+            attach_gen: 1,
+            accepted: true,
+            park_gen: 99,
+        }]),
+        Frame::Stall(vec![([7; 16], 3)]),
+        Frame::RedundantAttach(RedundantAttach {
+            session_id: [8; 16],
+            resume_secret: [9; 32],
+            attach_gen: 2,
+            recv_offset: 0,
+            max_offset: 16_384,
+        }),
+        Frame::RedundantOk(RedundantOk {
+            attach_gen: 2,
+            recv_offset: 0,
+            max_offset: 16_384,
+        }),
+        Frame::Control {
+            ty: ty::CTRL_HELLO,
+            payload: vec![1, 2, 3, 4],
+        },
+    ];
+
+    for f in &frames {
+        let bytes = f.to_bytes();
+        assert_eq!(bytes.len(), bytes.capacity(), "capacity mismatch for {f:?}");
+        let mut d = FrameDecoder::new();
+        d.push(&bytes);
+        assert_eq!(d.next_frame().unwrap().as_ref(), Some(f));
+        assert_eq!(d.buffered(), 0);
+    }
+
+    let mut tailed = Vec::new();
+    let data = Frame::Data {
+        offset: 12,
+        data: b"ab".to_vec(),
+        pad: 5,
+    };
+    data.encode_with(&mut tailed, [b"cd", b"efg"]);
+    let mut d = FrameDecoder::new();
+    d.push(&tailed);
+    assert_eq!(
+        d.next_frame().unwrap(),
+        Some(Frame::Data {
+            offset: 12,
+            data: b"abcdefg".to_vec(),
+            pad: 5,
+        })
+    );
+    assert_eq!(d.buffered(), 0);
+}

@@ -342,7 +342,8 @@ impl SendHalf {
                     data: Vec::new(),
                     pad: 0,
                 };
-                out.reserve_exact(6 + crate::codec::varint_len(offset) + n);
+                let payload_len = crate::codec::varint_len(offset) + n;
+                out.reserve_exact(2 + crate::codec::varint_len(payload_len as u64) + payload_len);
                 f.encode_with(out, deque_range(&self.buf, start, n));
                 Some(SentFrame::Data { offset, len: n })
             }
@@ -390,7 +391,8 @@ impl SendHalf {
             data: Vec::new(),
             pad: 0,
         };
-        out.reserve_exact(6 + crate::codec::varint_len(start_off) + n);
+        let payload_len = crate::codec::varint_len(start_off) + n;
+        out.reserve_exact(2 + crate::codec::varint_len(payload_len as u64) + payload_len);
         f.encode_with(out, deque_range(&self.buf, start, n));
         true
     }

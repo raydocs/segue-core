@@ -12,6 +12,11 @@ const MAX_FRAME: usize = 65535 + 16;
 const PREFIX: usize = 18;
 const MAX_BUFFER: usize = MAX_FRAME + PREFIX;
 
+pub(crate) const BULK_READ_THRESHOLD: usize = 64 * 1024;
+pub(crate) const BULK_READ_AHEAD: usize = 16 * 1024;
+const MAX_READ_RECORDS: usize = 4;
+const MAX_BATCH_BYTES: usize = 32 * 1024;
+
 pub(crate) struct RecordBuffer {
     bytes: Zeroizing<Vec<u8>>,
     start: usize,
@@ -39,6 +44,15 @@ impl RecordBuffer {
     pub(crate) fn set_read_ahead(&mut self, bytes: usize) {
         assert!(bytes <= MAX_BUFFER);
         self.read_ahead = bytes;
+    }
+
+    pub(crate) fn note_bulk_read(&mut self, remaining: &mut usize, plain_len: usize) {
+        if *remaining != 0 {
+            *remaining = remaining.saturating_sub(plain_len);
+            if *remaining == 0 {
+                self.set_read_ahead(BULK_READ_AHEAD);
+            }
+        }
     }
 
     /// Only expose the current frame, never unauthenticated following records.
@@ -101,6 +115,42 @@ impl RecordBuffer {
         }
         Poll::Ready(Ok(true))
     }
+}
+
+/// Coalesce up to [`MAX_READ_RECORDS`] decrypted records into `out` per
+/// `poll_read` while preserving previously delivered bytes if a subsequent
+/// record returns `Pending` or `Err`.
+pub(crate) fn poll_read_batched(
+    out: &mut ReadBuf<'_>,
+    read_error: &mut Option<io::Error>,
+    mut step: impl FnMut(&mut ReadBuf<'_>) -> Poll<io::Result<bool>>,
+) -> Poll<io::Result<()>> {
+    if let Some(error) = read_error.take() {
+        return Poll::Ready(Err(error));
+    }
+    let started = out.filled().len();
+    for _ in 0..MAX_READ_RECORDS {
+        let before = out.filled().len();
+        match step(out) {
+            Poll::Pending if out.filled().len() == started => return Poll::Pending,
+            Poll::Pending => return Poll::Ready(Ok(())),
+            Poll::Ready(Err(error)) if out.filled().len() != started => {
+                *read_error = Some(error);
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(more)) => {
+                if !more
+                    || out.remaining() == 0
+                    || out.filled().len() == before
+                    || out.filled().len() - started >= MAX_BATCH_BYTES
+                {
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        }
+    }
+    Poll::Ready(Ok(()))
 }
 
 #[cfg(test)]

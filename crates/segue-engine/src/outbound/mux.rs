@@ -5,7 +5,7 @@
 //! goes away, instead of resetting the child. Like Xray-core, a stalled child
 //! therefore delays its siblings' downlink frames (head-of-line blocking).
 use super::*;
-use bytes::Bytes;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use segue_proxy::mux::{self as wire, Frame, Status};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -470,6 +470,29 @@ impl Child {
             source: None,
         }
     }
+
+    async fn recv_packet(&mut self) -> io::Result<Option<Packet>> {
+        std::future::poll_fn(|cx| {
+            let shared = &self.token.parent.shared;
+            let mut state = lock(&shared.state);
+            let entry = state.children.get_mut(&self.token.id).ok_or_else(closed)?;
+            if entry.failed {
+                return Poll::Ready(Err(closed()));
+            }
+            if let Some(packet) = entry.rx.pop_front() {
+                self.source = packet.source.clone();
+                drop(state);
+                shared.drained.notify_one();
+                return Poll::Ready(Ok(Some(packet)));
+            }
+            if entry.read_eof {
+                return Poll::Ready(Ok(None));
+            }
+            entry.read_waker = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
+    }
 }
 impl AsyncRead for Child {
     fn poll_read(
@@ -610,38 +633,60 @@ async fn write_loop(
     shared: Arc<Shared>,
     mut stream: tokio::io::WriteHalf<BoxedTransportStream>,
 ) -> io::Result<()> {
+    struct Queued {
+        id: u16,
+        status: Status,
+        error: bool,
+        target: Option<Target>,
+        global: Option<[u8; 8]>,
+        data: Option<(u64, Bytes)>,
+    }
+
+    const MAX_WRITE_BATCH: usize = 16;
+    const MAX_BATCH_BYTES: usize = 64 * 1024;
+    let mut batch: Vec<Queued> = Vec::with_capacity(MAX_WRITE_BATCH);
+    let mut wire_buf: Vec<u8> = Vec::new();
+
     loop {
         let notified = shared.changed.notified();
-        let next = {
+        batch.clear();
+        {
             let mut state = lock(&shared.state);
             if state.closed {
                 return Err(closed());
             }
-            // Dropped children get control priority. Remaining
-            // children get one frame per round-robin visit.
-            let priority = state
-                .children
-                .iter()
-                .find(|(_, e)| e.dropped && !e.ended)
-                .map(|(&id, _)| id);
-            let ready = |e: &Entry| {
-                !e.ended
-                    && (e.closing
-                        || !e.tx.is_empty()
-                        || !e.started && e.target.network == RoutingNetwork::Tcp)
-            };
-            let id = priority.or_else(|| {
-                state
+            let mut approx_bytes = 0usize;
+            while batch.len() < MAX_WRITE_BATCH && approx_bytes < MAX_BATCH_BYTES {
+                let end_queued =
+                    |id: u16| batch.iter().any(|q| q.id == id && q.status == Status::End);
+                // Dropped children get control priority. Remaining
+                // children get one frame per round-robin visit.
+                let priority = state
                     .children
-                    .range((
-                        std::ops::Bound::Excluded(state.cursor),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .chain(state.children.range(..=state.cursor))
-                    .find(|(_, e)| ready(e))
-                    .map(|(&id, _)| id)
-            });
-            id.map(|id| {
+                    .iter()
+                    .find(|(&id, e)| e.dropped && !e.ended && !end_queued(id))
+                    .map(|(&id, _)| id);
+                let ready = |id: u16, e: &Entry| {
+                    !e.ended
+                        && !end_queued(id)
+                        && (e.closing
+                            || !e.tx.is_empty()
+                            || !e.started && e.target.network == RoutingNetwork::Tcp)
+                };
+                let id = priority.or_else(|| {
+                    state
+                        .children
+                        .range((
+                            std::ops::Bound::Excluded(state.cursor),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .chain(state.children.range(..=state.cursor))
+                        .find(|(&id, e)| ready(id, e))
+                        .map(|(&id, _)| id)
+                });
+                let Some(id) = id else {
+                    break;
+                };
                 state.cursor = id;
                 let e = state.children.get_mut(&id).unwrap();
                 let end = e.closing && e.tx.is_empty();
@@ -658,42 +703,60 @@ async fn write_loop(
                     .then(|| e.target.clone());
                 let global = (status == Status::New && e.target.network == RoutingNetwork::Udp)
                     .then_some(e.global_id);
+                approx_bytes += data.as_ref().map_or(0, |(_, b)| b.len()) + 32;
                 e.started = true;
                 e.inflight = true;
                 wake(&mut e.write_waker);
-                (id, status, e.failed, target, global, data)
-            })
-        };
-        let Some((id, status, error, target, global, data)) = next else {
+                batch.push(Queued {
+                    id,
+                    status,
+                    error: e.failed,
+                    target,
+                    global,
+                    data,
+                });
+            }
+        }
+        if batch.is_empty() {
             notified.await;
             continue;
-        };
-        let bytes = wire::encode(&Frame {
-            session_id: id,
-            status,
-            error: error && status == Status::End,
-            target,
-            global_id: global,
-            payload: data.as_ref().map(|(_, b)| b.as_ref()),
-        })?;
-        stream.write_all(&bytes).await?;
+        }
+        wire_buf.clear();
+        for q in &batch {
+            let encoded = wire::encode(&Frame {
+                session_id: q.id,
+                status: q.status,
+                error: q.error && q.status == Status::End,
+                target: q.target.clone(),
+                global_id: q.global,
+                payload: q.data.as_ref().map(|(_, b)| b.as_ref()),
+            })?;
+            wire_buf.extend_from_slice(&encoded);
+        }
+        stream.write_all(&wire_buf).await?;
         stream.flush().await?;
         let mut state = lock(&shared.state);
-        if let Some(e) = state.children.get_mut(&id) {
-            e.inflight = false;
-            if let Some((seq, _)) = data {
-                e.sent = seq;
+        for q in &batch {
+            if let Some(e) = state.children.get_mut(&q.id) {
+                if let Some((seq, _)) = q.data {
+                    e.sent = seq;
+                }
+                if q.status == Status::End {
+                    e.ended = true;
+                    e.read_eof = true;
+                    // A reader paused on this child now discards its frames.
+                    shared.drained.notify_one();
+                }
             }
-            if status == Status::End {
-                e.ended = true;
-                e.read_eof = true;
-                // A reader paused on this child now discards its frames.
-                shared.drained.notify_one();
-            }
-            wake(&mut e.write_waker);
-            wake(&mut e.read_waker);
-            if e.dropped && e.ended {
-                state.children.remove(&id);
+        }
+        for q in &batch {
+            if let Some(e) = state.children.get_mut(&q.id) {
+                e.inflight = false;
+                wake(&mut e.write_waker);
+                wake(&mut e.read_waker);
+                if e.dropped && e.ended {
+                    state.children.remove(&q.id);
+                }
             }
         }
     }
@@ -742,7 +805,8 @@ async fn read_loop(
     shared: Arc<Shared>,
     mut stream: tokio::io::ReadHalf<BoxedTransportStream>,
 ) -> io::Result<()> {
-    let mut bytes = Vec::new();
+    let mut bytes = BytesMut::with_capacity(8192);
+    let mut frames = 0u8;
     loop {
         if let Some((frame, n)) = wire::decode(&bytes)? {
             if !deliver(&shared, frame)? {
@@ -753,20 +817,24 @@ async fn read_loop(
                 shared.drained.notified().await;
                 continue;
             }
-            bytes.drain(..n);
+            bytes.advance(n);
+            frames = frames.wrapping_add(1);
+            if (frames & 0x0f) == 0 {
+                tokio::task::yield_now().await;
+            }
         } else {
             let capacity = wire::MAX_FRAME - bytes.len();
             if capacity == 0 {
                 return Err(closed());
             }
-            let mut chunk = [0; 4096];
-            let n = stream.read(&mut chunk[..capacity.min(4096)]).await?;
+            let chunk_cap = capacity.min(8192);
+            bytes.reserve(chunk_cap);
+            let mut limited = (&mut bytes).limit(chunk_cap);
+            let n = stream.read_buf(&mut limited).await?;
             if n == 0 {
                 return Err(closed());
             }
-            bytes.extend_from_slice(&chunk[..n]);
         }
-        tokio::task::yield_now().await;
     }
 }
 
@@ -811,15 +879,12 @@ impl UdpSession {
     }
     pub(super) async fn recv(&self) -> Result<datagram::Datagram, CoreError> {
         let mut reader = self.reader.lock().await;
-        let mut bytes = vec![0; wire::MAX_PAYLOAD];
-        let n = reader.read(&mut bytes).await?;
-        if n == 0 {
+        let Some(packet) = reader.recv_packet().await? else {
             return Err(closed().into());
-        }
-        bytes.truncate(n);
+        };
         Ok(datagram::Datagram {
-            source: reader.source.clone().unwrap_or_else(|| self.target.clone()),
-            payload: bytes,
+            source: packet.source.unwrap_or_else(|| self.target.clone()),
+            payload: packet.bytes.to_vec(),
         })
     }
 }
