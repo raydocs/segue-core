@@ -485,13 +485,12 @@ async fn later_server_addresses_get_three_seconds_and_the_last_the_rest() {
         Err(CoreError::Hysteria(HysteriaError::Timeout))
     ));
     assert_eq!(start.elapsed(), DIAL_DEADLINE);
-    // The first address had three seconds, and the last the seven left. The
-    // paused clock may run on before a datagram is read, so its time is an
-    // upper bound.
-    assert!(first_reached.await.unwrap() < CANDIDATE_ATTEMPT_TIMEOUT);
+    // Happy Eyeballs starts the first candidate right away and staggers the
+    // second by 250 ms, well inside CANDIDATE_ATTEMPT_TIMEOUT.
+    assert!(first_reached.await.unwrap() < HAPPY_EYEBALLS_STAGGER);
     let last = last_reached.await.unwrap();
     assert!(
-        (CANDIDATE_ATTEMPT_TIMEOUT..DIAL_DEADLINE - CANDIDATE_ATTEMPT_TIMEOUT).contains(&last),
+        (HAPPY_EYEBALLS_STAGGER..CANDIDATE_ATTEMPT_TIMEOUT).contains(&last),
         "{last:?}"
     );
     first_silent.abort();

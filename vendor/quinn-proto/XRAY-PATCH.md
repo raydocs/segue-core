@@ -347,3 +347,13 @@ probes first, and the same four bursts still lower the MTU. The test still
 requires the bytes to arrive and at least one loss.
 
 - 2026-11-18: `blackhole_after_mtu_change_is_detected_with_latency` (40 ms latency) keeps upstream's black-hole assertions (>=3 losses, >=3 congestion events, 1 black hole) for the spaced-probe patch; the zero-latency upstream test now accepts the one-loss repair.
+
+## Locally-initiated bidirectional stream budget
+
+`StreamsState::local_bidi_stream_budget` (forwarded by
+`Connection::local_bidi_stream_budget`) returns `(remaining, open)` for
+locally-initiated bidirectional streams: how many additional streams the peer's
+`MAX_STREAMS` window permits before opening blocks, and how many locally-
+initiated bidirectional streams remain active across send and receive tables. This
+lets an HTTP/3 pool multiplex requests onto a single QUIC connection up to the
+peer's actual stream credit without blocking behind low peer stream limits.

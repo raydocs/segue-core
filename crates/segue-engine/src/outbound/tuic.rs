@@ -8,7 +8,9 @@ use super::first_payload::{flush_header_alone, FirstPayloadDeadline, HeldHeader}
 use super::*;
 use segue_config::{TuicCongestionControl, TuicSettings, TuicUdpRelayMode};
 use segue_proxy::tuic::{self as wire, Command, Packet};
-use segue_transport::stream::quic::H3ConnectConfig;
+use segue_transport::stream::quic::{
+    H3ConnectConfig, QuicSendWindow, QUIC_SEND_WINDOW_SAMPLE_BYTES,
+};
 use std::collections::HashMap;
 use std::fmt;
 use std::task;
@@ -18,6 +20,9 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+const HAPPY_EYEBALLS_STAGGER: Duration = Duration::from_millis(250);
+const MAX_CONCURRENT_DIALS: usize = 3;
+const CONCURRENT_UNI_UDP: usize = 64;
 const FRAGMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PAYLOAD: usize = 65_535;
 const MAX_STREAM_IN: usize = MAX_PAYLOAD + 384;
@@ -100,6 +105,7 @@ impl fmt::Debug for Client {
 struct Shared {
     endpoint: quinn::Endpoint,
     connection: quinn::Connection,
+    send_window: QuicSendWindow,
     sessions: Mutex<Associations>,
     packet_id: std::sync::atomic::AtomicU32,
     tcp_slots: Arc<tokio::sync::Semaphore>,
@@ -202,6 +208,7 @@ impl Client {
         let stream = TuicStream {
             read,
             write,
+            since_window_sample: 0,
             _permit: permit,
             _client: self.clone(),
         };
@@ -264,6 +271,7 @@ impl Client {
 struct TuicStream {
     read: quinn::RecvStream,
     write: quinn::SendStream,
+    since_window_sample: usize,
     _permit: tokio::sync::OwnedSemaphorePermit,
     // Held so the QUIC connection outlives every stream opened on it.
     _client: Client,
@@ -302,7 +310,20 @@ impl AsyncWrite for TuicStream {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         // `SendStream::poll_write` returns `WriteError`; the trait method returns `io::Error`.
-        AsyncWrite::poll_write(Pin::new(&mut self.write), context, data)
+        let ready = AsyncWrite::poll_write(Pin::new(&mut self.write), context, data);
+        if let Poll::Ready(Ok(written)) = &ready {
+            if *written > 0 {
+                self.since_window_sample += *written;
+                if self.since_window_sample >= QUIC_SEND_WINDOW_SAMPLE_BYTES {
+                    self.since_window_sample = 0;
+                    self._client
+                        .inner
+                        .send_window
+                        .grow(&self._client.inner.connection);
+                }
+            }
+        }
+        ready
     }
 
     fn poll_flush(
@@ -590,32 +611,101 @@ impl TuicOutbound {
         )
         .await
         .map_err(|_| TuicError::Connect)?;
-        let mut error = TuicError::Connect;
-        for address in candidates.into_iter().take(3) {
-            match Box::pin(self.connect(address, dialer)).await {
-                Ok(client) => {
-                    let mut cached = self
-                        .0
-                        .cached
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    if *self.0.shutdown.borrow() {
-                        client.close();
-                        return Err(TuicError::Closed);
+        let candidates: Vec<SocketAddr> =
+            candidates.into_iter().take(MAX_CONCURRENT_DIALS).collect();
+        let client = if candidates.len() <= 1 {
+            let Some(&address) = candidates.first() else {
+                return Err(TuicError::Connect);
+            };
+            Box::pin(self.connect(address, dialer)).await?
+        } else {
+            self.race_candidates(&candidates, dialer).await?
+        };
+        let mut cached = self
+            .0
+            .cached
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *self.0.shutdown.borrow() {
+            client.close();
+            return Err(TuicError::Closed);
+        }
+        *cached = Some(Cached {
+            client: client.clone(),
+            tls: dialer.tls_connector().clone(),
+        });
+        Ok(client)
+    }
+
+    async fn race_candidates(
+        &self,
+        candidates: &[SocketAddr],
+        dialer: &TransportDialer,
+    ) -> Result<Client, TuicError> {
+        let mut iter = candidates.iter().copied();
+        let mut attempts = tokio::task::JoinSet::new();
+        let mut last_error = TuicError::Connect;
+
+        if let Some(first) = iter.next() {
+            let this = self.clone();
+            let dialer = dialer.clone();
+            attempts.spawn(async move { Box::pin(this.connect(first, &dialer)).await });
+        }
+
+        loop {
+            if attempts.is_empty() {
+                let Some(next) = iter.next() else {
+                    return Err(last_error);
+                };
+                let this = self.clone();
+                let dialer = dialer.clone();
+                attempts.spawn(async move { Box::pin(this.connect(next, &dialer)).await });
+            }
+
+            let has_more = iter.len() > 0 && attempts.len() < MAX_CONCURRENT_DIALS;
+            if has_more {
+                let stagger = tokio::time::sleep(HAPPY_EYEBALLS_STAGGER);
+                tokio::pin!(stagger);
+                tokio::select! {
+                    biased;
+                    res = attempts.join_next() => {
+                        match res {
+                            Some(Ok(Ok(client))) => {
+                                attempts.abort_all();
+                                return Ok(client);
+                            }
+                            Some(Ok(Err(error @ (TuicError::Configuration | TuicError::Protection)))) => {
+                                attempts.abort_all();
+                                return Err(error);
+                            }
+                            Some(Ok(Err(error))) => last_error = error,
+                            Some(Err(_)) | None => {}
+                        }
                     }
-                    *cached = Some(Cached {
-                        client: client.clone(),
-                        tls: dialer.tls_connector().clone(),
-                    });
-                    return Ok(client);
+                    () = &mut stagger => {
+                        if let Some(next) = iter.next() {
+                            let this = self.clone();
+                            let dialer = dialer.clone();
+                            attempts.spawn(async move { Box::pin(this.connect(next, &dialer)).await });
+                        }
+                    }
                 }
-                Err(error @ (TuicError::Configuration | TuicError::Protection)) => {
-                    return Err(error)
+            } else {
+                match attempts.join_next().await {
+                    Some(Ok(Ok(client))) => {
+                        attempts.abort_all();
+                        return Ok(client);
+                    }
+                    Some(Ok(Err(error @ (TuicError::Configuration | TuicError::Protection)))) => {
+                        attempts.abort_all();
+                        return Err(error);
+                    }
+                    Some(Ok(Err(error))) => last_error = error,
+                    Some(Err(_)) => {}
+                    None => return Err(last_error),
                 }
-                Err(current) => error = current,
             }
         }
-        Err(error)
     }
 
     async fn connect(
@@ -706,6 +796,7 @@ impl TuicOutbound {
             inner: Arc::new(Shared {
                 endpoint,
                 connection,
+                send_window: QuicSendWindow::new(),
                 sessions: Mutex::new(Associations {
                     next_id: 0,
                     sinks: HashMap::new(),
@@ -781,38 +872,60 @@ impl Drop for PendingConnection {
 
 async fn receive_packets(client: Client) {
     let mut shutdown = client.inner.shutdown.subscribe();
+    let uni_permits = Arc::new(tokio::sync::Semaphore::new(CONCURRENT_UNI_UDP));
     loop {
-        let packet = if client.inner.native {
-            tokio::select! {
+        if client.inner.native {
+            let packet = tokio::select! {
                 biased;
                 _ = shutdown.changed() => break,
                 bytes = client.inner.connection.read_datagram() => match bytes {
                     Ok(bytes) => wire::decode_datagram(&bytes),
                     Err(_) => break,
                 },
+            };
+            if let Ok(Command::Packet(packet)) = packet {
+                client.deliver(packet);
             }
-        } else {
-            tokio::select! {
-                biased;
-                _ = shutdown.changed() => break,
-                command = read_uni_command(&client.inner.connection) => match command {
-                    Ok(command) => Ok(command),
-                    Err(()) => break,
-                },
-            }
-        };
-        match packet {
-            Ok(Command::Packet(packet)) => client.deliver(packet),
-            Ok(_) => continue,
-            Err(_) => continue,
+            continue;
         }
+
+        let permit = tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            permit = Arc::clone(&uni_permits).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        let stream = tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            accepted = client.inner.connection.accept_uni() => match accepted {
+                Ok(stream) => stream,
+                Err(_) => break,
+            },
+        };
+        let task_client = client.clone();
+        let mut task_shutdown = client.inner.shutdown.subscribe();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let bytes = tokio::select! {
+                biased;
+                _ = task_shutdown.changed() => return,
+                result = read_uni_stream(stream) => match result {
+                    Ok(bytes) => bytes,
+                    Err(()) => return,
+                },
+            };
+            if let Ok(Command::Packet(packet)) = wire::decode_datagram(&bytes) {
+                task_client.deliver(packet);
+            }
+        });
     }
 }
 
-async fn read_uni_command(connection: &quinn::Connection) -> Result<Command, ()> {
-    let mut stream = connection.accept_uni().await.map_err(|_| ())?;
-    let bytes = stream.read_to_end(MAX_STREAM_IN).await.map_err(|_| ())?;
-    wire::decode_datagram(&bytes).map_err(|_| ())
+async fn read_uni_stream(mut stream: quinn::RecvStream) -> Result<Vec<u8>, ()> {
+    stream.read_to_end(MAX_STREAM_IN).await.map_err(|_| ())
 }
 
 async fn heartbeats(client: Client, period: Duration) {

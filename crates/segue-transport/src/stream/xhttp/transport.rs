@@ -59,15 +59,12 @@ const H1_PACKET_READ_CHUNK_BYTES: usize = 8 * 1024;
 const MAX_PACKET_RESPONSE_TASKS: usize = 256;
 const MAX_H1_IDLE_UPLOAD_STREAMS: usize = 256;
 const HTTP_MULTIPLEXED_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-// Quinn 0.11 exposes a blocking `open_bi` future but no public getter or
-// non-consuming probe for the peer's remaining outbound stream budget. Until
-// that capacity can be reserved without consuming an HTTP request stream, one
-// active request per pooled H3 connection is the only fail-safe policy: a
-// peer advertising MAX_STREAMS_BIDI=1 must not deadlock stream-up's persistent
-// downlink against its upload. The H3 engine itself remains concurrent; this
-// conservative transport-pool bound trades extra QUIC connections for
-// progress against low-limit peers.
-const H3_REQUESTS_PER_CONNECTION: usize = 1;
+// Quinn exposes the connection's remaining locally-initiated bidirectional
+// stream budget (`local_bidi_stream_budget`), so the pool multiplexes up to 64
+// concurrent streams per connection whenever the peer's MAX_STREAMS window
+// has slack, and fans out across connections on low-limit peers (e.g.
+// MAX_STREAMS_BIDI=1) so stream-up never deadlocks.
+const H3_MAX_REQUESTS_PER_CONNECTION: usize = 64;
 
 pub type XhttpDialFuture =
     Pin<Box<dyn Future<Output = Result<BoxedTransportStream, TransportError>> + Send + 'static>>;
@@ -3033,11 +3030,11 @@ impl H3Pool {
                         || connection.lifecycle.idle_for(now) < self.idle_timeout)
             });
 
-            if let Some(connection) = state
-                .connections
-                .iter_mut()
-                .find(|connection| connection.lifecycle.active() < H3_REQUESTS_PER_CONNECTION)
-            {
+            if let Some(connection) = state.connections.iter_mut().find(|connection| {
+                let active = connection.lifecycle.active();
+                active < H3_MAX_REQUESTS_PER_CONNECTION
+                    && connection.client.can_open_request(active)
+            }) {
                 connection.fresh = false;
                 return Ok(H3Checkout {
                     client: connection.client.clone(),

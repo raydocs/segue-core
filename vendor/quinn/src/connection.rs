@@ -668,6 +668,12 @@ impl Connection {
         conn.wake();
     }
 
+    /// Returns `(remaining, open)` for locally-initiated bidirectional streams.
+    pub fn local_bidi_stream_budget(&self) -> (u64, usize) {
+        let conn = self.0.state.lock("local_bidi_stream_budget");
+        conn.inner.local_bidi_stream_budget()
+    }
+
     /// Modify the number of remotely initiated bidirectional streams that may be concurrently open
     ///
     /// No streams may be opened by the peer unless fewer than `count` are already open. Large

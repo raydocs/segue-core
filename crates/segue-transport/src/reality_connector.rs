@@ -24,8 +24,8 @@ use std::fmt;
 use crate::{
     reality::{
         prepare_reality_handshake, validate_reality_client_hello_metadata,
-        validate_reality_fingerprint, RealityError, RealityHandshakeInput,
-        RealityPreparedClientHello, RealityPreparedHandshake,
+        validate_reality_fingerprint, validate_reality_short_id_len, RealityError,
+        RealityHandshakeInput, RealityPreparedClientHello, RealityPreparedHandshake,
     },
     BoxedTransportStream, RealityClientConfig, TransportError,
 };
@@ -67,6 +67,12 @@ pub trait RealityTlsSessionProvider: Send + Sync {
 pub trait RealityTlsSession: Send {
     fn prepared_client_hello(&self) -> Result<RealityPreparedClientHello, RealityError>;
 
+    /// Returns true when the session can validate, seal, and complete TLS in
+    /// a single rustls handshake pass without pre-rendering a ClientHello.
+    fn supports_direct_finalization(&self) -> bool {
+        false
+    }
+
     /// Hands the session the configured `spiderX`, crawled when the server
     /// answers with a real certificate instead of a REALITY one. Sessions
     /// that cannot crawl ignore it.
@@ -100,6 +106,73 @@ pub trait RealityTlsSession: Send {
         Err(TransportError::UnsupportedConnectorConfig(
             "REALITY over a masked carrier",
         ))
+    }
+
+    /// Completes TLS directly from lightweight sealing parameters over TCP.
+    async fn complete_direct(
+        self: Box<Self>,
+        _tcp_stream: TcpStream,
+        _params: RealityHandshakeParams,
+        _mldsa65_verify: Option<Vec<u8>>,
+    ) -> Result<BoxedTransportStream, TransportError> {
+        Err(TransportError::UnsupportedConnectorConfig(
+            "REALITY direct finalization",
+        ))
+    }
+
+    /// Completes TLS directly from lightweight sealing parameters over a
+    /// fragmented TCP stream.
+    async fn complete_direct_fragmented(
+        self: Box<Self>,
+        _tcp_stream: TcpStream,
+        _params: RealityHandshakeParams,
+        _mldsa65_verify: Option<Vec<u8>>,
+        _fragment: std::sync::Arc<crate::TcpFragmentConfig>,
+    ) -> Result<BoxedTransportStream, TransportError> {
+        Err(TransportError::UnsupportedConnectorConfig(
+            "REALITY tlshello fragmentation",
+        ))
+    }
+
+    /// Completes TLS directly from lightweight sealing parameters over a
+    /// masked carrier stream.
+    async fn complete_direct_over_stream(
+        self: Box<Self>,
+        _stream: BoxedTransportStream,
+        _params: RealityHandshakeParams,
+        _mldsa65_verify: Option<Vec<u8>>,
+    ) -> Result<BoxedTransportStream, TransportError> {
+        Err(TransportError::UnsupportedConnectorConfig(
+            "REALITY over a masked carrier",
+        ))
+    }
+}
+
+/// Parameters required to seal a REALITY session id inside a single-pass
+/// handshake without eagerly building an intermediate ClientHello.
+#[derive(Clone)]
+pub struct RealityHandshakeParams {
+    pub version: [u8; 3],
+    pub unix_time: u32,
+    pub short_id: Vec<u8>,
+    pub server_public_key: [u8; 32],
+}
+
+impl fmt::Debug for RealityHandshakeParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RealityHandshakeParams")
+            .field("version", &self.version)
+            .field("unix_time", &self.unix_time)
+            .field("short_id", &"<redacted>")
+            .field("server_public_key", &self.server_public_key)
+            .finish()
+    }
+}
+
+impl Drop for RealityHandshakeParams {
+    fn drop(&mut self) {
+        self.short_id.zeroize();
     }
 }
 
@@ -178,6 +251,22 @@ impl RealityConnector {
             spider_x: self.config.spider_x.clone(),
             mldsa65_verify: self.config.mldsa65_verify.clone(),
         }
+    }
+
+    /// Validates configuration and returns lightweight parameters for
+    /// single-pass ClientHello sealing without an extra ClientHello render.
+    pub fn prepare_handshake_params(
+        &self,
+        context: RealityHandshakeContext,
+    ) -> Result<RealityHandshakeParams, RealityError> {
+        self.validate_fingerprint()?;
+        validate_reality_short_id_len(&self.config.short_id)?;
+        Ok(RealityHandshakeParams {
+            version: context.version,
+            unix_time: context.unix_time,
+            short_id: self.config.short_id.clone(),
+            server_public_key: self.config.public_key,
+        })
     }
 
     pub fn prepare_handshake(

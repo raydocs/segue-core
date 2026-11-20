@@ -23,7 +23,7 @@ use http::{HeaderMap, Method, Request, StatusCode};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, EndpointConfig, TransportConfig, VarInt};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
@@ -696,20 +696,27 @@ pub(crate) const QUIC_INITIAL_SEND_WINDOW: u64 = 2 * 1024 * 1024;
 /// High bandwidth-delay paths may still grow to quinn's former 10 MB.
 pub(crate) const QUIC_MAX_SEND_WINDOW: u64 = 10_000_000;
 /// Uploaded bytes between send-window growth samples.
-pub(crate) const QUIC_SEND_WINDOW_SAMPLE_BYTES: usize = 1024 * 1024;
+pub const QUIC_SEND_WINDOW_SAMPLE_BYTES: usize = 1024 * 1024;
 
 /// One connection's send window, grown toward twice its congestion window.
 #[derive(Debug)]
-pub(crate) struct QuicSendWindow(AtomicU64);
+pub struct QuicSendWindow(AtomicU64);
+
+impl Default for QuicSendWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl QuicSendWindow {
-    pub(crate) fn new() -> Self {
+    /// Creates a new send window starting at the bounded initial budget.
+    pub fn new() -> Self {
         Self(AtomicU64::new(QUIC_INITIAL_SEND_WINDOW))
     }
 
     /// Called after another sample of uploaded bytes, never from an idle
     /// timer, so a quiet connection keeps its small window.
-    pub(crate) fn grow(&self, connection: &quinn::Connection) {
+    pub fn grow(&self, connection: &quinn::Connection) {
         let current = self.0.load(Ordering::Relaxed);
         if current == QUIC_MAX_SEND_WINDOW {
             return;
@@ -1125,6 +1132,20 @@ impl H3Client {
         !self.driver.task.is_finished() && self.driver.connection.close_reason().is_none()
     }
 
+    /// Whether this connection can accept another request without blocking
+    /// on the peer's bidirectional stream limit.
+    pub(crate) fn can_open_request(&self, active_checkouts: usize) -> bool {
+        if !self.is_live() {
+            return false;
+        }
+        if active_checkouts == 0 {
+            return true;
+        }
+        let (remaining, open) = self.driver.connection.local_bidi_stream_budget();
+        let unopened_checkouts = active_checkouts.saturating_sub(open);
+        remaining > unopened_checkouts as u64
+    }
+
     pub fn local_addr(&self) -> Result<SocketAddr, io::Error> {
         self.driver.endpoint.local_addr()
     }
@@ -1151,9 +1172,42 @@ impl H3Client {
             return self.start_fixed(request, body).await?.open().await;
         }
 
-        let (mut upload, response) = self.start_streaming(request).await?;
-        let (_, response) = tokio::try_join!(upload.send_owned(body), response.open())?;
-        Ok(response)
+        let (send, expected_content_length, response, shared) = self.open_exchange(request).await?;
+        let send_fut = send_fixed_body(send, body, expected_content_length, shared);
+        let open_fut = response.open();
+        tokio::pin!(send_fut);
+        tokio::pin!(open_fut);
+
+        let mut send_done = false;
+        let mut opened: Option<H3ResponseBody> = None;
+        loop {
+            tokio::select! {
+                result = &mut send_fut, if !send_done => {
+                    match result {
+                        Ok(()) => {
+                            send_done = true;
+                            if let Some(body) = opened {
+                                return Ok(body);
+                            }
+                        }
+                        Err(H3Error::Cancelled) if opened.is_none() => {
+                            // Prefer the HTTP status/error returned by `drive_response`
+                            // over the sibling cancellation notice.
+                            let _ = open_fut.await?;
+                            return Err(H3Error::Cancelled);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                result = &mut open_fut, if opened.is_none() => {
+                    let response_body = result?;
+                    if send_done {
+                        return Ok(response_body);
+                    }
+                    opened = Some(response_body);
+                }
+            }
+        }
     }
 
     /// Completes a fixed upload and returns without waiting for response headers.
@@ -1162,16 +1216,23 @@ impl H3Client {
         request: Request<()>,
         body: Bytes,
     ) -> Result<H3PendingResponse, H3Error> {
-        let (mut upload, response) = self.start_streaming(request).await?;
-        upload.send_owned(body).await?;
+        let (send, expected_content_length, response, shared) = self.open_exchange(request).await?;
+        send_fixed_body(send, body, expected_content_length, shared).await?;
         Ok(response)
     }
 
-    /// Opens an independently backpressured upload and download pair.
-    pub async fn start_streaming(
+    async fn open_exchange(
         &self,
         request: Request<()>,
-    ) -> Result<(H3Upload, H3PendingResponse), H3Error> {
+    ) -> Result<
+        (
+            H3SendHalf,
+            Option<u64>,
+            H3PendingResponse,
+            Arc<ExchangeShared>,
+        ),
+        H3Error,
+    > {
         let response_is_bodyless = request.method() == Method::HEAD;
         let expected_content_length = request
             .headers()
@@ -1195,20 +1256,9 @@ impl H3Client {
             _connection_guard: send_request,
             driver: Arc::clone(&self.driver),
         });
-        let upload_status = Arc::new(UploadWorkerStatus::new());
-        let (upload, upload_reader) = tokio::io::duplex(MAX_UPLOAD_DATA_BYTES);
-        let (upload_finished, upload_completion) = oneshot::channel();
         let (response_headers, response_waiter) = oneshot::channel();
         let (response_body, body_waiter) = mpsc::channel(RESPONSE_QUEUE_DEPTH);
 
-        tokio::spawn(drive_upload(
-            send,
-            upload_reader,
-            expected_content_length,
-            Arc::clone(&shared),
-            Arc::clone(&upload_status),
-            upload_finished,
-        ));
         tokio::spawn(drive_response(
             recv,
             response_is_bodyless,
@@ -1218,21 +1268,48 @@ impl H3Client {
         ));
 
         Ok((
+            send,
+            expected_content_length,
+            H3PendingResponse {
+                headers: Some(response_waiter),
+                body: Some(body_waiter),
+                response_is_bodyless,
+                cancel_on_drop: true,
+                shared: Arc::clone(&shared),
+            },
+            shared,
+        ))
+    }
+
+    /// Opens an independently backpressured upload and download pair.
+    pub async fn start_streaming(
+        &self,
+        request: Request<()>,
+    ) -> Result<(H3Upload, H3PendingResponse), H3Error> {
+        let (send, expected_content_length, response, shared) = self.open_exchange(request).await?;
+        let upload_status = Arc::new(UploadWorkerStatus::new());
+        let (upload, upload_reader) = tokio::io::duplex(MAX_UPLOAD_DATA_BYTES);
+        let (upload_finished, upload_completion) = oneshot::channel();
+
+        tokio::spawn(drive_upload(
+            send,
+            upload_reader,
+            expected_content_length,
+            Arc::clone(&shared),
+            Arc::clone(&upload_status),
+            upload_finished,
+        ));
+
+        Ok((
             H3Upload {
                 io: upload,
                 completion: Some(upload_completion),
                 finished: false,
                 accepted: 0,
                 status: upload_status,
-                shared: Arc::clone(&shared),
-            },
-            H3PendingResponse {
-                headers: Some(response_waiter),
-                body: Some(body_waiter),
-                response_is_bodyless,
-                cancel_on_drop: true,
                 shared,
             },
+            response,
         ))
     }
 }
@@ -1573,9 +1650,7 @@ pub(crate) async fn connect_quic_transport_raw(
                 .await
                 .map_err(|error| H3Error::UdpSocket(io::Error::other(error)))?;
             let socket = udp.into_std().map_err(H3Error::UdpSocket)?;
-            if datagram_buffers.is_some() {
-                configure_quic_datagram_socket(&socket);
-            }
+            configure_quic_datagram_socket(&socket);
             (socket, Some(peer))
         }
         None => {
@@ -1584,9 +1659,7 @@ pub(crate) async fn connect_quic_transport_raw(
                 addr: bind_addr,
                 source,
             })?;
-            if datagram_buffers.is_some() {
-                configure_quic_datagram_socket(&socket);
-            }
+            configure_quic_datagram_socket(&socket);
             protect_quic_socket(&socket, config.socket_protector.as_deref())?;
             socket.set_nonblocking(true).map_err(H3Error::UdpSocket)?;
             (socket, None)
@@ -1939,12 +2012,17 @@ fn xhttp_receive_batch(class: MemoryClass) -> usize {
     }
 }
 
-// Match the bounded carrier buffer request used by the Go QUIC references.
-// The OS can clamp/refuse it. These are kernel queues, not process RSS.
+// Match the bounded carrier buffer request used by the Go QUIC references,
+// scaled down on constrained-memory hosts. The OS can clamp/refuse it; these
+// are kernel socket queues, not process RSS.
 pub(crate) fn configure_quic_datagram_socket(socket: &StdUdpSocket) {
+    let bytes = match memory_class() {
+        MemoryClass::Standard => 7 * 1024 * 1024,
+        MemoryClass::Constrained => 2 * 1024 * 1024,
+    };
     let socket = socket2::SockRef::from(socket);
-    let _ = socket.set_recv_buffer_size(7 * 1024 * 1024);
-    let _ = socket.set_send_buffer_size(7 * 1024 * 1024);
+    let _ = socket.set_recv_buffer_size(bytes);
+    let _ = socket.set_send_buffer_size(bytes);
 }
 
 fn protect_quic_socket(
@@ -1981,6 +2059,63 @@ async fn cancelled(receiver: &mut watch::Receiver<bool>) {
             return;
         }
     }
+}
+
+async fn send_fixed_body(
+    mut send: H3SendHalf,
+    mut body: Bytes,
+    expected_content_length: Option<u64>,
+    shared: Arc<ExchangeShared>,
+) -> Result<(), H3Error> {
+    let mut cancellation = shared.cancellation();
+    let mut delivered = 0_u64;
+    let mut since_window_sample = 0_usize;
+    let result = loop {
+        if body.is_empty() {
+            break tokio::select! {
+                biased;
+                () = cancelled(&mut cancellation) => Err(H3Error::Cancelled),
+                result = send.finish() => match result {
+                    Ok(()) => Ok(()),
+                    Err(h3::error::StreamError::RemoteTerminate { code, .. })
+                        if code == Code::H3_NO_ERROR && expected_content_length == Some(delivered) =>
+                    {
+                        Ok(())
+                    }
+                    Err(source) => Err(H3Error::Http3Stream {
+                        context: "request body could not be finished",
+                        source,
+                    }),
+                },
+            };
+        }
+
+        let chunk = body.split_to(body.len().min(MAX_UPLOAD_DATA_BYTES));
+        let chunk_len = chunk.len();
+        let sent = tokio::select! {
+            biased;
+            () = cancelled(&mut cancellation) => Err(H3Error::Cancelled),
+            result = send.send_data(chunk) => result.map_err(|source| H3Error::Http3Stream {
+                context: "request DATA could not be sent",
+                source,
+            }),
+        };
+        if let Err(error) = sent {
+            break Err(error);
+        }
+        delivered += chunk_len as u64;
+        since_window_sample += chunk_len;
+        if since_window_sample >= shared.driver.send_window.sample_bytes() {
+            since_window_sample = 0;
+            shared.driver.update_send_window();
+        }
+    };
+
+    if result.is_err() {
+        send.stop_stream(Code::H3_REQUEST_CANCELLED);
+        shared.cancel();
+    }
+    result
 }
 
 async fn drive_upload(
@@ -2291,11 +2426,6 @@ impl fmt::Debug for H3Upload {
 }
 
 impl H3Upload {
-    async fn send_owned(&mut self, body: Bytes) -> Result<(), H3Error> {
-        self.write_all(&body).await.map_err(H3Error::UploadIo)?;
-        self.shutdown().await.map_err(H3Error::UploadIo)
-    }
-
     fn worker_error(&self) -> Option<io::Error> {
         lock_unpoisoned(&self.status.failure)
             .as_ref()

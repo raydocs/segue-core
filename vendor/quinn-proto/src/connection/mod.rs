@@ -1595,6 +1595,11 @@ impl Connection {
         self.streams.set_stream_receive_window(window.into());
     }
 
+    /// Returns `(remaining, open)` for locally-initiated bidirectional streams.
+    pub fn local_bidi_stream_budget(&self) -> (u64, usize) {
+        self.streams.local_bidi_stream_budget()
+    }
+
     fn on_ack_received(
         &mut self,
         now: Instant,

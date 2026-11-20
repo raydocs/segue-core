@@ -23,12 +23,12 @@ pub(crate) use h2::{
 };
 pub(crate) use h3::{
     configure_quic_datagram_socket, connect_quic_transport, connect_quic_transport_raw,
-    connect_quic_transport_with_datagrams, move_udp_carrier, CarrierSocket, QuicSendWindow,
-    QUIC_INITIAL_SEND_WINDOW, QUIC_SEND_WINDOW_SAMPLE_BYTES,
+    connect_quic_transport_with_datagrams, move_udp_carrier, CarrierSocket,
+    QUIC_INITIAL_SEND_WINDOW,
 };
 pub use h3::{
     H3BbrProfile, H3Congestion, H3ConnectConfig, H3Error, H3QuicConfig, H3QuicVersion,
-    H3UdpHopConfig,
+    H3UdpHopConfig, QuicSendWindow, QUIC_SEND_WINDOW_SAMPLE_BYTES,
 };
 pub use transport::{XhttpConnectTarget, XhttpHttpVersion, XhttpTransport, XhttpXmuxPolicy};
 
