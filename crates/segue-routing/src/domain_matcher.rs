@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use regex::Regex;
 use thiserror::Error;
 
-/// One parsed `keyword:`, `full:`, `domain:` or `regexp:` rule.
+/// One parsed `keyword:`, `full:`, `domain:`, strict subdomain, or `regexp:` rule.
 ///
 /// [`DomainMatcher::matches`] is the linear reference implementation of the
 /// matcher semantics; [`crate::DomainMatcherSet`] is the compiled form that
@@ -13,6 +13,7 @@ pub enum DomainMatcher {
     Keyword(String),
     Full(String),
     Suffix(String),
+    Subdomain(String),
     Regex(RegexMatcher),
 }
 
@@ -22,6 +23,7 @@ impl DomainMatcher {
             Self::Keyword(keyword) => contains_ignore_ascii_case(domain, keyword),
             Self::Full(expected) => domain.eq_ignore_ascii_case(expected),
             Self::Suffix(suffix) => domain_matches_suffix(domain, suffix),
+            Self::Subdomain(suffix) => domain_matches_subdomain(domain, suffix),
             Self::Regex(matcher) => matcher.matches(domain),
         }
     }
@@ -132,6 +134,20 @@ pub fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
         && domain_bytes[boundary_index + 1..].eq_ignore_ascii_case(suffix.as_bytes())
 }
 
+/// Strict subdomain test for [`DomainMatcher::Subdomain`]:
+/// `suffix` matches `<labels>.suffix` (with at least one character before the
+/// separator dot) and never `suffix` itself, ASCII case-insensitively.
+pub fn domain_matches_subdomain(domain: &str, suffix: &str) -> bool {
+    if domain.len() <= suffix.len() + 1 {
+        return false;
+    }
+
+    let boundary_index = domain.len() - suffix.len() - 1;
+    let domain_bytes = domain.as_bytes();
+    domain_bytes[boundary_index] == b'.'
+        && domain_bytes[boundary_index + 1..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +168,15 @@ mod tests {
         assert!(suffix.matches("a.b.example.com"));
         assert!(!suffix.matches("notexample.com"));
         assert!(!suffix.matches("example.com.evil"));
+
+        let sub = DomainMatcher::Subdomain("example.com".to_owned());
+        assert!(!sub.matches("example.com"));
+        assert!(!sub.matches("EXAMPLE.COM"));
+        assert!(sub.matches("a.EXAMPLE.com"));
+        assert!(sub.matches("a.b.example.com"));
+        assert!(!sub.matches(".example.com"));
+        assert!(!sub.matches("notexample.com"));
+        assert!(!sub.matches("example.com.evil"));
     }
 
     #[test]

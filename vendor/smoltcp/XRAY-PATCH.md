@@ -238,3 +238,13 @@ still reports at most three blocks, as RFC 2018 allows, so the extra ranges
 are retained for reassembly rather than advertised. `README.md` records the
 new default. The assembler tests derive their bounds from the constant, so
 they pass at 16 unchanged.
+
+## Window scale floor for lazily grown receive rings
+
+`Socket::set_window_scale_for_capacity` configures a floor (`min_win_shift`)
+on a `Closed` or `Listen` socket so that sockets starting with a small initial
+receive buffer (such as a 4 KiB block in the kernel TUN stack) advertise the RFC
+1323 window scale needed when the ring later grows beyond 64 KiB via
+`resize_recv_buffer`. `Socket::reset` preserves `min_win_shift` so the floor
+survives `listen` and `connect`.
+

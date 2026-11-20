@@ -30,6 +30,8 @@ use tokio::{
 const TCP_RECEIVE_BUFFER: usize = 1024 * 1024;
 const TCP_INITIAL_RECEIVE_WINDOW: usize = 64 * 1024;
 const TCP_SEND_BUFFER: usize = 1024 * 1024;
+const CONSTRAINED_TCP_RECEIVE_BUFFER: usize = 256 * 1024;
+const CONSTRAINED_TCP_SEND_BUFFER: usize = 256 * 1024;
 // How long past a round trip the retransmission timer of a CONNECT-IP stack
 // waits at least. RFC 6298 says a second; Linux uses this value. It stays
 // above the delayed ACK of the common stacks, so a peer that is only slow to
@@ -42,10 +44,23 @@ fn tcp_timestamp() -> u32 {
     (EPOCH.get_or_init(Clock::now).elapsed().as_millis() as u32).wrapping_add(1)
 }
 
-fn tcp_socket(retransmission_floor: Option<smoltcp::time::Duration>) -> tcp::Socket<'static> {
+fn tcp_buffer_sizes() -> (usize, usize) {
+    match segue_transport::memory_class() {
+        segue_transport::MemoryClass::Standard => (TCP_RECEIVE_BUFFER, TCP_SEND_BUFFER),
+        segue_transport::MemoryClass::Constrained => {
+            (CONSTRAINED_TCP_RECEIVE_BUFFER, CONSTRAINED_TCP_SEND_BUFFER)
+        }
+    }
+}
+
+fn tcp_socket_with_buffers(
+    retransmission_floor: Option<smoltcp::time::Duration>,
+    receive_buffer: usize,
+    send_buffer: usize,
+) -> tcp::Socket<'static> {
     let mut socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; TCP_RECEIVE_BUFFER]),
-        tcp::SocketBuffer::new(vec![0; TCP_SEND_BUFFER]),
+        tcp::SocketBuffer::new(vec![0; receive_buffer]),
+        tcp::SocketBuffer::new(vec![0; send_buffer]),
     );
     assert!(socket.set_receive_window_limit(TCP_INITIAL_RECEIVE_WINDOW));
     socket.set_congestion_control(tcp::CongestionControl::Reno);
@@ -128,36 +143,22 @@ struct UdpFlow {
     remote: IpEndpoint,
     incoming: mpsc::Sender<Bytes>,
 }
-enum Entry {
-    Tcp(TcpFlow),
-    Udp(UdpFlow),
-}
-impl Entry {
-    fn port(&self) -> u16 {
-        match self {
-            Self::Tcp(f) => f.port,
-            Self::Udp(f) => f.port,
-        }
-    }
-    fn handle(&self) -> SocketHandle {
-        match self {
-            Self::Tcp(f) => f.handle,
-            Self::Udp(f) => f.handle,
-        }
-    }
-}
-
 pub(crate) struct Stack<P: IpPacket = Packet<Ip>> {
     interface: Interface,
     device: Packets<P>,
     sockets: SocketSet<'static>,
-    flows: HashMap<u64, Entry>,
+    tcp_flows: HashMap<u64, TcpFlow>,
+    udp_flows: HashMap<u64, UdpFlow>,
     commands: mpsc::Receiver<Command>,
     incoming: mpsc::Receiver<P>,
     wake: Arc<Notify>,
     start: Clock,
     port: u16,
     mtu: usize,
+    tcp_receive_buffer: usize,
+    tcp_send_buffer: usize,
+    last_drive_saturated: bool,
+    consecutive_active: u8,
 }
 impl<P: IpPacket> Stack<P> {
     pub(crate) fn new(
@@ -205,17 +206,23 @@ impl<P: IpPacket> Stack<P> {
                 }
             }
         }
+        let (tcp_receive_buffer, tcp_send_buffer) = tcp_buffer_sizes();
         Self {
             interface,
             device,
             sockets: SocketSet::new(vec![]),
-            flows: HashMap::new(),
+            tcp_flows: HashMap::new(),
+            udp_flows: HashMap::new(),
             commands,
             incoming,
             wake,
             start: Clock::now(),
             port: rand::random::<u16>() | 0xc000,
             mtu: usize::from(mtu),
+            tcp_receive_buffer,
+            tcp_send_buffer,
+            last_drive_saturated: false,
+            consecutive_active: 0,
         }
     }
     fn now(&self) -> Instant {
@@ -224,7 +231,9 @@ impl<P: IpPacket> Stack<P> {
     fn next_port(&mut self) -> u16 {
         loop {
             self.port = self.port.wrapping_add(1) | 0xc000;
-            if !self.flows.values().any(|f| f.port() == self.port) {
+            if !self.tcp_flows.values().any(|f| f.port == self.port)
+                && !self.udp_flows.values().any(|f| f.port == self.port)
+            {
                 return self.port;
             }
         }
@@ -246,30 +255,44 @@ impl<P: IpPacket> Stack<P> {
                     .poll_delay(self.now(), &self.sockets)
                     .map(|d| Duration::from_millis(d.total_millis().max(1)))
             };
-            for flow in self.flows.values() {
-                if let Entry::Tcp(TcpFlow {
-                    reply: Some(_),
-                    deadline,
-                    ..
-                }) = flow
-                {
-                    let remaining = deadline.saturating_duration_since(Clock::now());
+            let now_clock = Clock::now();
+            for flow in self.tcp_flows.values() {
+                if flow.reply.is_some() {
+                    let remaining = flow.deadline.saturating_duration_since(now_clock);
                     delay = Some(delay.map_or(remaining, |d| d.min(remaining)));
                 }
             }
             let wake = self.wake.clone();
+            let mut drove = false;
             tokio::select! { biased;
                 _ = stop.cancelled() => return,
                 // Ahead of `drive`, which could not use a slot this wait holds.
                 slot = tx.reserve(), if full => match slot {
-                    Ok(slot) => drop(slot),
+                    Ok(slot) => {
+                        drop(slot);
+                        self.consecutive_active = 0;
+                    }
                     Err(_) => return,
                 },
-                result = poll_fn(|cx| self.drive(cx)) => if !result { return; },
-                _ = wake.notified() => {},
-                _ = async { match delay { Some(d) => tokio::time::sleep(d).await, None => std::future::pending().await } } => {},
+                result = poll_fn(|cx| self.drive(cx)) => {
+                    if !result { return; }
+                    drove = true;
+                },
+                _ = wake.notified() => {
+                    self.consecutive_active = 0;
+                },
+                _ = async { match delay { Some(d) => tokio::time::sleep(d).await, None => std::future::pending().await } } => {
+                    self.consecutive_active = 0;
+                },
             }
-            tokio::task::yield_now().await;
+            if drove {
+                if self.last_drive_saturated || self.consecutive_active >= 7 {
+                    self.consecutive_active = 0;
+                    tokio::task::yield_now().await;
+                } else {
+                    self.consecutive_active += 1;
+                }
+            }
         }
     }
     fn drive(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
@@ -277,17 +300,20 @@ impl<P: IpPacket> Stack<P> {
             return Poll::Ready(false);
         }
         let mut progress = false;
-        for _ in 0..32 {
+        let mut commands_read = 0_usize;
+        while commands_read < 32 {
             match self.commands.poll_recv(cx) {
                 Poll::Ready(Some(command)) => {
                     self.command(command);
+                    commands_read += 1;
                     progress = true;
                 }
                 Poll::Ready(None) => return Poll::Ready(false),
                 Poll::Pending => break,
             }
         }
-        for _ in 0..IP_PACKET_QUEUE {
+        let mut packets_polled = 0_usize;
+        while packets_polled < IP_PACKET_QUEUE {
             if self.device.rx.is_none() {
                 match self.incoming.poll_recv(cx) {
                     Poll::Ready(Some(packet)) => {
@@ -306,170 +332,163 @@ impl<P: IpPacket> Stack<P> {
                 self.interface
                     .poll_ingress_single(now, &mut self.device, &mut self.sockets)
                     != PollIngressSingleResult::None;
+            packets_polled += 1;
             if self.device.rx.is_some() || self.incoming.is_empty() {
                 break;
             }
         }
+        self.last_drive_saturated = commands_read == 32 || packets_polled == IP_PACKET_QUEUE;
         // A delayed carrier has one shared capacity budget. Let a single
         // sender fill its high-BDP buffer, and divide pending application data
         // among concurrent senders. Existing queued data drains normally when
         // a new flow opens; EOF is read only after space becomes available.
         let active_senders = self
-            .flows
+            .tcp_flows
             .values()
-            .filter(|entry| match entry {
-                Entry::Tcp(flow) => self.sockets.get::<tcp::Socket>(flow.handle).send_queue() != 0,
-                Entry::Udp(_) => false,
+            .filter(|flow| self.sockets.get::<tcp::Socket>(flow.handle).send_queue() != 0)
+            .count()
+            .max(1);
+        let send_budget = self.tcp_send_buffer / active_senders;
+        let activity_now = Clock::now();
+        let active_receivers = self
+            .tcp_flows
+            .values()
+            .filter(|flow| {
+                flow.receives_bulk(self.sockets.get::<tcp::Socket>(flow.handle), activity_now)
             })
             .count()
             .max(1);
-        let send_budget = TCP_SEND_BUFFER / active_senders;
-        let activity_now = Clock::now();
-        let active_receivers =
-            self.flows
-                .values()
-                .filter(|entry| match entry {
-                    Entry::Tcp(flow) => flow
-                        .receives_bulk(self.sockets.get::<tcp::Socket>(flow.handle), activity_now),
-                    Entry::Udp(_) => false,
-                })
-                .count()
-                .max(1);
         let receive_budget =
-            (TCP_RECEIVE_BUFFER / active_receivers).max(TCP_INITIAL_RECEIVE_WINDOW);
-        let mut removed = Vec::new();
-        for (&id, entry) in &mut self.flows {
-            match entry {
-                Entry::Tcp(flow) => {
-                    let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
-                    if flow.flow.closed.load(Ordering::Acquire) {
-                        socket.abort();
-                        removed.push(id);
-                        continue;
-                    }
-                    if flow.reply.is_some() {
-                        if matches!(
-                            socket.state(),
-                            tcp::State::Established | tcp::State::CloseWait
-                        ) {
-                            let _ = flow.reply.take().unwrap().send(Ok(()));
-                            progress = true;
-                        } else if Clock::now() >= flow.deadline
-                            || socket.state() == tcp::State::Closed
-                        {
-                            let _ = flow.reply.take().unwrap().send(Err(
-                                if socket.state() == tcp::State::Closed {
-                                    Error::Connect
-                                } else {
-                                    Error::Timeout
-                                },
-                            ));
-                            socket.abort();
-                            removed.push(id);
-                            continue;
+            (self.tcp_receive_buffer / active_receivers).max(TCP_INITIAL_RECEIVE_WINDOW);
+        let mut removed_tcp = Vec::new();
+        for (&id, flow) in &mut self.tcp_flows {
+            let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
+            if flow.flow.closed.load(Ordering::Acquire) {
+                socket.abort();
+                removed_tcp.push(id);
+                continue;
+            }
+            if flow.reply.is_some() {
+                if matches!(
+                    socket.state(),
+                    tcp::State::Established | tcp::State::CloseWait
+                ) {
+                    let _ = flow.reply.take().unwrap().send(Ok(()));
+                    progress = true;
+                } else if activity_now >= flow.deadline || socket.state() == tcp::State::Closed {
+                    let _ = flow.reply.take().unwrap().send(Err(
+                        if socket.state() == tcp::State::Closed {
+                            Error::Connect
                         } else {
-                            continue;
-                        }
+                            Error::Timeout
+                        },
+                    ));
+                    socket.abort();
+                    removed_tcp.push(id);
+                    continue;
+                } else {
+                    continue;
+                }
+            }
+            // Idle keepalive connections do not divide an active flow's
+            // budget. Rebalancing preserves outstanding advertised credit
+            // until it drains, including data sent before a new flow opens.
+            let window = if flow.receives_bulk(socket, activity_now) {
+                receive_budget
+            } else {
+                TCP_INITIAL_RECEIVE_WINDOW
+            };
+            progress |= socket.set_receive_window_limit(window);
+            let allowance = send_budget.saturating_sub(socket.send_queue());
+            if !flow.write_eof && socket.can_send() && allowance != 0 {
+                // Read only available shared budget; a zero-length read
+                // must never be mistaken for the application's EOF.
+                let read = socket
+                    .send(|bytes| {
+                        let limit = bytes.len().min(allowance);
+                        let mut buf = ReadBuf::new(&mut bytes[..limit]);
+                        let result = Pin::new(&mut flow.bridge).poll_read(cx, &mut buf);
+                        let n = buf.filled().len();
+                        (n, result.map_ok(|()| n))
+                    })
+                    .expect("send capacity checked");
+                match read {
+                    Poll::Ready(Ok(0)) => {
+                        flow.write_eof = true;
+                        socket.close();
+                        progress = true;
                     }
-                    // Idle keepalive connections do not divide an active flow's
-                    // budget. Rebalancing preserves outstanding advertised credit
-                    // until it drains, including data sent before a new flow opens.
-                    let window = if flow.receives_bulk(socket, activity_now) {
-                        receive_budget
-                    } else {
-                        TCP_INITIAL_RECEIVE_WINDOW
-                    };
-                    progress |= socket.set_receive_window_limit(window);
-                    let allowance = send_budget.saturating_sub(socket.send_queue());
-                    if !flow.write_eof && socket.can_send() && allowance != 0 {
-                        // Read only available shared budget; a zero-length read
-                        // must never be mistaken for the application's EOF.
-                        let read = socket
-                            .send(|bytes| {
-                                let limit = bytes.len().min(allowance);
-                                let mut buf = ReadBuf::new(&mut bytes[..limit]);
-                                let result = Pin::new(&mut flow.bridge).poll_read(cx, &mut buf);
-                                let n = buf.filled().len();
-                                (n, result.map_ok(|()| n))
-                            })
-                            .expect("send capacity checked");
-                        match read {
-                            Poll::Ready(Ok(0)) => {
-                                flow.write_eof = true;
-                                socket.close();
-                                progress = true;
-                            }
-                            Poll::Ready(Ok(_)) => {
-                                progress = true;
-                            }
-                            Poll::Ready(Err(_)) => {
-                                socket.abort();
-                                removed.push(id);
-                                continue;
-                            }
-                            Poll::Pending => {}
-                        }
+                    Poll::Ready(Ok(_)) => {
+                        progress = true;
                     }
-                    let mut failed = false;
-                    if socket.can_recv() {
-                        let _ = socket.recv(|bytes| {
-                            match Pin::new(&mut flow.bridge).poll_write(cx, bytes) {
-                                Poll::Ready(Ok(n)) if n != 0 => {
-                                    progress = true;
-                                    if flow.last_read.is_some_and(|last| {
-                                        activity_now.saturating_duration_since(last)
-                                            > Duration::from_secs(1)
-                                    }) {
-                                        flow.read_bytes = 0;
-                                    }
-                                    flow.read_bytes = flow.read_bytes.saturating_add(n);
-                                    flow.last_read = Some(activity_now);
-                                    (n, ())
-                                }
-                                Poll::Ready(_) => {
-                                    failed = true;
-                                    (0, ())
-                                }
-                                Poll::Pending => (0, ()),
-                            }
-                        });
-                    }
-                    if failed {
+                    Poll::Ready(Err(_)) => {
                         socket.abort();
-                        removed.push(id);
+                        removed_tcp.push(id);
                         continue;
                     }
-                    if socket.state() == tcp::State::Closed && !flow.read_eof {
-                        flow.flow.reset.store(true, Ordering::Release);
-                    }
-                    if !flow.read_eof
-                        && !socket.may_recv()
-                        && Pin::new(&mut flow.bridge).poll_shutdown(cx).is_ready()
-                    {
-                        flow.read_eof = true;
-                        progress = true;
-                    }
-                    if socket.state() == tcp::State::Closed {
-                        removed.push(id);
-                    }
+                    Poll::Pending => {}
                 }
-                Entry::Udp(flow) => {
-                    if flow.flow.closed.load(Ordering::Acquire) {
-                        removed.push(id);
-                        continue;
-                    }
-                    let socket = self.sockets.get_mut::<udp::Socket>(flow.handle);
-                    while let Ok((payload, meta)) = socket.recv() {
-                        if meta.endpoint == flow.remote {
-                            // Reserve before copying. A stalled application drops UDP,
-                            // leaving bounded storage and other flows able to progress.
-                            if let Ok(slot) = flow.incoming.try_reserve() {
-                                slot.send(Bytes::copy_from_slice(payload));
+            }
+            let mut failed = false;
+            if socket.can_recv() {
+                let _ =
+                    socket.recv(
+                        |bytes| match Pin::new(&mut flow.bridge).poll_write(cx, bytes) {
+                            Poll::Ready(Ok(n)) if n != 0 => {
+                                progress = true;
+                                if flow.last_read.is_some_and(|last| {
+                                    activity_now.saturating_duration_since(last)
+                                        > Duration::from_secs(1)
+                                }) {
+                                    flow.read_bytes = 0;
+                                }
+                                flow.read_bytes = flow.read_bytes.saturating_add(n);
+                                flow.last_read = Some(activity_now);
+                                (n, ())
                             }
-                        }
-                        progress = true;
+                            Poll::Ready(_) => {
+                                failed = true;
+                                (0, ())
+                            }
+                            Poll::Pending => (0, ()),
+                        },
+                    );
+            }
+            if failed {
+                socket.abort();
+                removed_tcp.push(id);
+                continue;
+            }
+            if socket.state() == tcp::State::Closed && !flow.read_eof {
+                flow.flow.reset.store(true, Ordering::Release);
+            }
+            if !flow.read_eof
+                && !socket.may_recv()
+                && Pin::new(&mut flow.bridge).poll_shutdown(cx).is_ready()
+            {
+                flow.read_eof = true;
+                progress = true;
+            }
+            if socket.state() == tcp::State::Closed {
+                removed_tcp.push(id);
+            }
+        }
+        let mut removed_udp = Vec::new();
+        for (&id, flow) in &mut self.udp_flows {
+            if flow.flow.closed.load(Ordering::Acquire) {
+                removed_udp.push(id);
+                continue;
+            }
+            let socket = self.sockets.get_mut::<udp::Socket>(flow.handle);
+            while let Ok((payload, meta)) = socket.recv() {
+                if meta.endpoint == flow.remote {
+                    // Reserve before copying. A stalled application drops UDP,
+                    // leaving bounded storage and other flows able to progress.
+                    if let Ok(slot) = flow.incoming.try_reserve() {
+                        slot.send(Bytes::copy_from_slice(payload));
                     }
                 }
+                progress = true;
             }
         }
         // Give TCP aborts a chance to emit RST before removing socket storage.
@@ -478,10 +497,15 @@ impl<P: IpPacket> Stack<P> {
             .interface
             .poll(now, &mut self.device, &mut self.sockets)
             != PollResult::None;
-        progress |= !removed.is_empty();
-        for id in removed {
-            if let Some(entry) = self.flows.remove(&id) {
-                self.sockets.remove(entry.handle());
+        progress |= !removed_tcp.is_empty() || !removed_udp.is_empty();
+        for id in removed_tcp {
+            if let Some(flow) = self.tcp_flows.remove(&id) {
+                self.sockets.remove(flow.handle);
+            }
+        }
+        for id in removed_udp {
+            if let Some(flow) = self.udp_flows.remove(&id) {
+                self.sockets.remove(flow.handle);
             }
         }
         if progress {
@@ -505,7 +529,11 @@ impl<P: IpPacket> Stack<P> {
                 }
                 // This TCP crosses a real UDP path; respect congestion instead
                 // of sending every flow's entire window into bounded queues.
-                let mut socket = tcp_socket(P::TCP_RETRANSMISSION_FLOOR);
+                let mut socket = tcp_socket_with_buffers(
+                    P::TCP_RETRANSMISSION_FLOOR,
+                    self.tcp_receive_buffer,
+                    self.tcp_send_buffer,
+                );
                 let port = self.next_port();
                 if socket
                     .connect(
@@ -518,9 +546,9 @@ impl<P: IpPacket> Stack<P> {
                     let _ = reply.send(Err(Error::NoRoute));
                     return;
                 }
-                self.flows.insert(
+                self.tcp_flows.insert(
                     flow.id,
-                    Entry::Tcp(TcpFlow {
+                    TcpFlow {
                         handle: self.sockets.add(socket),
                         flow,
                         _permit: permit,
@@ -532,7 +560,7 @@ impl<P: IpPacket> Stack<P> {
                         read_eof: false,
                         read_bytes: 0,
                         last_read: None,
-                    }),
+                    },
                 );
             }
             Command::Udp {
@@ -561,22 +589,22 @@ impl<P: IpPacket> Stack<P> {
                     let _ = reply.send(Err(Error::NoRoute));
                     return;
                 }
-                self.flows.insert(
+                self.udp_flows.insert(
                     flow.id,
-                    Entry::Udp(UdpFlow {
+                    UdpFlow {
                         handle: self.sockets.add(socket),
                         flow,
                         _permit: permit,
                         port,
                         remote: endpoint(remote),
                         incoming,
-                    }),
+                    },
                 );
                 let _ = reply.send(Ok(()));
             }
             Command::Send { id, payload, reply } => {
-                let result = match self.flows.get(&id) {
-                    Some(Entry::Udp(flow)) if !flow.flow.closed.load(Ordering::Acquire) => {
+                let result = match self.udp_flows.get(&id) {
+                    Some(flow) if !flow.flow.closed.load(Ordering::Acquire) => {
                         let socket = self.sockets.get_mut::<udp::Socket>(flow.handle);
                         match socket.send_slice(&payload, flow.remote) {
                             Ok(()) | Err(udp::SendError::BufferFull) => Ok(()),
@@ -692,7 +720,7 @@ mod tests {
             ));
             let mut handles = Vec::new();
             for port in [40000, 40001] {
-                let mut socket = tcp_socket(None);
+                let mut socket = tcp_socket_with_buffers(None, TCP_RECEIVE_BUFFER, TCP_SEND_BUFFER);
                 socket
                     .connect(interface.context(), (remote, 80), (local, port))
                     .unwrap();
@@ -914,7 +942,7 @@ mod tests {
         interface.update_ip_addrs(|addresses| {
             addresses.push(IpCidr::new(local.into(), 24)).unwrap();
         });
-        let mut socket = tcp_socket(None);
+        let mut socket = tcp_socket_with_buffers(None, TCP_RECEIVE_BUFFER, TCP_SEND_BUFFER);
         socket
             .connect(interface.context(), (remote, 80), (local, 40000))
             .unwrap();
@@ -1162,7 +1190,8 @@ mod tests {
             addresses.push(IpCidr::new(local.into(), 24)).unwrap();
         });
         interface.set_tcp_egress_burst(32);
-        let mut socket = tcp_socket(retransmission_floor);
+        let mut socket =
+            tcp_socket_with_buffers(retransmission_floor, TCP_RECEIVE_BUFFER, TCP_SEND_BUFFER);
         socket
             .connect(interface.context(), (remote, 80), (local, 40000))
             .unwrap();

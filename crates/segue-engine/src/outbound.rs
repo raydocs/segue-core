@@ -891,6 +891,12 @@ impl FreedomOutbound {
     }
 
     /// Whether `finalmask.udp` shapes this outbound's UDP flows.
+    pub(crate) fn socket_options_key(&self) -> usize {
+        self.socket_options
+            .as_deref()
+            .map_or(0, |options| std::ptr::from_ref(options) as usize)
+    }
+
     pub(crate) fn has_udp_masks(&self) -> bool {
         self.udp_masks.is_some()
     }

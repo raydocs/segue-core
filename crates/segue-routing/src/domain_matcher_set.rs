@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use aho_corasick::{AhoCorasick, AhoCorasickKind, StartKind};
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use thiserror::Error;
 
 use crate::{DomainMatcher, DomainNameMode};
@@ -30,13 +30,90 @@ pub struct DomainMatcherSet {
     matcher_count: usize,
 }
 
+enum CompiledRegexes {
+    Empty,
+    Single(Regex),
+    Set(RegexSet),
+    Fallback(Vec<Regex>),
+}
+
+impl CompiledRegexes {
+    fn from_regexes(mut regexes: Vec<Regex>) -> Self {
+        match regexes.len() {
+            0 => Self::Empty,
+            1 => Self::Single(regexes.pop().expect("single regex")),
+            _ => match RegexSet::new(regexes.iter().map(Regex::as_str)) {
+                Ok(set) => Self::Set(set),
+                Err(_) => Self::Fallback(regexes),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Single(_) => 1,
+            Self::Set(set) => set.len(),
+            Self::Fallback(list) => list.len(),
+        }
+    }
+
+    fn pattern_bytes(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Single(regex) => regex.as_str().len(),
+            Self::Set(set) => set.patterns().iter().map(String::len).sum(),
+            Self::Fallback(list) => list.iter().map(|regex| regex.as_str().len()).sum(),
+        }
+    }
+
+    fn is_match(&self, domain: &str) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::Single(regex) => regex.is_match(domain),
+            Self::Set(set) => set.is_match(domain),
+            Self::Fallback(list) => list.iter().any(|regex| regex.is_match(domain)),
+        }
+    }
+
+    fn patterns_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Empty, Self::Empty) => true,
+            (Self::Single(a), Self::Single(b)) => a.as_str() == b.as_str(),
+            (Self::Set(a), Self::Set(b)) => a.patterns() == b.patterns(),
+            (Self::Fallback(a), Self::Fallback(b)) => {
+                a.iter().map(Regex::as_str).eq(b.iter().map(Regex::as_str))
+            }
+            (a, b) if a.len() == b.len() => a.pattern_strs().eq(b.pattern_strs()),
+            _ => false,
+        }
+    }
+
+    fn pattern_strs(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match self {
+            Self::Empty => Box::new(std::iter::empty()),
+            Self::Single(regex) => Box::new(std::iter::once(regex.as_str())),
+            Self::Set(set) => Box::new(set.patterns().iter().map(String::as_str)),
+            Self::Fallback(list) => Box::new(list.iter().map(Regex::as_str)),
+        }
+    }
+}
+
 struct DomainMatcherSetInner {
     linear: Option<Box<[DomainMatcher]>>,
     full: HashSet<Box<str>>,
     suffix: HashSet<Box<str>>,
-    keywords: Vec<Box<str>>,
+    subdomain: HashSet<Box<str>>,
+    keyword_count: usize,
+    keyword_pattern_bytes: usize,
+    keyword_digest: u64,
     keyword_automaton: Option<AhoCorasick>,
-    regex: Vec<Regex>,
+    regex: CompiledRegexes,
 }
 
 impl DomainMatcherSet {
@@ -82,6 +159,7 @@ impl DomainMatcherSet {
         let domain = lowercase_ascii(domain);
         inner.full.contains(domain.as_ref())
             || inner.matches_suffix(&domain)
+            || inner.matches_subdomain(&domain)
             || inner.matches_keyword(&domain)
             || inner.matches_regex(&domain)
     }
@@ -94,16 +172,9 @@ impl DomainMatcherSetInner {
         }
         self.full.iter().map(|name| name.len()).sum::<usize>()
             + self.suffix.iter().map(|name| name.len()).sum::<usize>()
-            + self
-                .keywords
-                .iter()
-                .map(|keyword| keyword.len())
-                .sum::<usize>()
-            + self
-                .regex
-                .iter()
-                .map(|regex| regex.as_str().len())
-                .sum::<usize>()
+            + self.subdomain.iter().map(|name| name.len()).sum::<usize>()
+            + self.keyword_pattern_bytes
+            + self.regex.pattern_bytes()
     }
 
     fn matches_suffix(&self, domain: &str) -> bool {
@@ -114,6 +185,13 @@ impl DomainMatcherSetInner {
                     .any(|(index, _)| self.suffix.contains(&domain[index + 1..])))
     }
 
+    fn matches_subdomain(&self, domain: &str) -> bool {
+        !self.subdomain.is_empty()
+            && domain
+                .rmatch_indices('.')
+                .any(|(index, _)| index > 0 && self.subdomain.contains(&domain[index + 1..]))
+    }
+
     fn matches_keyword(&self, domain: &str) -> bool {
         self.keyword_automaton
             .as_ref()
@@ -121,7 +199,7 @@ impl DomainMatcherSetInner {
     }
 
     fn matches_regex(&self, domain: &str) -> bool {
-        self.regex.iter().any(|regex| regex.is_match(domain))
+        self.regex.is_match(domain)
     }
 
     fn matcher_kind_count(&self, select: fn(&DomainMatcher) -> bool) -> usize {
@@ -155,9 +233,18 @@ impl fmt::Debug for DomainMatcherSet {
                 }),
             )
             .field(
+                "subdomain",
+                &counts(|inner| {
+                    inner.subdomain.len()
+                        + inner.matcher_kind_count(|matcher| {
+                            matches!(matcher, DomainMatcher::Subdomain(_))
+                        })
+                }),
+            )
+            .field(
                 "keyword",
                 &counts(|inner| {
-                    inner.keywords.len()
+                    inner.keyword_count
                         + inner.matcher_kind_count(|matcher| {
                             matches!(matcher, DomainMatcher::Keyword(_))
                         })
@@ -186,11 +273,11 @@ impl PartialEq for DomainMatcherSet {
                     a.linear == b.linear
                         && a.full == b.full
                         && a.suffix == b.suffix
-                        && a.keywords == b.keywords
-                        && a.regex
-                            .iter()
-                            .map(Regex::as_str)
-                            .eq(b.regex.iter().map(Regex::as_str))
+                        && a.subdomain == b.subdomain
+                        && a.keyword_count == b.keyword_count
+                        && a.keyword_pattern_bytes == b.keyword_pattern_bytes
+                        && a.keyword_digest == b.keyword_digest
+                        && a.regex.patterns_eq(&b.regex)
                 }
                 (Some(_), None) | (None, Some(_)) => false,
             }
@@ -205,43 +292,41 @@ pub enum DomainMatcherSetError {
     Keyword(#[from] aho_corasick::BuildError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DomainMatcherSetBuilder {
-    linear: Option<Vec<DomainMatcher>>,
+    linear: Vec<DomainMatcher>,
+    indexed: bool,
     full: HashSet<Box<str>>,
     suffix: HashSet<Box<str>>,
+    subdomain: HashSet<Box<str>>,
     keywords: Vec<Box<str>>,
     regex: Vec<Regex>,
     matcher_count: usize,
-}
-
-impl Default for DomainMatcherSetBuilder {
-    fn default() -> Self {
-        Self {
-            linear: Some(Vec::new()),
-            full: HashSet::new(),
-            suffix: HashSet::new(),
-            keywords: Vec::new(),
-            regex: Vec::new(),
-            matcher_count: 0,
-        }
-    }
 }
 
 impl DomainMatcherSetBuilder {
     /// Adds one matcher; the already compiled regex of a `regexp:` matcher is
     /// shared, not recompiled.
     pub fn insert(&mut self, matcher: &DomainMatcher, mode: DomainNameMode) {
-        if let Some(linear) = &mut self.linear {
+        if !self.indexed {
             if self.matcher_count < LINEAR_MATCHER_LIMIT {
-                let matcher = normalize_linear_matcher(matcher, mode);
-                if !linear.contains(&matcher) {
-                    linear.push(matcher);
+                let normalized = normalize_linear_matcher(matcher, mode);
+                if !self.linear.contains(&normalized) {
+                    self.linear.push(normalized);
                 }
-            } else {
-                self.linear = None;
+                self.matcher_count += 1;
+                return;
+            }
+            self.indexed = true;
+            for existing in std::mem::take(&mut self.linear) {
+                self.insert_normalized(existing);
             }
         }
+        self.insert_raw(matcher, mode);
+        self.matcher_count += 1;
+    }
+
+    fn insert_raw(&mut self, matcher: &DomainMatcher, mode: DomainNameMode) {
         match matcher {
             DomainMatcher::Keyword(keyword) => self.keywords.push(lowercase_boxed(keyword)),
             DomainMatcher::Full(domain) => {
@@ -250,9 +335,27 @@ impl DomainMatcherSetBuilder {
             DomainMatcher::Suffix(suffix) => {
                 self.suffix.insert(lowercase_boxed(mode.pattern(suffix)));
             }
+            DomainMatcher::Subdomain(suffix) => {
+                self.subdomain.insert(lowercase_boxed(mode.pattern(suffix)));
+            }
             DomainMatcher::Regex(matcher) => self.regex.push(matcher.regex().clone()),
         }
-        self.matcher_count += 1;
+    }
+
+    fn insert_normalized(&mut self, matcher: DomainMatcher) {
+        match matcher {
+            DomainMatcher::Keyword(keyword) => self.keywords.push(keyword.into_boxed_str()),
+            DomainMatcher::Full(domain) => {
+                self.full.insert(domain.into_boxed_str());
+            }
+            DomainMatcher::Suffix(suffix) => {
+                self.suffix.insert(suffix.into_boxed_str());
+            }
+            DomainMatcher::Subdomain(suffix) => {
+                self.subdomain.insert(suffix.into_boxed_str());
+            }
+            DomainMatcher::Regex(matcher) => self.regex.push(matcher.regex().clone()),
+        }
     }
 
     pub fn matcher_count(&self) -> usize {
@@ -264,48 +367,64 @@ impl DomainMatcherSetBuilder {
             return Ok(DomainMatcherSet::default());
         }
         let matcher_count = self.matcher_count;
-        let (linear, full, suffix, keywords, keyword_automaton, regex) =
-            if let Some(linear) = self.linear {
-                (
-                    Some(linear.into_boxed_slice()),
-                    HashSet::new(),
-                    HashSet::new(),
-                    Vec::new(),
-                    None,
-                    Vec::new(),
-                )
+        let inner = if !self.indexed {
+            DomainMatcherSetInner {
+                linear: Some(self.linear.into_boxed_slice()),
+                full: HashSet::new(),
+                suffix: HashSet::new(),
+                subdomain: HashSet::new(),
+                keyword_count: 0,
+                keyword_pattern_bytes: 0,
+                keyword_digest: 0,
+                keyword_automaton: None,
+                regex: CompiledRegexes::Empty,
+            }
+        } else {
+            let keyword_count = self.keywords.len();
+            let keyword_pattern_bytes = self.keywords.iter().map(|keyword| keyword.len()).sum();
+            let keyword_digest = digest_keywords(&self.keywords);
+            let keyword_automaton = if self.keywords.is_empty() {
+                None
             } else {
-                let keyword_automaton = if self.keywords.is_empty() {
-                    None
-                } else {
-                    Some(
-                        AhoCorasick::builder()
-                            .kind(Some(AhoCorasickKind::ContiguousNFA))
-                            .start_kind(StartKind::Unanchored)
-                            .build(self.keywords.iter().map(|keyword| keyword.as_bytes()))?,
-                    )
-                };
-                (
-                    None,
-                    self.full,
-                    self.suffix,
-                    self.keywords,
-                    keyword_automaton,
-                    self.regex,
+                Some(
+                    AhoCorasick::builder()
+                        .kind(Some(AhoCorasickKind::ContiguousNFA))
+                        .start_kind(StartKind::Unanchored)
+                        .build(self.keywords.iter().map(|keyword| keyword.as_bytes()))?,
                 )
             };
-        Ok(DomainMatcherSet {
-            inner: Some(Arc::new(DomainMatcherSetInner {
-                linear,
-                full,
-                suffix,
-                keywords,
+            DomainMatcherSetInner {
+                linear: None,
+                full: self.full,
+                suffix: self.suffix,
+                subdomain: self.subdomain,
+                keyword_count,
+                keyword_pattern_bytes,
+                keyword_digest,
                 keyword_automaton,
-                regex,
-            })),
+                regex: CompiledRegexes::from_regexes(self.regex),
+            }
+        };
+        Ok(DomainMatcherSet {
+            inner: Some(Arc::new(inner)),
             matcher_count,
         })
     }
+}
+
+fn digest_keywords(keywords: &[Box<str>]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for keyword in keywords {
+        for byte in (keyword.len() as u64).to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        for &byte in keyword.as_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    hash
 }
 
 fn lowercase_boxed(value: &str) -> Box<str> {
@@ -321,6 +440,9 @@ fn normalize_linear_matcher(matcher: &DomainMatcher, mode: DomainNameMode) -> Do
         DomainMatcher::Suffix(suffix) => {
             DomainMatcher::Suffix(mode.pattern(suffix).to_ascii_lowercase())
         }
+        DomainMatcher::Subdomain(suffix) => {
+            DomainMatcher::Subdomain(mode.pattern(suffix).to_ascii_lowercase())
+        }
         DomainMatcher::Regex(matcher) => DomainMatcher::Regex(matcher.clone()),
     }
 }
@@ -329,7 +451,8 @@ fn matcher_pattern_bytes(matcher: &DomainMatcher) -> usize {
     match matcher {
         DomainMatcher::Keyword(pattern)
         | DomainMatcher::Full(pattern)
-        | DomainMatcher::Suffix(pattern) => pattern.len(),
+        | DomainMatcher::Suffix(pattern)
+        | DomainMatcher::Subdomain(pattern) => pattern.len(),
         DomainMatcher::Regex(matcher) => matcher.pattern().len(),
     }
 }
@@ -421,7 +544,8 @@ mod tests {
         assert_eq!(inner.linear.as_deref().unwrap().len(), 5);
         assert!(inner.full.is_empty());
         assert!(inner.suffix.is_empty());
-        assert!(inner.keywords.is_empty());
+        assert!(inner.subdomain.is_empty());
+        assert_eq!(inner.keyword_count, 0);
         assert!(inner.keyword_automaton.is_none());
         assert!(inner.regex.is_empty());
         assert!(set.matches("B.TEST"));
@@ -459,7 +583,7 @@ mod tests {
         assert_eq!(DomainMatcherSet::builder().build().unwrap(), empty);
         assert_eq!(
             format!("{empty:?}"),
-            "DomainMatcherSet { full: 0, suffix: 0, keyword: 0, regex: 0, matcher_count: 0 }"
+            "DomainMatcherSet { full: 0, suffix: 0, subdomain: 0, keyword: 0, regex: 0, matcher_count: 0 }"
         );
     }
 
@@ -584,7 +708,7 @@ mod tests {
         assert_eq!(left.pattern_bytes(), 6 + 6 + 2 + 3);
         assert_eq!(
             format!("{left:?}"),
-            "DomainMatcherSet { full: 1, suffix: 1, keyword: 1, regex: 1, matcher_count: 4 }"
+            "DomainMatcherSet { full: 1, suffix: 1, subdomain: 0, keyword: 1, regex: 1, matcher_count: 4 }"
         );
         let cloned = left.clone();
         assert!(cloned.matches("x.b.test") && cloned.matches("c") && cloned.matches("akwz"));
@@ -625,23 +749,13 @@ mod tests {
 
         let name_table_bytes = table_bytes(&inner.full) + table_bytes(&inner.suffix);
         let name_heap_bytes = heap_bytes(&inner.full) + heap_bytes(&inner.suffix);
-        let keyword_list_bytes = inner.keywords.capacity() * size_of::<Box<str>>()
-            + inner
-                .keywords
-                .iter()
-                .map(|keyword| keyword.len())
-                .sum::<usize>();
         let automaton_bytes = inner
             .keyword_automaton
             .as_ref()
             .map_or(0, AhoCorasick::memory_usage);
-        let regex_pattern_bytes = inner
-            .regex
-            .iter()
-            .map(|regex| regex.as_str().len())
-            .sum::<usize>();
+        let regex_pattern_bytes = inner.regex.pattern_bytes();
         eprintln!(
-            "names: tables {name_table_bytes} B + heap {name_heap_bytes} B; keywords: list {keyword_list_bytes} B + automaton {automaton_bytes} B; regex patterns {regex_pattern_bytes} B"
+            "names: tables {name_table_bytes} B + heap {name_heap_bytes} B; keywords: automaton {automaton_bytes} B; regex patterns {regex_pattern_bytes} B"
         );
 
         let flat_vec_name_bytes = 120_000 * 32 + name_heap_bytes;
@@ -654,5 +768,32 @@ mod tests {
         assert!(set.matches("cdn.keyword-1999.test"));
         assert!(set.matches("ad42-199.tracker.example"));
         assert!(!set.matches("clean.example"));
+    }
+
+    #[test]
+    fn subdomains_match_strictly_below_and_above_linear_limit() {
+        let small = DomainMatcherSet::compile(
+            &[DomainMatcher::Subdomain("Example.COM".to_owned())],
+            DomainNameMode::Routing,
+        )
+        .unwrap();
+        assert!(!small.matches("example.com"));
+        assert!(!small.matches(".example.com"));
+        assert!(small.matches("sub.example.com"));
+        assert!(small.matches("a.b.EXAMPLE.com"));
+
+        let mut builder = DomainMatcherSet::builder();
+        for index in 0..=LINEAR_MATCHER_LIMIT {
+            builder.insert(
+                &DomainMatcher::Subdomain(format!("sub-{index}.example")),
+                DomainNameMode::Routing,
+            );
+        }
+        let large = builder.build().unwrap();
+        assert!(large.inner.as_deref().unwrap().linear.is_none());
+        assert!(!large.matches("sub-0.example"));
+        assert!(!large.matches(".sub-0.example"));
+        assert!(large.matches("edge.SUB-0.example"));
+        assert!(large.matches("deep.edge.sub-8.example"));
     }
 }

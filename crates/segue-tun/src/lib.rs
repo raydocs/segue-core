@@ -401,12 +401,109 @@ impl TunEndpoint {
         self.push_packet(packet, Direction::Inbound).await
     }
 
+    pub fn try_push_inbound(&self, packet: Bytes) -> Result<(), TunError> {
+        self.push_packet_now(packet, Direction::Inbound).map(|_| ())
+    }
+
+    pub fn push_inbound_batch<I: IntoIterator<Item = Bytes>>(
+        &self,
+        packets: I,
+    ) -> Result<usize, TunError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TunError::QueueClosed);
+        }
+
+        let (queued_bytes, depth) = self.queued_bytes(Direction::Inbound);
+        let byte_limit = depth
+            .saturating_mul(QUEUE_BYTES_PER_SLOT)
+            .max(self.config.mtu);
+        let mut pushed = 0_usize;
+        let mut queue_closed = false;
+
+        for packet in packets {
+            let len = packet.len();
+            if len > self.config.mtu {
+                self.record_drop(Direction::Inbound);
+                continue;
+            }
+            if queued_bytes.fetch_add(len, Ordering::AcqRel) + len > byte_limit {
+                queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                self.record_drop(Direction::Inbound);
+                continue;
+            }
+            match self.inbound_tx.try_send(packet) {
+                Ok(()) => pushed += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                    self.record_drop(Direction::Inbound);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                    queue_closed = true;
+                    break;
+                }
+            }
+        }
+
+        if pushed > 0 {
+            self.inbound_packets
+                .fetch_add(pushed as u64, Ordering::Relaxed);
+            self.record_queue_occupancy(Direction::Inbound);
+        }
+        if queue_closed {
+            return Err(TunError::QueueClosed);
+        }
+        Ok(pushed)
+    }
+
     pub async fn poll_inbound(&self) -> Result<Bytes, TunError> {
         self.poll_packet(Direction::Inbound).await
     }
 
     pub async fn try_poll_inbound(&self) -> Result<Option<Bytes>, TunError> {
         self.try_poll_packet(Direction::Inbound).await
+    }
+
+    pub async fn try_poll_inbound_batch(
+        &self,
+        max_packets: usize,
+        packets: &mut Vec<Bytes>,
+    ) -> Result<usize, TunError> {
+        let max_packets = max_packets.max(1);
+        packets.clear();
+        let Ok(mut rx) = self.inbound_rx.try_lock() else {
+            return Ok(0);
+        };
+
+        let mut dequeued_bytes = 0_usize;
+        let mut closed_or_disconnected = false;
+        while packets.len() < max_packets {
+            match rx.try_recv() {
+                Ok(packet) => {
+                    dequeued_bytes += packet.len();
+                    packets.push(packet);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if self.closed.load(Ordering::Acquire) {
+                        closed_or_disconnected = true;
+                    }
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    closed_or_disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        if dequeued_bytes > 0 {
+            self.inbound_queued_bytes
+                .fetch_sub(dequeued_bytes, Ordering::AcqRel);
+        }
+        if packets.is_empty() && closed_or_disconnected {
+            return Err(TunError::QueueClosed);
+        }
+        Ok(packets.len())
     }
 
     pub async fn push_outbound(&self, packet: Bytes) -> Result<(), TunError> {
@@ -419,6 +516,10 @@ impl TunEndpoint {
 
     pub async fn try_poll_outbound(&self) -> Result<Option<Bytes>, TunError> {
         self.try_poll_packet(Direction::Outbound).await
+    }
+
+    pub fn try_poll_outbound_now(&self) -> Result<Option<Bytes>, TunError> {
+        self.try_poll_packet_now(Direction::Outbound)
     }
 
     pub fn mtu(&self) -> usize {
@@ -448,6 +549,7 @@ impl TunEndpoint {
             packets.reserve(max_packets.min(64));
         }
         let mut rx = self.outbound_rx.lock().await;
+        let mut dequeued_bytes = 0_usize;
 
         loop {
             let closed = self.closed_notify.notified();
@@ -455,7 +557,8 @@ impl TunEndpoint {
             if self.closed.load(Ordering::Acquire) {
                 match rx.try_recv() {
                     Ok(packet) => {
-                        packets.push(self.dequeued(Direction::Outbound, packet));
+                        dequeued_bytes += packet.len();
+                        packets.push(packet);
                         break;
                     }
                     Err(_) => return Err(TunError::QueueClosed),
@@ -465,7 +568,8 @@ impl TunEndpoint {
             tokio::select! {
                 packet = rx.recv() => match packet {
                     Some(packet) => {
-                        packets.push(self.dequeued(Direction::Outbound, packet));
+                        dequeued_bytes += packet.len();
+                        packets.push(packet);
                         break;
                     }
                     None => return Err(TunError::QueueClosed),
@@ -476,15 +580,72 @@ impl TunEndpoint {
 
         while packets.len() < max_packets {
             match rx.try_recv() {
-                Ok(packet) => packets.push(self.dequeued(Direction::Outbound, packet)),
+                Ok(packet) => {
+                    dequeued_bytes += packet.len();
+                    packets.push(packet);
+                }
                 Err(_) => break,
             }
         }
 
+        if dequeued_bytes > 0 {
+            self.outbound_queued_bytes
+                .fetch_sub(dequeued_bytes, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
+    /// Non-blocking drain of up to `max_packets` queued outbound packets into `packets`.
+    pub fn try_poll_outbound_batch_into(
+        &self,
+        max_packets: usize,
+        packets: &mut Vec<Bytes>,
+    ) -> Result<(), TunError> {
+        let max_packets = max_packets.max(1);
+        packets.clear();
+        if packets.capacity() < max_packets.min(64) {
+            packets.reserve(max_packets.min(64));
+        }
+        let Ok(mut rx) = self.outbound_rx.try_lock() else {
+            return Ok(());
+        };
+
+        let mut dequeued_bytes = 0_usize;
+        let mut closed_or_disconnected = false;
+        while packets.len() < max_packets {
+            match rx.try_recv() {
+                Ok(packet) => {
+                    dequeued_bytes += packet.len();
+                    packets.push(packet);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if self.closed.load(Ordering::Acquire) {
+                        closed_or_disconnected = true;
+                    }
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    closed_or_disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        if dequeued_bytes > 0 {
+            self.outbound_queued_bytes
+                .fetch_sub(dequeued_bytes, Ordering::AcqRel);
+        }
+        if packets.is_empty() && closed_or_disconnected {
+            return Err(TunError::QueueClosed);
+        }
         Ok(())
     }
 
     pub async fn stats(&self) -> TunStats {
+        self.stats_now()
+    }
+
+    pub fn stats_now(&self) -> TunStats {
         TunStats {
             inbound_packets: self.inbound_packets.load(Ordering::Relaxed),
             outbound_packets: self.outbound_packets.load(Ordering::Relaxed),
@@ -971,6 +1132,17 @@ impl TunEndpoint {
     }
 
     async fn push_packet(&self, packet: Bytes, direction: Direction) -> Result<(), TunError> {
+        if self.push_packet_now(packet, direction)? {
+            // Cooperate once at saturation so a single hot producer
+            // cannot repeatedly refill the last slot before the TUN
+            // runtime gets scheduled. Full queues still reject via
+            // `try_send`; this only improves fairness after acceptance.
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
+    fn push_packet_now(&self, packet: Bytes, direction: Direction) -> Result<bool, TunError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(TunError::QueueClosed);
         }
@@ -1009,14 +1181,7 @@ impl TunEndpoint {
                     Direction::Outbound => self.outbound_packets.fetch_add(1, Ordering::Relaxed),
                 };
                 self.record_queue_occupancy(direction);
-                if matches!(direction, Direction::Inbound) && self.inbound_tx.capacity() == 0 {
-                    // Cooperate once at saturation so a single hot producer
-                    // cannot repeatedly refill the last slot before the TUN
-                    // runtime gets scheduled. Full queues still reject via
-                    // `try_send`; this only improves fairness after acceptance.
-                    tokio::task::yield_now().await;
-                }
-                Ok(())
+                Ok(matches!(direction, Direction::Inbound) && self.inbound_tx.capacity() == 0)
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.record_drop(direction);
@@ -1075,6 +1240,10 @@ impl TunEndpoint {
     }
 
     async fn try_poll_packet(&self, direction: Direction) -> Result<Option<Bytes>, TunError> {
+        self.try_poll_packet_now(direction)
+    }
+
+    fn try_poll_packet_now(&self, direction: Direction) -> Result<Option<Bytes>, TunError> {
         let Ok(mut rx) = self.receiver(direction).try_lock() else {
             return Ok(None);
         };

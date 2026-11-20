@@ -44,7 +44,7 @@
 //!   mark after charging the flow's 2-block minimum (1 receive, 1 transmit);
 //!   otherwise the SYN is refused with a RST;
 //! * a receive ring starts at 4 KiB, a transmit ring at zero; each doubles
-//!   (up to `tcp_rx_buffer` / `tcp_tx_buffer`, 64 KiB max) when it is found
+//!   (up to `tcp_rx_buffer` / `tcp_tx_buffer`, 512 KiB max) when it is found
 //!   full and the pool is under high water;
 //! * relay chunks may use the pool up to 100 %, so the 20 % above high water
 //!   is always left for moving bytes, and a flow that cannot get a chunk
@@ -131,9 +131,10 @@ const CHUNK: usize = 16 * 1024;
 const RELAY_CHUNKS: usize = 4;
 /// IPv6 minimum MTU; ICMPv6 errors must fit in it (RFC 4443 §2.4).
 const IPV6_MIN_MTU: usize = 1280;
-/// smoltcp's window scale is fixed when the socket is created (at 4 KiB, so
-/// no scaling): a ring may not grow past what an unscaled window can offer.
-const MAX_RING: usize = 64 * 1024;
+/// Upper bound on each flow's ring buffer. `open_tcp` calls
+/// `set_window_scale_for_capacity` so a socket starting at 4 KiB still
+/// negotiates the RFC 1323 shift needed to grow up to this ceiling.
+const MAX_RING: usize = 512 * 1024;
 const DNS_PORT: u16 = 53;
 /// Budget for one TCP flow's bookkeeping outside the pool: socket struct,
 /// flow-table entries, relay task, two channels (~3.1 KiB measured by the
@@ -1312,6 +1313,7 @@ impl Netstack {
         sock.set_timeout(None);
         sock.set_tsval_generator(Some(tcp_timestamp));
         sock.set_congestion_control(tcp::CongestionControl::Reno);
+        sock.set_window_scale_for_capacity(self.max_rx());
         let listen = IpListenEndpoint {
             addr: Some(IpAddress::from(key.dst.ip())),
             port: key.dst.port(),

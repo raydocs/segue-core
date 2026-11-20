@@ -572,6 +572,7 @@ pub struct XrayCoreHandle {
     kernel_config: Option<segue_kernel::config::KernelConfig>,
     runtime: Runtime,
     pending_outbound_packets: Mutex<VecDeque<Bytes>>,
+    outbound_batch_scratch: Mutex<Vec<Bytes>>,
     socket_protector: Option<Arc<dyn SocketProtector>>,
     geodata_search: GeodataSearch,
     startup_probe_options: Option<StartupProbeOptions>,
@@ -680,6 +681,7 @@ unsafe fn xray_core_new_inner(error: *mut *mut XrayError) -> *mut XrayCoreHandle
         .enable_all()
         .thread_name("segue-ffi")
         .worker_threads(runtime_worker_threads())
+        .max_blocking_threads(16)
         .build()
     {
         Ok(runtime) => runtime,
@@ -703,6 +705,7 @@ unsafe fn xray_core_new_inner(error: *mut *mut XrayError) -> *mut XrayCoreHandle
         kernel_config: None,
         runtime,
         pending_outbound_packets: Mutex::new(VecDeque::new()),
+        outbound_batch_scratch: Mutex::new(Vec::new()),
         socket_protector: None,
         geodata_search: GeodataSearch::Defaults,
         startup_probe_options: None,
@@ -2776,7 +2779,7 @@ unsafe fn xray_tun_push_packet_inner(
         Bytes::copy_from_slice(data)
     };
 
-    match handle.runtime.block_on(core.tun().push_inbound(packet)) {
+    match core.tun().try_push_inbound(packet) {
         Ok(()) => XrayStatus::Ok,
         Err(err) => {
             unsafe {
@@ -2849,7 +2852,7 @@ unsafe fn xray_tun_poll_packet_inner(
     let polled_packet = if let Some(packet) = pending_packet {
         Ok(Some(packet))
     } else {
-        handle.runtime.block_on(core.tun().try_poll_outbound())
+        core.tun().try_poll_outbound_now()
     };
 
     match polled_packet {
@@ -3010,12 +3013,25 @@ unsafe fn xray_tun_poll_packets_inner(
         return Ok(XrayStatus::Ok);
     }
 
-    let wait = Duration::from_millis(u64::from(wait_ms));
-    let batch = handle.runtime.block_on(async {
-        tokio::time::timeout(wait, tun.poll_outbound_batch(effective_max)).await
-    });
+    let mut scratch = match handle.outbound_batch_scratch.lock() {
+        Ok(scratch) => scratch,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    scratch.clear();
+    let batch = if wait_ms == 0 {
+        Ok(tun.try_poll_outbound_batch_into(effective_max, &mut scratch))
+    } else {
+        let wait = Duration::from_millis(u64::from(wait_ms));
+        handle.runtime.block_on(async {
+            tokio::time::timeout(
+                wait,
+                tun.poll_outbound_batch_into(effective_max, &mut scratch),
+            )
+            .await
+        })
+    };
 
-    match batch {
+    let status = match batch {
         Err(_) => Ok(XrayStatus::NoPacket),
         Ok(Err(err)) => {
             unsafe {
@@ -3023,11 +3039,11 @@ unsafe fn xray_tun_poll_packets_inner(
             }
             Err(XrayStatus::TunError)
         }
-        Ok(Ok(packets)) if packets.is_empty() => Ok(XrayStatus::NoPacket),
-        Ok(Ok(packets)) => {
+        Ok(Ok(())) if scratch.is_empty() => Ok(XrayStatus::NoPacket),
+        Ok(Ok(())) => {
             let mut offset = 0usize;
             let mut written = 0usize;
-            for packet in &packets {
+            for packet in scratch.iter() {
                 if offset + packet.len() > buffer_len || written >= max_packets {
                     break;
                 }
@@ -3043,7 +3059,9 @@ unsafe fn xray_tun_poll_packets_inner(
             }
             Ok(XrayStatus::Ok)
         }
-    }
+    };
+    scratch.clear();
+    status
 }
 
 /// Polls one debug-only TCP slow-flow event from the TUN endpoint.
@@ -3731,7 +3749,7 @@ unsafe fn xray_tun_stats_inner(
         return XrayStatus::CoreNotLoaded;
     };
 
-    let snapshot = handle.runtime.block_on(core.tun().stats());
+    let snapshot = core.tun().stats_now();
     let stats_snapshot = XrayTunStats {
         // This field describes the caller's writable allocation. Preserve it:
         // replacing a legacy caller's 560 with 584 would make a second call

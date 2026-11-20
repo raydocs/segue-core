@@ -889,3 +889,76 @@ async fn jumbo_mtu_queue_holds_the_bytes_of_a_1500_byte_queue_and_frees_them() {
             .unwrap();
     }
 }
+
+#[tokio::test]
+async fn sync_and_batch_inbound_outbound_helpers_preserve_byte_budget() {
+    let tun = TunEndpoint::new(TunConfig {
+        mtu: 1500,
+        queue_depth: 4,
+    });
+
+    // Oversized packet in batch is dropped while valid packets are queued.
+    let pushed = tun
+        .push_inbound_batch([
+            Bytes::from_static(b"pkt-1"),
+            Bytes::from(vec![0xff; 2000]),
+            Bytes::from_static(b"pkt-2"),
+        ])
+        .unwrap();
+    assert_eq!(pushed, 2);
+    tun.try_push_inbound(Bytes::from_static(b"pkt-3")).unwrap();
+
+    let mut batch = Vec::new();
+    let count = tun.try_poll_inbound_batch(8, &mut batch).await.unwrap();
+    assert_eq!(count, 3);
+    assert_eq!(
+        batch,
+        vec![
+            Bytes::from_static(b"pkt-1"),
+            Bytes::from_static(b"pkt-2"),
+            Bytes::from_static(b"pkt-3"),
+        ]
+    );
+    assert_eq!(tun.stats_now().inbound_packets, 3);
+    assert_eq!(tun.stats_now().inbound_dropped_packets, 1);
+
+    // Outbound non-blocking batch + single poll release full byte budget.
+    for byte in 0..4u8 {
+        tun.push_outbound(Bytes::from(vec![byte; 1500]))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        tun.push_outbound(Bytes::from_static(b"overflow")).await,
+        Err(TunError::QueueFull)
+    );
+    tun.try_poll_outbound_batch_into(2, &mut batch).unwrap();
+    assert_eq!(batch.len(), 2);
+    let one = tun.try_poll_outbound_now().unwrap().unwrap();
+    assert_eq!(one.len(), 1500);
+    tun.poll_outbound_batch_into(4, &mut batch).await.unwrap();
+    assert_eq!(batch.len(), 1);
+    // All outbound byte budget released: 4 full MTU packets fit again.
+    for byte in 10..14u8 {
+        tun.push_outbound(Bytes::from(vec![byte; 1500]))
+            .await
+            .unwrap();
+    }
+
+    tun.close();
+    assert_eq!(
+        tun.try_push_inbound(Bytes::from_static(b"after-close")),
+        Err(TunError::QueueClosed)
+    );
+    // Drains remaining 4 outbound packets, then reports QueueClosed once empty.
+    tun.try_poll_outbound_batch_into(8, &mut batch).unwrap();
+    assert_eq!(batch.len(), 4);
+    assert_eq!(
+        tun.try_poll_outbound_batch_into(8, &mut batch),
+        Err(TunError::QueueClosed)
+    );
+    assert_eq!(
+        tun.try_poll_inbound_batch(4, &mut batch).await,
+        Err(TunError::QueueClosed)
+    );
+}
