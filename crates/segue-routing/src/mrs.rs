@@ -28,7 +28,7 @@ use ruzstd::decoding::errors::FrameDecoderError;
 use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 use thiserror::Error;
 
-use crate::srs::{cidrs_for_range, succinct_keys, FlatRule};
+use crate::srs::{cidrs_for_range, succinct_keys, FlatRule, IpBytes};
 use crate::{DomainMatcher, RegexMatcher};
 
 /// Largest `.mrs` file accepted on disk. Same cap as a geodata file.
@@ -356,7 +356,7 @@ impl<R: Read> Reader<R> {
             self.read_exact(&mut end)?;
             let start = unmap_endpoint(start);
             let end = unmap_endpoint(end);
-            if start.len() != end.len() {
+            if start.as_slice().len() != end.as_slice().len() {
                 return Err(MrsError::Invalid(
                     "IP range endpoints have different families".to_owned(),
                 ));
@@ -364,7 +364,7 @@ impl<R: Read> Reader<R> {
             if start.as_slice() > end.as_slice() {
                 continue;
             }
-            let split = cidrs_for_range(&start, &end)
+            let split = cidrs_for_range(start.as_slice(), end.as_slice())
                 .map_err(|error| MrsError::Invalid(error.to_string()))?;
             cidrs.extend(split);
             self.account_cidrs(cidrs.len())?;
@@ -420,13 +420,8 @@ fn flat_rule(domains: Vec<DomainMatcher>, ip_cidrs: Vec<crate::Cidr>) -> FlatRul
     }
 }
 
-fn unmap_endpoint(bytes: [u8; 16]) -> Vec<u8> {
-    let mapped = bytes[..10] == [0; 10] && bytes[10] == 0xff && bytes[11] == 0xff;
-    if mapped {
-        bytes[12..].to_vec()
-    } else {
-        bytes.to_vec()
-    }
+fn unmap_endpoint(bytes: [u8; 16]) -> IpBytes {
+    IpBytes::unmap_v6(bytes)
 }
 
 enum Class {
@@ -462,8 +457,7 @@ fn matchers_from_keys(keys: &[String]) -> Result<Vec<DomainMatcher>, MrsError> {
         matchers.push(DomainMatcher::Full(domain.clone()));
     }
     for domain in dots.difference(&exact) {
-        let pattern = format!(".+{}$", regex_escape(&format!(".{domain}")));
-        matchers.push(compile_regex(pattern)?);
+        matchers.push(DomainMatcher::Subdomain(domain.clone()));
     }
     for pattern in regexes {
         matchers.push(compile_regex(pattern)?);

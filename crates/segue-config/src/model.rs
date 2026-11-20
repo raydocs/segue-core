@@ -722,6 +722,26 @@ impl RoutingRule {
             && self.matches_domain(target_domain)
     }
 
+    /// Evaluates every non-target-IP routing condition once before checking a
+    /// list of resolved target IPs with [`Self::matches_ip`].
+    pub fn matches_route_without_target_ip(
+        &self,
+        route: &RouteContext<'_>,
+        target_domain: Option<&str>,
+        target_network: Option<Network>,
+        target_port: Option<u16>,
+    ) -> bool {
+        self.matches_local_os()
+            && self.matches_inbound(route.inbound_tag)
+            && self.matches_network(target_network)
+            && self.matches_protocol(route.protocol)
+            && self.matches_port(target_port)
+            && self.origin.matches_ports_and_user(route)
+            && self.matches_attributes(route.attributes)
+            && self.origin.matches_ips(route)
+            && self.matches_domain(target_domain)
+    }
+
     /// Whether `localOS` admits the running platform, fixed for the process
     /// as in Xray.
     pub fn matches_local_os(&self) -> bool {
@@ -3592,6 +3612,7 @@ mod tests {
         match matcher {
             DomainMatcher::Full(expected) => DomainMatcher::Full(trimmed(expected)),
             DomainMatcher::Suffix(suffix) => DomainMatcher::Suffix(trimmed(suffix)),
+            DomainMatcher::Subdomain(suffix) => DomainMatcher::Subdomain(trimmed(suffix)),
             other => other.clone(),
         }
         .matches(domain.trim_end_matches('.'))

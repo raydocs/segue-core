@@ -16,6 +16,7 @@
 //! buffered beside the decompressed ones, and both the file and the
 //! decompressed stream are size-capped.
 
+use std::collections::BTreeSet;
 use std::io::{self, ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::OnceLock;
@@ -514,7 +515,7 @@ impl<R: Read> Reader<R> {
         for _ in 0..count {
             let start = self.read_ip_addr()?;
             let end = self.read_ip_addr()?;
-            if start.len() != end.len() {
+            if start.as_slice().len() != end.as_slice().len() {
                 return Err(SrsError::Invalid(
                     "IP range endpoints have different lengths".to_owned(),
                 ));
@@ -524,18 +525,27 @@ impl<R: Read> Reader<R> {
                 // notices when a present item produced no address.
                 continue;
             }
-            cidrs.extend(cidrs_for_range(&start, &end)?);
+            cidrs.extend(cidrs_for_range(start.as_slice(), end.as_slice())?);
         }
         self.account_cidrs(cidrs.len())?;
         Ok(cidrs)
     }
 
-    fn read_ip_addr(&mut self) -> Result<Vec<u8>, SrsError> {
+    fn read_ip_addr(&mut self) -> Result<IpBytes, SrsError> {
         let len = self.read_count(16, "IP address")?;
-        if len != 4 && len != 16 {
-            return Err(SrsError::Invalid(format!("IP address length {len}")));
+        match len {
+            4 => {
+                let mut bytes = [0_u8; 4];
+                self.read_exact(&mut bytes)?;
+                Ok(IpBytes::V4(bytes))
+            }
+            16 => {
+                let mut bytes = [0_u8; 16];
+                self.read_exact(&mut bytes)?;
+                Ok(IpBytes::V6(bytes))
+            }
+            _ => Err(SrsError::Invalid(format!("IP address length {len}"))),
         }
-        self.read_vec(len)
     }
 
     fn read_succinct(&mut self) -> Result<Succinct, SrsError> {
@@ -928,36 +938,60 @@ fn select_ith_one(
     Ok(base + position as usize)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpBytes {
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
+impl IpBytes {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::V4(bytes) => bytes,
+            Self::V6(bytes) => bytes,
+        }
+    }
+
+    pub(crate) fn unmap_v6(bytes: [u8; 16]) -> Self {
+        let mapped = bytes[..10] == [0; 10] && bytes[10] == 0xff && bytes[11] == 0xff;
+        if mapped {
+            Self::V4([bytes[12], bytes[13], bytes[14], bytes[15]])
+        } else {
+            Self::V6(bytes)
+        }
+    }
+}
+
 fn dump_domains(keys: Vec<String>) -> Result<(Vec<String>, Vec<String>), SrsError> {
-    let mut domains = Vec::new();
+    let mut domains = BTreeSet::new();
     let mut prefixes = Vec::new();
     let mut dotted = Vec::new();
     for key in keys {
         let restored = reverse_domain(&key);
         let bytes = restored.as_bytes();
         if bytes.is_empty() {
-            domains.push(String::new());
+            domains.insert(String::new());
             continue;
         }
         match bytes[0] {
             PREFIX_LABEL => dotted.push(restored[1..].to_owned()),
             ROOT_LABEL => prefixes.push(restored[1..].to_owned()),
-            _ => domains.push(restored),
+            _ => {
+                domains.insert(restored);
+            }
         }
     }
     for raw in dotted {
         if let Some(apex) = raw.strip_prefix('.') {
-            if let Some(position) = domains.iter().position(|domain| domain == apex) {
-                domains.remove(position);
+            if domains.remove(apex) {
                 prefixes.push(apex.to_owned());
                 continue;
             }
         }
         prefixes.push(raw);
     }
-    domains.sort();
     prefixes.sort();
-    Ok((domains, prefixes))
+    Ok((domains.into_iter().collect(), prefixes))
 }
 
 fn reverse_domain(domain: &str) -> String {
@@ -986,11 +1020,13 @@ fn suffix_matcher(suffix: &str) -> Result<DomainMatcher, SrsError> {
         return Err(SrsError::Invalid("empty domain suffix".to_owned()));
     }
     // A leading dot is sing-box's "ends with this, but not the apex" form:
-    // `.com.cn` matches `example.com.cn` and not `com.cn`. [`DomainMatcher::Suffix`]
-    // also matches the apex, so this shape is a anchored regex instead.
-    if suffix.starts_with('.') {
-        if suffix == "." {
+    // `.com.cn` matches `example.com.cn` and not `com.cn`.
+    if let Some(rest) = suffix.strip_prefix('.') {
+        if rest.is_empty() {
             return Err(SrsError::Invalid("empty domain suffix".to_owned()));
+        }
+        if !rest.starts_with('.') {
+            return Ok(DomainMatcher::Subdomain(rest.to_owned()));
         }
         let pattern = format!("{}$", regex_escape(&suffix.to_ascii_lowercase()));
         let matcher =

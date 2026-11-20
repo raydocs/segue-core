@@ -515,6 +515,8 @@ pub struct Socket<'a> {
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
+    /// Minimum window scaling factor requested for future buffer growth.
+    min_win_shift: u8,
     /// The remote window size, relative to local_seq_no
     /// I.e. we're allowed to send octets until local_seq_no+remote_win_len
     remote_win_len: usize,
@@ -636,6 +638,7 @@ impl<'a> Socket<'a> {
             receive_window_end: None,
             remote_win_len: 0,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
+            min_win_shift: 0,
             remote_win_scale: None,
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
@@ -1076,7 +1079,8 @@ impl<'a> Socket<'a> {
         self.receive_window_end = None;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
-        self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
+        self.remote_win_shift =
+            (rx_cap_log2.saturating_sub(16).min(14) as u8).max(self.min_win_shift);
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
@@ -1381,7 +1385,8 @@ impl<'a> Socket<'a> {
     /// Growing always succeeds for owned storage. Shrinking requires an empty
     /// reassembly assembler and `capacity >= recv_queue()`. Window scaling is
     /// fixed when the socket is created or reset, so callers that grow beyond
-    /// 64 KiB must create the socket with the largest buffer first. Segments
+    /// 64 KiB must create the socket with the largest buffer first or call
+    /// `set_window_scale_for_capacity` before listening or connecting. Segments
     /// are only accepted into the physical buffer, so a window advertised
     /// before a shrink cannot overrun storage; the excess is dropped and
     /// retransmitted by the peer.
@@ -1391,6 +1396,29 @@ impl<'a> Socket<'a> {
             return false;
         }
         self.rx_buffer.resize(capacity)
+    }
+
+    fn win_shift_for_capacity(capacity: usize) -> u8 {
+        let cap_log2 = mem::size_of::<usize>() * 8 - capacity.leading_zeros() as usize;
+        cap_log2.saturating_sub(16).min(14) as u8
+    }
+
+    /// XRAY-PATCH: set a floor for the advertised TCP window scale shift so a
+    /// socket created with a small initial receive buffer can advertise a
+    /// scaled window for `max_rx_capacity` when it grows later. Must be called
+    /// while the socket is still `Closed` or `Listen`.
+    pub fn set_window_scale_for_capacity(&mut self, max_rx_capacity: usize) -> bool {
+        if !matches!(self.state, State::Closed | State::Listen) {
+            return false;
+        }
+        #[cfg(not(target_pointer_width = "16"))]
+        if max_rx_capacity > (1 << 30) {
+            return false;
+        }
+        let shift = Self::win_shift_for_capacity(max_rx_capacity);
+        self.min_win_shift = shift;
+        self.remote_win_shift = self.remote_win_shift.max(shift);
+        true
     }
 
     /// XRAY-PATCH: resize an owned transmit buffer in place. Requires

@@ -905,21 +905,9 @@ mod platform {
                     match read {
                         Ok(_) => {
                             consecutive_errors = 0;
-                            let mut closed = false;
-                            for packet in packets.drain(..) {
-                                match tun.push_inbound(packet).await {
-                                    Ok(())
-                                    | Err(
-                                        TunError::QueueFull
-                                        | TunError::PacketTooLarge { .. },
-                                    ) => {}
-                                    Err(TunError::QueueClosed) => {
-                                        closed = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if closed {
+                            if let Err(TunError::QueueClosed) =
+                                tun.push_inbound_batch(packets.drain(..))
+                            {
                                 break;
                             }
                         }
@@ -1248,60 +1236,99 @@ mod platform {
                     return self.read_batch(fd, out).await;
                 }
             }
-            match self.read_packet(fd).await? {
-                Some(packet) => {
-                    out.push(packet);
-                    Ok(1)
-                }
-                None => Ok(0),
-            }
+            self.read_packet_batch(fd, out).await
         }
 
-        /// Reads one packet, returning `None` for a read that carries no
-        /// payload once the format header is stripped.
-        async fn read_packet<T: AsRawFd>(&mut self, fd: &AsyncFd<T>) -> io::Result<Option<Bytes>> {
+        /// Reads up to a bounded batch of ready packets on a single-read
+        /// descriptor (`RawIp` or non-batched `DarwinUtun`) without re-awaiting
+        /// readiness between already-queued datagrams.
+        async fn read_packet_batch<T: AsRawFd>(
+            &mut self,
+            fd: &AsyncFd<T>,
+            out: &mut Vec<Bytes>,
+        ) -> io::Result<usize> {
+            const RAW_READ_BATCH_MAX: usize = 32;
+            let mut added = 0_usize;
+            let mut reads = 0_usize;
+
             loop {
-                // A packet is split off whole, so the arena is always empty
-                // here and its capacity is what is left of the allocation.
-                // The exhausted arena is released rather than recycled: the
-                // packets carved from it keep it alive until the stack has
-                // consumed them, so it is never exclusively owned at this
-                // point and `try_reclaim` would always fail.
-                if self.arena.capacity() < self.single_read {
-                    self.arena = BytesMut::with_capacity(self.arena_len);
+                let mut guard = fd.readable().await?;
+                while reads < RAW_READ_BATCH_MAX {
+                    // A packet is split off whole, so the arena is always empty
+                    // here and its capacity is what is left of the allocation.
+                    // The exhausted arena is released rather than recycled: the
+                    // packets carved from it keep it alive until the stack has
+                    // consumed them, so it is never exclusively owned at this
+                    // point and `try_reclaim` would always fail.
+                    if self.arena.capacity() < self.single_read {
+                        self.arena = BytesMut::with_capacity(self.arena_len);
+                    }
+
+                    let single_read = self.single_read;
+                    let spare = self.arena.spare_capacity_mut();
+                    let result = guard.try_io(|inner| {
+                        // SAFETY: the arena reserved at least `single_read`
+                        // spare bytes above, and nothing else references them
+                        // until they are split off.
+                        let read = unsafe {
+                            libc::read(
+                                inner.get_ref().as_raw_fd(),
+                                spare.as_mut_ptr().cast(),
+                                single_read,
+                            )
+                        };
+                        if read < 0 {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(read as usize)
+                        }
+                    });
+
+                    match result {
+                        Ok(Ok(0)) => {
+                            if reads > 0 {
+                                return Ok(added);
+                            }
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "tun fd reached EOF",
+                            ));
+                        }
+                        Ok(Ok(len)) => {
+                            reads += 1;
+                            if let Some(packet) = self.split_packet(len) {
+                                out.push(packet);
+                                added += 1;
+                            }
+                        }
+                        Ok(Err(err)) if err.kind() == io::ErrorKind::WouldBlock => {
+                            if reads > 0 {
+                                return Ok(added);
+                            }
+                            break;
+                        }
+                        Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted => {
+                            if reads > 0 {
+                                return Ok(added);
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            if reads > 0 {
+                                return Ok(added);
+                            }
+                            return Err(err);
+                        }
+                        Err(_) => {
+                            if reads > 0 {
+                                return Ok(added);
+                            }
+                            break;
+                        }
+                    }
                 }
 
-                let mut guard = fd.readable().await?;
-                let spare = self.arena.spare_capacity_mut();
-                let result = guard.try_io(|inner| {
-                    // SAFETY: the arena reserved at least `self.single_read`
-                    // spare bytes above, and nothing else references them
-                    // until they are split off.
-                    let read = unsafe {
-                        libc::read(
-                            inner.get_ref().as_raw_fd(),
-                            spare.as_mut_ptr().cast(),
-                            self.single_read,
-                        )
-                    };
-                    if read < 0 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Ok(read as usize)
-                    }
-                });
-
-                match result {
-                    Ok(Ok(0)) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "tun fd reached EOF",
-                        ))
-                    }
-                    Ok(Ok(len)) => return Ok(self.split_packet(len)),
-                    Ok(Err(err)) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => continue,
+                if reads > 0 {
+                    return Ok(added);
                 }
             }
         }
@@ -1339,13 +1366,13 @@ mod platform {
                 .expect("batching reader has batch state");
             loop {
                 let requested = batch.size.min(batch.max).max(1);
-                // One arena per batch, as on the single-packet path: carving
-                // splits the batch's bytes off the arena, so the packets keep
-                // the allocation alive and it cannot be reused while they
-                // live. A batch is 94 KiB at a 1500-byte MTU — one allocation
-                // for up to 64 packets, where the single-packet path allocates
-                // 64 KiB for about 40.
-                batch.arena = batch_arena(requested * single_read);
+                let arena_needed = requested * single_read;
+                // Reuse remaining zero-initialized tail capacity across
+                // `WouldBlock` retries and small batches; only allocate a
+                // fresh slab when the remaining capacity falls short.
+                if batch.arena.capacity() < arena_needed {
+                    batch.arena = batch_arena(arena_needed);
+                }
 
                 // Lay the slots out back to back in the arena's spare
                 // capacity. The raw pointer stays inside this block: holding
@@ -1768,10 +1795,19 @@ mod platform {
             let deadline = std::time::Instant::now() + Duration::from_millis(20);
             loop {
                 let room = self.poll_blocked(pending);
-                if room > 0 || std::time::Instant::now() >= deadline {
+                let now = std::time::Instant::now();
+                if room > 0 || now >= deadline {
                     return room;
                 }
-                tokio::time::sleep(Duration::from_micros(100)).await;
+                let next_sample = self
+                    .last_sample
+                    .map(|sampled| sampled + UTUN_GATE_SAMPLE)
+                    .unwrap_or(now);
+                let sleep_for = next_sample
+                    .saturating_duration_since(now)
+                    .min(deadline.saturating_duration_since(now))
+                    .max(Duration::from_micros(100));
+                tokio::time::sleep(sleep_for).await;
             }
         }
 

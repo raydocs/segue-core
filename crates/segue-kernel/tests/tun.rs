@@ -1260,6 +1260,85 @@ fn buffers_start_small_grow_with_traffic_and_are_released_when_idle() {
 }
 
 #[test]
+fn large_rx_buffer_advertises_window_scale_and_grows_past_64kib() {
+    let cfg = NetstackConfig {
+        tcp_rx_buffer: 256 * 1024,
+        ..Default::default()
+    };
+    let now = Instant::now();
+    let mut stack = Netstack::new(cfg, now);
+
+    let syn_repr = TcpRepr {
+        src_port: CLIENT4.port(),
+        dst_port: SITE4.port(),
+        control: TcpControl::Syn,
+        seq_number: TcpSeqNumber(1000),
+        ack_number: None,
+        window_len: 65535,
+        window_scale: Some(4),
+        max_seg_size: Some(1460),
+        sack_permitted: false,
+        sack_ranges: [None; 3],
+        timestamp: None,
+        payload: &[],
+    };
+    let (syn_s, syn_d) = (IpAddress::from(CLIENT4.ip()), IpAddress::from(SITE4.ip()));
+    let syn_pkt = ip_packet(
+        CLIENT4.ip(),
+        SITE4.ip(),
+        IpProtocol::Tcp,
+        syn_repr.buffer_len(),
+        |b| {
+            syn_repr.emit(&mut TcpPacket::new_unchecked(b), &syn_s, &syn_d, &caps());
+        },
+    );
+    stack.input(&syn_pkt, now, &mut accept_all);
+    let id = match stack.pop_event() {
+        Some(Event::TcpAccepted { id, .. }) => id,
+        other => panic!("expected TcpAccepted, got {other:?}"),
+    };
+    let raw_synack = one(&mut stack);
+    let out_pkt = out(&raw_synack);
+    let t = TcpPacket::new_checked(&out_pkt.l4[..]).unwrap();
+    let repr = TcpRepr::parse(
+        &t,
+        &IpAddress::from(out_pkt.src),
+        &IpAddress::from(out_pkt.dst),
+        &caps(),
+    )
+    .unwrap();
+    assert_eq!(repr.window_scale, Some(3));
+
+    let server_seq = (t.seq_number().0 as u32).wrapping_add(1);
+    stack.input(
+        &tcp(CLIENT4, SITE4, ACK, 1001, server_seq, b""),
+        now,
+        &mut accept_all,
+    );
+    assert!(stack.tcp_established(id).unwrap());
+
+    // Drive more than 64 KiB of upload with reads so the ring grows past 64 KiB.
+    let mut seq = 1001;
+    let mut total = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+    for _ in 0..120 {
+        let payload = vec![b'x'; 1400];
+        stack.input(
+            &tcp(CLIENT4, SITE4, ACK, seq, server_seq, &payload),
+            now,
+            &mut accept_all,
+        );
+        seq += 1400;
+        total += stack.tcp_read(id, &mut buf).unwrap();
+        stack.poll(now);
+        drain(&mut stack);
+    }
+    assert_eq!(total, 120 * 1400);
+    let (rx, _) = stack.tcp_buffers(id).unwrap();
+    assert!(rx > 64 * 1024, "expected rx ring > 64 KiB, got {rx}");
+}
+
+#[test]
 fn exhausted_pool_refuses_new_flows_with_rst() {
     let now = Instant::now();
     let cfg = NetstackConfig {

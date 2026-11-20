@@ -300,6 +300,18 @@ impl IpRangeSetBuilder {
         self.insert_cidr(Cidr::host(address));
     }
 
+    pub fn insert_range_v4(&mut self, start: u32, end: u32) {
+        if start <= end {
+            self.ipv4.push(InclusiveRange { start, end });
+        }
+    }
+
+    pub fn insert_range_v6(&mut self, start: u128, end: u128) {
+        if start <= end {
+            self.ipv6.push(InclusiveRange { start, end });
+        }
+    }
+
     pub fn insert_private_networks(&mut self) {
         for cidr in PRIVATE_NETWORKS {
             self.insert_cidr(cidr);
@@ -670,5 +682,30 @@ mod tests {
         assert!(set.matches(v4(10, 0, 0, 1)));
         assert!(set.matches(v4(93, 184, 216, 34)));
         assert!(set.matches(v4(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn explicit_v4_and_v6_ranges_insert_and_merge_cleanly() {
+        let mut builder = IpRangeSet::builder();
+        builder.insert_range_v4(
+            u32::from(Ipv4Addr::new(10, 0, 0, 1)),
+            u32::from(Ipv4Addr::new(10, 0, 0, 3)),
+        );
+        builder.insert_range_v4(
+            u32::from(Ipv4Addr::new(10, 0, 0, 4)),
+            u32::from(Ipv4Addr::new(10, 0, 0, 10)),
+        );
+        builder.insert_range_v4(
+            u32::from(Ipv4Addr::new(10, 0, 0, 20)),
+            u32::from(Ipv4Addr::new(10, 0, 0, 12)),
+        );
+        builder.insert_range_v6(0x2001_0db8_u128 << 96, (0x2001_0db8_u128 << 96) + 5);
+        builder.insert_range_v6(100, 50);
+        let set = builder.build();
+        assert_eq!(set.range_count(), 2);
+        assert!(set.contains(v4(10, 0, 0, 5)));
+        assert!(!set.contains(v4(10, 0, 0, 15)));
+        assert!(set.contains(IpAddr::V6(Ipv6Addr::from((0x2001_0db8_u128 << 96) + 3))));
+        assert!(!set.contains(IpAddr::V6(Ipv6Addr::from((0x2001_0db8_u128 << 96) + 6))));
     }
 }

@@ -143,12 +143,24 @@ impl WireguardOutbound {
         bootstrap: &dyn DnsResolver,
         dialer: &TransportDialer,
     ) -> Result<(Client, Arc<dyn DnsResolver>), CoreError> {
-        let _admission = self.0.connecting.lock().await;
         if *self.0.shutdown.borrow() {
             return Err(Error::Closed.into());
         }
         let dialer = self.socket_dialer(dialer);
         let protector = dialer.socket_protector_arc();
+        {
+            let slot = self.0.session.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = slot.as_ref().filter(|s| s.client.is_live()) {
+                if !same_protector(&cached.protector, &protector) {
+                    return Err(Error::Configuration.into());
+                }
+                return Ok((cached.client.clone(), cached.dns.clone()));
+            }
+        }
+        let _admission = self.0.connecting.lock().await;
+        if *self.0.shutdown.borrow() {
+            return Err(Error::Closed.into());
+        }
         {
             let mut slot = self.0.session.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = slot.as_ref().filter(|s| s.client.is_live()) {

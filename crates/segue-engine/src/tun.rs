@@ -974,6 +974,9 @@ pub(crate) async fn serve_tun_endpoint(
     let dns_tcp_connection_pool = Arc::new(dns_proxy::DnsTcpConnectionPool::new(
         tun_runtime_options.profile,
     ));
+    let dns_udp_socket_pool = Arc::new(dns_proxy::DnsUdpSocketPool::new(
+        tun_runtime_options.profile,
+    ));
     let tcp_flow_generation = Arc::new(AtomicU64::new(0));
     let udp_task_limit = runtime_policy.flows.udp.max_active_flows;
     let udp_task_permits = Arc::new(Semaphore::new(udp_task_pool_size(udp_task_limit)));
@@ -1014,6 +1017,7 @@ pub(crate) async fn serve_tun_endpoint(
         tcp_pending_open_permits,
         dns_tcp_flow_permits,
         dns_tcp_connection_pool,
+        dns_udp_socket_pool,
         tcp_flow_generation,
         udp_task_permits,
         dns_udp_task_permits,
@@ -1023,6 +1027,9 @@ pub(crate) async fn serve_tun_endpoint(
     let mut last_flow_stats = StdInstant::now();
     let mut next_smoltcp_deadline = None;
     let mut tcp_stack_dirty = false;
+    let mut inbound_batch: Vec<Bytes> = Vec::with_capacity(64);
+    let tick_sleep = sleep(Duration::ZERO);
+    tokio::pin!(tick_sleep);
 
     'runtime: loop {
         let smoltcp_now = Instant::now();
@@ -1034,6 +1041,9 @@ pub(crate) async fn serve_tun_endpoint(
             !delayed_stack_events.is_empty(),
             device.has_pending_outbound(),
         );
+        tick_sleep
+            .as_mut()
+            .reset(TokioInstant::now() + wait_plan.duration);
         let mut timer_expired = false;
         let mut tcp_stack_driven = false;
 
@@ -1109,7 +1119,7 @@ pub(crate) async fn serve_tun_endpoint(
                     log_bridge_task_result(result, &runtime_context.runtime_logger);
                 }
             }
-            () = sleep(wait_plan.duration) => {
+            () = &mut tick_sleep => {
                 timer_expired = true;
             }
         }
@@ -1124,42 +1134,74 @@ pub(crate) async fn serve_tun_endpoint(
             MAX_UDP_TASK_COMPLETIONS_PER_TICK,
         );
 
-        for _ in 0..MAX_TUN_INBOUND_DRAIN_PER_TICK {
-            let packet = match udp_admission
+        let mut drained = 0_usize;
+        while drained < MAX_TUN_INBOUND_DRAIN_PER_TICK {
+            let Some(packet) = udp_admission
                 .as_mut()
                 .and_then(admission::UdpAdmission::pop_ready)
-            {
-                Some(packet) => Ok(Some(packet)),
-                None => tun.try_poll_inbound().await,
+            else {
+                break;
             };
-            match packet {
-                Ok(Some(packet)) => {
-                    match process_tun_packet(
-                        packet,
-                        &tun,
-                        &mut iface,
-                        &mut sockets,
-                        &mut tcp_listeners,
-                        &mut tcp_flows,
-                        &mut udp_flows,
-                        &mut udp_admission,
-                        &mut flow_budget_state,
-                        &runtime_context,
-                        shutdown.clone(),
-                        &mut bridge_tasks,
-                        &mut udp_tasks,
-                        &mut device,
-                    )
-                    .await
-                    .tcp_stack_dirty()
-                    {
-                        Some(dirty) => tcp_stack_dirty |= dirty,
-                        None => break 'runtime,
+            match process_tun_packet(
+                packet,
+                &tun,
+                &mut iface,
+                &mut sockets,
+                &mut tcp_listeners,
+                &mut tcp_flows,
+                &mut udp_flows,
+                &mut udp_admission,
+                &mut flow_budget_state,
+                &runtime_context,
+                shutdown.clone(),
+                &mut bridge_tasks,
+                &mut udp_tasks,
+                &mut device,
+            )
+            .await
+            .tcp_stack_dirty()
+            {
+                Some(dirty) => tcp_stack_dirty |= dirty,
+                None => break 'runtime,
+            }
+            drained += 1;
+        }
+        while drained < MAX_TUN_INBOUND_DRAIN_PER_TICK {
+            let remaining = MAX_TUN_INBOUND_DRAIN_PER_TICK - drained;
+            match tun
+                .try_poll_inbound_batch(remaining, &mut inbound_batch)
+                .await
+            {
+                Ok(0) => break,
+                Ok(_) => {
+                    for packet in inbound_batch.drain(..) {
+                        match process_tun_packet(
+                            packet,
+                            &tun,
+                            &mut iface,
+                            &mut sockets,
+                            &mut tcp_listeners,
+                            &mut tcp_flows,
+                            &mut udp_flows,
+                            &mut udp_admission,
+                            &mut flow_budget_state,
+                            &runtime_context,
+                            shutdown.clone(),
+                            &mut bridge_tasks,
+                            &mut udp_tasks,
+                            &mut device,
+                        )
+                        .await
+                        .tcp_stack_dirty()
+                        {
+                            Some(dirty) => tcp_stack_dirty |= dirty,
+                            None => break 'runtime,
+                        }
+                        drained += 1;
                     }
                 }
-                Ok(None) => break,
                 Err(TunError::QueueClosed) => break 'runtime,
-                Err(_) => {}
+                Err(_) => break,
             }
         }
 
@@ -1244,9 +1286,13 @@ pub(crate) async fn serve_tun_endpoint(
             active_udp_tasks,
         );
         if flow_stats_due {
+            let pool_prune_now = TokioInstant::now();
             runtime_context
                 .dns_tcp_connection_pool
-                .prune_expired(TokioInstant::now());
+                .prune_expired(pool_prune_now);
+            runtime_context
+                .dns_udp_socket_pool
+                .prune_expired(pool_prune_now);
             record_flow_budget_stats(
                 tun.as_ref(),
                 &mut flow_budget_state,
@@ -1412,6 +1458,24 @@ async fn process_tun_packet(
                 };
             }
         }
+        let admission_key = UdpFlowKey::new(udp_packet.client, udp_packet.target);
+        if udp_flows.contains_key(&admission_key) {
+            handle_udp_packet(
+                udp_packet,
+                packet,
+                udp_flows,
+                flow_budget_state,
+                context,
+                shutdown,
+                udp_tasks,
+            );
+            if let Some(state) = udp_admission.as_mut() {
+                state.bind(admission_key, udp_flows);
+            }
+            return TunPacketOutcome::Continue {
+                tcp_stack_dirty: false,
+            };
+        }
         let dns_selection = match context
             .selected_dns_outbound_with_resolver(
                 udp_packet.target,
@@ -1512,7 +1576,6 @@ async fn process_tun_packet(
             }
             DnsUdpAction::Pass => {}
         }
-        let admission_key = UdpFlowKey::new(udp_packet.client, udp_packet.target);
         handle_udp_packet(
             udp_packet,
             packet,
@@ -1600,6 +1663,7 @@ struct TunRuntimeContext {
     tcp_pending_open_permits: Arc<Semaphore>,
     dns_tcp_flow_permits: Arc<Semaphore>,
     dns_tcp_connection_pool: Arc<dns_proxy::DnsTcpConnectionPool>,
+    dns_udp_socket_pool: Arc<dns_proxy::DnsUdpSocketPool>,
     tcp_flow_generation: Arc<AtomicU64>,
     udp_task_permits: Arc<Semaphore>,
     dns_udp_task_permits: Arc<Semaphore>,

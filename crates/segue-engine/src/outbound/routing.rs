@@ -148,19 +148,17 @@ pub(super) fn select_routed_target_with_resolved_ips<'a>(
     target_network: Option<Network>,
     target_port: Option<u16>,
 ) -> Option<&'a RoutingRuleTarget> {
+    if target_addrs.is_empty() {
+        return None;
+    }
     routing
         .rules
         .iter()
         .find(|rule| {
-            target_addrs.iter().any(|target_addr| {
-                rule.matches_route(
-                    route,
-                    target_domain,
-                    Some(&target_addr.ip()),
-                    target_network,
-                    target_port,
-                )
-            })
+            rule.matches_route_without_target_ip(route, target_domain, target_network, target_port)
+                && target_addrs
+                    .iter()
+                    .any(|target_addr| rule.matches_ip(Some(&target_addr.ip())))
         })
         .map(|rule| &rule.target)
 }

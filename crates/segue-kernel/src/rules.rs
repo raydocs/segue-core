@@ -442,7 +442,7 @@ impl Cidr {
 /// membership tests.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CidrTable {
-    v4: Vec<(u128, u128)>,
+    v4: Vec<(u32, u32)>,
     v6: Vec<(u128, u128)>,
 }
 
@@ -453,7 +453,7 @@ impl CidrTable {
         for c in cidrs {
             let (is4, a, b) = c.range();
             if is4 {
-                v4.push((a, b))
+                v4.push((a as u32, b as u32))
             } else {
                 v6.push((a, b))
             }
@@ -473,21 +473,40 @@ impl CidrTable {
             IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
             v4 => v4,
         };
-        let (table, x) = match ip {
-            IpAddr::V4(a) => (&self.v4, u32::from(a) as u128),
-            IpAddr::V6(a) => (&self.v6, u128::from(a)),
-        };
-        let i = table.partition_point(|&(start, _)| start <= x);
-        i > 0 && table[i - 1].1 >= x
+        match ip {
+            IpAddr::V4(a) => table_contains(&self.v4, u32::from(a)),
+            IpAddr::V6(a) => table_contains(&self.v6, u128::from(a)),
+        }
     }
 }
 
-fn merge(mut v: Vec<(u128, u128)>) -> Vec<(u128, u128)> {
+trait CidrInt: Ord + Copy {
+    fn saturating_next(self) -> Self;
+}
+
+impl CidrInt for u32 {
+    fn saturating_next(self) -> Self {
+        self.saturating_add(1)
+    }
+}
+
+impl CidrInt for u128 {
+    fn saturating_next(self) -> Self {
+        self.saturating_add(1)
+    }
+}
+
+fn table_contains<T: Ord + Copy>(table: &[(T, T)], x: T) -> bool {
+    let i = table.partition_point(|&(start, _)| start <= x);
+    i > 0 && table[i - 1].1 >= x
+}
+
+fn merge<T: CidrInt>(mut v: Vec<(T, T)>) -> Vec<(T, T)> {
     v.sort_unstable();
-    let mut out: Vec<(u128, u128)> = Vec::with_capacity(v.len());
+    let mut out: Vec<(T, T)> = Vec::with_capacity(v.len());
     for (a, b) in v {
         match out.last_mut() {
-            Some(last) if a <= last.1.saturating_add(1) => last.1 = last.1.max(b),
+            Some(last) if a <= last.1.saturating_next() => last.1 = last.1.max(b),
             _ => out.push((a, b)),
         }
     }

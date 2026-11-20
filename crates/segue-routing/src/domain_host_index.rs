@@ -17,20 +17,27 @@ pub enum DnsHostTarget {
 ///
 /// `full:` names live in a hash map keyed by the DNS-normalized name
 /// (ASCII-lowercased, trailing dots trimmed) and win over every other matcher;
-/// the first `full:` inserted for a name is kept. Remaining matchers are
-/// scanned in insertion order with [`DomainMatcher::matches`]. Callers pass
-/// queries normalized the same way.
+/// the first `full:` inserted for a name is kept. Non-degenerate `Suffix` and
+/// `Subdomain` matchers are indexed by label boundary with monotonic insertion
+/// order so O(labels) probes preserve exact insertion-order precedence beside
+/// `Keyword` / `Regex` entries in `others`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainHostIndex<T> {
     full: HashMap<Box<str>, T>,
-    others: Vec<(DomainMatcher, T)>,
+    suffix: HashMap<Box<str>, (usize, T)>,
+    subdomain: HashMap<Box<str>, (usize, T)>,
+    others: Vec<(usize, DomainMatcher, T)>,
+    next_order: usize,
 }
 
 impl<T> Default for DomainHostIndex<T> {
     fn default() -> Self {
         Self {
             full: HashMap::new(),
+            suffix: HashMap::new(),
+            subdomain: HashMap::new(),
             others: Vec::new(),
+            next_order: 0,
         }
     }
 }
@@ -48,30 +55,90 @@ impl<T> DomainHostIndex<T> {
                     .or_insert(target);
             }
             DomainMatcher::Suffix(suffix) => {
-                let suffix = normalize_dns_pattern(suffix);
-                self.others.push((DomainMatcher::Suffix(suffix), target));
+                let order = self.take_order();
+                let normalized = normalize_dns_pattern(suffix);
+                if normalized.is_empty() || normalized.starts_with('.') {
+                    self.others
+                        .push((order, DomainMatcher::Suffix(normalized), target));
+                } else {
+                    self.suffix
+                        .entry(normalized.into_boxed_str())
+                        .or_insert((order, target));
+                }
+            }
+            DomainMatcher::Subdomain(suffix) => {
+                let order = self.take_order();
+                let normalized = normalize_dns_pattern(suffix);
+                if normalized.is_empty() || normalized.starts_with('.') {
+                    self.others
+                        .push((order, DomainMatcher::Subdomain(normalized), target));
+                } else {
+                    self.subdomain
+                        .entry(normalized.into_boxed_str())
+                        .or_insert((order, target));
+                }
             }
             matcher @ (DomainMatcher::Keyword(_) | DomainMatcher::Regex(_)) => {
-                self.others.push((matcher, target));
+                let order = self.take_order();
+                self.others.push((order, matcher, target));
             }
         }
     }
 
+    fn take_order(&mut self) -> usize {
+        let order = self.next_order;
+        self.next_order += 1;
+        order
+    }
+
     pub fn lookup(&self, normalized_domain: &str) -> Option<&T> {
-        self.full.get(normalized_domain).or_else(|| {
-            self.others
-                .iter()
-                .find(|(matcher, _)| matcher.matches(normalized_domain))
-                .map(|(_, target)| target)
-        })
+        if let Some(target) = self.full.get(normalized_domain) {
+            return Some(target);
+        }
+        let mut best: Option<(usize, &T)> = None;
+        if !self.suffix.is_empty() {
+            if let Some((order, target)) = self.suffix.get(normalized_domain) {
+                best = Some((*order, target));
+            }
+        }
+        if !self.suffix.is_empty() || !self.subdomain.is_empty() {
+            for (dot_idx, _) in normalized_domain.match_indices('.') {
+                let tail = &normalized_domain[dot_idx + 1..];
+                if let Some((order, target)) = self.suffix.get(tail) {
+                    if best.is_none_or(|(best_order, _)| *order < best_order) {
+                        best = Some((*order, target));
+                    }
+                }
+                if dot_idx > 0 {
+                    if let Some((order, target)) = self.subdomain.get(tail) {
+                        if best.is_none_or(|(best_order, _)| *order < best_order) {
+                            best = Some((*order, target));
+                        }
+                    }
+                }
+            }
+        }
+        for (order, matcher, target) in &self.others {
+            if best.is_some_and(|(best_order, _)| *order >= best_order) {
+                break;
+            }
+            if matcher.matches(normalized_domain) {
+                best = Some((*order, target));
+                break;
+            }
+        }
+        best.map(|(_, target)| target)
     }
 
     pub fn len(&self) -> usize {
-        self.full.len() + self.others.len()
+        self.full.len() + self.suffix.len() + self.subdomain.len() + self.others.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.full.is_empty() && self.others.is_empty()
+        self.full.is_empty()
+            && self.suffix.is_empty()
+            && self.subdomain.is_empty()
+            && self.others.is_empty()
     }
 }
 
@@ -208,5 +275,29 @@ mod tests {
             Some(&49_999)
         );
         assert_eq!(index.lookup("miss-49999.hosts-probe.invalid"), None);
+    }
+
+    #[test]
+    fn suffix_and_subdomain_index_preserves_insertion_order_beside_others() {
+        let mut index = DomainHostIndex::new();
+        index.insert(suffix("Late.Example."), "suffix-first");
+        index.insert(keyword("early"), "keyword-second");
+        index.insert(
+            DomainMatcher::Subdomain("sub.example".to_owned()),
+            "subdomain-third",
+        );
+        index.insert(suffix("sub.example"), "suffix-fourth");
+        assert!(index.others.len() == 1);
+
+        // `suffix("late.example")` beats `keyword("early")` because suffix was inserted first.
+        assert_eq!(index.lookup("early.late.example"), Some(&"suffix-first"));
+        // `keyword("early")` beats `subdomain("sub.example")` because keyword came second.
+        assert_eq!(index.lookup("early.sub.example"), Some(&"keyword-second"));
+        // `subdomain("sub.example")` matches strict subdomain before `suffix("sub.example")`.
+        assert_eq!(index.lookup("api.sub.example"), Some(&"subdomain-third"));
+        // Apex `sub.example` skips `subdomain("sub.example")` and hits `suffix("sub.example")`.
+        assert_eq!(index.lookup("sub.example"), Some(&"suffix-fourth"));
+        // Trailing-dot query still respects exact matcher semantics.
+        assert_eq!(index.lookup("sub.example."), None);
     }
 }

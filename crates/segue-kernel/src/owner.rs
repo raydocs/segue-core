@@ -16,7 +16,8 @@
 //! to 4096 entries. A port reused inside that window can still be charged
 //! to the previous process.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -227,9 +228,95 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Slot {
+struct Slot<V> {
     at: Instant,
-    info: Option<ProcessInfo>,
+    seq: u64,
+    value: V,
+}
+
+#[derive(Clone, Debug)]
+struct TimedMap<K, V> {
+    ttl: Duration,
+    cap: usize,
+    next_seq: u64,
+    map: HashMap<K, Slot<V>>,
+    order: VecDeque<(K, u64)>,
+}
+
+impl<K: Eq + Hash + Copy, V: Clone> TimedMap<K, V> {
+    fn new(ttl: Duration, cap: usize) -> Self {
+        Self {
+            ttl,
+            cap,
+            next_seq: 0,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn get(&mut self, key: K, now: Instant) -> Option<V> {
+        let fresh = match self.map.get(&key) {
+            Some(slot) => now.saturating_duration_since(slot.at) < self.ttl,
+            None => return None,
+        };
+        if !fresh {
+            self.map.remove(&key);
+            return None;
+        }
+        self.map.get(&key).map(|slot| slot.value.clone())
+    }
+
+    fn insert(&mut self, key: K, value: V, now: Instant) {
+        if self.cap == 0 {
+            return;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if let Some(slot) = self.map.get_mut(&key) {
+            slot.at = now;
+            slot.seq = seq;
+            slot.value = value;
+            self.order.push_back((key, seq));
+            if self.order.len() > self.cap.saturating_mul(4) {
+                self.order
+                    .retain(|(k, s)| self.map.get(k).is_some_and(|slot| slot.seq == *s));
+            }
+            return;
+        }
+        while let Some(&(oldest_key, queued_seq)) = self.order.front() {
+            let Some(slot) = self.map.get(&oldest_key) else {
+                self.order.pop_front();
+                continue;
+            };
+            if slot.seq != queued_seq {
+                self.order.pop_front();
+                continue;
+            }
+            if now.saturating_duration_since(slot.at) >= self.ttl || self.map.len() >= self.cap {
+                self.order.pop_front();
+                self.map.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+        self.map.insert(
+            key,
+            Slot {
+                at: now,
+                seq,
+                value,
+            },
+        );
+        self.order.push_back((key, seq));
+    }
 }
 
 /// What [`OwnerCache::get`] found.
@@ -243,63 +330,33 @@ pub enum CacheGet {
 /// Expired entries do not count as hits. At the cap, the oldest entry is
 /// dropped to make room.
 pub struct OwnerCache {
-    ttl: Duration,
-    cap: usize,
-    map: HashMap<OwnerKey, Slot>,
+    inner: TimedMap<OwnerKey, Option<ProcessInfo>>,
 }
 
 impl OwnerCache {
     pub fn new(ttl: Duration, cap: usize) -> Self {
         Self {
-            ttl,
-            cap,
-            map: HashMap::new(),
+            inner: TimedMap::new(ttl, cap),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.inner.is_empty()
     }
 
     pub fn get(&mut self, key: OwnerKey, now: Instant) -> CacheGet {
-        let fresh = match self.map.get(&key) {
-            Some(slot) => now.saturating_duration_since(slot.at) < self.ttl,
-            None => return CacheGet::Miss,
-        };
-        if !fresh {
-            self.map.remove(&key);
-            return CacheGet::Miss;
+        match self.inner.get(key, now) {
+            Some(info) => CacheGet::Hit(info),
+            None => CacheGet::Miss,
         }
-        CacheGet::Hit(self.map.get(&key).map(|s| s.info.clone()).unwrap_or(None))
     }
 
     pub fn insert(&mut self, key: OwnerKey, info: Option<ProcessInfo>, now: Instant) {
-        if self.cap == 0 {
-            return;
-        }
-        if let Some(slot) = self.map.get_mut(&key) {
-            slot.at = now;
-            slot.info = info;
-            return;
-        }
-        self.map
-            .retain(|_, slot| now.saturating_duration_since(slot.at) < self.ttl);
-        while self.map.len() >= self.cap {
-            let oldest = self
-                .map
-                .iter()
-                .min_by_key(|(_, slot)| slot.at)
-                .map(|(k, _)| *k);
-            let Some(oldest) = oldest else {
-                break;
-            };
-            self.map.remove(&oldest);
-        }
-        self.map.insert(key, Slot { at: now, info });
+        self.inner.insert(key, info, now);
     }
 }
 
@@ -489,12 +546,18 @@ mod pcb {
 #[cfg(target_os = "macos")]
 mod darwin {
     use std::ffi::CStr;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
     use super::pcb::find_owner_pid;
     use super::{
-        file_name, OwnerCache, OwnerKey, OwnerResolver, ProcessInfo, Proto, CACHE_CAP, CACHE_TTL,
+        file_name, OwnerCache, OwnerKey, OwnerResolver, ProcessInfo, Proto, TimedMap, CACHE_CAP,
+        CACHE_TTL,
     };
+
+    const PID_CACHE_TTL: Duration = Duration::from_secs(1);
+    const PID_CACHE_CAP: usize = 256;
+    const PCB_SNAPSHOT_TTL: Duration = Duration::from_millis(20);
 
     extern "C" {
         fn proc_pidpath(
@@ -504,21 +567,30 @@ mod darwin {
         ) -> libc::c_int;
     }
 
+    struct PcbSnapshot {
+        at: Instant,
+        buf: Arc<[u8]>,
+    }
+
     pub struct DarwinOwner {
         cache: Mutex<OwnerCache>,
+        pid_cache: Mutex<TimedMap<u32, ProcessInfo>>,
+        pcb_cache: Mutex<[Option<PcbSnapshot>; 2]>,
     }
 
     pub fn shared() -> &'static DarwinOwner {
         static OWNER: OnceLock<DarwinOwner> = OnceLock::new();
         OWNER.get_or_init(|| DarwinOwner {
             cache: Mutex::new(OwnerCache::new(CACHE_TTL, CACHE_CAP)),
+            pid_cache: Mutex::new(TimedMap::new(PID_CACHE_TTL, PID_CACHE_CAP)),
+            pcb_cache: Mutex::new([None, None]),
         })
     }
 
     impl OwnerResolver for DarwinOwner {
         fn owner(&self, proto: Proto, local: std::net::SocketAddr) -> Option<ProcessInfo> {
             let key = OwnerKey::new(proto, local);
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             let cached = self
                 .cache
                 .lock()
@@ -527,31 +599,68 @@ mod darwin {
             if let super::CacheGet::Hit(info) = cached {
                 return info;
             }
-            let found = lookup(proto, local);
+            let found = self.lookup(proto, local);
             self.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
                 key,
                 found.clone(),
-                std::time::Instant::now(),
+                Instant::now(),
             );
             found
         }
     }
 
-    fn lookup(proto: Proto, local: std::net::SocketAddr) -> Option<ProcessInfo> {
-        let tcp = matches!(proto, Proto::Tcp);
-        let name = if tcp {
-            c"net.inet.tcp.pcblist_n"
-        } else {
-            c"net.inet.udp.pcblist_n"
-        };
-        let buf = sysctl_raw(name)?;
-        let pid = find_owner_pid(&buf, local, tcp)?;
-        let path = path_for_pid(pid)?;
-        let name = file_name(&path).to_owned();
-        if name.is_empty() {
-            return None;
+    impl DarwinOwner {
+        fn lookup(&self, proto: Proto, local: std::net::SocketAddr) -> Option<ProcessInfo> {
+            let tcp = matches!(proto, Proto::Tcp);
+            let name = if tcp {
+                c"net.inet.tcp.pcblist_n"
+            } else {
+                c"net.inet.udp.pcblist_n"
+            };
+            let idx = usize::from(tcp);
+            let cached_snapshot = {
+                let pcb = self.pcb_cache.lock().unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                pcb[idx]
+                    .as_ref()
+                    .filter(|snap| now.saturating_duration_since(snap.at) < PCB_SNAPSHOT_TTL)
+                    .map(|snap| Arc::clone(&snap.buf))
+            };
+            let pid = cached_snapshot
+                .as_deref()
+                .and_then(|buf| find_owner_pid(buf, local, tcp))
+                .or_else(|| {
+                    let fresh: Arc<[u8]> = Arc::from(sysctl_raw(name)?);
+                    let mut pcb = self.pcb_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    pcb[idx] = Some(PcbSnapshot {
+                        at: Instant::now(),
+                        buf: Arc::clone(&fresh),
+                    });
+                    drop(pcb);
+                    find_owner_pid(&fresh, local, tcp)
+                })?;
+
+            let now = Instant::now();
+            if let Some(info) = self
+                .pid_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(pid, now)
+            {
+                return Some(info);
+            }
+            let path = path_for_pid(pid)?;
+            let name = file_name(&path).to_owned();
+            if name.is_empty() {
+                return None;
+            }
+            let info = ProcessInfo { pid, name, path };
+            self.pid_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pid, info.clone(), Instant::now());
+            Some(info)
         }
-        Some(ProcessInfo { pid, name, path })
     }
 
     fn sysctl_raw(name: &CStr) -> Option<Vec<u8>> {
@@ -599,7 +708,7 @@ mod darwin {
     }
 
     fn path_for_pid(pid: u32) -> Option<String> {
-        let mut buf = vec![0u8; 4096];
+        let mut buf = [0u8; 4096];
         // proc_pidpath writes a NUL-terminated path and returns its length.
         let n = unsafe {
             proc_pidpath(
@@ -622,22 +731,25 @@ mod darwin {
     }
 
     pub(super) fn osrelease_major() -> Option<u32> {
-        let mut buf = [0u8; 32];
-        let mut len = buf.len();
-        let rc = unsafe {
-            libc::sysctlbyname(
-                c"kern.osrelease".as_ptr(),
-                buf.as_mut_ptr().cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if rc != 0 {
-            return None;
-        }
-        let text = CStr::from_bytes_until_nul(&buf).ok()?.to_str().ok()?;
-        text.split('.').next()?.parse().ok()
+        static MAJOR: OnceLock<Option<u32>> = OnceLock::new();
+        *MAJOR.get_or_init(|| {
+            let mut buf = [0u8; 32];
+            let mut len = buf.len();
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    c"kern.osrelease".as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc != 0 {
+                return None;
+            }
+            let text = CStr::from_bytes_until_nul(&buf).ok()?.to_str().ok()?;
+            text.split('.').next()?.parse().ok()
+        })
     }
 }
 

@@ -4,7 +4,7 @@ use gotatun::{
     tun::{IpRecv, IpSend, MtuWatcher},
     udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams},
 };
-use segue_transport::SocketProtector;
+use segue_transport::{memory_class, MemoryClass, SocketProtector};
 use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -118,8 +118,12 @@ impl Factory {
         // matches both pinned wireguard-go socket-buffer requests. It is
         // kernel storage per enabled family, not part of process RSS;
         // the OS may clamp or reject the request under its own limits.
-        let _ = socket.set_recv_buffer_size(7 * 1024 * 1024);
-        let _ = socket.set_send_buffer_size(7 * 1024 * 1024);
+        let buffer_size = match memory_class() {
+            MemoryClass::Standard => 7 * 1024 * 1024,
+            MemoryClass::Constrained => 1024 * 1024,
+        };
+        let _ = socket.set_recv_buffer_size(buffer_size);
+        let _ = socket.set_send_buffer_size(buffer_size);
         socket.bind(&bind.into())?;
         let socket: std::net::UdpSocket = socket.into();
         // Protect every socket before the factory publishes either half.
@@ -154,11 +158,79 @@ impl UdpTransportFactory for Factory {
         Ok((udp.clone(), udp))
     }
 }
+struct DrainSent<'a> {
+    packets: &'a mut Vec<(Packet, SocketAddr)>,
+    sent: usize,
+}
+
+impl Drop for DrainSent<'_> {
+    fn drop(&mut self) {
+        if self.sent > 0 {
+            self.packets.drain(..self.sent);
+        }
+    }
+}
+
+async fn send_packet_on_sockets(
+    stop: &Stop,
+    sockets: &Sockets,
+    packet: &Packet,
+    destination: SocketAddr,
+) -> io::Result<()> {
+    let socket = match sockets {
+        Sockets::Plain(sockets) => sockets[usize::from(destination.is_ipv6())]
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "WireGuard endpoint family unavailable",
+                )
+            })?,
+        // The masks were opened for the one peer's endpoint, which the
+        // masked socket reports every reply from.
+        Sockets::Masked(socket) if socket.peer() == destination => {
+            return tokio::select! { biased;
+                _ = stop.cancelled() => Err(closed()),
+                result = socket.send(packet) => result,
+            };
+        }
+        Sockets::Masked(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "WireGuard masks carry one peer",
+            ));
+        }
+    };
+    match socket.try_send_to(packet, destination) {
+        Ok(n) if n == packet.len() => return Ok(()),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short WireGuard datagram",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Err(error) => return Err(error),
+    }
+    tokio::select! { biased;
+        _ = stop.cancelled() => Err(closed()),
+        result = socket.send_to(packet, destination) => {
+            if result? != packet.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short WireGuard datagram",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 impl UdpSend for Udp {
     type SendManyBuf = ();
-    // Reuse Gotatun's bounded recv_many path to amortize channel selection.
-    // The default send_many_to keeps the existing per-packet socket selection,
-    // cancellation, protection and roaming behavior, including mixed peers.
+    // Reuse Gotatun's bounded send_many/recv_many paths to amortize channel selection
+    // and carrier watch borrows while preserving per-packet family selection,
+    // cancellation, protection, and roaming behavior.
     fn max_number_of_packets_to_send(&self) -> usize {
         16
     }
@@ -170,54 +242,38 @@ impl UdpSend for Udp {
             return Err(closed());
         }
         let sockets = self.carrier.borrow().as_ref().ok_or_else(closed)?.clone();
-        let socket = match &*sockets {
-            Sockets::Plain(sockets) => sockets[usize::from(destination.is_ipv6())]
-                .as_ref()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        "WireGuard endpoint family unavailable",
-                    )
-                })?,
-            // The masks were opened for the one peer's endpoint, which the
-            // masked socket reports every reply from.
-            Sockets::Masked(socket) if socket.peer() == destination => {
-                return tokio::select! { biased;
-                    _ = self.stop.cancelled() => Err(closed()),
-                    result = socket.send(&packet) => result,
-                };
-            }
-            Sockets::Masked(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "WireGuard masks carry one peer",
-                ))
-            }
-        };
-        match socket.try_send_to(&packet, destination) {
-            Ok(n) if n == packet.len() => return Ok(()),
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "short WireGuard datagram",
-                ))
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
+        send_packet_on_sockets(&self.stop, &sockets, &packet, destination).await
+    }
+    async fn send_many_to(
+        &self,
+        _send_buf: &mut Self::SendManyBuf,
+        packets: &mut Vec<(Packet, SocketAddr)>,
+    ) -> io::Result<()> {
+        tokio::task::consume_budget().await;
+        if self.stop.is_closed() {
+            return Err(closed());
         }
-        tokio::select! { biased;
-            _ = self.stop.cancelled() => Err(closed()),
-            result = socket.send_to(&packet, destination) => {
-                if result? != packet.len() { return Err(io::Error::new(io::ErrorKind::WriteZero, "short WireGuard datagram")); }
-                Ok(())
-            }
+        if packets.is_empty() {
+            return Ok(());
         }
+        let sockets = self.carrier.borrow().as_ref().ok_or_else(closed)?.clone();
+        let mut guard = DrainSent { packets, sent: 0 };
+        for index in 0..guard.packets.len() {
+            let (packet, destination) = &guard.packets[index];
+            send_packet_on_sockets(&self.stop, &sockets, packet, *destination).await?;
+            guard.sent += 1;
+        }
+        Ok(())
     }
 }
 impl UdpRecv for Udp {
     type RecvManyBuf = ();
     async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
         let mut packet = pool.get();
+        let expire_sleep = tokio::time::sleep(std::time::Duration::ZERO);
+        tokio::pin!(expire_sleep);
+        let mut armed_expires: Option<tokio::time::Instant> = None;
+
         let (n, source) = loop {
             // Observe each published socket set even if replacement raced with
             // the previous recv call. Keep at most one old set for a bounded
@@ -244,15 +300,22 @@ impl UdpRecv for Udp {
             let expires = self.previous.as_ref().map(|(_, expires)| *expires);
             if expires.is_some_and(|expires| expires <= tokio::time::Instant::now()) {
                 self.previous = None;
+                armed_expires = None;
                 continue;
+            }
+            if expires != armed_expires {
+                if let Some(deadline) = expires {
+                    expire_sleep.as_mut().reset(deadline);
+                }
+                armed_expires = expires;
             }
             tokio::select! { biased;
                 _ = self.stop.cancelled() => return Err(closed()),
                 result = self.carrier.changed() => { result.map_err(|_| closed())?; },
-                _ = async { match expires {
-                    Some(expires) => tokio::time::sleep_until(expires).await,
-                    None => std::future::pending().await,
-                }} => { self.previous = None; },
+                _ = &mut expire_sleep, if expires.is_some() => {
+                    self.previous = None;
+                    armed_expires = None;
+                },
                 result = std::future::poll_fn(|cx| {
                     // Prefer the new carrier; alternate family priority. Old
                     // packets still pass the engine's authentication/replay checks.
@@ -283,6 +346,46 @@ impl UdpRecv for Udp {
         };
         packet.truncate(n);
         Ok((packet, source))
+    }
+
+    async fn recv_many_from(
+        &mut self,
+        _recv_buf: &mut Self::RecvManyBuf,
+        pool: &mut PacketBufPool,
+        packets: &mut Vec<(Packet, SocketAddr)>,
+    ) -> io::Result<()> {
+        const MAX_RECV_BATCH: usize = 16;
+        let first = self.recv_from(pool).await?;
+        packets.push(first);
+
+        let Some(sockets) = self.receiving.as_ref() else {
+            return Ok(());
+        };
+        let Sockets::Plain(sockets) = &**sockets else {
+            return Ok(());
+        };
+
+        let mut spare = pool.get();
+        while packets.len() < MAX_RECV_BATCH {
+            let mut received = None;
+            for offset in 0..2 {
+                let index = (self.next + offset) % 2;
+                if let Some(socket) = &sockets[index] {
+                    if let Ok((n, source)) = socket.try_recv_from(&mut spare) {
+                        let mut packet = std::mem::replace(&mut spare, pool.get());
+                        packet.truncate(n);
+                        self.next = 1 - index;
+                        received = Some((packet, source));
+                        break;
+                    }
+                }
+            }
+            let Some(item) = received else {
+                break;
+            };
+            packets.push(item);
+        }
+        Ok(())
     }
 }
 pub(crate) struct IpTx {
@@ -494,5 +597,31 @@ mod udp_ready_send_tests {
             "ready UDP sends must honor the cooperative budget"
         );
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_many_to_and_recv_many_from_drain_ready_batches() {
+        let (_tx_carrier, sender_udp, _) = sender().await;
+        let (_rx_carrier, mut receiver_udp, recv_sock) = sender().await;
+        let dst = recv_sock.local_addr().unwrap();
+
+        let mut batch = vec![
+            (packet(b"p0"), dst),
+            (packet(b"p1"), dst),
+            (packet(b"p2"), dst),
+        ];
+        sender_udp.send_many_to(&mut (), &mut batch).await.unwrap();
+        assert!(batch.is_empty());
+
+        let mut pool = PacketBufPool::new(16);
+        let mut out = Vec::new();
+        while out.len() < 3 {
+            receiver_udp
+                .recv_many_from(&mut (), &mut pool, &mut out)
+                .await
+                .unwrap();
+        }
+        let payloads: Vec<&[u8]> = out.iter().map(|(pkt, _)| &pkt[..]).collect();
+        assert_eq!(payloads, vec![b"p0", b"p1", b"p2"]);
     }
 }

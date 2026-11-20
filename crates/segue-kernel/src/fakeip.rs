@@ -40,7 +40,7 @@
 //! a directory others can write) is an error: the kernel refuses to start
 //! rather than reinterpret addresses with a new key.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr};
@@ -97,14 +97,14 @@ pub struct FakeEntry {
 }
 
 struct Slot {
-    domain: String,
+    domain: Arc<str>,
     version: u64,
     last_used: Instant,
 }
 
 struct Inner {
     by_offset: HashMap<u32, Slot>,
-    by_domain: HashMap<String, u32>,
+    by_domain: HashMap<Arc<str>, u32>,
 }
 
 /// Bindings and placement, shared by the pool and its persistence thread.
@@ -481,58 +481,165 @@ impl FakeIpPool {
 
 impl Writer {
     fn run(mut self, rx: mpsc::Receiver<Job>) {
-        while let Ok(job) = rx.recv() {
-            match job {
-                Job::Assign {
-                    domain,
-                    version,
-                    reply,
-                } => {
-                    // Its asker gave up (timed out or cancelled): nobody
-                    // would get the address, so no binding is made.
-                    if reply.is_closed() {
-                        continue;
+        const MAX_BATCH: usize = 64;
+        let mut batch: Vec<(String, u64, oneshot::Sender<Option<Ipv4Addr>>)> =
+            Vec::with_capacity(MAX_BATCH);
+        // Commit the wakeup leader alone so slow/stalled disk backpressure
+        // leaves follow-up callers queued in `rx` (preserving `MAX_PENDING_JOBS`
+        // and caller timeout abandonment), then group-commit up to `MAX_BATCH`
+        // accumulated assignments on each subsequent non-empty iteration.
+        while let Ok(first) = rx.recv() {
+            let mut next_job = Some(first);
+            let mut coalescing = false;
+            while let Some(job) = next_job.take() {
+                let mut save_reply = None;
+                match job {
+                    Job::Assign {
+                        domain,
+                        version,
+                        reply,
+                    } => {
+                        if !reply.is_closed() {
+                            batch.push((domain, version, reply));
+                        }
                     }
-                    let _ = reply.send(self.assign(&domain, version));
+                    Job::Save { reply } => {
+                        save_reply = Some(reply);
+                    }
                 }
-                Job::Save { reply } => {
+                if coalescing {
+                    while batch.len() < MAX_BATCH && save_reply.is_none() {
+                        match rx.try_recv() {
+                            Ok(Job::Assign {
+                                domain,
+                                version,
+                                reply,
+                            }) => {
+                                if !reply.is_closed() {
+                                    batch.push((domain, version, reply));
+                                }
+                            }
+                            Ok(Job::Save { reply }) => {
+                                save_reply = Some(reply);
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                if !batch.is_empty() {
+                    self.assign_batch(&mut batch);
+                }
+                if let Some(reply) = save_reply {
                     let _ = reply.send(self.save());
+                }
+                match rx.try_recv() {
+                    Ok(queued) => {
+                        coalescing = true;
+                        next_job = Some(queued);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => return,
                 }
             }
         }
     }
 
-    /// Journal (and sync) a new binding, then add it. Only this thread adds
-    /// bindings, so the offset picked stays free while the disk works, and
-    /// a save (same thread) sees every binding whose line it truncates.
-    fn assign(&mut self, domain: &str, version: u64) -> Option<Ipv4Addr> {
-        if let Some(ip) = self.core.existing(domain, version) {
-            return Some(ip);
+    /// Group-commits a batch of pending binding requests with a single journal
+    /// write and `sync_data`, then exposes the committed bindings together.
+    fn assign_batch(&mut self, batch: &mut Vec<(String, u64, oneshot::Sender<Option<Ipv4Addr>>)>) {
+        let mut immediate: Vec<(oneshot::Sender<Option<Ipv4Addr>>, Option<Ipv4Addr>)> = Vec::new();
+        let mut staged: Vec<(u32, Arc<str>, u64)> = Vec::new();
+        let mut staged_by_domain: HashMap<Arc<str>, usize> = HashMap::new();
+        let mut staged_offsets: HashSet<u32> = HashSet::new();
+        let mut pending_replies: Vec<(oneshot::Sender<Option<Ipv4Addr>>, u32)> = Vec::new();
+        let mut line_buf: Vec<u8> = Vec::new();
+        let limit = size_limit(self.core.max_entries);
+        let unix_now = crate::policy::unix_now();
+        let journal_bytes = self.journal.as_ref().map(|j| j.bytes);
+
+        for (domain, version, reply) in batch.drain(..) {
+            if reply.is_closed() {
+                continue;
+            }
+            if let Some(ip) = self.core.existing(&domain, version) {
+                immediate.push((reply, Some(ip)));
+                continue;
+            }
+            if let Some(&idx) = staged_by_domain.get(domain.as_str()) {
+                let off = staged[idx].0;
+                staged[idx].2 = version;
+                pending_replies.push((reply, off));
+                continue;
+            }
+            let Some(current_bytes) = journal_bytes else {
+                immediate.push((reply, None));
+                continue;
+            };
+            let picked = {
+                let inner = self.core.inner.lock().expect("fake-ip lock");
+                self.core
+                    .pick_in_with_reserved(&inner, &domain, &staged_offsets, staged.len())
+            };
+            let Some(off) = picked else {
+                immediate.push((reply, None));
+                continue;
+            };
+            let line_start = line_buf.len();
+            serde_json::to_writer(&mut line_buf, &(off, &domain, version, unix_now))
+                .expect("line serializes");
+            line_buf.push(b'\n');
+            if current_bytes + line_buf.len() as u64 > limit {
+                line_buf.truncate(line_start);
+                immediate.push((reply, None));
+                continue;
+            }
+            let domain_arc: Arc<str> = Arc::from(domain);
+            let idx = staged.len();
+            staged.push((off, Arc::clone(&domain_arc), version));
+            staged_by_domain.insert(domain_arc, idx);
+            staged_offsets.insert(off);
+            pending_replies.push((reply, off));
         }
-        let off = self.core.pick(domain)?;
-        let j = self.journal.as_mut()?;
-        let mut line = serde_json::to_vec(&(off, domain, version, crate::policy::unix_now()))
-            .expect("line serializes");
-        line.push(b'\n');
-        if j.bytes + line.len() as u64 > size_limit(self.core.max_entries) {
-            // Cannot happen within the bounds (one line per binding, each
-            // at most BYTES_PER_ENTRY); never write what a restart refuses.
-            return None;
+
+        for (reply, result) in immediate {
+            let _ = reply.send(result);
         }
+
+        if staged.is_empty() {
+            return;
+        }
+
         #[cfg(test)]
         std::thread::sleep(*self.core.slow_append.lock().unwrap());
-        if j.file
-            .write_all(&line)
-            .and_then(|()| j.file.sync_data())
-            .is_err()
-        {
-            self.journal = None;
-            self.core.dirty.store(true, Ordering::Release);
-            return None;
+
+        let committed = if let Some(j) = self.journal.as_mut() {
+            if j.file
+                .write_all(&line_buf)
+                .and_then(|()| j.file.sync_data())
+                .is_ok()
+            {
+                j.bytes += line_buf.len() as u64;
+                true
+            } else {
+                self.journal = None;
+                self.core.dirty.store(true, Ordering::Release);
+                false
+            }
+        } else {
+            false
+        };
+
+        if committed {
+            self.core.insert_batch(staged);
+            for (reply, off) in pending_replies {
+                let _ = reply.send(Some(self.core.addr(off)));
+            }
+        } else {
+            for (reply, _) in pending_replies {
+                let _ = reply.send(None);
+            }
         }
-        j.bytes += line.len() as u64;
-        self.core.insert(off, domain, version);
-        Some(self.core.addr(off))
     }
 
     fn save(&mut self) -> std::io::Result<bool> {
@@ -696,8 +803,13 @@ impl Core {
         if !valid_domain(&domain) {
             return Err(format!("invalid domain at offset {off}"));
         }
-        match (inner.by_offset.get(&off), inner.by_domain.get(&domain)) {
-            (Some(s), Some(&o)) if dup_ok && s.domain == domain && o == off => return Ok(false),
+        match (
+            inner.by_offset.get(&off),
+            inner.by_domain.get(domain.as_str()),
+        ) {
+            (Some(s), Some(&o)) if dup_ok && s.domain.as_ref() == domain && o == off => {
+                return Ok(false)
+            }
             (None, None) => {}
             _ => return Err(format!("conflicting bindings for offset {off} / {domain}")),
         }
@@ -711,7 +823,8 @@ impl Core {
         // (the address stays live a little longer, never another domain's).
         let now = Instant::now();
         let last_used = now.checked_sub(Duration::from_secs(idle)).unwrap_or(now);
-        inner.by_domain.insert(domain.clone(), off);
+        let domain: Arc<str> = Arc::from(domain);
+        inner.by_domain.insert(Arc::clone(&domain), off);
         inner.by_offset.insert(
             off,
             Slot {
@@ -736,7 +849,7 @@ impl Core {
             .iter()
             .map(|(&off, s)| {
                 let idle = now.duration_since(s.last_used);
-                (off, s.domain.clone(), s.version, idle.as_secs())
+                (off, s.domain.as_ref().to_owned(), s.version, idle.as_secs())
             })
             .collect();
         let st = State {
@@ -782,11 +895,6 @@ impl Core {
 
     /// A free offset for a new `domain`; None when the name cannot be
     /// stored or nothing may be handed out (cap reached, range full).
-    fn pick(&self, domain: &str) -> Option<u32> {
-        let inner = self.inner.lock().expect("fake-ip lock");
-        self.pick_in(&inner, domain)
-    }
-
     fn pick_in(&self, inner: &Inner, domain: &str) -> Option<u32> {
         if !valid_domain(domain) || inner.by_offset.len() >= self.max_entries {
             return None;
@@ -798,18 +906,37 @@ impl Core {
             .find(|off| !inner.by_offset.contains_key(off))
     }
 
-    fn insert(&self, off: u32, domain: &str, version: u64) {
+    fn pick_in_with_reserved(
+        &self,
+        inner: &Inner,
+        domain: &str,
+        reserved: &HashSet<u32>,
+        pending_count: usize,
+    ) -> Option<u32> {
+        if !valid_domain(domain) || inner.by_offset.len() + pending_count >= self.max_entries {
+            return None;
+        }
+        let usable = self.size - 2;
+        let start = self.home(domain);
+        (0..usable)
+            .map(|i| 1 + (start - 1 + i) % usable)
+            .find(|off| !inner.by_offset.contains_key(off) && !reserved.contains(off))
+    }
+
+    fn insert_batch(&self, entries: Vec<(u32, Arc<str>, u64)>) {
         let mut inner = self.inner.lock().expect("fake-ip lock");
-        Self::insert_in(&mut inner, off, domain, version);
+        for (off, domain, version) in entries {
+            Self::insert_in(&mut inner, off, domain, version);
+        }
         self.dirty.store(true, Ordering::Release);
     }
 
-    fn insert_in(inner: &mut Inner, off: u32, domain: &str, version: u64) {
-        inner.by_domain.insert(domain.to_owned(), off);
+    fn insert_in(inner: &mut Inner, off: u32, domain: Arc<str>, version: u64) {
+        inner.by_domain.insert(Arc::clone(&domain), off);
         inner.by_offset.insert(
             off,
             Slot {
-                domain: domain.to_owned(),
+                domain,
                 version,
                 last_used: Instant::now(),
             },
@@ -823,7 +950,7 @@ impl Core {
         }
         let mut inner = self.inner.lock().expect("fake-ip lock");
         let off = self.pick_in(&inner, domain)?;
-        Self::insert_in(&mut inner, off, domain, version);
+        Self::insert_in(&mut inner, off, Arc::from(domain), version);
         self.dirty.store(true, Ordering::Release);
         Some(self.addr(off))
     }
@@ -849,7 +976,7 @@ impl Core {
         slot.last_used = now;
         self.dirty.store(true, Ordering::Release);
         Some(FakeEntry {
-            domain: slot.domain.clone(),
+            domain: slot.domain.as_ref().to_owned(),
             version: slot.version,
         })
     }
@@ -1600,6 +1727,36 @@ mod tests {
             p.tracked() <= 2,
             "abandoned jobs bound nothing: {}",
             p.tracked()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn group_commit_batches_queued_assignments_after_leader() {
+        let d = private_dir();
+        let path = d.0.join("fakeip.state");
+        let (mut p, _) = open_at(&path, DEFAULT_MAX_ENTRIES).unwrap();
+        p.set_slow_append(Duration::from_millis(40));
+        p.set_durable_timeout(Duration::from_secs(2));
+        let p = Arc::new(p);
+        let start = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..24 {
+            let p = p.clone();
+            set.spawn(async move { p.assign_durable(&format!("batch-{i}.com"), 1).await });
+        }
+        let mut assigned = 0;
+        while let Some(res) = set.join_next().await {
+            if res.unwrap().is_some() {
+                assigned += 1;
+            }
+        }
+        assert_eq!(assigned, 24);
+        assert_eq!(p.tracked(), 24);
+        // Without batching, 24 serial 40ms appends take at least 960ms; leader + 1..2 batches take ~80-160ms.
+        assert!(
+            start.elapsed() < Duration::from_millis(450),
+            "{:?}",
+            start.elapsed()
         );
     }
 
