@@ -154,6 +154,13 @@ struct RawExit {
     /// Optional separate engine outbound for background standby dials.
     #[serde(default)]
     redundant_carrier: Option<String>,
+    /// Optional engine UDP outbound tags (`<= 2`) used for `S1–S4` datagram
+    /// acceleration; when empty and `dgram_relay` is set, uses `carrier`.
+    #[serde(default)]
+    dgram_carriers: Vec<String>,
+    /// Optional relay UDP accelerator endpoint (`dgram_listen`).
+    #[serde(default)]
+    dgram_relay: Option<SocketAddr>,
     /// The relay address as the carrier's server sees it.
     relay: SocketAddr,
     #[serde(default)]
@@ -435,6 +442,22 @@ impl KernelConfig {
                     ));
                 }
             }
+            if e.dgram_carriers.len() > 2 {
+                return Err(format!(
+                    "exits[{i}]: dgram_carriers supports at most 2 outbound tags, got {}",
+                    e.dgram_carriers.len()
+                ));
+            }
+            for dc in &e.dgram_carriers {
+                if !outbounds.contains_key(dc) {
+                    return Err(format!("exits[{i}]: unknown dgram_carrier outbound {dc:?}"));
+                }
+                if home.contains(dc) {
+                    return Err(format!(
+                        "exits[{i}]: dgram_carriers entry {dc:?} must not be a home-role outbound"
+                    ));
+                }
+            }
             let egress_group = match &e.egress_group {
                 None => String::new(),
                 Some(g)
@@ -455,6 +478,8 @@ impl KernelConfig {
                 name: e.name.clone(),
                 carrier: e.carrier.clone(),
                 redundant_carrier: e.redundant_carrier.clone(),
+                dgram_carriers: e.dgram_carriers.clone(),
+                dgram_relay: e.dgram_relay,
                 relay: e.relay,
                 node_id: e.node_id,
                 egress_group,
@@ -1212,5 +1237,47 @@ mod tests {
         .err()
         .unwrap();
         assert!(err_home.contains("redundant_carrier"), "{err_home}");
+    }
+
+    #[test]
+    fn exit_dgram_carriers_validates_tags_count_and_role() {
+        let valid = KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+                "outbounds":{"main":{"type":"direct"},"u1":{"type":"direct"},"u2":{"type":"direct"}},
+                "exits":[{"name":"la","carrier":"main","dgram_carriers":["u1","u2"],"dgram_relay":"127.0.0.1:8444","relay":"127.0.0.1:7443"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(valid.exits[0].dgram_carriers, vec!["u1", "u2"]);
+        assert_eq!(
+            valid.exits[0].dgram_relay,
+            Some("127.0.0.1:8444".parse().unwrap())
+        );
+
+        let too_many = KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+                "outbounds":{"main":{"type":"direct"},"u1":{"type":"direct"}},
+                "exits":[{"name":"la","carrier":"main","dgram_carriers":["u1","u1","u1"],"relay":"127.0.0.1:7443"}]}"#,
+        )
+        .err()
+        .unwrap();
+        assert!(too_many.contains("dgram_carriers"), "{too_many}");
+
+        let bad_tag = KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+                "outbounds":{"main":{"type":"direct"}},
+                "exits":[{"name":"la","carrier":"main","dgram_carriers":["missing"],"relay":"127.0.0.1:7443"}]}"#,
+        )
+        .err()
+        .unwrap();
+        assert!(bad_tag.contains("dgram_carrier"), "{bad_tag}");
+
+        let err_home = KernelConfig::parse(
+            r#"{"listen":"127.0.0.1:1080","default":{"type":"direct"},
+                "outbounds":{"main":{"type":"direct"},"h":{"type":"direct","role":"home"}},
+                "exits":[{"name":"la","carrier":"main","dgram_carriers":["h"],"relay":"127.0.0.1:7443"}]}"#,
+        )
+        .err()
+        .unwrap();
+        assert!(err_home.contains("dgram_carriers"), "{err_home}");
     }
 }

@@ -59,9 +59,10 @@ use async_trait::async_trait;
 use segue_routing::TargetAddr;
 use segue_session::client::{ClientSession, CloseReason, Health as SessionHealth, OpenParams};
 use segue_session::codec::{code, CtrlHello, Kind, SessionId, Target, VERSION};
+use segue_session::dgram::DGRAM_MAX_BYTES;
 use segue_session::driver::{
     run_client_ctl, run_client_standby, run_control, BoxCarrier, ClientCtl, Connector, ControlHint,
-    ControlTiming, MoveHook, StandbyCtl, StandbyEvent,
+    ControlTiming, DgramCtl, DgramFlow, MoveHook, StandbyCtl, StandbyEvent,
 };
 use segue_session::pool::Pool;
 use segue_session::quality::{Quality, QualityEvent, QualityTracker};
@@ -118,6 +119,11 @@ pub struct Exit {
     pub carrier: String,
     /// Optional separate engine outbound for background standby dials.
     pub redundant_carrier: Option<String>,
+    /// Optional engine UDP outbound tags (`<= 2`) used for `S1–S4` datagram
+    /// acceleration; when empty and `dgram_relay` is set, uses `carrier`.
+    pub dgram_carriers: Vec<String>,
+    /// Optional relay UDP accelerator endpoint (`dgram_listen`).
+    pub dgram_relay: Option<SocketAddr>,
     /// Relay address as the carrier's server sees it.
     pub relay: SocketAddr,
     /// Node id sent as `anchor_node_id`.
@@ -959,6 +965,91 @@ impl KernelDialer {
         })
     }
 
+    /// Optional unreliable UDP datagram accelerator for AI sessions (`S4`)
+    /// when `exits[i].dgram_relay` is configured.
+    fn dgram_ctl(&self, i: usize, exit_class: u8) -> Option<DgramCtl> {
+        if exit_class != EXIT_AI {
+            return None;
+        }
+        let relay = self.exits[i].dgram_relay?;
+        let carriers: Vec<String> = if self.exits[i].dgram_carriers.is_empty() {
+            vec![self.exits[i].carrier.clone()]
+        } else {
+            self.exits[i].dgram_carriers.clone()
+        };
+        let flows = self.session_cfg.dgram.flows.clamp(1, 2);
+        let engine = self.engine.clone();
+        let state = self.state.clone();
+        Some(DgramCtl {
+            open: Arc::new(move |idx| {
+                let engine = engine.clone();
+                let state = state.clone();
+                let tag = carriers[idx % carriers.len()].clone();
+                Box::pin(async move {
+                    let allowed = {
+                        let st = state.lock().unwrap();
+                        !st.user_off && st.revoked.is_none()
+                    };
+                    if !allowed {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "tunnel off or revoked",
+                        ));
+                    }
+                    let target_addr = TargetAddr::Ip(relay.ip());
+                    let port = relay.port();
+                    let udp = engine
+                        .dial_udp(Some(&tag), &target_addr, port)
+                        .await
+                        .map_err(|e| std::io::Error::other(e.0))?;
+                    if !udp.loses_datagrams() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "dgram carrier is stream-encapsulated",
+                        ));
+                    }
+                    if udp.max_payload(&target_addr, port) == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "dgram carrier has zero payload",
+                        ));
+                    }
+                    let udp: Arc<dyn crate::dial::UdpSession> = Arc::from(udp);
+                    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+                    let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+                    let udp_tx = udp.clone();
+                    let taddr_tx = target_addr;
+                    let task = tokio::spawn(async move {
+                        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+                        impl Drop for AbortOnDrop {
+                            fn drop(&mut self) {
+                                self.0.abort();
+                            }
+                        }
+                        let _writer = AbortOnDrop(tokio::spawn(async move {
+                            while let Some(pkt) = out_rx.recv().await {
+                                if pkt.len() > udp_tx.max_payload(&taddr_tx, port) {
+                                    continue;
+                                }
+                                if udp_tx.send(&taddr_tx, port, &pkt).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }));
+                        let mut buf = Vec::with_capacity(DGRAM_MAX_BYTES + 128);
+                        while udp.recv(&mut buf).await.is_ok() {
+                            if !buf.is_empty() {
+                                let _ = in_tx.try_send(buf.clone());
+                            }
+                        }
+                    });
+                    Ok(DgramFlow::from_parts(out_tx, in_rx, Some(task)))
+                })
+            }),
+            flows,
+        })
+    }
+
     fn connector(&self, i: usize) -> Connector {
         self.connector_for(i, true)
     }
@@ -1203,7 +1294,12 @@ impl KernelDialer {
             anchor_node_id: self.exits[i].node_id,
             instance_hint: 0,
         };
-        let s = ClientSession::new(self.session_cfg.clone(), &self.pool, params, Instant::now())
+        let dgram_ctl = self.dgram_ctl(i, r.exit_class);
+        let mut sess_cfg = self.session_cfg.clone();
+        if dgram_ctl.is_some() {
+            sess_cfg.dgram.enabled = true;
+        }
+        let s = ClientSession::new(sess_cfg, &self.pool, params, Instant::now())
             .ok_or_else(|| (DialError("refused: session memory exhausted".into()), None))?;
         // Pool-charged and released when drained (tokio's duplex keeps a
         // burst's capacity for the life of the stream); its reserved blocks
@@ -1235,11 +1331,12 @@ impl KernelDialer {
             }),
             standby: self.standby_ctl(i, r.exit_class),
             moves: Some(self.move_hook()),
+            dgram: dgram_ctl,
         };
         // Two driver futures. Boxed so the spawn task has one type, and so
         // a non-AI session's driver is only the plain loop.
         let run: std::pin::Pin<Box<dyn std::future::Future<Output = CloseReason> + Send>> =
-            if ctl.standby.is_some() {
+            if ctl.standby.is_some() || ctl.dgram.is_some() {
                 Box::pin(run_client_standby(s, far, self.connector(i), ctl))
             } else {
                 Box::pin(run_client_ctl(s, far, self.connector(i), ctl))

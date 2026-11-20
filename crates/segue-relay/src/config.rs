@@ -17,6 +17,8 @@ use crate::socks5::Credentials;
 #[serde(deny_unknown_fields)]
 struct Raw {
     listen: SocketAddr,
+    #[serde(default)]
+    dgram_listen: Option<SocketAddr>,
     node_id: u64,
     #[serde(default)]
     metrics_listen: Option<SocketAddr>,
@@ -45,6 +47,37 @@ struct Raw {
     limits: RawLimits,
     #[serde(default)]
     redundancy: RawRedundancy,
+    #[serde(default)]
+    dgram: RawDgram,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawDgram {
+    enabled: Option<bool>,
+    ai_only: bool,
+    max_frame_bytes: usize,
+    flows: u8,
+    piggyback_k2: usize,
+    piggyback_k1: usize,
+    max_bytes_per_sec: u32,
+    max_packets_per_sec: u32,
+}
+
+impl Default for RawDgram {
+    fn default() -> Self {
+        let d = segue_session::DgramConfig::default();
+        Self {
+            enabled: None,
+            ai_only: d.ai_only,
+            max_frame_bytes: d.max_frame_bytes,
+            flows: d.flows,
+            piggyback_k2: d.piggyback_k2,
+            piggyback_k1: d.piggyback_k1,
+            max_bytes_per_sec: d.max_bytes_per_sec,
+            max_packets_per_sec: d.max_packets_per_sec,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +254,7 @@ pub struct LineConfig {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen: SocketAddr,
+    pub dgram_listen: Option<SocketAddr>,
     pub node_id: u64,
     pub metrics_listen: Option<SocketAddr>,
     pub ticket_keys: Vec<(u32, [u8; 32])>,
@@ -240,6 +274,7 @@ pub struct Config {
     pub dev_allow_cidrs: Vec<Cidr>,
     pub limits: Limits,
     pub redundancy: segue_session::RedundancyConfig,
+    pub dgram: segue_session::DgramConfig,
 }
 
 fn read_credentials(
@@ -284,6 +319,14 @@ impl Config {
             return Err(
                 "listen must be a loopback address (the outer servers forward to it)".into(),
             );
+        }
+        if let Some(d) = raw.dgram_listen {
+            if !d.ip().is_loopback() {
+                return Err(
+                    "dgram_listen must be a loopback address (the outer servers forward to it)"
+                        .into(),
+                );
+            }
         }
         if let Some(m) = raw.metrics_listen {
             if !m.ip().is_loopback() {
@@ -434,8 +477,28 @@ impl Config {
             max_frame_bytes: raw.redundancy.max_frame_bytes,
             ai_only: raw.redundancy.ai_only,
         };
+        let dgram_enabled = raw.dgram.enabled.unwrap_or(raw.dgram_listen.is_some());
+        if dgram_enabled && raw.dgram.max_frame_bytes == 0 {
+            return Err("dgram.max_frame_bytes must be > 0".into());
+        }
+        if dgram_enabled && (raw.dgram.flows == 0 || raw.dgram.flows > 2) {
+            return Err("dgram.flows must be 1 or 2".into());
+        }
+        let dgram_defaults = segue_session::DgramConfig::default();
+        let dgram = segue_session::DgramConfig {
+            enabled: dgram_enabled,
+            ai_only: raw.dgram.ai_only,
+            max_frame_bytes: raw.dgram.max_frame_bytes,
+            flows: raw.dgram.flows,
+            piggyback_k2: raw.dgram.piggyback_k2.max(1),
+            piggyback_k1: raw.dgram.piggyback_k1.max(1),
+            max_bytes_per_sec: raw.dgram.max_bytes_per_sec.max(1200),
+            max_packets_per_sec: raw.dgram.max_packets_per_sec.max(1),
+            ..dgram_defaults
+        };
         Ok(Self {
             listen: raw.listen,
+            dgram_listen: raw.dgram_listen,
             node_id: raw.node_id,
             metrics_listen: raw.metrics_listen,
             ticket_keys,
@@ -462,6 +525,7 @@ impl Config {
             dev_allow_cidrs,
             limits,
             redundancy,
+            dgram,
         })
     }
 }
@@ -512,5 +576,26 @@ mod tests {
 
         assert!(parse_with_extra(r#", "redundancy": {"mode": "bogus"}"#).is_err());
         assert!(parse_with_extra(r#", "redundancy": {"max_frame_bytes": 0}"#).is_err());
+    }
+
+    #[test]
+    fn dgram_listen_requires_loopback_and_enables_accelerator() {
+        let off = parse_with_extra("").unwrap();
+        assert_eq!(off.dgram_listen, None);
+        assert!(!off.dgram.enabled);
+
+        let err = parse_with_extra(r#", "dgram_listen": "0.0.0.0:8444""#).unwrap_err();
+        assert!(err.contains("loopback"), "{err}");
+
+        let on = parse_with_extra(
+            r#", "dgram_listen": "127.0.0.1:8444", "dgram": {"flows": 1, "max_bytes_per_sec": 65536}"#,
+        )
+        .unwrap();
+        assert_eq!(on.dgram_listen, Some("127.0.0.1:8444".parse().unwrap()));
+        assert!(on.dgram.enabled);
+        assert_eq!(on.dgram.flows, 1);
+        assert_eq!(on.dgram.max_bytes_per_sec, 65536);
+
+        assert!(parse_with_extra(r#", "dgram": {"enabled": true, "flows": 3}"#).is_err());
     }
 }

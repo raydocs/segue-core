@@ -8,11 +8,11 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use segue_session::codec::code;
-use segue_session::driver::{run_relay_ctl, BoxCarrier, RelayCtrl, RelayNotice};
+use segue_session::driver::{run_relay_ctl_dgram, BoxCarrier, RelayCtrl, RelayNotice};
 use segue_session::pool::Pool;
 use segue_session::relay::RelayTable;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::config::Config;
@@ -230,6 +230,7 @@ impl Relay {
         scfg.timing.site_flush_idle = self.cfg.limits.site_flush_idle;
         scfg.timing.site_flush_max = self.cfg.limits.site_flush_max;
         scfg.redundancy = self.cfg.redundancy;
+        scfg.dgram = self.cfg.dgram;
         let auth = TicketAuth {
             verifier: self.verifier.clone(),
             revoked: self.revoked.clone(),
@@ -324,19 +325,49 @@ fn own<F: std::future::Future<Output = ()> + Send + 'static>(f: F) -> Owned {
 
 /// Serve until `shutdown` turns true, then drain up to `limits.drain`.
 ///
+/// If [`Config::dgram_listen`] is configured, binds that loopback UDP socket for
+/// the per-session datagram accelerator.
+///
 /// Every task this spawns is owned by the future: dropping it before it
 /// returns aborts them all, including first-frame reads in flight.
-pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch::Receiver<bool>) {
+pub async fn serve(relay: Arc<Relay>, listener: TcpListener, shutdown: watch::Receiver<bool>) {
+    let dgram = match relay.cfg.dgram_listen {
+        Some(addr) => match UdpSocket::bind(addr).await {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                crate::log!(
+                    "error",
+                    "dgram listen failed",
+                    "addr" = addr.to_string(),
+                    "error" = e.to_string()
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    serve_with_dgram(relay, listener, dgram, shutdown).await;
+}
+
+/// [`serve`] with an already-bound optional shared UDP socket for the `S1–S4`
+/// per-session datagram accelerator.
+pub async fn serve_with_dgram(
+    relay: Arc<Relay>,
+    listener: TcpListener,
+    dgram: Option<Arc<UdpSocket>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let (accept_tx, accept_rx) = mpsc::channel::<BoxCarrier>(64);
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<RelayCtrl>(256);
     let (note_tx, mut note_rx) = mpsc::unbounded_channel::<RelayNotice>();
     let table = relay.table();
-    let mut driver = own(run_relay_ctl(
+    let mut driver = own(run_relay_ctl_dgram(
         table,
         accept_rx,
         relay.dialer.connector(),
         Some(note_tx),
         Some(ctrl_rx),
+        dgram,
     ));
 
     let m = relay.metrics.clone();

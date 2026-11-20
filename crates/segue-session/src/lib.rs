@@ -17,6 +17,7 @@
 
 pub mod client;
 pub mod codec;
+pub mod dgram;
 pub mod driver;
 pub mod flow;
 pub mod park;
@@ -24,6 +25,8 @@ pub mod pipe;
 pub mod pool;
 pub mod quality;
 pub mod relay;
+
+pub use dgram::{DgramConfig, DgramStats};
 
 use std::time::Duration;
 
@@ -314,6 +317,7 @@ pub struct Config {
     pub timing: Timing,
     pub limits: Limits,
     pub redundancy: RedundancyConfig,
+    pub dgram: DgramConfig,
 }
 
 /// Why the client gave up the carrier it was using.

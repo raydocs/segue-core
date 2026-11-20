@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use segue_relay::config::Config;
-use segue_relay::server::{serve, Relay};
+use segue_relay::server::{serve_with_dgram, Relay};
 use segue_relay::ticket::{generate_pkcs8, read_signer, Claims, ExitClass};
 use segue_relay::{log, system_clock};
 
@@ -179,6 +179,21 @@ fn run(path: &Path) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        let dgram_sock = match relay.cfg.dgram_listen {
+            Some(addr) => match tokio::net::UdpSocket::bind(addr).await {
+                Ok(s) => Some(Arc::new(s)),
+                Err(e) => {
+                    log!(
+                        "error",
+                        "dgram_listen",
+                        "addr" = addr.to_string(),
+                        "error" = e.to_string()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            },
+            None => None,
+        };
         log!(
             "info",
             "relay listening",
@@ -192,7 +207,7 @@ fn run(path: &Path) -> ExitCode {
             wait_signal().await;
             let _ = tx.send(true);
         });
-        serve(relay, listener, rx).await;
+        serve_with_dgram(relay, listener, dgram_sock, rx).await;
         ExitCode::SUCCESS
     })
 }

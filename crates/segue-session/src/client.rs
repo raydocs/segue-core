@@ -17,9 +17,10 @@ use std::time::Instant;
 use rand::RngCore;
 
 use crate::codec::{
-    code, Frame, Kind, Open, RedundantAttach, Reject, Resume, Secret, SessionId, Target,
+    code, DgramBind, Frame, Kind, Open, RedundantAttach, Reject, Resume, Secret, SessionId, Target,
     MAX_PAYLOAD, STALL_MS_MAX, VERSION,
 };
+use crate::dgram::{DgramAccel, DgramStats, FLAG_BIND};
 use crate::flow::{DupQueue, RecvHalf, SendHalf, SentFrame};
 use crate::park::{ParkDecision, ParkTracker};
 use crate::pool::{Pool, BLOCK, FRAME_MAX};
@@ -209,6 +210,35 @@ struct RedundantCarrier {
     dup: DupQueue,
 }
 
+/// Optional per-session unreliable UDP datagram accelerator (`S1–S4`).
+struct ClientDgram {
+    accel: DgramAccel,
+    bind_due: bool,
+    active_flows: u8,
+    flow_confirmed: [bool; 2],
+    bind_ping_attempts: [u8; 2],
+    next_bind_ping: [Option<Instant>; 2],
+}
+
+impl ClientDgram {
+    fn arm(&mut self, gen: u32, nonce: [u8; 16], rx_hw: u64, ack_hw: u64, now: Instant) {
+        self.accel.rearm_gen(gen, nonce, rx_hw, ack_hw, now);
+        self.bind_due = true;
+        self.flow_confirmed = [false; 2];
+        self.bind_ping_attempts = [0; 2];
+        self.next_bind_ping = [None; 2];
+    }
+
+    fn flush_parked_fin(&mut self, recv: &mut RecvHalf, now: Instant) {
+        if let Some(fin_off) = self.accel.parked_fin {
+            if recv.recv_offset() == fin_off {
+                self.accel.parked_fin = None;
+                let _ = recv.on_fin(fin_off, now);
+            }
+        }
+    }
+}
+
 pub struct ClientSession {
     cfg: Config,
     session_id: SessionId,
@@ -223,6 +253,12 @@ pub struct ClientSession {
     /// Spare carrier (v0.6 draft). `None` unless the caller asked.
     /// Boxed so an idle session does not carry the spare state inline.
     redundant: Option<Box<RedundantCarrier>>,
+    /// Optional UDP datagram accelerator (`S1–S4`), boxed so disabled sessions
+    /// pay zero extra heap cost.
+    dgram: Option<Box<ClientDgram>>,
+    /// Caller-requested number of active UDP flows (`0..=2`), kept here so
+    /// [`Self::set_dgram_flows`] works before or after `OPENED`.
+    dgram_flows: u8,
     /// Latched by [`request_redundant`](Self::request_redundant) until a
     /// spare is attached or the dial fails. Off by default.
     want_redundant: bool,
@@ -348,6 +384,8 @@ impl ClientSession {
             instance_id: 0,
             carrier: None,
             redundant: None,
+            dgram: None,
+            dgram_flows: 0,
             want_redundant: false,
             promoted_in_gen: false,
             confirmed: false,
@@ -599,6 +637,169 @@ impl ClientSession {
     }
     pub fn recv_half(&self) -> &RecvHalf {
         &self.recv
+    }
+
+    /// Whether the S1–S4 UDP datagram accelerator is enabled for this session.
+    pub fn dgram_enabled(&self) -> bool {
+        self.cfg.dgram.enabled_for(self.params.exit_class)
+    }
+
+    /// Whether `DGRAM_BIND_OK` has bound UDP acceleration for the current
+    /// generation.
+    pub fn dgram_bound(&self) -> bool {
+        self.dgram.as_ref().is_some_and(|d| d.accel.bound)
+    }
+
+    /// Snapshot of this session's UDP datagram accelerator counters.
+    pub fn dgram_stats(&self) -> DgramStats {
+        self.dgram
+            .as_ref()
+            .map_or_else(DgramStats::default, |d| d.accel.stats)
+    }
+
+    /// Inform the session how many independent UDP accelerator flows (`0..=2`)
+    /// are currently ready. Safe to call before or after session open.
+    pub fn set_dgram_flows(&mut self, flows: u8, now: Instant) {
+        let cap = if self.dgram_enabled() {
+            (self.cfg.dgram.max_flows() as u8).min(flows)
+        } else {
+            0
+        };
+        self.dgram_flows = cap;
+        let Some(d) = self.dgram.as_mut() else {
+            return;
+        };
+        let prev = d.active_flows;
+        d.active_flows = cap;
+        if cap < prev {
+            for f in usize::from(cap)..usize::from(prev) {
+                d.flow_confirmed[f] = false;
+                d.bind_ping_attempts[f] = 0;
+                d.next_bind_ping[f] = None;
+            }
+        }
+        if d.accel.bound && cap > prev {
+            for f in usize::from(prev)..usize::from(cap) {
+                if !d.flow_confirmed[f] {
+                    d.accel.queue_ack_flag(f, FLAG_BIND);
+                    d.bind_ping_attempts[f] = d.bind_ping_attempts[f].max(1);
+                    d.next_bind_ping[f] = Some(now + d.accel.retx_after());
+                }
+            }
+        }
+    }
+
+    /// Rebind logical UDP accelerator flow `flow` after a socket reconnect or
+    /// logical-to-physical flow slot shift.
+    pub fn rebind_dgram_flow(&mut self, flow: usize, now: Instant) {
+        if flow >= 2 {
+            return;
+        }
+        let Some(d) = self.dgram.as_mut() else {
+            return;
+        };
+        d.flow_confirmed[flow] = false;
+        d.bind_ping_attempts[flow] = 0;
+        d.next_bind_ping[flow] = None;
+        if d.accel.bound && flow < usize::from(d.active_flows) {
+            d.accel.queue_ack_flag(flow, FLAG_BIND);
+            d.bind_ping_attempts[flow] = 1;
+            d.next_bind_ping[flow] = Some(now + d.accel.retx_after());
+        }
+    }
+
+    /// Whether [`poll_dgram_transmit`](Self::poll_dgram_transmit) currently has
+    /// a datagram queued on UDP flow `flow`.
+    pub fn has_dgram_transmit(&self, flow: usize, _now: Instant) -> bool {
+        !self.is_closed()
+            && self.confirmed
+            && self
+                .dgram
+                .as_ref()
+                .is_some_and(|d| d.accel.has_transmit(flow, usize::from(d.active_flows)))
+    }
+
+    /// Encode the next datagram for UDP flow `flow` into `out`, returning
+    /// `true` when a packet was written.
+    pub fn poll_dgram_transmit(&mut self, flow: usize, now: Instant, out: &mut Vec<u8>) -> bool {
+        if self.is_closed() || !self.confirmed {
+            return false;
+        }
+        let Some(d) = self.dgram.as_mut() else {
+            return false;
+        };
+        d.accel.poll_transmit(
+            flow,
+            &self.send,
+            &self.recv,
+            usize::from(d.active_flows),
+            now,
+            out,
+        )
+    }
+
+    /// Feed an inbound datagram from UDP flow `flow`. Malformed, unauthenticated,
+    /// stale-generation, or out-of-window packets are dropped silently and never
+    /// reset the session or count toward [`Self::fruitless_carriers`].
+    pub fn on_dgram(&mut self, flow: usize, pkt: &[u8], now: Instant) -> bool {
+        if self.is_closed() || !self.confirmed || flow >= 2 {
+            return false;
+        }
+        let Some(d) = self.dgram.as_mut() else {
+            return false;
+        };
+        let Some(decoded) = crate::dgram::decode_dgram_packet(pkt) else {
+            d.accel.stats.rx_dropped_bad += 1;
+            return false;
+        };
+        if !d.accel.bound
+            || decoded.header.session_id != self.session_id
+            || decoded.header.attach_gen != self.gen
+            || !crate::ct_eq(&decoded.header.nonce, &d.accel.nonce)
+        {
+            d.accel.stats.rx_dropped_bad += 1;
+            return false;
+        }
+        d.flow_confirmed[flow] = true;
+        d.next_bind_ping[flow] = None;
+        match decoded.body {
+            crate::dgram::DgramBody::Data(entries) => {
+                let n = d
+                    .accel
+                    .on_rx_data(&entries, pkt.len(), flow, &mut self.recv, None, now);
+                if n > 0 {
+                    d.flush_parked_fin(&mut self.recv, now);
+                }
+            }
+            crate::dgram::DgramBody::Ack {
+                recv_offset,
+                max_offset,
+                sacks,
+                flags,
+            } => {
+                if d.accel.on_rx_ack(
+                    recv_offset,
+                    max_offset,
+                    &sacks,
+                    flags,
+                    pkt.len(),
+                    flow,
+                    &mut self.send,
+                    now,
+                ) {
+                    let acked = self.send.acked();
+                    if let Some(r) = self.redundant.as_mut() {
+                        r.dup.prune_acked(acked);
+                    }
+                }
+            }
+            crate::dgram::DgramBody::Fin { offset } => {
+                d.accel.on_rx_fin(offset, pkt.len(), flow, now);
+                d.flush_parked_fin(&mut self.recv, now);
+            }
+        }
+        self.check_done();
+        true
     }
 
     /// The caller should open a new carrier and call [`attach`](Self::attach).
@@ -1073,6 +1274,11 @@ impl ClientSession {
             self.need_attach = false;
             self.hello = None;
             self.want_redundant = false;
+            if let Some(d) = self.dgram.as_mut() {
+                d.accel.bound = false;
+                d.bind_due = false;
+                d.next_bind_ping = [None; 2];
+            }
             let rst = self.rst;
             let acked = self.send.acked();
             if let (Some(code), Some(r)) = (rst, self.redundant.as_mut().filter(|r| r.bound)) {
@@ -1225,6 +1431,9 @@ impl ClientSession {
                             r.progressed_at = Some(now);
                             r.ack_due = true;
                         }
+                        if let Some(d) = self.dgram.as_mut() {
+                            d.flush_parked_fin(&mut self.recv, now);
+                        }
                         self.made_progress(now);
                     }
                 }
@@ -1239,6 +1448,9 @@ impl ClientSession {
                     if let Some(r) = self.redundant.as_mut() {
                         r.dup.prune_acked(acked);
                         r.progressed_at = Some(now);
+                    }
+                    if let Some(d) = self.dgram.as_mut() {
+                        d.accel.prune_acked(acked);
                     }
                     self.made_progress(now);
                     self.check_done();
@@ -1348,14 +1560,41 @@ impl ClientSession {
             Frame::Rst { code } => self.close(CloseReason::Reset(code)),
             // After the spare is promoted these can still be in flight.
             Frame::RedundantOk(_) | Frame::RedundantAttach(_) => {}
+            Frame::DgramBindOk(ok) if self.confirmed => {
+                if ok.attach_gen == self.gen {
+                    if let Some(d) = self.dgram.as_mut() {
+                        if !d.accel.bound && crate::ct_eq(&ok.nonce, &d.accel.nonce) {
+                            d.accel.bound = true;
+                            d.flow_confirmed = [false; 2];
+                            d.bind_ping_attempts = [0; 2];
+                            for f in 0..usize::from(d.active_flows) {
+                                d.accel.queue_ack_flag(f, FLAG_BIND);
+                                d.bind_ping_attempts[f] = 1;
+                                d.next_bind_ping[f] = Some(now + d.accel.retx_after());
+                            }
+                        }
+                    }
+                }
+            }
+            Frame::DgramBind(_) | Frame::DgramBindOk(_) => {}
             Frame::Pad(_) | Frame::Dgram { .. } => {}
             Frame::Data { offset, data, .. } if self.confirmed => {
+                let end = offset.saturating_add(data.len() as u64);
                 let n = if self.promoted_in_gen {
                     self.recv.on_data_ooo(offset, &data, now)?
                 } else {
                     self.recv.on_data(offset, &data, now)?
                 };
-                if n > 0 {
+                let mut reliable_new = n > 0;
+                if let Some(d) = self.dgram.as_mut() {
+                    if end > d.accel.reliable_rx_hw {
+                        d.accel.reliable_rx_hw = end;
+                        d.accel.on_reliable_progress(self.send.acked());
+                        reliable_new = true;
+                    }
+                    d.flush_parked_fin(&mut self.recv, now);
+                }
+                if reliable_new {
                     self.made_progress(now);
                 }
             }
@@ -1363,17 +1602,33 @@ impl ClientSession {
                 recv_offset,
                 max_offset,
             } if self.confirmed => {
-                if self.send.on_ack(recv_offset, max_offset)? {
-                    let acked = self.send.acked();
-                    if let Some(r) = self.redundant.as_mut() {
-                        r.dup.prune_acked(acked);
+                let ack_moved = self.send.on_ack(recv_offset, max_offset)?;
+                let acked = self.send.acked();
+                if let Some(r) = self.redundant.as_mut() {
+                    r.dup.prune_acked(acked);
+                }
+                let mut reliable_new = ack_moved;
+                if let Some(d) = self.dgram.as_mut() {
+                    if recv_offset > d.accel.reliable_ack_hw {
+                        d.accel.reliable_ack_hw = recv_offset;
+                        d.accel.on_reliable_progress(acked);
+                        reliable_new = true;
+                    } else if ack_moved {
+                        d.accel.prune_acked(acked);
                     }
+                }
+                if reliable_new {
                     self.made_progress(now);
                 }
             }
             Frame::Fin { offset } if self.confirmed => {
                 if self.promoted_in_gen && offset > self.recv.recv_offset() {
                     return Ok(());
+                }
+                if let Some(d) = self.dgram.as_mut() {
+                    if d.accel.parked_fin == Some(offset) {
+                        d.accel.parked_fin = None;
+                    }
                 }
                 self.recv.on_fin(offset, now)?;
             }
@@ -1427,6 +1682,28 @@ impl ClientSession {
         self.attach_started = None;
         self.detached_since = None;
         self.backoff = std::time::Duration::from_millis(200);
+        if self.dgram_enabled() {
+            let mut nonce = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut nonce);
+            let rx_hw = self.recv.recv_offset();
+            let ack_hw = self.send.acked();
+            let gen = self.gen;
+            let active_flows = self.dgram_flows;
+            let cfg = self.cfg.dgram;
+            let sid = self.session_id;
+            let d = self.dgram.get_or_insert_with(|| {
+                Box::new(ClientDgram {
+                    accel: DgramAccel::new(cfg, sid, gen, nonce, now),
+                    bind_due: true,
+                    active_flows,
+                    flow_confirmed: [false; 2],
+                    bind_ping_attempts: [0; 2],
+                    next_bind_ping: [None; 2],
+                })
+            });
+            d.active_flows = active_flows;
+            d.arm(gen, nonce, rx_hw, ack_hw, now);
+        }
     }
 
     fn check_done(&mut self) {
@@ -1436,6 +1713,16 @@ impl ClientSession {
     }
 
     fn mirror_primary_send(&mut self, meta: SentFrame, now: Instant) {
+        if let Some(d) = self.dgram.as_mut() {
+            let active = usize::from(d.active_flows);
+            match meta {
+                SentFrame::Fin(offset) => d.accel.on_primary_fin(offset, active, now),
+                SentFrame::Data { offset, len } => {
+                    d.accel
+                        .on_primary_data(self.send.acked(), offset, len, active, now);
+                }
+            }
+        }
         let Some(r) = self
             .redundant
             .as_mut()
@@ -1539,6 +1826,16 @@ impl ClientSession {
             return None;
         }
         if self.confirmed {
+            if let Some(d) = self.dgram.as_mut() {
+                if d.bind_due {
+                    d.bind_due = false;
+                    return Some(TxNext::Frame(Frame::DgramBind(DgramBind {
+                        session_id: self.session_id,
+                        attach_gen: self.gen,
+                        nonce: d.accel.nonce,
+                    })));
+                }
+            }
             let piggyback = self.send.has_sendable();
             if let Some(ack) = self.recv.poll_ack(now, piggyback) {
                 self.ka_due = false;
@@ -1591,7 +1888,8 @@ impl ClientSession {
         if !self.confirmed && !optimistic {
             return false;
         }
-        self.send.has_sendable()
+        (self.confirmed && self.dgram.as_ref().is_some_and(|d| d.bind_due))
+            || self.send.has_sendable()
             || (self.confirmed
                 && (self.ka_due || self.recv.ack_deadline().is_some_and(|d| d <= now)))
     }
@@ -1620,7 +1918,8 @@ impl ClientSession {
         if self.hello.is_some() {
             return FRAME_MAX;
         }
-        if self.rst.is_some() || !self.confirmed {
+        if self.rst.is_some() || !self.confirmed || self.dgram.as_ref().is_some_and(|d| d.bind_due)
+        {
             return BLOCK;
         }
         if self.recv.ack_deadline().is_some_and(|d| d <= now)
@@ -1865,6 +2164,18 @@ impl ClientSession {
             }
         }
         put(self.recv.idle_deadline());
+        if self.confirmed {
+            if let Some(d) = &self.dgram {
+                put(d.accel.next_deadline(acked, usize::from(d.active_flows)));
+                if d.accel.bound {
+                    for f in 0..usize::from(d.active_flows) {
+                        if !d.flow_confirmed[f] {
+                            put(d.next_bind_ping[f]);
+                        }
+                    }
+                }
+            }
+        }
         d
     }
 
@@ -1973,6 +2284,28 @@ impl ClientSession {
         // return the past while the connect is in flight (busy loop).
         if self.backoff_until.is_some_and(|b| now >= b) {
             self.backoff_until = None;
+        }
+        if self.confirmed {
+            let acked = self.send.acked();
+            if let Some(d) = self.dgram.as_mut() {
+                d.accel
+                    .handle_timeout(now, acked, usize::from(d.active_flows));
+                if d.accel.bound {
+                    let retx = d.accel.retx_after();
+                    for f in 0..usize::from(d.active_flows) {
+                        if !d.flow_confirmed[f] && d.next_bind_ping[f].is_some_and(|due| now >= due)
+                        {
+                            if d.bind_ping_attempts[f] < 3 {
+                                d.bind_ping_attempts[f] += 1;
+                                d.accel.queue_ack_flag(f, FLAG_BIND);
+                                d.next_bind_ping[f] = Some(now + retx);
+                            } else {
+                                d.next_bind_ping[f] = None;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

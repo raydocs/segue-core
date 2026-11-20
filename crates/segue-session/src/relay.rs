@@ -18,13 +18,15 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::codec::{
-    code, ty, ClosedInfo, CtrlHello, CtrlHelloReply, Frame, Kind, Opened, RedundantAttach,
-    RedundantOk, Reject, Resumed, Secret, SessionId, Target,
+    code, ty, ClosedInfo, CtrlHello, CtrlHelloReply, DgramBindOk, Frame, Kind, Opened,
+    RedundantAttach, RedundantOk, Reject, Resumed, Secret, SessionId, Target,
 };
+use crate::dgram::{decode_dgram_header, decode_dgram_packet, DgramAccel, DgramBody, DgramStats};
 use crate::flow::{DupQueue, RecvHalf, SendHalf, SentFrame};
 use crate::pool::Pool;
 use crate::{ct_eq, Config, MoveStats, ProtoError};
@@ -136,6 +138,48 @@ struct RelayRedundant {
     dup: DupQueue,
 }
 
+struct RelayDgram {
+    accel: DgramAccel,
+    bind_ok_due: bool,
+    peers: [Option<SocketAddr>; 2],
+    last_seen: [Option<Instant>; 2],
+}
+
+impl RelayDgram {
+    fn peer_count(&self) -> usize {
+        usize::from(self.peers[0].is_some()) + usize::from(self.peers[1].is_some())
+    }
+
+    fn flow_for_peer(&mut self, peer: SocketAddr, now: Instant) -> usize {
+        if self.peers[0] == Some(peer) {
+            self.last_seen[0] = Some(now);
+            return 0;
+        }
+        if self.peers[1] == Some(peer) {
+            self.last_seen[1] = Some(now);
+            return 1;
+        }
+        if self.peers[0].is_none() {
+            self.peers[0] = Some(peer);
+            self.last_seen[0] = Some(now);
+            return 0;
+        }
+        if self.peers[1].is_none() && self.accel.cfg.max_flows() >= 2 {
+            self.peers[1] = Some(peer);
+            self.last_seen[1] = Some(now);
+            return 1;
+        }
+        let victim = if self.accel.cfg.max_flows() < 2 || self.last_seen[0] <= self.last_seen[1] {
+            0
+        } else {
+            1
+        };
+        self.peers[victim] = Some(peer);
+        self.last_seen[victim] = Some(now);
+        victim
+    }
+}
+
 struct Session {
     device: u64,
     secret: Secret,
@@ -144,6 +188,9 @@ struct Session {
     /// Second live carrier (v0.6 draft), boxed so single-carrier sessions do
     /// not pay for Stage 2 spare state inline.
     redundant: Option<Box<RelayRedundant>>,
+    /// Optional UDP datagram accelerator (`S1–S4`), boxed so single-carrier
+    /// and non-AI sessions pay zero extra heap cost.
+    dgram: Option<Box<RelayDgram>>,
     /// Reply owed on the current carrier once connected.
     reply: Option<ReplyKind>,
     connected: bool,
@@ -278,6 +325,7 @@ pub struct RelayTable {
     carriers: HashMap<CarrierId, CarrierSlot>,
     ctrl_by_device: HashMap<u64, Vec<CarrierId>>,
     ctrl_carriers: HashSet<CarrierId>,
+    dgram_sessions: HashSet<SessionId>,
     events: VecDeque<RelayEvent>,
     to_close: Vec<CarrierId>,
     /// Latest `now` seen; used for tombstone expiry.
@@ -302,6 +350,7 @@ impl RelayTable {
             carriers: HashMap::new(),
             ctrl_by_device: HashMap::new(),
             ctrl_carriers: HashSet::new(),
+            dgram_sessions: HashSet::new(),
             events: VecDeque::new(),
             to_close: Vec::new(),
             clock: Instant::now(),
@@ -849,6 +898,7 @@ impl RelayTable {
                     cur_gen: o.attach_gen,
                     carrier: Some(cid),
                     redundant: None,
+                    dgram: None,
                     reply: Some(ReplyKind::Opened),
                     connected: false,
                     state: SessionState::Connecting,
@@ -1070,6 +1120,13 @@ impl RelayTable {
         s.last_progress = now;
         s.carrier_rx = now;
         s.promoted_in_gen = false;
+        if let Some(d) = s.dgram.as_mut() {
+            d.accel.bound = false;
+            d.bind_ok_due = false;
+            d.peers = [None; 2];
+            d.last_seen = [None; 2];
+        }
+        self.dgram_sessions.remove(sid);
         if s.state == SessionState::Detached {
             s.state = SessionState::Active;
         }
@@ -1087,6 +1144,25 @@ impl RelayTable {
         Ok(())
     }
 
+    fn flush_dgram_fin(s: &mut Session, hold_fin: bool, now: Instant) {
+        let Some(fin_off) = s.dgram.as_ref().and_then(|d| d.accel.parked_fin) else {
+            return;
+        };
+        if s.recv.recv_offset() != fin_off {
+            return;
+        }
+        if let Some(d) = s.dgram.as_mut() {
+            d.accel.parked_fin = None;
+        }
+        if hold_fin && !s.recv.fin_received() {
+            if s.held_fin.is_none() {
+                s.held_fin = Some(fin_off);
+            }
+        } else {
+            let _ = s.recv.on_fin(fin_off, now);
+        }
+    }
+
     fn on_session_frame(
         &mut self,
         sid: &SessionId,
@@ -1095,12 +1171,38 @@ impl RelayTable {
         from_current: bool,
     ) -> Result<bool, ProtoError> {
         let hold = self.hold_fin;
+        let dgram_cfg = self.cfg.dgram;
         let s = self.sessions.get_mut(sid).unwrap();
         let allow_gap = !from_current || s.promoted_in_gen;
         let mut progressed = false;
         match frame {
+            Frame::DgramBind(bind) => {
+                if from_current
+                    && dgram_cfg.enabled_for(s.exit_class)
+                    && s.connected
+                    && bind.session_id == *sid
+                    && bind.attach_gen == s.cur_gen
+                {
+                    let rx_hw = s.recv.recv_offset();
+                    let ack_hw = s.send.acked();
+                    let mut accel = DgramAccel::new(dgram_cfg, *sid, s.cur_gen, bind.nonce, now);
+                    accel.bound = true;
+                    accel.reliable_rx_hw = rx_hw;
+                    accel.reliable_ack_hw = ack_hw;
+                    s.dgram = Some(Box::new(RelayDgram {
+                        accel,
+                        bind_ok_due: true,
+                        peers: [None; 2],
+                        last_seen: [None; 2],
+                    }));
+                    self.dgram_sessions.insert(*sid);
+                }
+                return Ok(false);
+            }
+            Frame::DgramBindOk(_) => return Ok(false),
             Frame::Data { offset, data, .. } => {
-                if s.held_fin.is_some_and(|f| offset + data.len() as u64 > f) {
+                let end = offset.saturating_add(data.len() as u64);
+                if s.held_fin.is_some_and(|f| end > f) {
                     if !from_current {
                         return Ok(false);
                     }
@@ -1119,10 +1221,24 @@ impl RelayTable {
                         }
                     }
                 }
+                let acked = s.send.acked();
+                if let Some(d) = s.dgram.as_mut() {
+                    if from_current && end > d.accel.reliable_rx_hw {
+                        d.accel.reliable_rx_hw = end;
+                        d.accel.on_reliable_progress(acked);
+                        progressed = true;
+                    }
+                }
+                Self::flush_dgram_fin(s, hold, now);
             }
             Frame::Fin { offset } if hold && !s.recv.fin_received() => {
                 if allow_gap && offset > s.recv.recv_offset() {
                     return Ok(false);
+                }
+                if let Some(d) = s.dgram.as_mut() {
+                    if d.accel.parked_fin == Some(offset) {
+                        d.accel.parked_fin = None;
+                    }
                 }
                 match s.held_fin {
                     Some(f) if f == offset => {}
@@ -1145,6 +1261,11 @@ impl RelayTable {
                 if allow_gap && offset > s.recv.recv_offset() {
                     return Ok(false);
                 }
+                if let Some(d) = s.dgram.as_mut() {
+                    if d.accel.parked_fin == Some(offset) {
+                        d.accel.parked_fin = None;
+                    }
+                }
                 let was_fin = s.recv.fin_received();
                 s.recv.on_fin(offset, now)?;
                 if !was_fin {
@@ -1161,11 +1282,21 @@ impl RelayTable {
                 max_offset,
             } => {
                 let ack_progressed = s.send.on_ack(recv_offset, max_offset)?;
+                let acked = s.send.acked();
                 if ack_progressed {
                     progressed = true;
-                    let acked = s.send.acked();
                     if let Some(r) = s.redundant.as_mut() {
                         r.dup.prune_acked(acked);
+                    }
+                }
+                let mut reliable_ack_moved = false;
+                if let Some(d) = s.dgram.as_mut() {
+                    if from_current && recv_offset > d.accel.reliable_ack_hw {
+                        d.accel.reliable_ack_hw = recv_offset;
+                        d.accel.on_reliable_progress(acked);
+                        reliable_ack_moved = true;
+                    } else if ack_progressed {
+                        d.accel.prune_acked(acked);
                     }
                 }
                 // An ACK on the spare updates the window and is deduplicated,
@@ -1174,7 +1305,7 @@ impl RelayTable {
                 if from_current && s.state == SessionState::Active {
                     s.last_progress = now;
                 }
-                if from_current && ack_progressed {
+                if from_current && (ack_progressed || reliable_ack_moved) {
                     s.last_progress = now;
                     if s.state == SessionState::Detached && s.carrier.is_some() {
                         // B1: ACK progress on the current carrier.
@@ -1223,6 +1354,7 @@ impl RelayTable {
         let Some(s) = self.sessions.remove(sid) else {
             return;
         };
+        self.dgram_sessions.remove(sid);
         if let Some(sids) = self.sessions_by_device.get_mut(&s.device) {
             sids.remove(sid);
             if sids.is_empty() {
@@ -1409,6 +1541,16 @@ impl RelayTable {
         if !s.connected {
             return false;
         }
+        if let Some(d) = s.dgram.as_mut() {
+            if d.bind_ok_due {
+                d.bind_ok_due = false;
+                sink.emit(Frame::DgramBindOk(DgramBindOk {
+                    attach_gen: s.cur_gen,
+                    nonce: d.accel.nonce,
+                }));
+                return true;
+            }
+        }
         let piggyback = s.send.has_sendable();
         if let Some(a) = s.recv.poll_ack(now, piggyback) {
             s.last_sent = now;
@@ -1439,6 +1581,15 @@ impl RelayTable {
             s.last_sent = now;
             let acked = s.send.acked();
             let exit_class = s.exit_class;
+            if let Some(d) = s.dgram.as_mut() {
+                let active = d.peer_count();
+                match meta {
+                    SentFrame::Fin(offset) => d.accel.on_primary_fin(offset, active, now),
+                    SentFrame::Data { offset, len } => {
+                        d.accel.on_primary_data(acked, offset, len, active, now);
+                    }
+                }
+            }
             if let Some(r) = s.redundant.as_mut().filter(|r| r.demoted_at.is_none()) {
                 match meta {
                     SentFrame::Fin(offset) => r.fin_due = Some(offset),
@@ -1612,6 +1763,132 @@ impl RelayTable {
         }
     }
 
+    /// Deliver an inbound UDP accelerator datagram received from `peer`.
+    /// Malformed, unknown, unauthenticated, or stale packets are ignored
+    /// silently and never tear down the session.
+    pub fn on_dgram(&mut self, peer: SocketAddr, pkt: &[u8], now: Instant) -> bool {
+        self.clock = self.clock.max(now);
+        let Some(hdr) = decode_dgram_header(pkt) else {
+            return false;
+        };
+        let sid = hdr.session_id;
+        let hold = self.hold_fin;
+        let Some(s) = self.sessions.get_mut(&sid) else {
+            return false;
+        };
+        let Some(d) = s.dgram.as_mut() else {
+            return false;
+        };
+        if !s.connected
+            || !d.accel.bound
+            || hdr.attach_gen != s.cur_gen
+            || !ct_eq(&hdr.nonce, &d.accel.nonce)
+        {
+            d.accel.stats.rx_dropped_bad += 1;
+            return false;
+        }
+        let Some(decoded) = decode_dgram_packet(pkt) else {
+            d.accel.stats.rx_dropped_bad += 1;
+            return false;
+        };
+        let flow = d.flow_for_peer(peer, now);
+        match decoded.body {
+            DgramBody::Data(entries) => {
+                let held_fin = s.held_fin;
+                let _ = d
+                    .accel
+                    .on_rx_data(&entries, pkt.len(), flow, &mut s.recv, held_fin, now);
+                Self::flush_dgram_fin(s, hold, now);
+            }
+            DgramBody::Ack {
+                recv_offset,
+                max_offset,
+                sacks,
+                flags,
+            } => {
+                if d.accel.on_rx_ack(
+                    recv_offset,
+                    max_offset,
+                    &sacks,
+                    flags,
+                    pkt.len(),
+                    flow,
+                    &mut s.send,
+                    now,
+                ) {
+                    let acked = s.send.acked();
+                    if let Some(r) = s.redundant.as_mut() {
+                        r.dup.prune_acked(acked);
+                    }
+                }
+            }
+            DgramBody::Fin { offset } => {
+                d.accel.on_rx_fin(offset, pkt.len(), flow, now);
+                Self::flush_dgram_fin(s, hold, now);
+            }
+        }
+        self.check_done(&sid, now);
+        true
+    }
+
+    /// Encode the next queued UDP accelerator datagram across bound sessions,
+    /// returning its destination `SocketAddr` when written into `out`.
+    pub fn poll_dgram_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<SocketAddr> {
+        self.clock = self.clock.max(now);
+        if self.dgram_sessions.is_empty() {
+            return None;
+        }
+        let Self {
+            sessions,
+            dgram_sessions,
+            ..
+        } = self;
+        for &sid in dgram_sessions.iter() {
+            let Some(s) = sessions.get_mut(&sid) else {
+                continue;
+            };
+            if !s.connected || s.state == SessionState::Detached {
+                continue;
+            }
+            let Some(d) = s.dgram.as_mut() else {
+                continue;
+            };
+            let peer_count = d.peer_count();
+            if !d.accel.bound || peer_count == 0 {
+                continue;
+            }
+            for flow in 0..peer_count {
+                let Some(peer) = d.peers[flow] else {
+                    continue;
+                };
+                if d.accel
+                    .poll_transmit(flow, &s.send, &s.recv, peer_count, now, out)
+                {
+                    return Some(peer);
+                }
+            }
+        }
+        None
+    }
+
+    /// Snapshot of session `sid`'s UDP datagram accelerator stats, if bound.
+    pub fn dgram_stats(&self, sid: &SessionId) -> Option<DgramStats> {
+        self.sessions
+            .get(sid)
+            .and_then(|s| s.dgram.as_ref())
+            .map(|d| d.accel.stats)
+    }
+
+    /// Whether session `sid` has a bound UDP datagram accelerator (and how many
+    /// client peers have been learned so far).
+    pub fn dgram_peers(&self, sid: &SessionId) -> Option<usize> {
+        self.sessions
+            .get(sid)
+            .and_then(|s| s.dgram.as_ref())
+            .filter(|d| d.accel.bound)
+            .map(|d| d.peer_count())
+    }
+
     /// Revocation / admin: RST every session of `device`.
     pub fn reset_device(&mut self, device: u64, close_code: u8) {
         if let Some(ids) = self.sessions_by_device.remove(&device) {
@@ -1720,6 +1997,16 @@ impl RelayTable {
             if let Some(i) = s.recv.idle_deadline() {
                 put(i);
             }
+            if s.connected && s.state == SessionState::Active {
+                if let Some(d) = &s.dgram {
+                    let peers = d.peer_count();
+                    if d.accel.bound && peers > 0 {
+                        if let Some(due) = d.accel.next_deadline(s.send.acked(), peers) {
+                            put(due);
+                        }
+                    }
+                }
+            }
         }
         for cid in &self.ctrl_carriers {
             if let Some(c) = self.carriers.get(cid).filter(|c| !c.close_after) {
@@ -1826,6 +2113,13 @@ impl RelayTable {
                         if now >= r.last_activity + ka {
                             r.ack_due = true;
                         }
+                    }
+                }
+                let acked = s.send.acked();
+                if let Some(d) = s.dgram.as_mut() {
+                    let peers = d.peer_count();
+                    if d.accel.bound && peers > 0 {
+                        d.accel.handle_timeout(now, acked, peers);
                     }
                 }
             }

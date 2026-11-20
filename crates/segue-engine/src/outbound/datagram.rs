@@ -348,6 +348,12 @@ impl OutboundUdpSession {
         self.0.max_payload(target)
     }
 
+    /// Whether datagrams on this outbound travel unreliably (UDP or QUIC
+    /// datagrams) rather than encapsulated inside a reliable stream.
+    pub fn loses_datagrams(&self) -> bool {
+        self.0.loses_datagrams()
+    }
+
     pub async fn send(&self, target: &Target, payload: &[u8]) -> Result<(), CoreError> {
         self.0.send(target, payload).await
     }

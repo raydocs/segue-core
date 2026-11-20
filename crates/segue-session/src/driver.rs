@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::client::{ClientSession, CloseReason, Health, State, Tx};
 use crate::codec::{code, ty, CtrlHello, Frame, FrameDecoder, Kind, SessionId, Target};
+use crate::dgram::DGRAM_MAX_BYTES;
 use crate::pool::{Grant as PoolGrant, Pool, Ticket, Tier, FRAME_MAX};
 use crate::quality::QualityEvent;
 use crate::relay::{Grant, RelayEvent, RelayTable};
@@ -1004,6 +1006,71 @@ pub struct ClientCtl {
     /// snapshot, not a delta, so a caller that sums across sessions keeps the
     /// previous snapshot itself.
     pub moves: Option<MoveHook>,
+    /// Optional unreliable UDP datagram accelerator flows (`S4`).
+    pub dgram: Option<DgramCtl>,
+}
+
+/// One unreliable UDP datagram flow between client and relay (`S4`).
+pub struct DgramFlow {
+    pub tx: mpsc::Sender<Vec<u8>>,
+    pub rx: mpsc::Receiver<Vec<u8>>,
+    _task: Option<Task>,
+}
+
+impl DgramFlow {
+    /// Wrap a connected [`tokio::net::UdpSocket`] in a bounded bidirectional flow.
+    pub fn from_udp_socket(socket: tokio::net::UdpSocket) -> Self {
+        let sock = Arc::new(socket);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let sock_tx = sock.clone();
+        let task = spawn(async move {
+            let _writer = Task(tokio::spawn(async move {
+                while let Some(pkt) = out_rx.recv().await {
+                    let _ = sock_tx.send(&pkt).await;
+                }
+            }));
+            let mut buf = vec![0u8; DGRAM_MAX_BYTES + 128];
+            loop {
+                match sock.recv(&mut buf).await {
+                    Ok(n) if n > 0 => {
+                        let _ = in_tx.try_send(buf[..n].to_vec());
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            tx: out_tx,
+            rx: in_rx,
+            _task: Some(task),
+        }
+    }
+
+    /// Wrap custom outbound/inbound packet channels plus an optional worker task.
+    pub fn from_parts(
+        tx: mpsc::Sender<Vec<u8>>,
+        rx: mpsc::Receiver<Vec<u8>>,
+        task: Option<JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            tx,
+            rx,
+            _task: task.map(Task),
+        }
+    }
+}
+
+/// Opens UDP accelerator flow `flow_idx` (`0` or `1`) towards the relay.
+pub type DgramOpener = Arc<dyn Fn(usize) -> BoxFuture<io::Result<DgramFlow>> + Send + Sync>;
+
+/// How [`run_client_standby`] opens optional [`DgramFlow`]s for an AI session.
+#[derive(Clone)]
+pub struct DgramCtl {
+    pub open: DgramOpener,
+    /// Target number of independent flows (`1` or `2`).
+    pub flows: u8,
 }
 
 /// Receives a session's [`MoveStats`] snapshot.
@@ -1180,6 +1247,180 @@ struct SpareCtl {
     keep: Option<StandbyKeep>,
 }
 
+struct DgramDriver {
+    ctl: DgramCtl,
+    dial_tx: mpsc::Sender<(usize, io::Result<DgramFlow>)>,
+    dial_rx: mpsc::Receiver<(usize, io::Result<DgramFlow>)>,
+    dialing: [bool; 2],
+    dials: [Option<Task>; 2],
+    flows: [Option<mpsc::Sender<Vec<u8>>>; 2],
+    flow_gen: [u64; 2],
+    prev_map: [Option<(usize, u64)>; 2],
+    rx_tx: mpsc::Sender<(usize, Vec<u8>)>,
+    rx_rx: mpsc::Receiver<(usize, Vec<u8>)>,
+    readers: [Option<Task>; 2],
+    retry_at: [Option<tokio::time::Instant>; 2],
+    retry_backoff: [std::time::Duration; 2],
+    scratch: Vec<u8>,
+}
+
+impl DgramDriver {
+    fn new(ctl: DgramCtl) -> Self {
+        let (dial_tx, dial_rx) = mpsc::channel(4);
+        let (rx_tx, rx_rx) = mpsc::channel(128);
+        let min_backoff = std::time::Duration::from_millis(250);
+        Self {
+            ctl,
+            dial_tx,
+            dial_rx,
+            dialing: [false; 2],
+            dials: [None, None],
+            flows: [None, None],
+            flow_gen: [0, 0],
+            prev_map: [None, None],
+            rx_tx,
+            rx_rx,
+            readers: [None, None],
+            retry_at: [None, None],
+            retry_backoff: [min_backoff, min_backoff],
+            scratch: Vec::with_capacity(DGRAM_MAX_BYTES),
+        }
+    }
+
+    fn target_flows(&self) -> usize {
+        usize::from(self.ctl.flows.clamp(1, 2))
+    }
+
+    fn active_mapping(&self) -> ([Option<usize>; 2], usize) {
+        let mut live = [None, None];
+        let mut count = 0usize;
+        for (i, slot) in self.flows.iter().enumerate() {
+            if slot.is_some() {
+                live[count] = Some(i);
+                count += 1;
+            }
+        }
+        (live, count)
+    }
+
+    fn poll_events(
+        &mut self,
+        s: &mut ClientSession,
+        now_std: std::time::Instant,
+        now_tk: tokio::time::Instant,
+        wake: &Arc<Notify>,
+    ) {
+        while let Ok((idx, res)) = self.dial_rx.try_recv() {
+            if idx >= 2 {
+                continue;
+            }
+            self.dialing[idx] = false;
+            self.dials[idx] = None;
+            match res {
+                Ok(flow) => {
+                    let rx_tx = self.rx_tx.clone();
+                    let wake = wake.clone();
+                    let mut rx = flow.rx;
+                    let task = flow._task;
+                    let reader = spawn(async move {
+                        let _keep = task;
+                        while let Some(pkt) = rx.recv().await {
+                            if rx_tx.try_send((idx, pkt)).is_ok() {
+                                wake.notify_one();
+                            }
+                        }
+                        wake.notify_one();
+                    });
+                    self.flow_gen[idx] = self.flow_gen[idx].wrapping_add(1);
+                    self.flows[idx] = Some(flow.tx);
+                    self.readers[idx] = Some(reader);
+                    self.retry_at[idx] = None;
+                    self.retry_backoff[idx] = std::time::Duration::from_millis(250);
+                }
+                Err(_) => {
+                    self.retry_at[idx] = Some(now_tk + self.retry_backoff[idx]);
+                    self.retry_backoff[idx] =
+                        (self.retry_backoff[idx] * 2).min(std::time::Duration::from_secs(10));
+                }
+            }
+        }
+        for idx in 0..2 {
+            if self.readers[idx].as_ref().is_some_and(Task::is_finished) {
+                self.readers[idx] = None;
+                self.flows[idx] = None;
+                self.retry_at[idx] = Some(now_tk + self.retry_backoff[idx]);
+                self.retry_backoff[idx] =
+                    (self.retry_backoff[idx] * 2).min(std::time::Duration::from_secs(10));
+            }
+        }
+        let (live, live_count) = self.active_mapping();
+        s.set_dgram_flows(live_count as u8, now_std);
+        let cur_map = [
+            live[0].map(|p| (p, self.flow_gen[p])),
+            live[1].map(|p| (p, self.flow_gen[p])),
+        ];
+        for (l, (&cur, &prev)) in cur_map[..live_count]
+            .iter()
+            .zip(self.prev_map[..live_count].iter())
+            .enumerate()
+        {
+            if cur != prev {
+                s.rebind_dgram_flow(l, now_std);
+            }
+        }
+        self.prev_map = cur_map;
+
+        while let Ok((phys, pkt)) = self.rx_rx.try_recv() {
+            if let Some(logical) = (0..live_count).find(|&l| live[l] == Some(phys)) {
+                s.on_dgram(logical, &pkt, now_std);
+            }
+        }
+
+        if !s.is_closed() && s.state() == State::Active && s.dgram_enabled() {
+            for idx in 0..self.target_flows() {
+                if !self.dialing[idx]
+                    && self.flows[idx].is_none()
+                    && self.retry_at[idx].is_none_or(|due| now_tk >= due)
+                {
+                    self.dialing[idx] = true;
+                    let fut = (self.ctl.open)(idx);
+                    let tx = self.dial_tx.clone();
+                    let wake = wake.clone();
+                    self.dials[idx] = Some(spawn(async move {
+                        let _ = tx.send((idx, fut.await)).await;
+                        wake.notify_one();
+                    }));
+                }
+            }
+        }
+    }
+
+    fn flush_tx(&mut self, s: &mut ClientSession, now_std: std::time::Instant) {
+        if !s.dgram_bound() {
+            return;
+        }
+        let (live, live_count) = self.active_mapping();
+        for (logical, phys) in live.iter().copied().enumerate().take(live_count) {
+            let Some(phys) = phys else {
+                continue;
+            };
+            let Some(tx) = &self.flows[phys] else {
+                continue;
+            };
+            while tx.capacity() > 0 && s.has_dgram_transmit(logical, now_std) {
+                self.scratch.clear();
+                if s.poll_dgram_transmit(logical, now_std, &mut self.scratch) {
+                    if tx.try_send(std::mem::take(&mut self.scratch)).is_err() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// [`run_client_ctl`] with an optional redundant-carrier request.
 pub async fn run_client_ctl_with_redundant<A>(
     s: ClientSession,
@@ -1214,6 +1455,7 @@ where
         quality,
         standby,
         moves,
+        dgram,
     } = ctl;
     let mut last_moves = moves.as_ref().map(|_| Box::new(MoveStats::default()));
     let mut report = |s: &mut ClientSession| {
@@ -1288,9 +1530,14 @@ where
     let mut abuf = ReadBuffer::new(Some(pool.clone()));
     // A queued message the pool could not cover is waiting for blocks.
     let mut pool_blocked;
+    let mut dgram_drv = dgram.map(|d| Box::new(DgramDriver::new(d)));
 
     loop {
         let t = now();
+        let tnow = tokio::time::Instant::now();
+        if let Some(drv) = dgram_drv.as_mut() {
+            drv.poll_events(&mut s, t, tnow, &writable);
+        }
         // An attach's clock runs from the last byte of its hello the
         // carrier took: a slow carrier still taking a large OPEN is not
         // an unanswered one.
@@ -1500,6 +1747,9 @@ where
         if !tx_slot.load(Ordering::Acquire) {
             tx_hold = None;
         }
+        if let Some(drv) = dgram_drv.as_mut() {
+            drv.flush_tx(&mut s, t);
+        }
         // Received bytes go from the receive buffer straight to the app,
         // with no buffer in between: when the app would block, one byte is
         // taken out and its write awaited below, which wakes the loop.
@@ -1575,6 +1825,21 @@ where
             }
             keep.next_at
         });
+        let dgram_due = dgram_drv.as_ref().and_then(|drv| {
+            if s.is_closed() || s.state() != State::Active || !s.dgram_enabled() {
+                return None;
+            }
+            (0..drv.target_flows())
+                .filter_map(|i| {
+                    if !drv.dialing[i] && drv.flows[i].is_none() {
+                        drv.retry_at[i]
+                    } else {
+                        None
+                    }
+                })
+                .min()
+        });
+        let aux_due = [spare_due, dgram_due].into_iter().flatten().min();
         tokio::select! {
             ev = ev_rx.recv() => {
                 let t = now();
@@ -1736,7 +2001,7 @@ where
             }
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
             _ = tokio::time::sleep_until(backoff.unwrap_or_else(tokio::time::Instant::now)), if backoff.is_some() => {}
-            _ = tokio::time::sleep_until(spare_due.unwrap_or_else(tokio::time::Instant::now)), if spare_due.is_some() => {}
+            _ = tokio::time::sleep_until(aux_due.unwrap_or_else(tokio::time::Instant::now)), if aux_due.is_some() => {}
             _ = tokio::time::sleep_until(drain.unwrap_or_else(tokio::time::Instant::now)), if drain.is_some() => {}
             // A frame held the transport region past the hold: its carrier
             // stopped moving. Give the carrier up (the frame's blocks go
@@ -1775,6 +2040,14 @@ where
             h.abort();
         }
         if let Some(h) = spare.bridge.take() {
+            h.abort();
+        }
+    }
+    if let Some(mut drv) = dgram_drv.take() {
+        for h in drv.dials.iter_mut().flatten() {
+            h.abort();
+        }
+        for h in drv.readers.iter_mut().flatten() {
             h.abort();
         }
     }
@@ -1886,6 +2159,7 @@ where
         quality,
         standby: _,
         moves,
+        dgram: _,
     } = ctl;
     let mut last_moves = moves.as_ref().map(|_| Box::new(MoveStats::default()));
     let mut report = |s: &mut ClientSession| {
@@ -2598,16 +2872,57 @@ fn apply_site_ev(
 
 /// [`run_relay`] with a command channel (revocation resets).
 pub async fn run_relay_ctl(
+    table: RelayTable,
+    accept: mpsc::Receiver<BoxCarrier>,
+    site: DeviceSiteConnector,
+    notices: Option<mpsc::UnboundedSender<RelayNotice>>,
+    ctrl: Option<mpsc::Receiver<RelayCtrl>>,
+) {
+    run_relay_inner(table, accept, site, notices, ctrl, None).await
+}
+
+/// [`run_relay_ctl`] with an optional shared UDP socket for the `S1–S4`
+/// per-session datagram accelerator.
+pub async fn run_relay_ctl_dgram(
+    table: RelayTable,
+    accept: mpsc::Receiver<BoxCarrier>,
+    site: DeviceSiteConnector,
+    notices: Option<mpsc::UnboundedSender<RelayNotice>>,
+    ctrl: Option<mpsc::Receiver<RelayCtrl>>,
+    dgram: Option<Arc<tokio::net::UdpSocket>>,
+) {
+    run_relay_inner(table, accept, site, notices, ctrl, dgram).await
+}
+
+async fn run_relay_inner(
     mut table: RelayTable,
     mut accept: mpsc::Receiver<BoxCarrier>,
     site: DeviceSiteConnector,
     notices: Option<mpsc::UnboundedSender<RelayNotice>>,
     mut ctrl: Option<mpsc::Receiver<RelayCtrl>>,
+    dgram: Option<Arc<tokio::net::UdpSocket>>,
 ) {
     let writable = Arc::new(Notify::new());
     let (ev_tx, mut ev_rx) = mpsc::channel::<CarrierEv>(256);
     let (site_tx, mut site_rx) = mpsc::channel::<SiteEv>(256);
     let (flushed_tx, mut flushed_rx) = mpsc::unbounded_channel::<SessionId>();
+    let mut dgram_state = dgram.as_ref().map(|sock| {
+        let sock = sock.clone();
+        let (tx, rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(256);
+        let task = spawn(async move {
+            let mut buf = vec![0u8; DGRAM_MAX_BYTES + 128];
+            loop {
+                match sock.recv_from(&mut buf).await {
+                    Ok((n, peer)) if n > 0 => {
+                        let _ = tx.try_send((peer, buf[..n].to_vec()));
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        (task, rx, Vec::with_capacity(DGRAM_MAX_BYTES))
+    });
     // The client's FIN is acknowledged only once the site writer flushed
     // (see `Flush`).
     table.confirm_site_flush(true);
@@ -2770,11 +3085,19 @@ pub async fn run_relay_ctl(
             }
         }
         if !accepting && carriers.is_empty() && table.session_count() == 0 {
+            drop(dgram_state);
             for (_, h) in dials.drain() {
                 h.abort();
             }
             tasks.finish().await;
             return;
+        }
+        if let (Some(sock), Some((_, _, out))) = (&dgram, &mut dgram_state) {
+            out.clear();
+            while let Some(peer) = table.poll_dgram_transmit(t, out) {
+                let _ = sock.try_send_to(out, peer);
+                out.clear();
+            }
         }
         last_deadline = table
             .poll_timeout_writable(|cid| carriers.get(&cid).is_some_and(|io| io.tx.capacity() > 0));
@@ -2843,6 +3166,23 @@ pub async fn run_relay_ctl(
             c = async { ctrl.as_mut().unwrap().recv().await }, if ctrl.is_some() => match c {
                 Some(RelayCtrl::ResetDevice { device, close_code }) => table.reset_device(device, close_code),
                 None => ctrl = None,
+            },
+            d = async { dgram_state.as_mut().unwrap().1.recv().await }, if dgram_state.is_some() => {
+                let t = now();
+                match d {
+                    Some((peer, pkt)) => {
+                        table.on_dgram(peer, &pkt, t);
+                        if let Some((_, rx, _)) = dgram_state.as_mut() {
+                            for _ in 1..RELAY_BATCH {
+                                let Ok((peer, pkt)) = rx.try_recv() else { break };
+                                table.on_dgram(peer, &pkt, t);
+                            }
+                        }
+                    }
+                    None => {
+                        dgram_state = None;
+                    }
+                }
             },
             _ = writable.notified() => {
                 if !carriers.is_empty() {

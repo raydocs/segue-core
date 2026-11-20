@@ -488,6 +488,8 @@ fn session_dialer(engine: Arc<dyn Dialer>, proxy: SocketAddr, ticket: Vec<u8>) -
             name: "ov".into(),
             carrier: "tcp".into(),
             redundant_carrier: None,
+            dgram_carriers: Vec::new(),
+            dgram_relay: None,
             relay: proxy,
             node_id: 1,
             egress_group: String::new(),
