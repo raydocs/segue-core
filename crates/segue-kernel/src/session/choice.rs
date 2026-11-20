@@ -48,8 +48,8 @@ pub fn better_by_margin(a: &Quality, b: &Quality) -> bool {
 /// Order two measured qualities, lower loss then lower RTT being better.
 /// `Greater` means `a` is the better exit.
 fn cmp_quality(a: &Quality, b: &Quality) -> Ordering {
-    a.loss
-        .partial_cmp(&b.loss)
+    b.loss
+        .partial_cmp(&a.loss)
         .unwrap_or(Ordering::Equal)
         .then_with(|| match (a.srtt, b.srtt) {
             (Some(x), Some(y)) => y.cmp(&x),
@@ -275,5 +275,22 @@ mod tests {
         assert_eq!(a.observe(&up, &quality), Some(0));
         let down = [false, false];
         assert_eq!(a.observe(&down, &quality), Some(0), "kept for the fallback");
+    }
+
+    #[test]
+    fn picks_lowest_loss_among_multiple_better_challengers() {
+        // Order 1: exit 1 beats incumbent, exit 2 is even cleaner -> must pick exit 2.
+        let mut a = AutoChoice::default();
+        let up = [true, true, true];
+        let quality = [q(0.20, 200), q(0.10, 100), q(0.01, 120)];
+        assert_eq!(a.observe(&up, &quality), Some(0));
+        assert_eq!(rounds(&mut a, &up, &quality, 2), Some(0));
+        assert_eq!(rounds(&mut a, &up, &quality, 1), Some(2));
+
+        // Reverse challenger order: still must pick exit 1 (0.01 loss).
+        let mut b = AutoChoice::default();
+        let quality_rev = [q(0.20, 200), q(0.01, 120), q(0.10, 100)];
+        assert_eq!(b.observe(&up, &quality_rev), Some(0));
+        assert_eq!(rounds(&mut b, &up, &quality_rev, 3), Some(1));
     }
 }

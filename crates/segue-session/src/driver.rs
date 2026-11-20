@@ -1422,13 +1422,14 @@ where
             if let Some(io) = carriers.get(&cid) {
                 let mut min = 1;
                 while io.tx.capacity() > 0 && s.has_transmit(cid, t) {
-                    let c = match take_charge(&pool, &tx_slot, &mut tx_ticket, min, FRAME_MAX) {
+                    let want = s.tx_size_hint(cid, t).max(min).min(FRAME_MAX);
+                    let c = match take_charge(&pool, &tx_slot, &mut tx_ticket, min, want) {
                         Some(c) => Some(c),
                         None => {
                             // Listen before the second try, so blocks or a
                             // turn in line given in between wake the loop.
                             freed = Some(pool.armed());
-                            take_charge(&pool, &tx_slot, &mut tx_ticket, min, FRAME_MAX)
+                            take_charge(&pool, &tx_slot, &mut tx_ticket, min, want)
                         }
                     };
                     let Some(c) = c else {
@@ -1471,8 +1472,8 @@ where
                         s.skip_redundant_tx(t);
                         break;
                     }
-                    let Some(grant) = PoolGrant::between(&pool, min, FRAME_MAX, Tier::Elastic)
-                    else {
+                    let want = s.tx_size_hint(cid, t).max(min).min(FRAME_MAX);
+                    let Some(grant) = PoolGrant::between(&pool, min, want, Tier::Elastic) else {
                         if !s.is_redundant_hello() {
                             s.skip_redundant_tx(t);
                         }
@@ -1975,13 +1976,14 @@ where
             if let Some(io) = carriers.get(&cid) {
                 let mut min = 1;
                 while io.tx.capacity() > 0 && s.has_transmit(cid, t) {
-                    let c = match take_charge(&pool, &tx_slot, &mut tx_ticket, min, FRAME_MAX) {
+                    let want = s.tx_size_hint(cid, t).max(min).min(FRAME_MAX);
+                    let c = match take_charge(&pool, &tx_slot, &mut tx_ticket, min, want) {
                         Some(c) => Some(c),
                         None => {
                             // Listen before the second try, so blocks or a
                             // turn in line given in between wake the loop.
                             freed = Some(pool.armed());
-                            take_charge(&pool, &tx_slot, &mut tx_ticket, min, FRAME_MAX)
+                            take_charge(&pool, &tx_slot, &mut tx_ticket, min, want)
                         }
                     };
                     let Some(c) = c else {

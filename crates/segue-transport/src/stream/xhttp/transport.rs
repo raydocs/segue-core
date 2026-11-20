@@ -1521,7 +1521,11 @@ impl XhttpTransport {
 }
 
 async fn dial_one(dial: &XhttpDial) -> Result<BoxedTransportStream, XhttpTransportError> {
-    dial().await.map_err(XhttpTransportError::Dial)
+    let mut stream = dial().await.map_err(XhttpTransportError::Dial)?;
+    // XHTTP frames its own HTTP exchange and never runs Vision directly, so
+    // TCP/HTTP1.1 paths can leave 8 KiB record-aligned reads immediately.
+    stream.release_record_alignment();
+    Ok(stream)
 }
 
 fn prepare_auto_gzip(request: &mut XhttpRequest, enabled: bool) -> bool {
@@ -3538,5 +3542,78 @@ mod xmux_reservation_tests {
         drop((first_usage, second_usage));
         assert_eq!(first_client.open_usage.load(Ordering::Acquire), 0);
         assert_eq!(second_client.open_usage.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn dial_one_releases_record_alignment() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+        struct SpyStream {
+            inner: DuplexStream,
+            released: Arc<AtomicBool>,
+        }
+        impl AsyncRead for SpyStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+        impl AsyncWrite for SpyStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+        impl crate::TransportStream for SpyStream {
+            fn poll_read_direct(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                AsyncRead::poll_read(self, cx, buf)
+            }
+            fn poll_write_direct(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                AsyncWrite::poll_write(self, cx, buf)
+            }
+            fn release_record_alignment(&mut self) {
+                self.released.store(true, Ordering::Release);
+            }
+        }
+
+        let released = Arc::new(AtomicBool::new(false));
+        let dial: XhttpDial = Arc::new({
+            let released = Arc::clone(&released);
+            move || {
+                let released = Arc::clone(&released);
+                Box::pin(async move {
+                    let (a, _b) = tokio::io::duplex(64);
+                    Ok(Box::new(SpyStream { inner: a, released }) as BoxedTransportStream)
+                })
+            }
+        });
+        let _stream = dial_one(&dial).await.expect("dial_one");
+        assert!(released.load(Ordering::Acquire));
     }
 }

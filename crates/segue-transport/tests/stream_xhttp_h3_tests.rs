@@ -354,7 +354,7 @@ async fn serve_clean_exchange(server: &TestServer) -> (Method, String, Vec<u8>) 
 #[tokio::test]
 async fn each_congestion_choice_runs_its_controller_after_the_handshake() {
     for (congestion, expected) in [
-        (H3Congestion::BbrStandard, "quinn-bbr"),
+        (H3Congestion::BbrStandard, "xray-bbr-standard"),
         (H3Congestion::Reno, "new-reno"),
         (H3Congestion::BbrConservative, "xray-bbr-conservative"),
         (H3Congestion::BbrAggressive, "xray-bbr-aggressive"),

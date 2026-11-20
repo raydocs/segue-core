@@ -119,10 +119,14 @@ struct RelayRedundant {
     /// When this carrier was demoted from current by a stall. `None` for a
     /// freshly attached spare or after any valid frame arrives on it.
     demoted_at: Option<Instant>,
+    /// Next periodic probe time while `demoted_at.is_some()`.
+    next_probe: Option<Instant>,
     /// Last TX or RX timestamp on this carrier (for AI idle keepalive).
     last_activity: Instant,
-    /// Last RX timestamp on this carrier.
-    last_rx: Option<Instant>,
+    /// Last RX timestamp when this bound spare delivered end-to-end progress.
+    progressed_at: Option<Instant>,
+    /// Last `(recv_offset, max_offset)` transmitted as `ACK` on this spare.
+    last_acked: (u64, u64),
     /// Mirrored `ACK` owed on this bound spare.
     ack_due: bool,
     /// Mirrored `FIN` offset owed on this bound spare.
@@ -470,33 +474,19 @@ impl RelayTable {
                     return;
                 }
                 if is_redundant {
-                    let live = self
-                        .cfg
-                        .timing
-                        .live_for(self.sessions.get(&sid).map_or(0, |s| s.exit_class));
                     let is_rst = matches!(frame, Frame::Rst { .. });
                     let mut promote_detached = false;
-                    let mut promote_stale = false;
                     if let Some(s) = self.sessions.get_mut(&sid) {
                         if let Some(r) = s.redundant.as_mut().filter(|r| r.cid == cid) {
                             r.demoted_at = None;
+                            r.next_probe = None;
                             r.last_activity = now;
-                            r.last_rx = Some(now);
                         }
-                        if !is_rst {
-                            if s.state == SessionState::Detached {
-                                promote_detached = true;
-                            } else if s.state == SessionState::Active && now >= s.carrier_rx + live
-                            {
-                                promote_stale = true;
-                            }
+                        if !is_rst && s.state == SessionState::Detached {
+                            promote_detached = true;
                         }
                     }
-                    if promote_detached {
-                        if self.promote_bound_spare(&sid, now, false) {
-                            is_current = true;
-                        }
-                    } else if promote_stale && self.promote_bound_spare(&sid, now, true) {
+                    if promote_detached && self.promote_bound_spare(&sid, now, false) {
                         is_current = true;
                     }
                 }
@@ -505,12 +495,34 @@ impl RelayTable {
                         s.carrier_rx = now;
                     }
                 }
-                if let Err(e) = self.on_session_frame(&sid, frame, now, is_current) {
-                    if is_current {
-                        self.fail(&sid, e);
-                    } else {
-                        // A bad frame on the spare path drops only that carrier.
-                        self.drop_spare(sid, cid);
+                match self.on_session_frame(&sid, frame, now, is_current) {
+                    Ok(progressed) => {
+                        if !is_current && progressed {
+                            let live = self
+                                .cfg
+                                .timing
+                                .live_for(self.sessions.get(&sid).map_or(0, |s| s.exit_class));
+                            let mut promote_stale = false;
+                            if let Some(s) = self.sessions.get_mut(&sid) {
+                                if let Some(r) = s.redundant.as_mut().filter(|r| r.cid == cid) {
+                                    r.progressed_at = Some(now);
+                                }
+                                if s.state == SessionState::Active && now >= s.carrier_rx + live {
+                                    promote_stale = true;
+                                }
+                            }
+                            if promote_stale {
+                                let _ = self.promote_bound_spare(&sid, now, true);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if is_current {
+                            self.fail(&sid, e);
+                        } else {
+                            // A bad frame on the spare path drops only that carrier.
+                            self.drop_spare(sid, cid);
+                        }
                     }
                 }
                 self.check_done(&sid, now);
@@ -574,8 +586,10 @@ impl RelayTable {
                 s.redundant = Some(Box::new(RelayRedundant {
                     cid: old_cid,
                     demoted_at: Some(now),
+                    next_probe: self.cfg.timing.demoted_probe_interval().map(|d| now + d),
                     last_activity: now,
-                    last_rx: None,
+                    progressed_at: None,
+                    last_acked: (u64::MAX, u64::MAX),
                     ack_due: false,
                     fin_due: None,
                     dup: DupQueue::new(acked),
@@ -938,8 +952,10 @@ impl RelayTable {
             s.redundant = Some(Box::new(RelayRedundant {
                 cid,
                 demoted_at: None,
+                next_probe: None,
                 last_activity: now,
-                last_rx: None,
+                progressed_at: None,
+                last_acked: (u64::MAX, u64::MAX),
                 ack_due: false,
                 fin_due: fin_in_flight,
                 dup,
@@ -1016,31 +1032,36 @@ impl RelayTable {
         frame: Frame,
         now: Instant,
         from_current: bool,
-    ) -> Result<(), ProtoError> {
+    ) -> Result<bool, ProtoError> {
         let hold = self.hold_fin;
         let s = self.sessions.get_mut(sid).unwrap();
         let allow_gap = !from_current || s.promoted_in_gen;
+        let mut progressed = false;
         match frame {
             Frame::Data { offset, data, .. } => {
                 if s.held_fin.is_some_and(|f| offset + data.len() as u64 > f) {
                     if !from_current {
-                        return Ok(());
+                        return Ok(false);
                     }
                     return Err(ProtoError::Violation("data after fin"));
                 }
-                if allow_gap && offset > s.recv.recv_offset() {
-                    return Ok(());
-                }
-                let n = s.recv.on_data(offset, &data, now)?;
-                if !from_current && n > 0 {
-                    if let Some(r) = s.redundant.as_mut() {
-                        r.ack_due = true;
+                let n = if allow_gap {
+                    s.recv.on_data_ooo(offset, &data, now)?
+                } else {
+                    s.recv.on_data(offset, &data, now)?
+                };
+                if n > 0 {
+                    progressed = true;
+                    if !from_current {
+                        if let Some(r) = s.redundant.as_mut() {
+                            r.ack_due = true;
+                        }
                     }
                 }
             }
             Frame::Fin { offset } if hold && !s.recv.fin_received() => {
                 if allow_gap && offset > s.recv.recv_offset() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 match s.held_fin {
                     Some(f) if f == offset => {}
@@ -1050,6 +1071,7 @@ impl RelayTable {
                     }
                     None => {
                         s.held_fin = Some(offset);
+                        progressed = true;
                         if !from_current {
                             if let Some(r) = s.redundant.as_mut() {
                                 r.ack_due = true;
@@ -1060,13 +1082,16 @@ impl RelayTable {
             }
             Frame::Fin { offset } => {
                 if allow_gap && offset > s.recv.recv_offset() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 let was_fin = s.recv.fin_received();
                 s.recv.on_fin(offset, now)?;
-                if !from_current && !was_fin {
-                    if let Some(r) = s.redundant.as_mut() {
-                        r.ack_due = true;
+                if !was_fin {
+                    progressed = true;
+                    if !from_current {
+                        if let Some(r) = s.redundant.as_mut() {
+                            r.ack_due = true;
+                        }
                     }
                 }
             }
@@ -1074,8 +1099,9 @@ impl RelayTable {
                 recv_offset,
                 max_offset,
             } => {
-                let progressed = s.send.on_ack(recv_offset, max_offset)?;
-                if progressed {
+                let ack_progressed = s.send.on_ack(recv_offset, max_offset)?;
+                if ack_progressed {
+                    progressed = true;
                     let acked = s.send.acked();
                     if let Some(r) = s.redundant.as_mut() {
                         r.dup.prune_acked(acked);
@@ -1087,7 +1113,7 @@ impl RelayTable {
                 if from_current && s.state == SessionState::Active {
                     s.last_progress = now;
                 }
-                if from_current && progressed {
+                if from_current && ack_progressed {
                     s.last_progress = now;
                     if s.state == SessionState::Detached && s.carrier.is_some() {
                         // B1: ACK progress on the current carrier.
@@ -1102,7 +1128,7 @@ impl RelayTable {
             Frame::Pad(_) | Frame::Dgram { .. } => {}
             _ => return Err(ProtoError::Violation("unexpected frame on session carrier")),
         }
-        Ok(())
+        Ok(progressed)
     }
 
     /// The site connect finished.
@@ -1213,6 +1239,7 @@ impl RelayTable {
             let r = s.redundant.as_mut()?;
             if r.ack_due {
                 r.ack_due = false;
+                r.last_acked = (recv_offset, max_offset);
                 r.last_activity = now;
                 return Some(Frame::Ack {
                     recv_offset,
@@ -1270,8 +1297,11 @@ impl RelayTable {
         let piggyback = s.send.has_sendable();
         if let Some(a) = s.recv.poll_ack(now, piggyback) {
             s.last_sent = now;
+            let cur = (s.recv.recv_offset(), s.recv.max_offset());
             if let Some(r) = s.redundant.as_mut().filter(|r| r.demoted_at.is_none()) {
-                r.ack_due = true;
+                if cur != r.last_acked {
+                    r.ack_due = true;
+                }
             }
             self.check_done(&sid, now);
             return Some(a);
@@ -1513,16 +1543,26 @@ impl RelayTable {
             if let Some(r) = &s.redundant {
                 if let Some(at) = r.demoted_at {
                     put(at + t.t_detached_standby);
+                    if s.connected
+                        && s.state == SessionState::Active
+                        && writable(r.cid)
+                        && !r.ack_due
+                    {
+                        if let Some(p) = r.next_probe {
+                            put(p);
+                        }
+                    }
                 }
                 if s.state == SessionState::Active {
-                    if r.demoted_at.is_none() && r.last_rx.is_some_and(|rx| rx > s.carrier_rx) {
+                    if r.demoted_at.is_none() && r.progressed_at.is_some_and(|rx| rx > s.carrier_rx)
+                    {
                         put(s.carrier_rx + live);
                     }
                     if s.connected && writable(r.cid) {
                         if let Some(due) = r.dup.next_due_unacked(s.send.acked()) {
                             put(due);
                         }
-                        if !r.ack_due {
+                        if r.demoted_at.is_none() && !r.ack_due {
                             if let Some(ka) = ka_ai {
                                 put(r.last_activity + ka);
                             }
@@ -1624,17 +1664,25 @@ impl RelayTable {
             } else if s.state == SessionState::Active
                 && now >= s.carrier_rx + live_bound
                 && s.redundant.as_ref().is_some_and(|r| {
-                    r.demoted_at.is_none() && r.last_rx.is_some_and(|rx| rx > s.carrier_rx)
+                    r.demoted_at.is_none() && r.progressed_at.is_some_and(|rx| rx > s.carrier_rx)
                 })
             {
                 promote_on_rx.push(*sid);
             }
             if s.connected && s.state == SessionState::Active {
-                if let Some(ka) = t.keepalive_ai_for(s.exit_class) {
+                let ka = t.keepalive_ai_for(s.exit_class);
+                if let Some(ka) = ka {
                     if now >= s.last_sent.max(s.carrier_rx) + ka {
                         s.ka_due = true;
                     }
-                    if let Some(r) = s.redundant.as_mut() {
+                }
+                if let Some(r) = s.redundant.as_mut() {
+                    if r.demoted_at.is_some() {
+                        if r.next_probe.is_some_and(|p| now >= p) {
+                            r.ack_due = true;
+                            r.next_probe = t.demoted_probe_interval().map(|d| now + d);
+                        }
+                    } else if let Some(ka) = ka {
                         if now >= r.last_activity + ka {
                             r.ack_due = true;
                         }
