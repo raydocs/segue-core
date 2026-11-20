@@ -2006,6 +2006,10 @@ pub trait TunRouter: Send + Sync {
         UdpRoute::Refuse
     }
 
+    fn posture_notify(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
+
     /// A slot for [`TcpRoute::Wait`]. `None`: the cap is full, so the SYN
     /// is refused.
     fn take_wait_slot(&self) -> Option<HoldGuard> {
@@ -2180,6 +2184,10 @@ impl TunRouter for TunKernel {
 
     fn take_wait_slot(&self) -> Option<HoldGuard> {
         self.kernel.try_hold()
+    }
+
+    fn posture_notify(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        self.kernel.flows.as_ref().and_then(|f| f.posture_notify())
     }
 
     fn flow_verdict(&self, action: &Action) -> crate::killswitch::Verdict {
@@ -2841,8 +2849,9 @@ fn action_of(dial: &Dial) -> Action {
 /// way, so the cap slot does not outlive the wait.
 async fn hold_dial(ctx: &Ctx, dial: Dial, guard: HoldGuard, up: &mpsc::Sender<Up>) -> Option<Dial> {
     let action = action_of(&dial);
+    let notify = ctx.router.posture_notify();
     let verdict = tokio::select! {
-        verdict = crate::killswitch::wait_out(|| ctx.router.flow_verdict(&action)) => verdict,
+        verdict = crate::killswitch::wait_out_notified(notify.as_deref(), || ctx.router.flow_verdict(&action)) => verdict,
         _ = up.closed() => {
             drop(guard);
             return None;

@@ -212,14 +212,15 @@ impl HomePool {
         }
         let cap = self.limits.line_units_failover;
         let pisp = g.lines[primary].cfg.isp.clone();
+        let seat_counts = all_seats(g);
         // Prefer another ISP, then fewest seats.
         let best = (0..g.lines.len())
             .filter(|&i| {
                 i != primary
                     && g.lines[i].state == LineState::Active
-                    && (seats(g, i) < cap || g.lines[i].live.contains_key(&device))
+                    && (seat_counts[i] < cap || g.lines[i].live.contains_key(&device))
             })
-            .min_by_key(|&i| (g.lines[i].cfg.isp == pisp, seats(g, i)));
+            .min_by_key(|&i| (g.lines[i].cfg.isp == pisp, seat_counts[i]));
         let Some(t) = best else {
             return Err(HomeError::LineDown);
         };
@@ -439,6 +440,33 @@ fn seats(g: &Inner, i: usize) -> usize {
     assigned + lingering
 }
 
+/// Seats used on every line computed in one pass over assigned devices and live
+/// leases. Matches `seats(g, i)` for every `i`.
+fn all_seats(g: &Inner) -> Vec<usize> {
+    let mut counts = vec![0usize; g.lines.len()];
+    for a in g.devices.values() {
+        counts[a.primary] += 1;
+        if let Some(cur) = a.current {
+            if cur != a.primary {
+                counts[cur] += 1;
+            }
+        }
+    }
+    for (i, line) in g.lines.iter().enumerate() {
+        let lingering = line
+            .live
+            .keys()
+            .filter(|d| {
+                g.devices
+                    .get(d)
+                    .is_none_or(|a| a.primary != i && a.current != Some(i))
+            })
+            .count();
+        counts[i] += lingering;
+    }
+    counts
+}
+
 /// One Home connection's hold on its line's seat (D2). Dropped when the
 /// connection ends; the last one on a line releases the device's seat
 /// there (unless the line is its primary or current line).
@@ -472,15 +500,16 @@ fn pick_new(g: &Inner, cap: usize) -> Option<usize> {
             .entry(g.lines[a.primary].cfg.isp.as_str())
             .or_default() += 1;
     }
+    let seat_counts = all_seats(g);
     (0..g.lines.len())
-        .filter(|&i| g.lines[i].state == LineState::Active && seats(g, i) < cap)
+        .filter(|&i| g.lines[i].state == LineState::Active && seat_counts[i] < cap)
         .min_by_key(|&i| {
             (
                 isp_units
                     .get(g.lines[i].cfg.isp.as_str())
                     .copied()
                     .unwrap_or(0),
-                seats(g, i),
+                seat_counts[i],
                 i,
             )
         })

@@ -18,6 +18,17 @@ use crate::{
 
 const WRITE_PLAINTEXT: usize = 8192;
 const MAX_CIPHERTEXT: usize = 16640;
+const BULK_READ_THRESHOLD: u64 = 64 * 1024;
+const BULK_READ_AHEAD: usize = 16 * 1024;
+
+fn erase(bytes: &mut [u8]) {
+    // SAFETY: u64 has no invalid bit patterns or padding; align_to_mut yields
+    // disjoint slices covering `bytes`, erased with Zeroize volatile stores.
+    let (prefix, words, suffix) = unsafe { bytes.align_to_mut::<u64>() };
+    prefix.zeroize();
+    words.zeroize();
+    suffix.zeroize();
+}
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -45,6 +56,10 @@ pub struct EncryptedStream<S> {
     body_pos: usize,
     plain_pos: usize,
     plain_len: usize,
+    rx_buf: Zeroizing<Vec<u8>>,
+    rx_pos: usize,
+    rx_len: usize,
+    rx_total: u64,
     padding: bool,
     failed: bool,
     eof: bool,
@@ -80,20 +95,30 @@ struct DirectHeader {
 }
 
 impl DirectHeader {
-    fn apply(&mut self, data: &mut [u8], mask: &mut HeaderMask, writing: bool) -> io::Result<()> {
-        for byte in data {
+    fn apply(
+        &mut self,
+        mut data: &mut [u8],
+        mask: &mut HeaderMask,
+        writing: bool,
+    ) -> io::Result<()> {
+        while !data.is_empty() {
             if self.skip > 0 {
-                self.skip -= 1;
+                let step = self.skip.min(data.len());
+                self.skip -= step;
+                data = &mut data[step..];
                 continue;
             }
+            let take = (5 - self.position).min(data.len());
+            let head = &mut data[..take];
             if writing {
-                self.header[self.position] = *byte;
+                self.header[self.position..self.position + take].copy_from_slice(head);
             }
-            mask.apply(std::slice::from_mut(byte))?;
+            mask.apply(head)?;
             if !writing {
-                self.header[self.position] = *byte;
+                self.header[self.position..self.position + take].copy_from_slice(head);
             }
-            self.position += 1;
+            self.position += take;
+            data = &mut data[take..];
             if self.position == 5 {
                 let length = usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
                 // Same boundary as Xray's XorConn/DecodeHeader. On an invalid
@@ -138,6 +163,10 @@ impl<S> EncryptedStream<S> {
             body_pos: 0,
             plain_pos: 0,
             plain_len: 0,
+            rx_buf: Zeroizing::new(Vec::new()),
+            rx_pos: 0,
+            rx_len: 0,
+            rx_total: 0,
             padding: padding_len > 0,
             failed: false,
             eof: false,
@@ -183,6 +212,10 @@ impl<S> EncryptedStream<S> {
             body_pos: 0,
             plain_pos: 0,
             plain_len: 0,
+            rx_buf: Zeroizing::new(Vec::new()),
+            rx_pos: 0,
+            rx_len: 0,
+            rx_total: 0,
             padding: false,
             failed: false,
             eof: false,
@@ -233,8 +266,13 @@ impl<S> EncryptedStream<S> {
 
     fn fail<T>(&mut self, error: io::Error) -> Poll<io::Result<T>> {
         self.failed = true;
-        self.pending.zeroize();
-        self.body.zeroize();
+        erase(&mut self.pending);
+        self.pending.clear();
+        erase(&mut self.body);
+        self.body.clear();
+        erase(&mut self.rx_buf);
+        self.rx_pos = 0;
+        self.rx_len = 0;
         // A resumed stream is trusted only after its first authenticated
         // server record. Invalidate the leased ticket at the first failure so
         // another connection cannot race with a poisoned stream that remains
@@ -280,7 +318,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
             return Poll::Ready(Err(error));
         }
         let start = output.filled().len();
-        if let Err(error) = ready!(self.poll_carrier_read(cx, output)) {
+        if self.rx_pos < self.rx_len {
+            let n = output.remaining().min(self.rx_len - self.rx_pos);
+            output.put_slice(&self.rx_buf[self.rx_pos..self.rx_pos + n]);
+            erase(&mut self.rx_buf[self.rx_pos..self.rx_pos + n]);
+            self.rx_pos += n;
+            if self.rx_pos == self.rx_len {
+                self.rx_pos = 0;
+                self.rx_len = 0;
+            }
+        } else if let Err(error) = ready!(self.poll_carrier_read(cx, output)) {
             return self.fail(error);
         }
         if let Some(mask) = &mut self.read_mask {
@@ -362,13 +409,96 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match Pin::new(&mut self.inner).poll_read(cx, buf) {
-            Poll::Pending => match self.check_confirmation_deadline(cx) {
-                Ok(()) => Poll::Pending,
-                Err(error) => Poll::Ready(Err(error)),
-            },
-            ready => ready,
+        poll_carrier_read_split(
+            &mut self.inner,
+            &self.lease,
+            &mut self.confirmation_deadline,
+            cx,
+            buf,
+        )
+    }
+
+    fn poll_read_carrier_dst(
+        &mut self,
+        cx: &mut Context<'_>,
+        target: CarrierDst,
+    ) -> Poll<io::Result<usize>> {
+        let dst_len = match target {
+            CarrierDst::ServerRandom => self.server_random.len() - self.server_random_pos,
+            CarrierDst::Header => self.header.len() - self.header_pos,
+            CarrierDst::Body => self.body.len() - self.body_pos,
+        };
+        if self.rx_pos < self.rx_len {
+            let n = dst_len.min(self.rx_len - self.rx_pos);
+            let dst = match target {
+                CarrierDst::ServerRandom => {
+                    &mut self.server_random[self.server_random_pos..self.server_random_pos + n]
+                }
+                CarrierDst::Header => &mut self.header[self.header_pos..self.header_pos + n],
+                CarrierDst::Body => &mut self.body[self.body_pos..self.body_pos + n],
+            };
+            dst.copy_from_slice(&self.rx_buf[self.rx_pos..self.rx_pos + n]);
+            erase(&mut self.rx_buf[self.rx_pos..self.rx_pos + n]);
+            self.rx_pos += n;
+            if self.rx_pos == self.rx_len {
+                self.rx_pos = 0;
+                self.rx_len = 0;
+            }
+            return Poll::Ready(Ok(n));
         }
+        if self.rx_total >= BULK_READ_THRESHOLD && dst_len < BULK_READ_AHEAD {
+            if self.rx_buf.is_empty() {
+                self.rx_buf.resize(BULK_READ_AHEAD, 0);
+            }
+            let filled = {
+                let mut buf = ReadBuf::new(&mut self.rx_buf);
+                ready!(poll_carrier_read_split(
+                    &mut self.inner,
+                    &self.lease,
+                    &mut self.confirmation_deadline,
+                    cx,
+                    &mut buf,
+                ))?;
+                buf.filled().len()
+            };
+            if filled == 0 {
+                return Poll::Ready(Ok(0));
+            }
+            self.rx_total = self.rx_total.saturating_add(filled as u64);
+            let n = dst_len.min(filled);
+            let dst = match target {
+                CarrierDst::ServerRandom => {
+                    &mut self.server_random[self.server_random_pos..self.server_random_pos + n]
+                }
+                CarrierDst::Header => &mut self.header[self.header_pos..self.header_pos + n],
+                CarrierDst::Body => &mut self.body[self.body_pos..self.body_pos + n],
+            };
+            dst.copy_from_slice(&self.rx_buf[..n]);
+            erase(&mut self.rx_buf[..n]);
+            self.rx_pos = n;
+            self.rx_len = filled;
+            if self.rx_pos == self.rx_len {
+                self.rx_pos = 0;
+                self.rx_len = 0;
+            }
+            return Poll::Ready(Ok(n));
+        }
+        let dst = match target {
+            CarrierDst::ServerRandom => &mut self.server_random[self.server_random_pos..],
+            CarrierDst::Header => &mut self.header[self.header_pos..],
+            CarrierDst::Body => &mut self.body[self.body_pos..],
+        };
+        let mut buf = ReadBuf::new(dst);
+        ready!(poll_carrier_read_split(
+            &mut self.inner,
+            &self.lease,
+            &mut self.confirmation_deadline,
+            cx,
+            &mut buf,
+        ))?;
+        let n = buf.filled().len();
+        self.rx_total = self.rx_total.saturating_add(n as u64);
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -383,28 +513,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
         let length = (input.len() + TAG_LEN) as u16;
         let [hi, lo] = length.to_be_bytes();
         let header = [23, 3, 3, hi, lo];
-        // Seal in the reusable output buffer, then make room for the header.
-        self.pending.extend_from_slice(input);
         let rekey = self.write_aead.nonce == MAX_NONCE;
-        self.write_aead.seal(&mut self.pending, &header)?;
-        let len = self.pending.len();
-        self.pending.resize(len + 5, 0);
-        self.pending.copy_within(..len, 5);
-        self.pending[..5].copy_from_slice(&header);
+        let start = if let Some(prefix) = self.prewrite.take() {
+            self.arm_confirmation = true;
+            self.pending
+                .reserve_exact(prefix.len() + 5 + input.len() + TAG_LEN);
+            self.pending.extend_from_slice(&prefix);
+            prefix.len()
+        } else {
+            0
+        };
+        self.pending.extend_from_slice(&header);
+        self.pending.extend_from_slice(input);
+        self.write_aead
+            .seal_from(&mut self.pending, start + 5, &header)?;
         if rekey {
-            self.write_aead =
-                Aead::new(&self.pending, self.united.as_ref(), self.write_aead.suite)?;
+            self.write_aead = Aead::new(
+                &self.pending[start..],
+                self.united.as_ref(),
+                self.write_aead.suite,
+            )?;
         }
         if let Some(mask) = &mut self.write_mask {
-            mask.apply(&mut self.pending[..5])?;
-        }
-        if let Some(prefix) = self.prewrite.take() {
-            self.arm_confirmation = true;
-            let mut joined = Zeroizing::new(Vec::with_capacity(prefix.len() + self.pending.len()));
-            joined.extend_from_slice(&prefix);
-            joined.extend_from_slice(&self.pending);
-            self.pending.zeroize();
-            self.pending = joined;
+            mask.apply(&mut self.pending[start..start + 5])?;
         }
         Ok(())
     }
@@ -435,23 +566,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CarrierDst {
+    ServerRandom,
+    Header,
+    Body,
+}
+
+fn poll_carrier_read_split<S: AsyncRead + Unpin>(
+    inner: &mut S,
+    lease: &Option<Lease>,
+    confirmation_deadline: &mut Option<Pin<Box<Sleep>>>,
+    cx: &mut Context<'_>,
+    buf: &mut ReadBuf<'_>,
+) -> Poll<io::Result<()>> {
+    match Pin::new(inner).poll_read(cx, buf) {
+        Poll::Pending => {
+            if lease.is_some()
+                && confirmation_deadline
+                    .as_mut()
+                    .is_some_and(|deadline| deadline.as_mut().poll(cx).is_ready())
+            {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "VLESS encryption resumption confirmation timed out",
+                )))
+            } else {
+                Poll::Pending
+            }
+        }
+        ready => ready,
+    }
+}
+
 macro_rules! carrier_read_len {
-    ($this:ident, $cx:ident, $slice:expr) => {{
-        let polled = {
-            let mut buf = ReadBuf::new($slice);
-            match Pin::new(&mut $this.inner).poll_read($cx, &mut buf) {
-                Poll::Ready(Ok(())) => Ok(buf.filled().len()),
-                Poll::Ready(Err(error)) => Err(error),
-                Poll::Pending => Ok(usize::MAX),
-            }
-        };
-        match polled {
-            Ok(usize::MAX) => {
-                return match $this.check_confirmation_deadline($cx) {
-                    Ok(()) => Poll::Pending,
-                    Err(error) => $this.fail(error),
-                };
-            }
+    ($this:ident, $cx:ident, $dst:expr) => {{
+        match ready!($this.poll_read_carrier_dst($cx, $dst)) {
             Ok(n) => n,
             Err(error) => return $this.fail(error),
         }
@@ -485,10 +635,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for EncryptedStream<S> {
                 let n = output.remaining().min(this.plain_len - this.plain_pos);
                 let bytes = &mut this.body[this.plain_pos..this.plain_pos + n];
                 output.put_slice(bytes);
-                bytes.zeroize();
+                erase(bytes);
                 this.plain_pos += n;
                 if this.plain_pos == this.plain_len {
-                    this.body.zeroize();
+                    erase(&mut this.body);
                     this.body.clear();
                     this.body_pos = 0;
                 }
@@ -499,8 +649,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for EncryptedStream<S> {
             }
             if this.read_aead.is_none() {
                 while this.server_random_pos < this.server_random.len() {
-                    let start = this.server_random_pos;
-                    let n = carrier_read_len!(this, cx, &mut this.server_random[start..]);
+                    let n = carrier_read_len!(this, cx, CarrierDst::ServerRandom);
                     if n == 0 {
                         return this.fail(io::Error::from(io::ErrorKind::UnexpectedEof));
                     }
@@ -522,7 +671,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for EncryptedStream<S> {
             }
             if !this.padding && this.body.is_empty() {
                 while this.header_pos < 5 {
-                    let n = carrier_read_len!(this, cx, &mut this.header[this.header_pos..]);
+                    let n = carrier_read_len!(this, cx, CarrierDst::Header);
                     if n == 0 {
                         if this.header_pos == 0 {
                             // EOF before the first authenticated resumed
@@ -549,7 +698,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for EncryptedStream<S> {
                 this.body_pos = 0;
             }
             while this.body_pos < this.body.len() {
-                let n = carrier_read_len!(this, cx, &mut this.body[this.body_pos..]);
+                let n = carrier_read_len!(this, cx, CarrierDst::Body);
                 if n == 0 {
                     return this.fail(io::Error::from(io::ErrorKind::UnexpectedEof));
                 }
@@ -564,7 +713,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for EncryptedStream<S> {
                 {
                     return this.fail(error);
                 }
-                this.body.zeroize();
+                erase(&mut this.body);
                 this.body.clear();
                 this.body_pos = 0;
                 this.padding = false;

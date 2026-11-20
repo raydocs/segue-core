@@ -15,7 +15,7 @@
 //! * no task outlives the pool: closing a session aborts both of its tasks.
 
 use super::*;
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use segue_proxy::anytls::{self as wire, Command, FrameHeader, PaddingFactory};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize},
@@ -556,7 +556,7 @@ async fn write_loop(
                 None => break,
             },
         };
-        let bytes = match command {
+        let mut bytes = match command {
             WriteCommand::Control(bytes) => {
                 if buffering {
                     buffer.extend_from_slice(&bytes);
@@ -579,6 +579,7 @@ async fn write_loop(
         if bytes.is_empty() {
             continue;
         }
+        let mut closing = false;
         let writes = if padding {
             packet += 1;
             let factory = lock(&inner.padding).clone();
@@ -589,7 +590,35 @@ async fn write_loop(
                 vec![bytes]
             }
         } else {
-            vec![bytes]
+            let mut batch = Vec::new();
+            let mut total = bytes.len();
+            for _ in 0..15 {
+                if total >= 64 * 1024 {
+                    break;
+                }
+                match rx.try_recv() {
+                    Ok(WriteCommand::Control(more) | WriteCommand::Data(more)) => {
+                        if !more.is_empty() {
+                            if batch.is_empty() {
+                                batch = bytes;
+                                bytes = Vec::new();
+                            }
+                            total += more.len();
+                            batch.extend_from_slice(&more);
+                        }
+                    }
+                    Ok(WriteCommand::Close) => {
+                        closing = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if batch.is_empty() {
+                vec![bytes]
+            } else {
+                vec![batch]
+            }
         };
         for chunk in writes {
             if conn.write_all(&chunk).await.is_err() {
@@ -600,6 +629,9 @@ async fn write_loop(
         if conn.flush().await.is_err() {
             inner.close();
             return;
+        }
+        if closing {
+            break;
         }
     }
     // The writer ending closes the carrier, which ends the reader too.
@@ -612,22 +644,36 @@ async fn read_loop(
     mut conn: tokio::io::ReadHalf<BoxedTransportStream>,
     writer: mpsc::Sender<WriteCommand>,
 ) {
-    let mut header = [0u8; wire::HEADER_LENGTH];
-    let mut payload = Vec::new();
+    let mut buf = BytesMut::with_capacity(8192);
     loop {
-        if conn.read_exact(&mut header).await.is_err() {
-            break;
+        while buf.len() < wire::HEADER_LENGTH {
+            match conn.read_buf(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    inner.close();
+                    return;
+                }
+                Ok(_) => {}
+            }
         }
-        let Ok(Some(frame)) = FrameHeader::decode(&header) else {
+        let Ok(Some(frame)) = FrameHeader::decode(&buf[..wire::HEADER_LENGTH]) else {
             break;
         };
         let length = usize::from(frame.length);
-        payload.clear();
-        payload.resize(length, 0);
-        if length > 0 && conn.read_exact(&mut payload).await.is_err() {
-            break;
+        buf.advance(wire::HEADER_LENGTH);
+        if buf.len() < length {
+            buf.reserve(length - buf.len());
         }
-        if !dispatch(&inner, &writer, frame, &payload).await {
+        while buf.len() < length {
+            match conn.read_buf(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    inner.close();
+                    return;
+                }
+                Ok(_) => {}
+            }
+        }
+        let payload = buf.split_to(length).freeze();
+        if !dispatch(&inner, &writer, frame, payload).await {
             break;
         }
     }
@@ -639,7 +685,7 @@ async fn dispatch(
     inner: &Arc<SessionInner>,
     writer: &mpsc::Sender<WriteCommand>,
     frame: FrameHeader,
-    payload: &[u8],
+    payload: Bytes,
 ) -> bool {
     match frame.command {
         Command::Push => {
@@ -659,11 +705,7 @@ async fn dispatch(
             };
             // A full queue pauses the whole session until its consumer
             // drains, as the Go pipe blocks the reader.
-            if tx
-                .send(StreamEvent::Data(Bytes::copy_from_slice(payload)))
-                .await
-                .is_err()
-            {
+            if tx.send(StreamEvent::Data(payload)).await.is_err() {
                 lock(&inner.streams).remove(&frame.stream_id);
             }
             true
@@ -674,7 +716,7 @@ async fn dispatch(
         Command::SynAck => {
             inner.syn_generation.fetch_add(1, Ordering::AcqRel);
             if !payload.is_empty() {
-                let message = String::from_utf8_lossy(payload).into_owned();
+                let message = String::from_utf8_lossy(&payload).into_owned();
                 if let Some(tx) = lock(&inner.streams).remove(&frame.stream_id) {
                     let _ = tx.try_send(StreamEvent::Failed(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
@@ -692,7 +734,7 @@ async fn dispatch(
         }
         Command::Waste | Command::Settings => true,
         Command::ServerSettings => {
-            if let Ok(map) = wire::parse_settings(payload) {
+            if let Ok(map) = wire::parse_settings(&payload) {
                 // `str::parse` does not coerce `&String` when passed as a function item.
                 if let Some(Ok(version)) = map.get("v").map(|value| value.parse::<u8>()) {
                     inner.peer_version.store(version, Ordering::Release);
@@ -702,13 +744,13 @@ async fn dispatch(
         }
         Command::UpdatePaddingScheme => {
             // Only a well-formed scheme replaces the current one.
-            if let Some(factory) = PaddingFactory::new(payload) {
+            if let Some(factory) = PaddingFactory::new(&payload) {
                 *lock(&inner.padding) = factory;
             }
             true
         }
         Command::Alert => {
-            let message = String::from_utf8_lossy(payload).into_owned();
+            let message = String::from_utf8_lossy(&payload).into_owned();
             let message = if message.is_empty() {
                 "AnyTLS server alert".to_owned()
             } else {

@@ -243,7 +243,10 @@ impl UdpSession for EngineUdp {
 const MAX_UDP_PAYLOAD: usize = 65_507;
 
 /// A connected socket from this device to one destination.
-struct DirectUdp(UdpSocket);
+struct DirectUdp {
+    socket: UdpSocket,
+    peer: SocketAddr,
+}
 
 impl DirectUdp {
     async fn connect(
@@ -275,7 +278,7 @@ impl DirectUdp {
                 Ok::<_, std::io::Error>(socket)
             };
             match attempt.await {
-                Ok(socket) => return Ok(Self(socket)),
+                Ok(socket) => return Ok(Self { socket, peer: dest }),
                 Err(e) => last = DialError(format!("direct udp: {dest}: {e}")),
             }
         }
@@ -291,7 +294,7 @@ impl UdpSession for DirectUdp {
 
     async fn send(&self, _addr: &TargetAddr, _port: u16, payload: &[u8]) -> Result<(), DialError> {
         // One socket per destination: the flow's address is fixed.
-        self.0
+        self.socket
             .send(payload)
             .await
             .map(drop)
@@ -307,15 +310,11 @@ impl UdpSession for DirectUdp {
         if buf.capacity() == 0 {
             buf.reserve(MAX_UDP_PAYLOAD);
         }
-        self.0
+        self.socket
             .recv_buf(buf)
             .await
             .map_err(|e| DialError(format!("direct udp: {e}")))?;
-        let peer = self
-            .0
-            .peer_addr()
-            .map_err(|e| DialError(format!("direct udp: {e}")))?;
-        Ok((TargetAddr::Ip(peer.ip()), peer.port()))
+        Ok((TargetAddr::Ip(self.peer.ip()), self.peer.port()))
     }
 }
 

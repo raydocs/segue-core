@@ -6,10 +6,12 @@
 //! holds only public keys and verifies offline. A ticket is a bearer secret:
 //! it is never logged, and [`Claims`] carries nothing that grants access.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use ring::digest::{digest, SHA256};
 use ring::signature::{self, KeyPair as _};
 use segue_session::codec::{code, Kind, Target};
 use segue_session::relay::{Authorizer, Grant};
@@ -112,20 +114,39 @@ pub fn generate_pkcs8() -> Vec<u8> {
         .to_vec()
 }
 
+const VERIFIED_CACHE_CAP: usize = 4096;
+
+fn ticket_hash(ticket: &[u8]) -> [u8; 32] {
+    digest(&SHA256, ticket).as_ref().try_into().unwrap()
+}
+
 /// Offline ticket verification against the configured public keys.
 pub struct Verifier {
     keys: Vec<(u32, [u8; 32])>,
+    cache: Mutex<HashMap<[u8; 32], Claims>>,
 }
 
 impl Verifier {
     pub fn new(keys: Vec<(u32, [u8; 32])>) -> Self {
-        Self { keys }
+        Self {
+            keys,
+            cache: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Signature and shape only; validity window is checked by the caller.
     pub fn decode(&self, ticket: &[u8]) -> Result<Claims, TicketError> {
         if ticket.len() > MAX_TICKET {
             return Err(TicketError::Bad);
+        }
+        let key_hash = ticket_hash(ticket);
+        if let Some(cached) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key_hash)
+        {
+            return Ok(cached.clone());
         }
         let s = std::str::from_utf8(ticket).map_err(|_| TicketError::Bad)?;
         let rest = s.strip_prefix(PREFIX).ok_or(TicketError::Bad)?;
@@ -153,6 +174,11 @@ impl Verifier {
         if c.v != 1 || c.not_after <= c.not_before {
             return Err(TicketError::Bad);
         }
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= VERIFIED_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key_hash, c.clone());
         Ok(c)
     }
 
@@ -202,24 +228,26 @@ pub struct TicketAuth {
 impl TicketAuth {
     fn check(&self, ticket: &[u8], resume: bool) -> Result<Claims, u8> {
         let now = (self.clock)();
-        let c = match self.verifier.verify(ticket, now) {
+        let c = match self.verifier.decode(ticket) {
             Ok(c) => c,
-            Err(TicketError::Expired) => {
-                let c = self.verifier.decode(ticket).map_err(|_| code::AUTH)?;
-                let grace = resume
-                    && now < c.not_after.saturating_add(RESUME_GRACE_SECS)
-                    && self.revoked.is_fresh_at(now);
-                if !grace {
-                    Metrics::inc(&self.metrics.tickets_expired);
-                    return Err(code::EXPIRED);
-                }
-                c
-            }
-            Err(TicketError::Bad) => {
+            Err(TicketError::Bad | TicketError::Expired) => {
                 Metrics::inc(&self.metrics.tickets_bad);
                 return Err(code::AUTH);
             }
         };
+        if now < c.not_before {
+            Metrics::inc(&self.metrics.tickets_bad);
+            return Err(code::AUTH);
+        }
+        if now >= c.not_after {
+            let grace = resume
+                && now < c.not_after.saturating_add(RESUME_GRACE_SECS)
+                && self.revoked.is_fresh_at(now);
+            if !grace {
+                Metrics::inc(&self.metrics.tickets_expired);
+                return Err(code::EXPIRED);
+            }
+        }
         if self.revoked.contains(c.device_id) {
             Metrics::inc(&self.metrics.tickets_revoked);
             return Err(code::REVOKED);
@@ -298,5 +326,25 @@ mod tests {
             v.verify(&vec![b'S'; MAX_TICKET + 1], 1000),
             Err(TicketError::Bad)
         );
+    }
+
+    #[test]
+    fn verified_cache_reuses_claims_checks_expiry_and_is_bounded() {
+        let s = Signer::from_pkcs8(7, &generate_pkcs8()).unwrap();
+        let v = Verifier::new(vec![(7, s.public_key())]);
+        let t = s.sign(&claims(42, 1000));
+
+        assert_eq!(v.verify(&t, 1000).unwrap().device_id, 42);
+        assert_eq!(v.cache.lock().unwrap().len(), 1);
+        // Cached hit still enforces not_before / not_after against `now`.
+        assert_eq!(v.verify(&t, 1050).unwrap().device_id, 42);
+        assert_eq!(v.verify(&t, 1100), Err(TicketError::Expired));
+        assert_eq!(v.verify(&t, 980), Err(TicketError::Bad));
+
+        for i in 100..(100 + VERIFIED_CACHE_CAP + 32) {
+            let ti = s.sign(&claims(i as u64, 1000));
+            v.decode(&ti).unwrap();
+        }
+        assert!(v.cache.lock().unwrap().len() <= VERIFIED_CACHE_CAP);
     }
 }

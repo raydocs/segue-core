@@ -1,10 +1,15 @@
 use std::io;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use segue_config::CoreConfig;
 use tokio::io::{split, AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(test)]
 use tokio::io::{ReadHalf, WriteHalf};
+#[cfg(test)]
 use tokio::sync::mpsc;
 
 use crate::connection::ConnectionTraffic;
@@ -27,7 +32,6 @@ const INITIAL_COPY_BUFFER_SIZE: usize = 4 * 1024;
 const MIN_COPY_BUFFER_SIZE: usize = 1024;
 const MAX_COPY_BUFFER_SIZE: usize = 1024 * 1024;
 const COPY_FLUSH_THRESHOLD: usize = 64 * 1024;
-const COPY_FLUSH_INTERVAL: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EffectivePolicy {
@@ -200,36 +204,74 @@ where
 {
     let (mut a_read, mut a_write) = split(a);
     let (mut b_read, mut b_write) = split(b);
-    let (activity_tx, activity_rx) = mpsc::channel(1);
+    let activity = AtomicActivity::new();
     let a_to_b = copy_direction_with_counter(
         &mut a_read,
         &mut b_write,
-        activity_tx.clone(),
+        activity.clone(),
         buffer_size,
         traffic.map(|traffic| &traffic.uplink_bytes),
     );
     let b_to_a = copy_direction_with_counter(
         &mut b_read,
         &mut a_write,
-        activity_tx,
+        activity.clone(),
         buffer_size,
         traffic.map(|traffic| &traffic.downlink_bytes),
     );
-    relay_until_done_or_idle(a_to_b, b_to_a, activity_rx, timeouts).await
+    relay_until_done_or_idle(a_to_b, b_to_a, activity, timeouts).await
+}
+
+fn elapsed_ns(start: tokio::time::Instant, now: tokio::time::Instant) -> u64 {
+    now.saturating_duration_since(start)
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+/// Lock-free timestamped activity tracker shared across both relay directions so
+/// data bursts never wake the idle-timeout task or churn timer wheel entries.
+#[derive(Clone)]
+pub(super) struct AtomicActivity {
+    start: tokio::time::Instant,
+    last_ns: Arc<AtomicU64>,
+}
+
+impl AtomicActivity {
+    pub(super) fn new() -> Self {
+        Self {
+            start: tokio::time::Instant::now(),
+            last_ns: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn last_ns(&self) -> u64 {
+        self.last_ns.load(Ordering::Acquire)
+    }
+}
+
+impl CopyActivity for AtomicActivity {
+    #[inline]
+    fn record(&mut self, _: usize) {
+        let now_ns = elapsed_ns(self.start, tokio::time::Instant::now());
+        if now_ns > self.last_ns.load(Ordering::Relaxed) {
+            self.last_ns.fetch_max(now_ns, Ordering::AcqRel);
+        }
+    }
 }
 
 /// Runs the two directions of a relay to their ends under its inactivity
-/// bounds. Each direction reports what it moved on `activity_rx`.
-async fn relay_until_done_or_idle(
+/// bounds. Each direction records its timestamped activity in `activity`.
+pub(super) async fn relay_until_done_or_idle(
     a_to_b: impl std::future::Future<Output = io::Result<u64>>,
     b_to_a: impl std::future::Future<Output = io::Result<u64>>,
-    mut activity_rx: mpsc::Receiver<()>,
+    activity: AtomicActivity,
     timeouts: RelayTimeouts,
 ) -> io::Result<(u64, u64)> {
     tokio::pin!(a_to_b, b_to_a);
     let mut a_to_b_result = None;
     let mut b_to_a_result = None;
     let mut idle = timeouts.conn_idle;
+    let mut window_start_ns = 0u64;
     let idle_sleep = tokio::time::sleep(idle);
     tokio::pin!(idle_sleep);
 
@@ -237,23 +279,27 @@ async fn relay_until_done_or_idle(
         tokio::select! {
             result = &mut a_to_b, if a_to_b_result.is_none() => {
                 a_to_b_result = Some(result?);
+                let now = tokio::time::Instant::now();
                 idle = timeouts.downlink_only;
-                idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle);
+                window_start_ns = elapsed_ns(activity.start, now);
+                idle_sleep.as_mut().reset(now + idle);
             }
             result = &mut b_to_a, if b_to_a_result.is_none() => {
                 b_to_a_result = Some(result?);
+                let now = tokio::time::Instant::now();
                 idle = timeouts.uplink_only;
-                idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle);
-            }
-            activity = activity_rx.recv() => {
-                if activity.is_some() {
-                    idle_sleep
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + idle);
-                }
+                window_start_ns = elapsed_ns(activity.start, now);
+                idle_sleep.as_mut().reset(now + idle);
             }
             () = &mut idle_sleep => {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "connection idle timeout"));
+                let now = tokio::time::Instant::now();
+                let latest_ns = activity.last_ns().max(window_start_ns);
+                let deadline = activity.start + Duration::from_nanos(latest_ns) + idle;
+                if now >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "connection idle timeout"));
+                }
+                window_start_ns = latest_ns;
+                idle_sleep.as_mut().reset(deadline);
             }
         }
 
@@ -280,6 +326,8 @@ where
 trait CopyActivity {
     fn record(&mut self, bytes: usize);
 }
+
+#[cfg(test)]
 impl CopyActivity for mpsc::Sender<()> {
     #[inline]
     fn record(&mut self, _: usize) {
@@ -292,7 +340,7 @@ async fn copy_direction_with_counter<R, W>(
     writer: &mut W,
     mut activity: impl CopyActivity,
     buffer_size: usize,
-    counter: Option<&std::sync::atomic::AtomicU64>,
+    counter: Option<&AtomicU64>,
 ) -> io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -305,43 +353,47 @@ where
     // process lends for as long as data keeps coming (`relay_buffer`).
     let buffer_cap = buffer_size.clamp(MIN_COPY_BUFFER_SIZE, MAX_COPY_BUFFER_SIZE);
     let mut buffer = relay_buffer::RelayBuffer::new(buffer_cap, &relay_buffer::PROCESS_POOL);
-    let flush_deadline = tokio::time::sleep(COPY_FLUSH_INTERVAL);
-    tokio::pin!(flush_deadline);
 
     loop {
-        tokio::select! {
-            read = std::future::poll_fn(|cx| buffer.poll_read(cx, std::pin::Pin::new(&mut *reader))) => {
-                let len = read?;
-                if len == 0 {
-                    if unflushed > 0 {
-                        writer.flush().await?;
-                    }
-                    writer.shutdown().await?;
-                    return Ok(total);
-                }
-
-                writer.write_all(buffer.filled(len)).await?;
-                total = total.saturating_add(len as u64);
-                if let Some(counter) = counter {
-                    counter.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                let was_clean = unflushed == 0;
-                unflushed = unflushed.saturating_add(len);
-                activity.record(len);
-
-                if unflushed >= COPY_FLUSH_THRESHOLD {
+        let read = if unflushed > 0 {
+            match std::future::poll_fn(|cx| {
+                Poll::Ready(match buffer.poll_read(cx, Pin::new(&mut *reader)) {
+                    Poll::Ready(res) => Some(res),
+                    Poll::Pending => None,
+                })
+            })
+            .await
+            {
+                Some(res) => res,
+                None => {
                     writer.flush().await?;
                     unflushed = 0;
-                } else if was_clean {
-                    flush_deadline
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + COPY_FLUSH_INTERVAL);
+                    continue;
                 }
             }
-            () = &mut flush_deadline, if unflushed > 0 => {
+        } else {
+            std::future::poll_fn(|cx| buffer.poll_read(cx, Pin::new(&mut *reader))).await
+        };
+        let len = read?;
+        if len == 0 {
+            if unflushed > 0 {
                 writer.flush().await?;
-                unflushed = 0;
             }
+            writer.shutdown().await?;
+            return Ok(total);
+        }
+
+        writer.write_all(buffer.filled(len)).await?;
+        total = total.saturating_add(len as u64);
+        if let Some(counter) = counter {
+            counter.fetch_add(len as u64, Ordering::Relaxed);
+        }
+        unflushed = unflushed.saturating_add(len);
+        activity.record(len);
+
+        if unflushed >= COPY_FLUSH_THRESHOLD {
+            writer.flush().await?;
+            unflushed = 0;
         }
     }
 }
@@ -935,5 +987,37 @@ mod tests {
         };
 
         assert_eq!(policy.relay_buffer_size(), 1024 * 1024);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn copy_direction_flushes_immediately_on_reader_pending() {
+        let (reader_io, mut reader_peer) = tokio::io::duplex(64);
+        let (mut reader, _unused_writer) = tokio::io::split(reader_io);
+        let state = Arc::new(Mutex::new(RecordingWriteState::default()));
+        let writer_io = RecordingIo {
+            state: state.clone(),
+        };
+        let (_unused_reader, mut writer) = tokio::io::split(writer_io);
+        let (activity_tx, _activity_rx) = mpsc::channel(1);
+
+        let task = tokio::spawn(async move {
+            copy_direction(&mut reader, &mut writer, activity_tx, 8 * 1024).await
+        });
+        reader_peer.write_all(b"ping").await.unwrap();
+        // Let copy_direction read "ping", observe Pending on the follow-up poll,
+        // and flush immediately without advancing the paused clock.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            if state.lock().unwrap().flushes == 1 {
+                break;
+            }
+        }
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.bytes_written, 4);
+            assert_eq!(s.flushes, 1);
+        }
+        reader_peer.shutdown().await.unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), 4);
     }
 }

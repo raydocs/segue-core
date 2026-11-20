@@ -574,3 +574,72 @@ async fn vision_direct_cannot_recover_poisoned_or_incomplete_records() {
     );
     assert!(right.read(&mut bytes).await.is_err());
 }
+
+#[tokio::test]
+async fn bulk_read_ahead_crosses_records_and_drains_into_vision_direct() {
+    for random in [false, true] {
+        let (mut left, mut right) = pair(16, random, CipherSuite::Aes256Gcm);
+        // Send >64 KiB in small records so right crosses BULK_READ_THRESHOLD,
+        // activates the 16 KiB read-ahead buffer, then transitions to Vision
+        // Direct with buffered direct bytes already sitting in rx_buf.
+        let bulk_chunks = vec![pattern(2048); 36]; // 72 KiB across 36 records
+        let tail_plain = b"last-auth-record".to_vec();
+        let tls = [
+            &[23u8, 3, 3, 0, 20][..],
+            &pattern(20),
+            &[23u8, 3, 3, 0, 17][..],
+            &pattern(17),
+        ]
+        .concat();
+
+        let (sent_bulk, sent_tail, sent_tls) =
+            (bulk_chunks.clone(), tail_plain.clone(), tls.clone());
+        let send = async move {
+            for chunk in &sent_bulk {
+                left.write_all(chunk).await.unwrap();
+            }
+            left.write_all(&sent_tail).await.unwrap();
+            left.flush().await.unwrap();
+            write_direct(&mut left, &sent_tls).await;
+        };
+
+        let recv = async move {
+            let mut got_bulk = Vec::with_capacity(72 * 1024);
+            let mut tmp = [0u8; 4096];
+            while got_bulk.len() < 72 * 1024 {
+                let n = right.read(&mut tmp).await.unwrap();
+                assert!(n > 0);
+                got_bulk.extend_from_slice(&tmp[..n]);
+            }
+            assert_eq!(got_bulk, bulk_chunks.concat());
+            assert!(
+                right.rx_buf.len() == super::BULK_READ_AHEAD,
+                "16 KiB rx_buf should activate past 64 KiB"
+            );
+
+            let mut got_tail = vec![0u8; tail_plain.len()];
+            right.read_exact(&mut got_tail).await.unwrap();
+            assert_eq!(got_tail, tail_plain);
+
+            let mut got_direct = Vec::new();
+            loop {
+                let mut buf = [0u8; 64];
+                let mut rbuf = tokio::io::ReadBuf::new(&mut buf);
+                std::future::poll_fn(|cx| right.poll_read_vision_direct(cx, &mut rbuf))
+                    .await
+                    .unwrap();
+                if rbuf.filled().is_empty() {
+                    break;
+                }
+                got_direct.extend_from_slice(rbuf.filled());
+            }
+            assert_eq!(got_direct, tls);
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(send, recv);
+        })
+        .await
+        .unwrap();
+    }
+}

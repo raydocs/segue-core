@@ -559,9 +559,24 @@ impl CtrlHelloReply {
     }
 }
 
+fn lp_len(b: &[u8]) -> usize {
+    varint_len(b.len() as u64) + b.len()
+}
+
 fn put_lp(out: &mut Vec<u8>, b: &[u8]) {
     put_varint(out, b.len() as u64);
     out.extend_from_slice(b);
+}
+
+fn target_len(t: &Target) -> usize {
+    match t {
+        Target::Ip(SocketAddr::V4(_)) => 7,
+        Target::Ip(SocketAddr::V6(_)) => 19,
+        Target::Domain(name, _) => {
+            assert!(!name.is_empty() && name.len() <= 255, "domain length");
+            4 + name.len()
+        }
+    }
 }
 
 fn put_target(out: &mut Vec<u8>, t: &Target) {
@@ -615,11 +630,152 @@ impl Frame {
     /// Append the encoded frame to `out`. Panics if the payload would exceed
     /// [`MAX_PAYLOAD`]; callers size DATA with [`max_data_len`].
     ///
-    /// The payload is written straight into `out` behind a 4-byte length
-    /// slot that is narrowed afterwards (an in-place move, no intermediate
-    /// buffer: r6 N13).
+    /// Exact payload length is computed upfront so the frame header, varint
+    /// length, and payload are written sequentially with zero in-place moves.
     pub fn encode(&self, out: &mut Vec<u8>) {
         self.encode_with(out, [&[], &[]]);
+    }
+
+    fn flags_byte(&self) -> u8 {
+        match self {
+            Frame::Data { pad, .. } if *pad > 0 => FLAG_PADDED,
+            Frame::Wake { full, .. } => u8::from(*full),
+            Frame::RedundantAttach(_) | Frame::RedundantOk(_) => FLAG_IGNORABLE,
+            _ => 0,
+        }
+    }
+
+    fn payload_len(&self, tail: [&[u8]; 2]) -> usize {
+        use core::mem::size_of_val;
+        match self {
+            Frame::Open(o) => {
+                1 + lp_len(&o.ticket)
+                    + o.session_id.len()
+                    + o.resume_secret.len()
+                    + size_of_val(&o.attach_gen)
+                    + 1
+                    + varint_len(o.anchor_instance_id)
+                    + 1
+                    + target_len(&o.target)
+                    + 1
+                    + o.t_stall_ms
+                        .map_or(0, |ms| varint_len(ms.clamp(1, STALL_MS_MAX)))
+                    + o.first_data.len()
+                    + tail[0].len()
+                    + tail[1].len()
+            }
+            Frame::Opened(o) => {
+                varint_len(o.instance_id)
+                    + size_of_val(&o.attach_gen)
+                    + varint_len(o.recv_offset)
+                    + varint_len(o.max_offset)
+                    + varint_len(o.window_cap)
+                    + varint_len(o.ack_bytes)
+            }
+            Frame::Resume(r) => {
+                1 + lp_len(&r.ticket)
+                    + varint_len(r.anchor_node_id)
+                    + varint_len(r.anchor_instance_id)
+                    + r.session_id.len()
+                    + r.resume_secret.len()
+                    + size_of_val(&r.attach_gen)
+                    + varint_len(r.recv_offset)
+                    + varint_len(r.max_offset)
+                    + r.t_stall_ms
+                        .map_or(0, |ms| varint_len(ms.clamp(1, STALL_MS_MAX)))
+            }
+            Frame::Resumed(r) => {
+                varint_len(r.instance_id)
+                    + size_of_val(&r.attach_gen)
+                    + varint_len(r.recv_offset)
+                    + varint_len(r.max_offset)
+            }
+            Frame::Reject(r) => {
+                1 + size_of_val(&r.attach_gen)
+                    + r.closed.as_ref().map_or(0, |c| {
+                        1 + varint_len(c.final_recv_offset) + varint_len(c.final_sent_offset)
+                    })
+            }
+            Frame::Data { offset, data, pad } => {
+                (if *pad > 0 { varint_len(*pad as u64) } else { 0 })
+                    + varint_len(*offset)
+                    + data.len()
+                    + tail[0].len()
+                    + tail[1].len()
+                    + *pad
+            }
+            Frame::Ack {
+                recv_offset,
+                max_offset,
+            } => varint_len(*recv_offset) + varint_len(*max_offset),
+            Frame::Fin { offset } => varint_len(*offset),
+            Frame::Rst { .. } => 1,
+            Frame::Pad(n) => *n,
+            Frame::Dgram { addr, data } => {
+                let addr_len = match addr {
+                    SocketAddr::V4(_) => 7,
+                    SocketAddr::V6(_) => 19,
+                };
+                addr_len + data.len()
+            }
+            Frame::Ping { nonce } => size_of_val(nonce),
+            Frame::Pong { nonce, extra } => size_of_val(nonce) + extra.len(),
+            Frame::Wake { entries, .. } => {
+                varint_len(entries.len() as u64)
+                    + entries
+                        .iter()
+                        .map(|e| {
+                            varint_len(e.anchor_node_id)
+                                + e.session_id.len()
+                                + size_of_val(&e.park_gen)
+                        })
+                        .sum::<usize>()
+            }
+            Frame::Park(entries) => {
+                varint_len(entries.len() as u64)
+                    + entries
+                        .iter()
+                        .map(|e| {
+                            e.session_id.len()
+                                + varint_len(e.req_id)
+                                + size_of_val(&e.attach_gen)
+                                + varint_len(e.c_recv_offset)
+                                + varint_len(e.c_sent_offset)
+                        })
+                        .sum::<usize>()
+            }
+            Frame::ParkAck(entries) => {
+                varint_len(entries.len() as u64)
+                    + entries
+                        .iter()
+                        .map(|e| {
+                            e.session_id.len()
+                                + varint_len(e.req_id)
+                                + size_of_val(&e.attach_gen)
+                                + 1
+                                + size_of_val(&e.park_gen)
+                        })
+                        .sum::<usize>()
+            }
+            Frame::Stall(entries) => {
+                varint_len(entries.len() as u64)
+                    + entries
+                        .iter()
+                        .map(|(sid, gen)| sid.len() + size_of_val(gen))
+                        .sum::<usize>()
+            }
+            Frame::RedundantAttach(a) => {
+                a.session_id.len()
+                    + a.resume_secret.len()
+                    + size_of_val(&a.attach_gen)
+                    + varint_len(a.recv_offset)
+                    + varint_len(a.max_offset)
+            }
+            Frame::RedundantOk(a) => {
+                size_of_val(&a.attach_gen) + varint_len(a.recv_offset) + varint_len(a.max_offset)
+            }
+            Frame::Control { payload, .. } => payload.len(),
+        }
     }
 
     /// [`encode`](Self::encode) with `tail` appended to OPEN's
@@ -632,13 +788,15 @@ impl Frame {
             tail_len == 0 || matches!(self, Frame::Open(_) | Frame::Data { .. }),
             "tail on a frame without data"
         );
-        let start = out.len();
+        let len = self.payload_len(tail);
+        assert!(len <= MAX_PAYLOAD, "frame payload too large");
+        let n = varint_len(len as u64);
+        out.reserve(2 + n + len);
+        let expected_end = out.len() + 2 + n + len;
         out.push(self.type_byte());
-        out.push(0);
-        out.extend_from_slice(&[0; 4]);
-        let body = out.len();
+        out.push(self.flags_byte());
+        put_varint(out, len as u64);
         let p = &mut *out;
-        let mut flags = 0u8;
         match self {
             Frame::Open(o) => {
                 p.push(o.version);
@@ -697,7 +855,6 @@ impl Frame {
             }
             Frame::Data { offset, data, pad } => {
                 if *pad > 0 {
-                    flags |= FLAG_PADDED;
                     put_varint(p, *pad as u64);
                 }
                 put_varint(p, *offset);
@@ -725,8 +882,7 @@ impl Frame {
                 p.extend_from_slice(&nonce.to_be_bytes());
                 p.extend_from_slice(extra);
             }
-            Frame::Wake { full, entries } => {
-                flags |= u8::from(*full);
+            Frame::Wake { entries, .. } => {
                 put_varint(p, entries.len() as u64);
                 for e in entries {
                     put_varint(p, e.anchor_node_id);
@@ -762,7 +918,6 @@ impl Frame {
                 }
             }
             Frame::RedundantAttach(a) => {
-                flags |= FLAG_IGNORABLE;
                 p.extend_from_slice(&a.session_id);
                 p.extend_from_slice(&a.resume_secret);
                 p.extend_from_slice(&a.attach_gen.to_be_bytes());
@@ -770,14 +925,13 @@ impl Frame {
                 put_varint(p, a.max_offset);
             }
             Frame::RedundantOk(a) => {
-                flags |= FLAG_IGNORABLE;
                 p.extend_from_slice(&a.attach_gen.to_be_bytes());
                 put_varint(p, a.recv_offset);
                 put_varint(p, a.max_offset);
             }
             Frame::Control { payload, .. } => p.extend_from_slice(payload),
         }
-        finish_frame(out, start, body, flags);
+        debug_assert_eq!(out.len(), expected_end);
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -786,20 +940,11 @@ impl Frame {
         v
     }
 
-    /// Upper bound of the encoded size for the frames that carry bytes
-    /// (so [`to_bytes`](Self::to_bytes) allocates once), a small guess for
-    /// the rest.
+    /// Exact encoded byte length of the frame with empty tails (so
+    /// [`to_bytes`](Self::to_bytes) allocates once at exact capacity).
     pub(crate) fn size_hint(&self) -> usize {
-        let body = match self {
-            Frame::Open(o) => o.ticket.len() + o.first_data.len() + 340,
-            Frame::Resume(r) => r.ticket.len() + 96,
-            Frame::Data { data, pad, .. } => data.len() + pad + 24,
-            Frame::Dgram { data, .. } => data.len() + 24,
-            Frame::Pong { extra, .. } => extra.len() + 8,
-            Frame::Pad(n) => *n,
-            _ => 64,
-        };
-        (6 + body).min(MAX_PAYLOAD + 6)
+        let len = self.payload_len([&[], &[]]).min(MAX_PAYLOAD);
+        2 + varint_len(len as u64) + len
     }
 
     /// Decode a payload the caller owns: DATA keeps the payload's own
@@ -1060,34 +1205,6 @@ impl Frame {
         };
         r.end()?;
         Ok(Some(f))
-    }
-}
-
-/// Close a frame started at `start` with a 4-byte length slot ending at
-/// `body`: write the flags and the shortest varint length, moving the
-/// payload down in place when the varint is shorter.
-fn finish_frame(out: &mut Vec<u8>, start: usize, body: usize, flags: u8) {
-    let len = out.len() - body;
-    assert!(len <= MAX_PAYLOAD, "frame payload too large");
-    out[start + 1] = flags;
-    let mut v = [0u8; 8];
-    let n = varint_len(len as u64);
-    write_varint(&mut v[..n], len as u64);
-    let at = start + 2;
-    out[at..at + n].copy_from_slice(&v[..n]);
-    if n < 4 {
-        out.copy_within(body.., at + n);
-        out.truncate(out.len() - (4 - n));
-    }
-}
-
-/// `v` as a varint of exactly `buf.len()` bytes (1, 2, 4 or 8).
-fn write_varint(buf: &mut [u8], v: u64) {
-    match buf.len() {
-        1 => buf[0] = v as u8,
-        2 => buf.copy_from_slice(&((v as u16) | 0x4000).to_be_bytes()),
-        4 => buf.copy_from_slice(&((v as u32) | 0x8000_0000).to_be_bytes()),
-        _ => buf.copy_from_slice(&(v | 0xC000_0000_0000_0000).to_be_bytes()),
     }
 }
 

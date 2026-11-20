@@ -6,7 +6,7 @@
 //! room, so nothing queues without bound. Site reads are requested one at a
 //! time and never larger than the session's replay capacity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -1863,8 +1863,7 @@ pub async fn run_client_standby<A>(
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (_tx, rx) = mpsc::unbounded_channel();
-    run_client_loop(s, app, connect, ctl, Some(rx)).await
+    run_client_loop(s, app, connect, ctl, None).await
 }
 
 /// [`run_client`] with hooks.
@@ -2485,6 +2484,118 @@ pub async fn run_relay(
     run_relay_ctl(table, accept, site, notices, None).await
 }
 
+const RELAY_BATCH: usize = 64;
+
+fn apply_carrier_ev(
+    ev: CarrierEv,
+    t: std::time::Instant,
+    table: &mut RelayTable,
+    carriers: &mut HashMap<u64, CarrierIo>,
+) {
+    match ev {
+        CarrierEv::Frame(cid, Ok(f), _) => table.on_frame(cid, f.into_frame(), t),
+        CarrierEv::Frame(cid, Err(e), _) => table.on_decode_error(cid, e),
+        CarrierEv::Progress(cid, _) => table.on_carrier_progress(cid, t),
+        CarrierEv::Closed(cid) | CarrierEv::Stuck(cid) | CarrierEv::Io(cid) => {
+            if let Some(io) = carriers.remove(&cid) {
+                io.reader.abort();
+                io.writer.abort();
+            }
+            table.on_carrier_closed(cid, t);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_site_ev(
+    ev: SiteEv,
+    t: std::time::Instant,
+    table: &mut RelayTable,
+    dials: &mut HashMap<SessionId, Task>,
+    sites: &mut HashMap<SessionId, SiteIo>,
+    site_tx: &mpsc::Sender<SiteEv>,
+    flushed_tx: &mpsc::UnboundedSender<SessionId>,
+    writable: &Arc<Notify>,
+) {
+    match ev {
+        SiteEv::Connected(sid, Ok(stream)) => {
+            dials.remove(&sid);
+            if table.state(&sid).is_none() {
+                // Session ended while connecting (RST / timeout):
+                // drop the site connection instead of leaking it.
+                drop(stream);
+                return;
+            }
+            let (mut r, w) = tokio::io::split(stream);
+            let wrote = Stamp::new();
+            let w = SiteWrite {
+                inner: w,
+                sid,
+                flushed: Some(flushed_tx.clone()),
+                wrote: wrote.clone(),
+            };
+            let etx = site_tx.clone();
+            let (tx, writer) = spawn_writer(w, writable.clone(), async move {
+                let _ = etx.send(SiteEv::Error(sid)).await;
+            });
+            let (req, mut req_rx) = mpsc::channel::<usize>(1);
+            let stx = site_tx.clone();
+            let reader = spawn(async move {
+                let mut b = vec![0u8; CHUNK];
+                while let Some(n) = req_rx.recv().await {
+                    match r.read(&mut b[..n]).await {
+                        Ok(0) => {
+                            let _ = stx.send(SiteEv::Data(sid, Vec::new())).await;
+                            return;
+                        }
+                        Ok(k) => {
+                            if stx.send(SiteEv::Data(sid, b[..k].to_vec())).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => {
+                            let _ = stx.send(SiteEv::Error(sid)).await;
+                            return;
+                        }
+                    }
+                }
+            });
+            sites.insert(
+                sid,
+                SiteIo {
+                    tx,
+                    req,
+                    reader,
+                    writer,
+                    outstanding: false,
+                    shut: false,
+                    eof: false,
+                    wrote,
+                    flush: Flush::Waiting,
+                },
+            );
+            table.connect_done(&sid, Ok(()), t);
+        }
+        SiteEv::Connected(sid, Err(e)) => {
+            dials.remove(&sid);
+            table.connect_done(&sid, Err(SiteError::code_of(&e)), t);
+        }
+        SiteEv::Data(sid, d) => {
+            if let Some(io) = sites.get_mut(&sid) {
+                io.outstanding = false;
+                if d.is_empty() {
+                    io.eof = true;
+                    table.site_fin(&sid);
+                } else {
+                    let n = table.site_data(&sid, &d);
+                    debug_assert_eq!(n, d.len());
+                }
+            }
+        }
+        SiteEv::Error(sid) => table.site_reset(&sid),
+    }
+}
+
 /// [`run_relay`] with a command channel (revocation resets).
 pub async fn run_relay_ctl(
     mut table: RelayTable,
@@ -2494,36 +2605,44 @@ pub async fn run_relay_ctl(
     mut ctrl: Option<mpsc::Receiver<RelayCtrl>>,
 ) {
     let writable = Arc::new(Notify::new());
-    let (ev_tx, mut ev_rx) = mpsc::channel::<CarrierEv>(64);
-    let (site_tx, mut site_rx) = mpsc::channel::<SiteEv>(64);
+    let (ev_tx, mut ev_rx) = mpsc::channel::<CarrierEv>(256);
+    let (site_tx, mut site_rx) = mpsc::channel::<SiteEv>(256);
     let (flushed_tx, mut flushed_rx) = mpsc::unbounded_channel::<SessionId>();
     // The client's FIN is acknowledged only once the site writer flushed
     // (see `Flush`).
     table.confirm_site_flush(true);
     let mut carriers: HashMap<u64, CarrierIo> = HashMap::new();
     let mut sites: HashMap<SessionId, SiteIo> = HashMap::new();
+    let mut draining_sites: HashSet<SessionId> = HashSet::new();
     // Site connects in flight, cancelled when their session ends.
     let mut dials: HashMap<SessionId, Task> = HashMap::new();
     let mut tasks = Tasks::default();
     let mut next_cid = 0u64;
     let mut accepting = true;
     let mut buf = vec![0u8; CHUNK];
+    let mut timeout_due = true;
+    let mut last_deadline: Option<std::time::Instant> = None;
 
     loop {
         let t = now();
-        table.handle_timeout(t);
+        if timeout_due || last_deadline.is_some_and(|d| t >= d) {
+            table.handle_timeout(t);
+            timeout_due = false;
+        }
         // Upload drains that stopped progressing or ran too long (`Flush`).
         let tnow = tokio::time::Instant::now();
-        let stuck: Vec<SessionId> = sites
-            .iter_mut()
-            .filter_map(|(sid, io)| {
-                let complete = table.upload_complete(sid);
-                io.flush
-                    .check(complete, &io.wrote, tnow, table.timing())
-                    .then_some(*sid)
+        let stuck: Vec<SessionId> = draining_sites
+            .iter()
+            .copied()
+            .filter(|sid| {
+                sites.get_mut(sid).is_some_and(|io| {
+                    let complete = table.upload_complete(sid);
+                    io.flush.check(complete, &io.wrote, tnow, table.timing())
+                })
             })
             .collect();
         for sid in stuck {
+            draining_sites.remove(&sid);
             table.site_reset(&sid);
         }
         while let Some(ev) = table.take_event() {
@@ -2570,6 +2689,7 @@ pub async fn run_relay_ctl(
                     if let Some(h) = dials.remove(&session_id) {
                         h.abort();
                     }
+                    draining_sites.remove(&session_id);
                     if let Some(io) = sites.remove(&session_id) {
                         io.reader.abort();
                         if close_code == code::CLEAN {
@@ -2598,18 +2718,23 @@ pub async fn run_relay_ctl(
                 table.drop_redundant_dups_if_busy(cid, t);
             }
             while io.tx.capacity() > 0 {
-                match table.poll_transmit(cid, t) {
-                    Some(f) => {
-                        let _ = io.tx.try_send(f.to_bytes().into());
-                    }
-                    None => break,
+                let mut frame = Vec::new();
+                if table.poll_transmit_into(cid, t, &mut frame).is_some() {
+                    let _ = io.tx.try_send(frame.into());
+                } else {
+                    break;
                 }
             }
         }
         for cid in table.take_closed_carriers() {
             if let Some(io) = carriers.remove(&cid) {
-                while let Some(f) = table.poll_transmit(cid, t) {
-                    if io.tx.try_send(f.to_bytes().into()).is_err() {
+                loop {
+                    let mut frame = Vec::new();
+                    if table.poll_transmit_into(cid, t, &mut frame).is_some() {
+                        if io.tx.try_send(frame.into()).is_err() {
+                            break;
+                        }
+                    } else {
                         break;
                     }
                 }
@@ -2633,6 +2758,10 @@ pub async fn run_relay_ctl(
                     break;
                 }
             }
+            if matches!(io.flush, Flush::Waiting) && table.upload_complete(sid) {
+                io.flush = Flush::Draining { since: tnow };
+                draining_sites.insert(*sid);
+            }
             if !io.outstanding && !io.eof {
                 let cap = table.site_read_capacity(sid).min(CHUNK);
                 if cap > 0 && io.req.try_send(cap).is_ok() {
@@ -2647,14 +2776,18 @@ pub async fn run_relay_ctl(
             tasks.finish().await;
             return;
         }
-        let deadline = table
-            .poll_timeout_writable(|cid| carriers.get(&cid).is_some_and(|io| io.tx.capacity() > 0))
-            .map(tokio::time::Instant::from_std);
+        last_deadline = table
+            .poll_timeout_writable(|cid| carriers.get(&cid).is_some_and(|io| io.tx.capacity() > 0));
+        let deadline = last_deadline.map(tokio::time::Instant::from_std);
         let drain = tasks.next_deadline();
         let tm = table.timing();
-        let flush = sites
-            .values()
-            .filter_map(|io| io.flush.deadline(&io.wrote, tm))
+        let flush = draining_sites
+            .iter()
+            .filter_map(|sid| {
+                sites
+                    .get(sid)
+                    .and_then(|io| io.flush.deadline(&io.wrote, tm))
+            })
             .min();
         tokio::select! {
             c = accept.recv(), if accepting => match c {
@@ -2675,85 +2808,50 @@ pub async fn run_relay_ctl(
             },
             ev = ev_rx.recv() => {
                 let t = now();
-                match ev {
-                    Some(CarrierEv::Frame(cid, Ok(f), _)) => table.on_frame(cid, f.into_frame(), t),
-                    Some(CarrierEv::Frame(cid, Err(e), _)) => table.on_decode_error(cid, e),
-                    Some(CarrierEv::Progress(cid, _)) => table.on_carrier_progress(cid, t),
-                    Some(CarrierEv::Closed(cid) | CarrierEv::Stuck(cid) | CarrierEv::Io(cid)) => {
-                        if let Some(io) = carriers.remove(&cid) {
-                            io.reader.abort();
-                            io.writer.abort();
-                        }
-                        table.on_carrier_closed(cid, t);
+                if let Some(ev) = ev {
+                    apply_carrier_ev(ev, t, &mut table, &mut carriers);
+                    for _ in 1..RELAY_BATCH {
+                        let Ok(ev) = ev_rx.try_recv() else { break };
+                        apply_carrier_ev(ev, t, &mut table, &mut carriers);
                     }
-                    None => {}
                 }
             }
             ev = site_rx.recv() => {
                 let t = now();
-                match ev {
-                    Some(SiteEv::Connected(sid, Ok(stream))) => {
-                        dials.remove(&sid);
-                        if table.state(&sid).is_none() {
-                            // Session ended while connecting (RST / timeout):
-                            // drop the site connection instead of leaking it.
-                            drop(stream);
-                            continue;
-                        }
-                        let (mut r, w) = tokio::io::split(stream);
-                        let wrote = Stamp::new();
-                        let w = SiteWrite { inner: w, sid, flushed: Some(flushed_tx.clone()), wrote: wrote.clone() };
-                        let etx = site_tx.clone();
-                        let (tx, writer) = spawn_writer(w, writable.clone(), async move {
-                            let _ = etx.send(SiteEv::Error(sid)).await;
-                        });
-                        let (req, mut req_rx) = mpsc::channel::<usize>(1);
-                        let stx = site_tx.clone();
-                        let reader = spawn(async move {
-                            let mut b = vec![0u8; CHUNK];
-                            while let Some(n) = req_rx.recv().await {
-                                match r.read(&mut b[..n]).await {
-                                    Ok(0) => { let _ = stx.send(SiteEv::Data(sid, Vec::new())).await; return; }
-                                    Ok(k) => { if stx.send(SiteEv::Data(sid, b[..k].to_vec())).await.is_err() { return; } }
-                                    Err(_) => { let _ = stx.send(SiteEv::Error(sid)).await; return; }
-                                }
-                            }
-                        });
-                        sites.insert(sid, SiteIo { tx, req, reader, writer, outstanding: false, shut: false, eof: false, wrote, flush: Flush::Waiting });
-                        table.connect_done(&sid, Ok(()), t);
+                if let Some(ev) = ev {
+                    apply_site_ev(ev, t, &mut table, &mut dials, &mut sites, &site_tx, &flushed_tx, &writable);
+                    for _ in 1..RELAY_BATCH {
+                        let Ok(ev) = site_rx.try_recv() else { break };
+                        apply_site_ev(ev, t, &mut table, &mut dials, &mut sites, &site_tx, &flushed_tx, &writable);
                     }
-                    Some(SiteEv::Connected(sid, Err(e))) => {
-                        dials.remove(&sid);
-                        table.connect_done(&sid, Err(SiteError::code_of(&e)), t);
-                    }
-                    Some(SiteEv::Data(sid, d)) => {
-                        if let Some(io) = sites.get_mut(&sid) {
-                            io.outstanding = false;
-                            if d.is_empty() {
-                                io.eof = true;
-                                table.site_fin(&sid);
-                            } else {
-                                let n = table.site_data(&sid, &d);
-                                debug_assert_eq!(n, d.len());
-                            }
-                        }
-                    }
-                    Some(SiteEv::Error(sid)) => table.site_reset(&sid),
-                    None => {}
                 }
             }
             Some(sid) = flushed_rx.recv() => {
-                if let Some(io) = sites.get_mut(&sid) {
-                    io.flush = Flush::Done;
+                let mut mark_flushed = |sid: SessionId| {
+                    if let Some(io) = sites.get_mut(&sid) {
+                        io.flush = Flush::Done;
+                    }
+                    draining_sites.remove(&sid);
+                    table.site_flushed(&sid, now());
+                };
+                mark_flushed(sid);
+                for _ in 1..RELAY_BATCH {
+                    let Ok(sid) = flushed_rx.try_recv() else { break };
+                    mark_flushed(sid);
                 }
-                table.site_flushed(&sid, now());
             }
             c = async { ctrl.as_mut().unwrap().recv().await }, if ctrl.is_some() => match c {
                 Some(RelayCtrl::ResetDevice { device, close_code }) => table.reset_device(device, close_code),
                 None => ctrl = None,
             },
-            _ = writable.notified() => {}
-            _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
+            _ = writable.notified() => {
+                if !carriers.is_empty() {
+                    timeout_due = true;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
+                timeout_due = true;
+            }
             _ = tokio::time::sleep_until(drain.unwrap_or_else(tokio::time::Instant::now)), if drain.is_some() => {}
             _ = tokio::time::sleep_until(flush.unwrap_or_else(tokio::time::Instant::now)), if flush.is_some() => {}
         }

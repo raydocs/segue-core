@@ -39,25 +39,41 @@ impl Aead {
         self.0.open(nonce, &[], bytes)
     }
 }
+pub(super) enum BlockCipher {
+    Aes128(aes::Aes128),
+    Aes256(aes::Aes256),
+}
+
+impl BlockCipher {
+    pub(super) fn new(key: &[u8]) -> Self {
+        match key.len() {
+            16 => Self::Aes128(aes::Aes128::new_from_slice(key).unwrap()),
+            32 => Self::Aes256(aes::Aes256::new_from_slice(key).unwrap()),
+            _ => unreachable!("validated AES key"),
+        }
+    }
+
+    pub(super) fn encrypt(&self, block: &mut [u8; 16]) {
+        match self {
+            Self::Aes128(c) => c.encrypt_block(block.into()),
+            Self::Aes256(c) => c.encrypt_block(block.into()),
+        }
+    }
+
+    pub(super) fn decrypt(&self, block: &mut [u8; 16]) {
+        match self {
+            Self::Aes128(c) => c.decrypt_block(block.into()),
+            Self::Aes256(c) => c.decrypt_block(block.into()),
+        }
+    }
+}
+
 pub(super) fn block(key: &[u8], block: &mut [u8; 16], decrypt: bool) {
-    match key.len() {
-        16 => {
-            let c = aes::Aes128::new_from_slice(key).unwrap();
-            if decrypt {
-                c.decrypt_block(block.into())
-            } else {
-                c.encrypt_block(block.into())
-            }
-        }
-        32 => {
-            let c = aes::Aes256::new_from_slice(key).unwrap();
-            if decrypt {
-                c.decrypt_block(block.into())
-            } else {
-                c.encrypt_block(block.into())
-            }
-        }
-        _ => unreachable!("validated AES key"),
+    let cipher = BlockCipher::new(key);
+    if decrypt {
+        cipher.decrypt(block);
+    } else {
+        cipher.encrypt(block);
     }
 }
 pub(super) fn identity_hash(key: &[u8]) -> Zeroizing<[u8; 16]> {

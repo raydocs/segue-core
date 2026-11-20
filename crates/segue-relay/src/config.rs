@@ -43,6 +43,38 @@ struct Raw {
     dev_allow_cidrs: Vec<String>,
     #[serde(default)]
     limits: RawLimits,
+    #[serde(default)]
+    redundancy: RawRedundancy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawRedundancy {
+    mode: String,
+    delay_ms: u64,
+    max_frame_bytes: usize,
+    ai_only: bool,
+}
+
+impl Default for RawRedundancy {
+    fn default() -> Self {
+        let d = segue_session::RedundancyConfig::default();
+        let (mode, delay_ms) = match d.mode {
+            segue_session::RedundancyMode::Off => ("off".into(), 0),
+            segue_session::RedundancyMode::Dup { delay } => {
+                ("dup".into(), delay.as_millis() as u64)
+            }
+            segue_session::RedundancyMode::Hedge { delay } => {
+                ("hedge".into(), delay.as_millis() as u64)
+            }
+        };
+        Self {
+            mode,
+            delay_ms,
+            max_frame_bytes: d.max_frame_bytes,
+            ai_only: d.ai_only,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -378,6 +410,30 @@ impl Config {
         {
             return Err("limits: timeouts must be > 0".into());
         }
+        let mode = match raw.redundancy.mode.as_str() {
+            "off" => segue_session::RedundancyMode::Off,
+            "dup" => segue_session::RedundancyMode::Dup {
+                delay: Duration::from_millis(raw.redundancy.delay_ms),
+            },
+            "hedge" => segue_session::RedundancyMode::Hedge {
+                delay: Duration::from_millis(raw.redundancy.delay_ms),
+            },
+            other => {
+                return Err(format!(
+                    "redundancy.mode: expected \"off\", \"dup\", or \"hedge\", got {other:?}"
+                ))
+            }
+        };
+        if !matches!(mode, segue_session::RedundancyMode::Off)
+            && raw.redundancy.max_frame_bytes == 0
+        {
+            return Err("redundancy.max_frame_bytes must be > 0".into());
+        }
+        let redundancy = segue_session::RedundancyConfig {
+            mode,
+            max_frame_bytes: raw.redundancy.max_frame_bytes,
+            ai_only: raw.redundancy.ai_only,
+        };
         Ok(Self {
             listen: raw.listen,
             node_id: raw.node_id,
@@ -405,7 +461,56 @@ impl Config {
             blocked_cidrs,
             dev_allow_cidrs,
             limits,
-            redundancy: segue_session::RedundancyConfig::default(),
+            redundancy,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use segue_session::{RedundancyConfig, RedundancyMode};
+
+    fn parse_with_extra(extra: &str) -> Result<Config, String> {
+        let pk = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let json = format!(
+            r#"{{
+                "listen": "127.0.0.1:8443",
+                "node_id": 1,
+                "ticket_keys": [{{"key_id": 1, "public_key": "{pk}"}}],
+                "policy": {{
+                    "public_keys": [{{"key_id": 1, "public_key": "{pk}"}}],
+                    "bundle": "bundle.bin"
+                }}{extra}
+            }}"#
+        );
+        Config::parse_in(&json, Path::new("."))
+    }
+
+    #[test]
+    fn redundancy_block_defaults_and_parses() {
+        let cfg = parse_with_extra("").unwrap();
+        assert_eq!(cfg.redundancy, RedundancyConfig::default());
+
+        let cfg = parse_with_extra(r#", "redundancy": {"mode": "off"}"#).unwrap();
+        assert_eq!(cfg.redundancy.mode, RedundancyMode::Off);
+
+        let cfg = parse_with_extra(
+            r#", "redundancy": {"mode": "hedge", "delay_ms": 45, "max_frame_bytes": 512, "ai_only": false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.redundancy,
+            RedundancyConfig {
+                mode: RedundancyMode::Hedge {
+                    delay: Duration::from_millis(45),
+                },
+                max_frame_bytes: 512,
+                ai_only: false,
+            }
+        );
+
+        assert!(parse_with_extra(r#", "redundancy": {"mode": "bogus"}"#).is_err());
+        assert!(parse_with_extra(r#", "redundancy": {"max_frame_bytes": 0}"#).is_err());
     }
 }

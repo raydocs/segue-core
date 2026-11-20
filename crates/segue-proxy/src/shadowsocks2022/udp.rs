@@ -1,10 +1,21 @@
 use super::{
-    crypto::{self, Aead},
+    crypto::{self, Aead, BlockCipher},
     *,
 };
 use crate::aead::XChaChaKey;
 use rand::RngCore;
 use std::sync::Arc;
+
+enum UdpCipher {
+    XChaCha(XChaChaKey),
+    Aes(Box<AesUdpCipher>),
+}
+
+struct AesUdpCipher {
+    separate_enc: BlockCipher,
+    separate_dec: BlockCipher,
+    identity_steps: Vec<(BlockCipher, Zeroizing<[u8; 16]>)>,
+}
 
 /// A native UDP association. Authentication, response binding and address
 /// validation precede replay-state changes. Memory stays constant per session.
@@ -13,6 +24,7 @@ pub struct UdpSession {
     id: u64,
     next: Option<u64>,
     local: Aead,
+    cipher: UdpCipher,
     current: Option<Remote>,
     previous: Option<Remote>,
     previous_seen: u64,
@@ -63,11 +75,28 @@ impl UdpSession {
     }
     fn with_id(method: Arc<Method>, id: u64) -> Self {
         let local = Aead::session(&method, &id.to_be_bytes());
+        let cipher = if method.cipher == Cipher::ChaCha20Poly1305 {
+            UdpCipher::XChaCha(XChaChaKey::new(method.psk()))
+        } else {
+            let separate_enc = BlockCipher::new(&method.keys[0]);
+            let separate_dec = BlockCipher::new(method.psk());
+            let identity_steps = method
+                .keys
+                .windows(2)
+                .map(|keys| (BlockCipher::new(&keys[0]), crypto::identity_hash(&keys[1])))
+                .collect();
+            UdpCipher::Aes(Box::new(AesUdpCipher {
+                separate_enc,
+                separate_dec,
+                identity_steps,
+            }))
+        };
         Self {
             method,
             id,
             next: Some(0),
             local,
+            cipher,
             current: None,
             previous: None,
             previous_seen: 0,
@@ -75,9 +104,11 @@ impl UdpSession {
     }
     pub fn encode(&mut self, target: &Target, payload: &[u8]) -> io::Result<Vec<u8>> {
         let mut nonce = [0; 24];
-        rand::rngs::OsRng
-            .try_fill_bytes(&mut nonce)
-            .map_err(|_| invalid("Shadowsocks 2022 random source failed"))?;
+        if matches!(self.cipher, UdpCipher::XChaCha(_)) {
+            rand::rngs::OsRng
+                .try_fill_bytes(&mut nonce)
+                .map_err(|_| invalid("Shadowsocks 2022 random source failed"))?;
+        }
         self.encode_at(target, payload, now()?, nonce)
     }
     /// Bytes `encode` adds to a payload for `target`: the separate header
@@ -122,31 +153,34 @@ impl UdpSession {
         body.extend_from_slice(&[0, 0]);
         body.extend_from_slice(&address);
         body.extend_from_slice(payload);
-        if self.method.cipher == Cipher::ChaCha20Poly1305 {
-            let mut plain = Zeroizing::new(separate.to_vec());
-            plain.extend_from_slice(&body);
-            XChaChaKey::new(self.method.psk())
-                .seal(&nonce, &[], &mut plain)
-                .map_err(|_| invalid("Shadowsocks 2022 encryption failed"))?;
-            let mut wire = nonce.to_vec();
-            wire.extend_from_slice(&plain);
-            Ok(wire)
-        } else {
-            self.local
-                .seal(separate[4..].try_into().unwrap(), &mut body)?;
-            let mut wire = separate.to_vec();
-            for keys in self.method.keys.windows(2) {
-                let mut identity = crypto::identity_hash(&keys[1]);
-                for (byte, hdr) in identity.iter_mut().zip(separate) {
-                    *byte ^= hdr;
-                }
-                crypto::block(&keys[0], &mut identity, false);
-                wire.extend_from_slice(&*identity);
+        match &self.cipher {
+            UdpCipher::XChaCha(xchacha) => {
+                let mut plain = Zeroizing::new(separate.to_vec());
+                plain.extend_from_slice(&body);
+                xchacha
+                    .seal(&nonce, &[], &mut plain)
+                    .map_err(|_| invalid("Shadowsocks 2022 encryption failed"))?;
+                let mut wire = nonce.to_vec();
+                wire.extend_from_slice(&plain);
+                Ok(wire)
             }
-            crypto::block(&self.method.keys[0], &mut separate, false);
-            wire[..16].copy_from_slice(&separate);
-            wire.extend_from_slice(&body);
-            Ok(wire)
+            UdpCipher::Aes(aes) => {
+                self.local
+                    .seal(separate[4..].try_into().unwrap(), &mut body)?;
+                let mut wire = separate.to_vec();
+                for (cipher, id_hash) in &aes.identity_steps {
+                    let mut identity = **id_hash;
+                    for (byte, hdr) in identity.iter_mut().zip(separate) {
+                        *byte ^= hdr;
+                    }
+                    cipher.encrypt(&mut identity);
+                    wire.extend_from_slice(&identity);
+                }
+                aes.separate_enc.encrypt(&mut separate);
+                wire[..16].copy_from_slice(&separate);
+                wire.extend_from_slice(&body);
+                Ok(wire)
+            }
         }
     }
     pub fn decode(&mut self, wire: &[u8]) -> io::Result<(Target, Vec<u8>)> {
@@ -158,20 +192,23 @@ impl UdpSession {
         }
         let mut body;
         let mut separate = [0; 16];
-        if self.method.cipher == Cipher::ChaCha20Poly1305 {
-            body = Zeroizing::new(wire[24..].to_vec());
-            XChaChaKey::new(self.method.psk())
-                .open(wire[..24].try_into().unwrap(), &[], &mut body)
-                .map_err(|_| invalid("Shadowsocks 2022 authentication failed"))?;
-            if body.len() < 16 {
-                return Err(invalid("truncated Shadowsocks 2022 packet"));
+        match &self.cipher {
+            UdpCipher::XChaCha(xchacha) => {
+                body = Zeroizing::new(wire[24..].to_vec());
+                xchacha
+                    .open(wire[..24].try_into().unwrap(), &[], &mut body)
+                    .map_err(|_| invalid("Shadowsocks 2022 authentication failed"))?;
+                if body.len() < 16 {
+                    return Err(invalid("truncated Shadowsocks 2022 packet"));
+                }
+                separate.copy_from_slice(&body[..16]);
+                body.drain(..16);
             }
-            separate.copy_from_slice(&body[..16]);
-            body.drain(..16);
-        } else {
-            separate.copy_from_slice(&wire[..16]);
-            crypto::block(self.method.psk(), &mut separate, true);
-            body = Zeroizing::new(wire[16..].to_vec());
+            UdpCipher::Aes(aes) => {
+                separate.copy_from_slice(&wire[..16]);
+                aes.separate_dec.decrypt(&mut separate);
+                body = Zeroizing::new(wire[16..].to_vec());
+            }
         }
         let id = u64::from_be_bytes(separate[..8].try_into().unwrap());
         let packet_id = u64::from_be_bytes(separate[8..].try_into().unwrap());

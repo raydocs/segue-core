@@ -288,7 +288,10 @@ async fn kill_switch_allows(kernel: &Kernel, action: &Action) -> bool {
             let Some(guard) = kernel.try_hold() else {
                 return false;
             };
-            let verdict = killswitch::wait_out(|| kernel.verdict_of(action)).await;
+            let notify = kernel.flows.as_ref().and_then(|f| f.posture_notify());
+            let verdict =
+                killswitch::wait_out_notified(notify.as_deref(), || kernel.verdict_of(action))
+                    .await;
             drop(guard);
             matches!(
                 verdict,

@@ -34,12 +34,11 @@ use segue_transport::{BoxedTransportStream, RawRead};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Interest, ReadBuf};
 use tokio::net::tcp::WriteHalf;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 
 use super::relay_buffer::{RelayBuffer, PROCESS_POOL};
 use super::{
-    copy_direction_with_counter, relay_until_done_or_idle, CopyActivity, RelayTimeouts,
-    MAX_COPY_BUFFER_SIZE, MIN_COPY_BUFFER_SIZE,
+    copy_direction_with_counter, relay_until_done_or_idle, AtomicActivity, CopyActivity,
+    RelayTimeouts, MAX_COPY_BUFFER_SIZE, MIN_COPY_BUFFER_SIZE,
 };
 use crate::connection::ConnectionTraffic;
 
@@ -93,8 +92,8 @@ pub(crate) async fn copy_bidirectional_with_splice(
 ) -> io::Result<(u64, u64)> {
     let (mut inbound_read, mut inbound_write) = inbound.split();
     let outbound = SharedStream(Mutex::new(outbound));
-    let (activity_tx, activity_rx) = mpsc::channel(1);
-    let upload_activity = activity_tx.clone();
+    let activity = AtomicActivity::new();
+    let upload_activity = activity.clone();
     let upload = async {
         copy_direction_with_counter(
             &mut inbound_read,
@@ -108,11 +107,11 @@ pub(crate) async fn copy_bidirectional_with_splice(
     let download = copy_download(
         &outbound,
         &mut inbound_write,
-        activity_tx,
+        activity.clone(),
         buffer_size,
         &traffic.downlink_bytes,
     );
-    relay_until_done_or_idle(upload, download, activity_rx, timeouts).await
+    relay_until_done_or_idle(upload, download, activity, timeouts).await
 }
 
 /// The outbound stream, which both directions of the one relay task use.
@@ -239,7 +238,7 @@ async fn copy_download(
     // decoded before its socket took over leaves through these reads, ahead
     // of anything spliced. The inbound is a socket, so a write needs no flush.
     let buffer_cap = buffer_size.clamp(MIN_COPY_BUFFER_SIZE, MAX_COPY_BUFFER_SIZE);
-    let mut buffer = RelayBuffer::new(buffer_cap, &PROCESS_POOL);
+    let mut buffer: Option<RelayBuffer> = None;
     loop {
         match outbound.source() {
             Source::Socket => break,
@@ -249,12 +248,13 @@ async fn copy_download(
             }
             Source::Undecided => {}
         }
-        let len = poll_fn(|cx| buffer.poll_read(cx, Pin::new(&mut reader))).await?;
+        let buf = buffer.get_or_insert_with(|| RelayBuffer::new(buffer_cap, &PROCESS_POOL));
+        let len = poll_fn(|cx| buf.poll_read(cx, Pin::new(&mut reader))).await?;
         if len == 0 {
             inbound.shutdown().await?;
             return Ok(delivered.total);
         }
-        inbound.write_all(buffer.filled(len)).await?;
+        inbound.write_all(buf.filled(len)).await?;
         delivered.add(len);
     }
     // The socket takes over: what the process lent goes back to it.

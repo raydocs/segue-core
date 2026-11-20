@@ -251,17 +251,46 @@ impl Drop for HoldGuard {
 
 /// Re-read `current` until it is no longer [`Verdict::Wait`], or
 /// [`WAIT_DEADLINE`] has passed (then [`Verdict::Refuse`]).
-pub async fn wait_out(mut current: impl FnMut() -> Verdict) -> Verdict {
+pub async fn wait_out(current: impl FnMut() -> Verdict) -> Verdict {
+    wait_out_notified(None, current).await
+}
+
+/// Like [`wait_out`], waking immediately when `notify` signals a posture change
+/// instead of waiting for the fallback polling interval.
+pub async fn wait_out_notified(
+    notify: Option<&tokio::sync::Notify>,
+    mut current: impl FnMut() -> Verdict,
+) -> Verdict {
     let deadline = tokio::time::Instant::now() + WAIT_DEADLINE;
     loop {
-        let verdict = current();
-        if !matches!(verdict, Verdict::Wait) {
-            return verdict;
+        if let Some(n) = notify {
+            let notified = n.notified();
+            tokio::pin!(notified);
+            // Register before sampling `current()` so a concurrent posture update
+            // cannot fire between the check and awaiting `notified`.
+            notified.as_mut().enable();
+            let verdict = current();
+            if !matches!(verdict, Verdict::Wait) {
+                return verdict;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Verdict::Refuse;
+            }
+            tokio::select! {
+                () = &mut notified => {}
+                () = tokio::time::sleep_until(deadline) => return Verdict::Refuse,
+            }
+        } else {
+            let verdict = current();
+            if !matches!(verdict, Verdict::Wait) {
+                return verdict;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Verdict::Refuse;
+            }
+            tokio::time::sleep(WAIT_POLL.min(deadline - now)).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Verdict::Refuse;
-        }
-        tokio::time::sleep(WAIT_POLL).await;
     }
 }
 
@@ -272,6 +301,9 @@ pub trait FlowPosture: Send + Sync {
     /// `None`: `tag` is not a session route (an engine outbound).
     fn protection(&self, tag: &str) -> Option<Protection>;
     fn try_hold(&self) -> Option<HoldGuard>;
+    fn posture_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -683,5 +715,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn wait_out_notified_wakes_before_poll_interval() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let ready = Arc::new(AtomicBool::new(false));
+
+        let n2 = notify.clone();
+        let r2 = ready.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            r2.store(true, Ordering::Release);
+            n2.notify_waiters();
+        });
+
+        let started = tokio::time::Instant::now();
+        let verdict = tokio::time::timeout(
+            Duration::from_millis(25),
+            wait_out_notified(Some(&notify), || {
+                if ready.load(Ordering::Acquire) {
+                    Verdict::Proxy("overseas".into())
+                } else {
+                    Verdict::Wait
+                }
+            }),
+        )
+        .await
+        .expect("wait_out_notified should wake immediately without waiting WAIT_POLL");
+        assert_eq!(verdict, Verdict::Proxy("overseas".into()));
+        assert!(started.elapsed() < Duration::from_millis(25));
     }
 }

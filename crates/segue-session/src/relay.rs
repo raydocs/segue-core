@@ -16,7 +16,8 @@
 //! each is closed after `t_ctrl_idle` without a frame or `max_lifetime`
 //! after its CTRL_HELLO.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -251,14 +252,32 @@ pub fn ctrl_quiet(t: &crate::Timing) -> std::time::Duration {
 /// STALL entries per frame (20 bytes each, under MAX_PAYLOAD).
 const STALL_BATCH: usize = 512;
 
+enum TxSink<'a> {
+    Owned(Option<Frame>),
+    Encoded { out: &'a mut Vec<u8> },
+}
+
+impl TxSink<'_> {
+    fn emit(&mut self, f: Frame) {
+        match self {
+            Self::Owned(slot) => *slot = Some(f),
+            Self::Encoded { out } => f.encode(out),
+        }
+    }
+}
+
 pub struct RelayTable {
     cfg: Config,
     pool: Arc<Pool>,
     auth: Box<dyn Authorizer>,
     instance_id: u64,
     sessions: HashMap<SessionId, Session>,
+    sessions_by_device: HashMap<u64, HashSet<SessionId>>,
     tombs: HashMap<SessionId, Tomb>,
+    tombs_exp: BinaryHeap<Reverse<(Instant, SessionId)>>,
     carriers: HashMap<CarrierId, CarrierSlot>,
+    ctrl_by_device: HashMap<u64, Vec<CarrierId>>,
+    ctrl_carriers: HashSet<CarrierId>,
     events: VecDeque<RelayEvent>,
     to_close: Vec<CarrierId>,
     /// Latest `now` seen; used for tombstone expiry.
@@ -277,13 +296,27 @@ impl RelayTable {
             auth,
             instance_id,
             sessions: HashMap::new(),
+            sessions_by_device: HashMap::new(),
             tombs: HashMap::new(),
+            tombs_exp: BinaryHeap::new(),
             carriers: HashMap::new(),
+            ctrl_by_device: HashMap::new(),
+            ctrl_carriers: HashSet::new(),
             events: VecDeque::new(),
             to_close: Vec::new(),
             clock: Instant::now(),
             hold_fin: false,
             moves: MoveStats::default(),
+        }
+    }
+
+    fn remove_ctrl_index(&mut self, device: u64, cid: CarrierId) {
+        self.ctrl_carriers.remove(&cid);
+        if let Some(cids) = self.ctrl_by_device.get_mut(&device) {
+            cids.retain(|&c| c != cid);
+            if cids.is_empty() {
+                self.ctrl_by_device.remove(&device);
+            }
         }
     }
 
@@ -376,6 +409,9 @@ impl RelayTable {
         let Some(slot) = self.carriers.remove(&cid) else {
             return;
         };
+        if let Some(device) = slot.control {
+            self.remove_ctrl_index(device, cid);
+        }
         let Some(sid) = slot.session else {
             return;
         };
@@ -426,9 +462,14 @@ impl RelayTable {
     }
 
     fn close_carrier_now(&mut self, cid: CarrierId) {
+        let mut ctrl_device = None;
         if let Some(slot) = self.carriers.get_mut(&cid) {
             slot.session = None;
             slot.close_after = true;
+            ctrl_device = slot.control;
+        }
+        if let Some(device) = ctrl_device {
+            self.remove_ctrl_index(device, cid);
         }
         self.to_close.push(cid);
     }
@@ -657,12 +698,17 @@ impl RelayTable {
         // At the cap, replace the device's quietest streams, but only ones
         // that stopped sending; never kick a live one (review r6 R8).
         let mut mine: Vec<(Instant, Instant, CarrierId)> = self
-            .carriers
-            .iter()
-            .filter(|(c, x)| **c != cid && x.control == Some(device) && !x.close_after)
-            .map(|(c, x)| {
-                let since = x.ctrl_since.unwrap_or(now);
-                (x.ctrl_seen.unwrap_or(since), since, *c)
+            .ctrl_by_device
+            .get(&device)
+            .into_iter()
+            .flat_map(|cids| cids.iter().copied())
+            .filter(|&c| c != cid)
+            .filter_map(|c| {
+                let x = self.carriers.get(&c)?;
+                (!x.close_after).then(|| {
+                    let since = x.ctrl_since.unwrap_or(now);
+                    (x.ctrl_seen.unwrap_or(since), since, c)
+                })
             })
             .collect();
         if mine.len() >= MAX_CTRL_PER_DEVICE {
@@ -694,19 +740,29 @@ impl RelayTable {
             }
             .to_frame(),
         );
+        let entry = self.ctrl_by_device.entry(device).or_default();
+        if !entry.contains(&cid) {
+            entry.push(cid);
+        }
+        self.ctrl_carriers.insert(cid);
     }
 
     /// Queue `STALL` entries on every control stream of `device`.
     fn send_stall(&mut self, device: u64, entries: &[(SessionId, u32)]) {
         let mut queued = 0u64;
-        for slot in self.carriers.values_mut() {
-            if slot.control != Some(device) || slot.close_after {
-                continue;
-            }
-            for batch in entries.chunks(STALL_BATCH) {
-                if slot.ctrl_out.len() < CTRL_QUEUE {
-                    slot.ctrl_out.push_back(Frame::Stall(batch.to_vec()));
-                    queued = queued.saturating_add(batch.len() as u64);
+        if let Some(cids) = self.ctrl_by_device.get(&device) {
+            for &cid in cids {
+                let Some(slot) = self.carriers.get_mut(&cid) else {
+                    continue;
+                };
+                if slot.control != Some(device) || slot.close_after {
+                    continue;
+                }
+                for batch in entries.chunks(STALL_BATCH) {
+                    if slot.ctrl_out.len() < CTRL_QUEUE {
+                        slot.ctrl_out.push_back(Frame::Stall(batch.to_vec()));
+                        queued = queued.saturating_add(batch.len() as u64);
+                    }
                 }
             }
         }
@@ -810,7 +866,12 @@ impl RelayTable {
                     carrier_rx: now,
                     promoted_in_gen: false,
                 };
+                let device = s.device;
                 self.sessions.insert(sid, s);
+                self.sessions_by_device
+                    .entry(device)
+                    .or_default()
+                    .insert(sid);
                 self.carriers.get_mut(&cid).unwrap().session = Some(sid);
                 self.events.push_back(RelayEvent::Connect {
                     session_id: sid,
@@ -1162,18 +1223,20 @@ impl RelayTable {
         let Some(s) = self.sessions.remove(sid) else {
             return;
         };
+        if let Some(sids) = self.sessions_by_device.get_mut(&s.device) {
+            sids.remove(sid);
+            if sids.is_empty() {
+                self.sessions_by_device.remove(&s.device);
+            }
+        }
         let info = ClosedInfo {
             close_code,
             final_recv_offset: s.recv.recv_offset(),
             final_sent_offset: s.send.sent_hw(),
         };
-        self.tombs.insert(
-            *sid,
-            Tomb {
-                info,
-                until: self.clock + self.cfg.timing.t_tomb,
-            },
-        );
+        let until = self.clock + self.cfg.timing.t_tomb;
+        self.tombs.insert(*sid, Tomb { info, until });
+        self.tombs_exp.push(Reverse((until, *sid)));
         if let Some(cid) = s.carrier {
             if let Some(slot) = self.carriers.get_mut(&cid) {
                 slot.session = None;
@@ -1218,33 +1281,72 @@ impl RelayTable {
 
     /// Next frame for carrier `cid`.
     pub fn poll_transmit(&mut self, cid: CarrierId, now: Instant) -> Option<Frame> {
+        let mut sink = TxSink::Owned(None);
+        self.poll_transmit_inner(cid, now, &mut sink);
+        match sink {
+            TxSink::Owned(f) => f,
+            TxSink::Encoded { .. } => unreachable!(),
+        }
+    }
+
+    /// Encode the next frame for carrier `cid` directly into `out`, returning
+    /// the number of wire bytes written (`None` when nothing is queued).
+    pub fn poll_transmit_into(
+        &mut self,
+        cid: CarrierId,
+        now: Instant,
+        out: &mut Vec<u8>,
+    ) -> Option<usize> {
+        let before = out.len();
+        let wrote = {
+            let mut sink = TxSink::Encoded { out };
+            self.poll_transmit_inner(cid, now, &mut sink)
+        };
+        wrote.then(|| out.len() - before)
+    }
+
+    fn poll_transmit_inner(&mut self, cid: CarrierId, now: Instant, sink: &mut TxSink<'_>) -> bool {
         self.clock = self.clock.max(now);
         let redundancy = self.cfg.redundancy;
-        let slot = self.carriers.get_mut(&cid)?;
+        let Some(slot) = self.carriers.get_mut(&cid) else {
+            return false;
+        };
         if let Some(f) = slot.out.take() {
-            return Some(f);
+            sink.emit(f);
+            return true;
         }
         if slot.control.is_some() {
-            return slot.ctrl_out.pop_front();
+            let Some(f) = slot.ctrl_out.pop_front() else {
+                return false;
+            };
+            sink.emit(f);
+            return true;
         }
-        let sid = slot.session?;
-        let s = self.sessions.get_mut(&sid)?;
+        let Some(sid) = slot.session else {
+            return false;
+        };
+        let Some(s) = self.sessions.get_mut(&sid) else {
+            return false;
+        };
         if s.redundant.as_ref().is_some_and(|r| r.cid == cid) {
             if !s.connected || s.state == SessionState::Detached {
-                return None;
+                return false;
             }
             let acked = s.send.acked();
             let recv_offset = s.recv.recv_offset();
             let max_offset = s.recv.max_offset();
-            let r = s.redundant.as_mut()?;
+            let Some(r) = s.redundant.as_mut() else {
+                return false;
+            };
             if r.ack_due {
                 r.ack_due = false;
                 r.last_acked = (recv_offset, max_offset);
                 r.last_activity = now;
-                return Some(Frame::Ack {
+                sink.emit(Frame::Ack {
                     recv_offset,
                     max_offset,
                 });
+                return true;
             }
             r.dup.prune_acked(acked);
             if let Some(offset) = r.fin_due {
@@ -1253,28 +1355,40 @@ impl RelayTable {
                 } else if acked == offset {
                     r.fin_due = None;
                     r.last_activity = now;
-                    return Some(Frame::Fin { offset });
+                    sink.emit(Frame::Fin { offset });
+                    return true;
                 }
             }
             while let Some((offset, len)) = r.dup.pop_due(now) {
-                if let Some(f) = s.send.dup_frame(offset, len) {
+                let sent = match sink {
+                    TxSink::Owned(out_frame) => {
+                        if let Some(f) = s.send.dup_frame(offset, len) {
+                            *out_frame = Some(f);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    TxSink::Encoded { out } => s.send.dup_frame_into(out, usize::MAX, offset, len),
+                };
+                if sent {
                     r.last_activity = now;
-                    return Some(f);
+                    return true;
                 }
             }
-            return None;
+            return false;
         }
         if s.carrier != Some(cid) {
-            return None;
+            return false;
         }
         if let Some(kind) = s.reply {
             if !s.connected {
-                return None;
+                return false;
             }
             s.reply = None;
             s.recv.mark_acked();
             let (recv_offset, max_offset) = s.recv.last_ack();
-            return Some(match kind {
+            sink.emit(match kind {
                 ReplyKind::Opened => Frame::Opened(Opened {
                     instance_id: self.instance_id,
                     attach_gen: s.cur_gen,
@@ -1290,9 +1404,10 @@ impl RelayTable {
                     max_offset,
                 }),
             });
+            return true;
         }
         if !s.connected {
-            return None;
+            return false;
         }
         let piggyback = s.send.has_sendable();
         if let Some(a) = s.recv.poll_ack(now, piggyback) {
@@ -1303,16 +1418,24 @@ impl RelayTable {
                     r.ack_due = true;
                 }
             }
+            sink.emit(a);
             self.check_done(&sid, now);
-            return Some(a);
+            return true;
         }
         if s.state == SessionState::Detached {
-            return None;
+            return false;
         }
         if s.send.has_sendable() && !s.send.unacked() {
             s.last_progress = now;
         }
-        if let Some((f, meta)) = s.send.poll_frame_meta() {
+        let meta = match sink {
+            TxSink::Owned(out_frame) => s.send.poll_frame_meta().map(|(f, meta)| {
+                *out_frame = Some(f);
+                meta
+            }),
+            TxSink::Encoded { out } => s.send.poll_frame_into_meta(out, usize::MAX),
+        };
+        if let Some(meta) = meta {
             s.last_sent = now;
             let acked = s.send.acked();
             let exit_class = s.exit_class;
@@ -1333,16 +1456,17 @@ impl RelayTable {
                     }
                 }
             }
-            return Some(f);
+            return true;
         }
         // r8 N4: while the client's FIN waits for the site to take the
         // upload, or on an idle AI keepalive, repeat the current ACK.
         if s.ka_due || (s.held_fin.is_some() && now >= s.last_sent + s.keepalive) {
             s.ka_due = false;
             s.last_sent = now;
-            return Some(s.recv.force_ack());
+            sink.emit(s.recv.force_ack());
+            return true;
         }
-        None
+        false
     }
 
     /// Shed queued Stage 2 duplicates and mirrored control frames when the
@@ -1490,28 +1614,29 @@ impl RelayTable {
 
     /// Revocation / admin: RST every session of `device`.
     pub fn reset_device(&mut self, device: u64, close_code: u8) {
-        let ids: Vec<_> = self
-            .sessions
-            .iter()
-            .filter(|(_, s)| s.device == device)
-            .map(|(k, _)| *k)
-            .collect();
-        for sid in ids {
-            if let Some(s) = self.sessions.get_mut(&sid) {
-                s.rst = Some(close_code);
+        if let Some(ids) = self.sessions_by_device.remove(&device) {
+            for sid in ids {
+                if let Some(s) = self.sessions.get_mut(&sid) {
+                    s.rst = Some(close_code);
+                }
+                self.finish(&sid, close_code, true);
             }
-            self.finish(&sid, close_code, true);
         }
         // REVOKED on the device's control streams, then close them (§6).
-        for (&cid, slot) in self.carriers.iter_mut() {
-            if slot.control == Some(device) && !slot.close_after {
-                slot.ctrl_out.clear();
-                slot.ctrl_out.push_back(Frame::Control {
-                    ty: ty::REVOKED,
-                    payload: vec![close_code],
-                });
-                slot.close_after = true;
-                self.to_close.push(cid);
+        if let Some(cids) = self.ctrl_by_device.remove(&device) {
+            for cid in cids {
+                self.ctrl_carriers.remove(&cid);
+                if let Some(slot) = self.carriers.get_mut(&cid) {
+                    if slot.control == Some(device) && !slot.close_after {
+                        slot.ctrl_out.clear();
+                        slot.ctrl_out.push_back(Frame::Control {
+                            ty: ty::REVOKED,
+                            payload: vec![close_code],
+                        });
+                        slot.close_after = true;
+                        self.to_close.push(cid);
+                    }
+                }
             }
         }
     }
@@ -1531,7 +1656,7 @@ impl RelayTable {
     /// message the writer finishes) and calls this again.
     pub fn poll_timeout_writable(&self, writable: impl Fn(CarrierId) -> bool) -> Option<Instant> {
         let t = &self.cfg.timing;
-        let mut d: Option<Instant> = self.tombs.values().map(|x| x.until).min();
+        let mut d: Option<Instant> = self.tombs_exp.peek().map(|&Reverse((until, _))| until);
         let mut put = |x: Instant| d = Some(d.map_or(x, |d| d.min(x)));
         for s in self.sessions.values() {
             put(s.created + t.max_lifetime);
@@ -1596,9 +1721,11 @@ impl RelayTable {
                 put(i);
             }
         }
-        for c in self.carriers.values().filter(|c| !c.close_after) {
-            if let (Some(since), Some(seen)) = (c.ctrl_since, c.ctrl_seen) {
-                put((seen + t.t_ctrl_idle).min(since + t.max_lifetime));
+        for cid in &self.ctrl_carriers {
+            if let Some(c) = self.carriers.get(cid).filter(|c| !c.close_after) {
+                if let (Some(since), Some(seen)) = (c.ctrl_since, c.ctrl_seen) {
+                    put((seen + t.t_ctrl_idle).min(since + t.max_lifetime));
+                }
             }
         }
         d
@@ -1607,18 +1734,30 @@ impl RelayTable {
     pub fn handle_timeout(&mut self, now: Instant) {
         self.clock = self.clock.max(now);
         let t = self.cfg.timing.clone();
-        self.tombs.retain(|_, x| x.until > now);
+        while let Some(&Reverse((until, sid))) = self.tombs_exp.peek() {
+            if until > now {
+                break;
+            }
+            self.tombs_exp.pop();
+            if self.tombs.get(&sid).is_some_and(|x| x.until <= now) {
+                self.tombs.remove(&sid);
+            }
+        }
         let ctrl_done: Vec<CarrierId> = self
-            .carriers
+            .ctrl_carriers
             .iter()
-            .filter(|(_, c)| !c.close_after)
-            .filter(|(_, c)| match (c.ctrl_since, c.ctrl_seen) {
-                (Some(since), Some(seen)) => {
-                    now >= seen + t.t_ctrl_idle || now >= since + t.max_lifetime
-                }
-                _ => false,
+            .copied()
+            .filter(|cid| {
+                self.carriers.get(cid).is_some_and(|c| {
+                    !c.close_after
+                        && match (c.ctrl_since, c.ctrl_seen) {
+                            (Some(since), Some(seen)) => {
+                                now >= seen + t.t_ctrl_idle || now >= since + t.max_lifetime
+                            }
+                            _ => false,
+                        }
+                })
             })
-            .map(|(id, _)| *id)
             .collect();
         for cid in ctrl_done {
             self.close_carrier_now(cid);
@@ -1631,6 +1770,7 @@ impl RelayTable {
         // DETACHED. Collected here: promoting needs `&mut self`.
         let mut promote_on_live: Vec<SessionId> = Vec::new();
         let mut promote_on_rx: Vec<SessionId> = Vec::new();
+        let mut standby: Vec<(SessionId, CarrierId)> = Vec::new();
         for (sid, s) in self.sessions.iter_mut() {
             if now >= s.created + t.max_lifetime {
                 s.rst = Some(code::MAX_LIFETIME);
@@ -1692,6 +1832,13 @@ impl RelayTable {
             if s.recv.idle_deadline().is_some_and(|d| now >= d) {
                 s.recv.update_credit(now);
             }
+            if let Some(r) = s.redundant.as_ref() {
+                if let Some(at) = r.demoted_at {
+                    if now >= at + t.t_detached_standby {
+                        standby.push((*sid, r.cid));
+                    }
+                }
+            }
         }
         for sid in promote_on_live {
             if self.promote_bound_spare(&sid, now, true) {
@@ -1719,24 +1866,19 @@ impl RelayTable {
                     });
                     stalled.push((s.device, sid, s.cur_gen));
                 }
+                if let Some(r) = s.redundant.as_ref() {
+                    if r.demoted_at
+                        .is_some_and(|at| now >= at + t.t_detached_standby)
+                    {
+                        standby.push((sid, r.cid));
+                    }
+                }
             }
         }
         for sid in promote_on_rx {
             let _ = self.promote_bound_spare(&sid, now, true);
         }
         // A demoted carrier with no frame in `t_detached_standby` is dropped.
-        let standby: Vec<(SessionId, CarrierId)> = self
-            .sessions
-            .iter()
-            .filter_map(|(sid, s)| {
-                let r = s.redundant.as_ref()?;
-                let at = r.demoted_at?;
-                if now < at + t.t_detached_standby {
-                    return None;
-                }
-                Some((*sid, r.cid))
-            })
-            .collect();
         for (sid, cid) in standby {
             self.drop_spare(sid, cid);
         }
@@ -1752,5 +1894,163 @@ impl RelayTable {
         for sid in too_old {
             self.finish(&sid, code::MAX_LIFETIME, true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{Kind, Open, RedundantAttach, VERSION};
+    use crate::{RedundancyMode, Timing};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    struct DeviceAuth(u64);
+    impl Authorizer for DeviceAuth {
+        fn open(&self, _ticket: &[u8], _target: &Target, _kind: Kind) -> Result<Grant, u8> {
+            Ok(Grant {
+                device: self.0,
+                exit_classes: 1,
+                ai_anchor_node_id: 0,
+            })
+        }
+        fn resume(&self, _ticket: &[u8]) -> Result<u64, u8> {
+            Ok(self.0)
+        }
+    }
+
+    fn make_open(sid: SessionId, gen: u32) -> Frame {
+        Frame::Open(Open {
+            version: VERSION,
+            ticket: b"t".to_vec(),
+            session_id: sid,
+            resume_secret: [0x22; 32],
+            attach_gen: gen,
+            retry: false,
+            anchor_instance_id: 0,
+            kind: Kind::Tcp,
+            target: Target::Ip(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                443,
+            )),
+            exit_class: 0,
+            t_stall_ms: None,
+            first_data: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn poll_transmit_into_matches_poll_transmit_bytes() {
+        let mut cfg = Config::default();
+        cfg.redundancy.mode = RedundancyMode::Dup {
+            delay: Duration::from_millis(1),
+        };
+        cfg.redundancy.ai_only = false;
+        let t0 = Instant::now();
+
+        let make = || {
+            let mut t =
+                RelayTable::new(cfg.clone(), Pool::new(1 << 20), Box::new(DeviceAuth(7)), 99);
+            let sid = [0x11; 16];
+            t.add_carrier(1);
+            t.on_frame(1, make_open(sid, 1), t0);
+            t.connect_done(&sid, Ok(()), t0);
+            t.add_carrier(2);
+            t.on_frame(
+                2,
+                Frame::RedundantAttach(RedundantAttach {
+                    session_id: sid,
+                    resume_secret: [0x22; 32],
+                    attach_gen: 1,
+                    recv_offset: 0,
+                    max_offset: 16_384,
+                }),
+                t0,
+            );
+            t.site_data(&sid, b"hello downlink payload");
+            t.add_carrier(3);
+            t.on_frame(
+                3,
+                CtrlHello {
+                    version: VERSION,
+                    ticket: b"t".to_vec(),
+                    held_anchors: Vec::new(),
+                }
+                .to_frame(),
+                t0,
+            );
+            t
+        };
+
+        let mut a = make();
+        let mut b = make();
+        let t1 = t0 + Duration::from_millis(5);
+        for cid in [3, 1, 1, 2, 2] {
+            let expected = a.poll_transmit(cid, t1).map(|f| f.to_bytes());
+            let mut got = Vec::new();
+            let wrote = b.poll_transmit_into(cid, t1, &mut got);
+            assert_eq!(wrote.is_some(), expected.is_some(), "cid {cid}");
+            if let Some(exp) = expected {
+                assert_eq!(got, exp, "cid {cid}");
+                assert_eq!(wrote, Some(exp.len()));
+            }
+        }
+    }
+
+    #[test]
+    fn device_ctrl_and_tomb_indices_stay_consistent() {
+        let mut cfg = Config {
+            timing: Timing {
+                t_tomb: Duration::from_secs(5),
+                t_ctrl_idle: Duration::from_secs(2),
+                ..Timing::default()
+            },
+            ..Config::default()
+        };
+        cfg.timing.max_lifetime = Duration::from_secs(60);
+        let mut table = RelayTable::new(cfg, Pool::new(1 << 20), Box::new(DeviceAuth(42)), 1);
+        let t0 = Instant::now();
+
+        let sid1 = [1u8; 16];
+        let sid2 = [2u8; 16];
+        table.add_carrier(10);
+        table.on_frame(10, make_open(sid1, 1), t0);
+        table.add_carrier(11);
+        table.on_frame(11, make_open(sid2, 1), t0);
+        table.add_carrier(20);
+        table.on_frame(
+            20,
+            CtrlHello {
+                version: VERSION,
+                ticket: b"t".to_vec(),
+                held_anchors: Vec::new(),
+            }
+            .to_frame(),
+            t0,
+        );
+        assert_eq!(table.sessions_by_device.get(&42).map(HashSet::len), Some(2));
+        assert_eq!(table.ctrl_by_device.get(&42).map(Vec::len), Some(1));
+        assert!(table.ctrl_carriers.contains(&20));
+
+        table.send_stall(42, &[(sid1, 1)]);
+        assert_eq!(table.move_stats().stall_hints, 1);
+
+        // Revoking device closes sessions and control streams and records tombs.
+        table.reset_device(42, code::REVOKED);
+        assert!(table.sessions.is_empty());
+        assert!(table.sessions_by_device.is_empty());
+        assert!(table.ctrl_by_device.is_empty());
+        assert!(table.ctrl_carriers.is_empty());
+        assert_eq!(table.tombs.len(), 2);
+        assert_eq!(table.tombs_exp.len(), 2);
+
+        // Poll timeout sees earliest tombstone deadline; handle_timeout evicts expired tombs.
+        let due = table.poll_timeout().unwrap();
+        assert_eq!(due, t0 + Duration::from_secs(5));
+        table.handle_timeout(t0 + Duration::from_secs(4));
+        assert_eq!(table.tombs.len(), 2);
+        table.handle_timeout(t0 + Duration::from_secs(5));
+        assert!(table.tombs.is_empty());
+        assert!(table.tombs_exp.is_empty());
     }
 }

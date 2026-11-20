@@ -354,12 +354,21 @@ impl SmartDns {
     }
 
     fn store(&self, key: (String, u16), value: Raw, ttl: u32) {
+        if self.s.cache_size == 0 {
+            return;
+        }
         let mut cache = self.cache.lock().expect("dns cache");
         if cache.len() >= self.s.cache_size && !cache.contains_key(&key) {
             let now = Instant::now();
             cache.retain(|_, e| e.expires > now);
-            if cache.len() >= self.s.cache_size {
-                cache.clear();
+            if cache.len() >= self.s.cache_size && !cache.is_empty() {
+                let evict_n = (cache.len() / 4).max(1);
+                let mut by_exp: Vec<_> =
+                    cache.iter().map(|(k, e)| (e.expires, k.clone())).collect();
+                by_exp.select_nth_unstable_by_key(evict_n - 1, |(exp, _)| *exp);
+                for (_, old_key) in by_exp.into_iter().take(evict_n) {
+                    cache.remove(&old_key);
+                }
             }
         }
         cache.insert(
@@ -500,11 +509,12 @@ async fn exchange(server: SocketAddr, packet: &[u8], bind_if: u32) -> std::io::R
     sock.connect(server).await?;
     sock.send(packet).await?;
     question_bytes(packet).ok_or(std::io::ErrorKind::InvalidInput)?;
-    let mut buf = vec![0u8; 65535];
+    let mut buf = Vec::with_capacity(65535);
     loop {
-        let n = sock.recv(&mut buf).await?;
-        if answers_query(packet, &buf[..n]) {
-            return Ok(buf[..n].to_vec());
+        buf.clear();
+        sock.recv_buf(&mut buf).await?;
+        if answers_query(packet, &buf) {
+            return Ok(buf);
         }
     }
 }
