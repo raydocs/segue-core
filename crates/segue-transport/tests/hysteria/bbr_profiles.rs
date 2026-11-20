@@ -107,10 +107,10 @@ async fn pinned_reference_runs_each_bbr_profile_after_authentication() {
     for (congestion, expected) in [
         (H3Congestion::BbrConservative, "xray-bbr-conservative"),
         (H3Congestion::BbrAggressive, "xray-bbr-aggressive"),
-        (H3Congestion::BbrStandard, "quinn-bbr"),
+        (H3Congestion::BbrStandard, "xray-bbr-standard"),
         (brutal(H3BbrProfile::Conservative), "xray-bbr-conservative"),
         (brutal(H3BbrProfile::Aggressive), "xray-bbr-aggressive"),
-        (brutal(H3BbrProfile::Standard), "quinn-bbr"),
+        (brutal(H3BbrProfile::Standard), "xray-bbr-standard"),
     ] {
         check(&server, &target, congestion, expected).await;
     }

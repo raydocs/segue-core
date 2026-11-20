@@ -26,10 +26,10 @@ use std::time::Duration;
 /// Weight of a new RTT sample in the smoothed RTT (the TCP SRTT alpha).
 const RTT_ALPHA: f64 = 0.125;
 
-/// Per control-PING factor the replayed-byte count is aged by. With the
-/// default 5 s PING period this is a ~33 s half-life: old replays are
-/// forgotten while the sent-byte denominator keeps growing, so the loss
-/// ratio falls back toward zero on a path that has become clean.
+/// Per control-PING EWMA decay factor applied to both sent and replayed byte
+/// counters. With the default 5 s PING period this is a ~33 s half-life: old
+/// traffic ages out symmetrically so clean periods heal past loss and new loss
+/// stays observable even after gigabytes of prior clean transfer.
 const LOSS_DECAY: f64 = 0.9;
 
 /// A snapshot of one path's measured quality.
@@ -71,10 +71,10 @@ pub enum QualityEvent {
 #[derive(Clone, Debug, Default)]
 pub struct QualityTracker {
     srtt: Option<Duration>,
-    /// Highest offset ever sent, the denominator of the loss ratio.
-    sent: u64,
-    /// Bytes replayed onto a new carrier, the numerator.
-    replayed: u64,
+    /// Aged sent-byte denominator of the loss ratio.
+    sent: f64,
+    /// Aged replayed-byte numerator of the loss ratio.
+    replayed: f64,
     stalls: u64,
 }
 
@@ -84,13 +84,18 @@ impl QualityTracker {
     }
 
     /// A control PING/PONG round trip: smooth it into the RTT estimate,
-    /// and age the loss estimate (the PING is the tracker's clock).
+    /// and age the loss estimate symmetrically (the PING is the tracker's clock).
     pub fn on_rtt(&mut self, sample: Duration) {
         self.srtt = Some(match self.srtt {
             None => sample,
             Some(s) => s.mul_f64(1.0 - RTT_ALPHA) + sample.mul_f64(RTT_ALPHA),
         });
-        self.replayed = (self.replayed as f64 * LOSS_DECAY) as u64;
+        self.sent *= LOSS_DECAY;
+        self.replayed *= LOSS_DECAY;
+        if self.sent < 1e-3 {
+            self.sent = 0.0;
+            self.replayed = 0.0;
+        }
     }
 
     /// A carrier was given up with something expected on it (a stall, a
@@ -102,8 +107,8 @@ impl QualityTracker {
     /// `sent` new bytes went out, and `replayed` of the already-sent bytes
     /// had to go out again on a new carrier. Both are deltas.
     pub fn on_replay(&mut self, sent: u64, replayed: u64) {
-        self.sent = self.sent.saturating_add(sent);
-        self.replayed = self.replayed.saturating_add(replayed);
+        self.sent += sent as f64;
+        self.replayed += replayed as f64;
     }
 
     /// Apply one session event.
@@ -116,10 +121,10 @@ impl QualityTracker {
 
     /// Fraction of sent bytes replayed, in `[0, 1]`.
     pub fn loss(&self) -> f64 {
-        if self.sent == 0 {
+        if self.sent <= 0.0 {
             0.0
         } else {
-            (self.replayed as f64 / self.sent as f64).min(1.0)
+            (self.replayed / self.sent).clamp(0.0, 1.0)
         }
     }
 
@@ -202,5 +207,20 @@ mod tests {
         t.on_carrier_lost();
         assert_eq!(t.snapshot().stalls, 2);
         assert!(t.snapshot().is_measured());
+    }
+
+    #[test]
+    fn new_loss_is_detected_after_prior_clean_traffic() {
+        let mut t = QualityTracker::new();
+        t.on_replay(100_000, 0);
+        for _ in 0..40 {
+            t.on_rtt(Duration::from_millis(100));
+        }
+        t.on_replay(10_000, 5_000);
+        assert!(
+            t.loss() > 0.30,
+            "new loss masked by aged clean denominator: {}",
+            t.loss()
+        );
     }
 }

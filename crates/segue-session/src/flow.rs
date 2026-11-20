@@ -14,13 +14,17 @@
 //! it carries no bytes, and requiring window for it could deadlock a peer
 //! whose app has stopped reading.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::codec::{max_data_len, Frame};
 use crate::pool::{Grant, Pool, Tier, BLOCK};
 use crate::{Limits, ProtoError, Timing};
+
+/// Maximum buffered out-of-order bytes parked per receive half for Stage 2
+/// redundant frames arriving ahead of the primary cursor.
+const OOO_MAX_BYTES: usize = 32 * 1024;
 
 /// Make room for `add` more bytes without growing past `limit` (the grant):
 /// capacity doubles as usual but stops at the grant, so the memory a buffer
@@ -281,6 +285,20 @@ impl SendHalf {
             }
         }
         None
+    }
+
+    /// Conservative upper-bound frame size for the next [`poll_frame_into`](Self::poll_frame_into)
+    /// call so callers only reserve 1 block from [`Pool`] for small frames.
+    pub fn pending_send_hint(&self) -> usize {
+        let end = self.data_end();
+        if self.cursor < end {
+            let lim = end.min(self.peer_max);
+            if self.cursor < lim {
+                let n = ((lim - self.cursor) as usize).min(max_data_len(self.cursor, 0));
+                return n.saturating_add(18).clamp(BLOCK, crate::pool::FRAME_MAX);
+            }
+        }
+        BLOCK
     }
 
     /// Next DATA or FIN for the current carrier, within the peer's window.
@@ -593,7 +611,7 @@ impl DupQueue {
             let chunk = usize::try_from(cursor - offset)
                 .unwrap_or(max_bytes)
                 .min(max_bytes);
-            self.on_primary_data(offset, acked, chunk, max_bytes, delay, now);
+            self.on_primary_data(acked, offset, chunk, max_bytes, delay, now);
             offset += chunk as u64;
         }
     }
@@ -766,6 +784,8 @@ pub const GROWTH_SHARE_DIV: usize = 2;
 pub struct RecvHalf {
     consumed: u64,
     buf: VecDeque<u8>,
+    ooo: BTreeMap<u64, Vec<u8>>,
+    ooo_bytes: usize,
     recv: u64,
     adv_max: u64,
     fin: Option<u64>,
@@ -826,6 +846,8 @@ impl RecvHalf {
         Some(Self {
             consumed: 0,
             buf: VecDeque::new(),
+            ooo: BTreeMap::new(),
+            ooo_bytes: 0,
             recv: 0,
             adv_max: initial,
             fin: None,
@@ -919,8 +941,90 @@ impl RecvHalf {
         self.now_hint = self.now_hint.max(now);
         self.est.on_data(end, now);
         self.last_data = now;
+        let drained = self.drain_ooo(now);
         self.touch(now);
-        Ok(fresh.len())
+        Ok(fresh.len() + drained)
+    }
+
+    /// Variant for redundant / gap-tolerant carriers: delivers in-order bytes
+    /// immediately (draining any parked suffix) and parks ahead-of-order
+    /// chunks in a bounded side buffer up to `OOO_MAX_BYTES` without failing.
+    pub fn on_data_ooo(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        now: Instant,
+    ) -> Result<usize, ProtoError> {
+        let Some(end) = offset.checked_add(data.len() as u64) else {
+            return Err(ProtoError::Violation("data beyond max_offset"));
+        };
+        if let Some(f) = self.fin {
+            if end > f {
+                return Err(ProtoError::Violation("data after fin"));
+            }
+            return Ok(0);
+        }
+        if end > self.adv_max {
+            return Err(ProtoError::Violation("data beyond max_offset"));
+        }
+        if offset <= self.recv {
+            return self.on_data(offset, data, now);
+        }
+        self.park_ooo(offset, data);
+        Ok(0)
+    }
+
+    fn park_ooo(&mut self, offset: u64, data: &[u8]) {
+        if data.is_empty() || data.len() > OOO_MAX_BYTES || self.grant.pool().under_pressure() {
+            return;
+        }
+        let end = offset + data.len() as u64;
+        if self
+            .ooo
+            .range(..=offset)
+            .next_back()
+            .is_some_and(|(&k, v)| k + v.len() as u64 >= end)
+        {
+            return;
+        }
+        if let Some(existing) = self.ooo.get_mut(&offset) {
+            let delta = data.len().saturating_sub(existing.len());
+            if delta == 0 || self.ooo_bytes + delta > OOO_MAX_BYTES {
+                return;
+            }
+            self.ooo_bytes += delta;
+            *existing = data.to_vec();
+            return;
+        }
+        if self.ooo_bytes + data.len() <= OOO_MAX_BYTES {
+            self.ooo_bytes += data.len();
+            self.ooo.insert(offset, data.to_vec());
+        }
+    }
+
+    fn drain_ooo(&mut self, now: Instant) -> usize {
+        let mut added = 0usize;
+        while let Some(&off) = self.ooo.keys().next() {
+            if off > self.recv {
+                break;
+            }
+            let (_, seg) = self.ooo.pop_first().unwrap();
+            self.ooo_bytes = self.ooo_bytes.saturating_sub(seg.len());
+            let end = off + seg.len() as u64;
+            if end <= self.recv {
+                continue;
+            }
+            let skip = (self.recv - off) as usize;
+            let fresh = &seg[skip..];
+            reserve_within(&mut self.buf, fresh.len(), self.grant.bytes());
+            self.buf.extend(fresh);
+            self.recv = end;
+            self.now_hint = self.now_hint.max(now);
+            self.est.on_data(end, now);
+            self.last_data = now;
+            added += fresh.len();
+        }
+        added
     }
 
     pub fn on_fin(&mut self, offset: u64, now: Instant) -> Result<(), ProtoError> {
@@ -931,6 +1035,8 @@ impl RecvHalf {
             None => {
                 self.fin = Some(offset);
                 self.recv = offset + 1;
+                self.ooo.clear();
+                self.ooo_bytes = 0;
                 self.touch(now);
                 // Nothing more arrives: give back credit (and growth) now,
                 // even if the buffer is already drained and no read will
@@ -961,11 +1067,15 @@ impl RecvHalf {
 
     pub fn read(&mut self, out: &mut [u8], now: Instant) -> usize {
         let n = out.len().min(self.buf.len());
-        for (o, b) in out.iter_mut().zip(self.buf.drain(..n)) {
-            *o = b;
-        }
-        self.consumed += n as u64;
         if n > 0 {
+            let (a, b) = self.buf.as_slices();
+            let first = n.min(a.len());
+            out[..first].copy_from_slice(&a[..first]);
+            if first < n {
+                out[first..n].copy_from_slice(&b[..n - first]);
+            }
+            self.buf.drain(..n);
+            self.consumed += n as u64;
             self.update_credit(now);
         }
         n
@@ -1488,5 +1598,70 @@ mod tests {
         assert_eq!(r.idle_deadline(), Some(t + timing.idle_after));
         r.update_credit(idle_10s);
         assert_eq!(r.target_window(), l.initial_credit);
+    }
+
+    #[test]
+    fn dup_queue_seed_inflight_chunks_multiple_segments() {
+        let now = Instant::now();
+        let delay = Duration::from_millis(30);
+        let mut q = DupQueue::new(100);
+        // 2500 B in-flight (> max_bytes 1024) must split cleanly into 3 chunks
+        // and not wipe earlier chunks via swapped `(acked, offset)` arguments.
+        q.seed_inflight(100, 2600, 1024, delay, now);
+        assert_eq!(q.pop_due(now + delay), Some((100, 1024)));
+        assert_eq!(q.pop_due(now + delay), Some((1124, 1024)));
+        assert_eq!(q.pop_due(now + delay), Some((2148, 452)));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn recv_ooo_parks_and_drains_on_gap_fill_and_slice_reads_wrapped() {
+        let now = Instant::now();
+        let pool = Pool::new(8 << 20);
+        let limits = Limits {
+            initial_credit: 64 * 1024,
+            ..Limits::default()
+        };
+        let mut r = RecvHalf::new(&pool, &limits, &Timing::default(), now).unwrap();
+
+        // Ahead-of-order chunk parks cleanly without error.
+        assert_eq!(r.on_data_ooo(100, b"world!", now).unwrap(), 0);
+        assert_eq!(r.recv_offset(), 0);
+        // Exact duplicate/covered OOO chunk is ignored without inflating buffer.
+        assert_eq!(r.on_data_ooo(101, b"orld", now).unwrap(), 0);
+        // Missing prefix fills the gap and drains both segments contiguously.
+        assert_eq!(r.on_data_ooo(0, &[b'a'; 100], now).unwrap(), 106);
+        assert_eq!(r.recv_offset(), 106);
+
+        let mut head = [0u8; 64];
+        assert_eq!(r.read(&mut head, now), 64);
+        assert_eq!(&head[..], &[b'a'; 64][..]);
+        let mut rest = [0u8; 64];
+        assert_eq!(r.read(&mut rest, now), 42);
+        assert_eq!(&rest[..36], &[b'a'; 36][..]);
+        assert_eq!(&rest[36..42], b"world!");
+
+        // Segment > OOO_MAX_BYTES is skipped best-effort without error or parking.
+        let base = r.recv_offset();
+        let huge = vec![0x5a; OOO_MAX_BYTES + 1];
+        assert_eq!(r.on_data_ooo(base + 100, &huge, now).unwrap(), 0);
+        // Filling [base, base + 100) must NOT pull `huge` from OOO (it was dropped).
+        assert_eq!(r.on_data_ooo(base, &[0x33u8; 100], now).unwrap(), 100);
+        assert_eq!(r.recv_offset(), base + 100);
+
+        // Force VecDeque wrap and verify slice-based `read()` copies exact bytes.
+        let mut flush_buf = vec![0u8; 256];
+        assert_eq!(r.read(&mut flush_buf, now), 100);
+        let p1: Vec<u8> = (0..8 * 1024).map(|i| (i % 251) as u8).collect();
+        let p2: Vec<u8> = (0..8 * 1024).map(|i| ((i + 7) % 251) as u8).collect();
+        assert_eq!(r.on_data(r.recv_offset(), &p1, now).unwrap(), p1.len());
+        let mut drain = vec![0u8; 4 * 1024];
+        assert_eq!(r.read(&mut drain, now), 4 * 1024);
+        assert_eq!(&drain[..], &p1[..4 * 1024]);
+        assert_eq!(r.on_data(r.recv_offset(), &p2, now).unwrap(), p2.len());
+        let mut merged = vec![0u8; 12 * 1024];
+        assert_eq!(r.read(&mut merged, now), 12 * 1024);
+        assert_eq!(&merged[..4 * 1024], &p1[4 * 1024..]);
+        assert_eq!(&merged[4 * 1024..], &p2[..]);
     }
 }

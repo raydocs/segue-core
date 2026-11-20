@@ -22,7 +22,7 @@ use crate::codec::{
 };
 use crate::flow::{DupQueue, RecvHalf, SendHalf, SentFrame};
 use crate::park::{ParkDecision, ParkTracker};
-use crate::pool::Pool;
+use crate::pool::{Pool, BLOCK, FRAME_MAX};
 use crate::quality::QualityEvent;
 use crate::{Config, MoveReason, MoveStats, ProtoError};
 
@@ -191,10 +191,14 @@ struct RedundantCarrier {
     /// Cleared immediately when any valid frame arrives on this carrier once
     /// bound.
     demoted_at: Option<Instant>,
+    /// Next periodic probe time while `demoted_at.is_some()`.
+    next_probe: Option<Instant>,
     /// Last TX or RX timestamp on this carrier (for AI idle keepalive).
     last_activity: Instant,
     /// Last RX timestamp when this bound spare delivered end-to-end progress.
     progressed_at: Option<Instant>,
+    /// Last `(recv_offset, max_offset)` transmitted as `ACK` on this spare.
+    last_acked: (u64, u64),
     /// Mirrored `ACK` owed on this bound spare.
     ack_due: bool,
     /// Mirrored `FIN` offset owed on this bound spare.
@@ -451,8 +455,10 @@ impl ClientSession {
             started: now,
             hello: true,
             demoted_at: None,
+            next_probe: None,
             last_activity: now,
             progressed_at: None,
+            last_acked: (u64::MAX, u64::MAX),
             ack_due: false,
             fin_due: None,
             rst_due: None,
@@ -543,8 +549,10 @@ impl ClientSession {
                         started: now,
                         hello: false,
                         demoted_at: Some(now),
+                        next_probe: self.cfg.timing.demoted_probe_interval().map(|d| now + d),
                         last_activity: now,
                         progressed_at: None,
+                        last_acked: (u64::MAX, u64::MAX),
                         ack_due: false,
                         fin_due: None,
                         rst_due: None,
@@ -1165,6 +1173,7 @@ impl ClientSession {
                     r.bound = true;
                     r.hello = false;
                     r.demoted_at = None;
+                    r.next_probe = None;
                     r.last_activity = now;
                 }
                 // The relay's snapshot. Never fatal: the spare is optional.
@@ -1206,13 +1215,11 @@ impl ClientSession {
             return Ok(());
         };
         r.demoted_at = None;
+        r.next_probe = None;
         r.last_activity = now;
         match frame {
             Frame::Data { offset, data, .. } => {
-                if offset > self.recv.recv_offset() {
-                    return Ok(());
-                }
-                if let Ok(n) = self.recv.on_data(offset, &data, now) {
+                if let Ok(n) = self.recv.on_data_ooo(offset, &data, now) {
                     if n > 0 {
                         if let Some(r) = self.redundant.as_mut() {
                             r.progressed_at = Some(now);
@@ -1343,10 +1350,12 @@ impl ClientSession {
             Frame::RedundantOk(_) | Frame::RedundantAttach(_) => {}
             Frame::Pad(_) | Frame::Dgram { .. } => {}
             Frame::Data { offset, data, .. } if self.confirmed => {
-                if self.promoted_in_gen && offset > self.recv.recv_offset() {
-                    return Ok(());
-                }
-                if self.recv.on_data(offset, &data, now)? > 0 {
+                let n = if self.promoted_in_gen {
+                    self.recv.on_data_ooo(offset, &data, now)?
+                } else {
+                    self.recv.on_data(offset, &data, now)?
+                };
+                if n > 0 {
                     self.made_progress(now);
                 }
             }
@@ -1468,6 +1477,7 @@ impl ClientSession {
         }
         if r.ack_due {
             r.ack_due = false;
+            r.last_acked = (recv_offset, max_offset);
             return Some(TxNext::Frame(Frame::Ack {
                 recv_offset,
                 max_offset,
@@ -1532,12 +1542,15 @@ impl ClientSession {
             let piggyback = self.send.has_sendable();
             if let Some(ack) = self.recv.poll_ack(now, piggyback) {
                 self.ka_due = false;
+                let cur = (self.recv.recv_offset(), self.recv.max_offset());
                 if let Some(r) = self
                     .redundant
                     .as_mut()
                     .filter(|r| r.bound && r.demoted_at.is_none())
                 {
-                    r.ack_due = true;
+                    if cur != r.last_acked {
+                        r.ack_due = true;
+                    }
                 }
                 self.check_done();
                 return Some(TxNext::Frame(ack));
@@ -1581,6 +1594,41 @@ impl ClientSession {
         self.send.has_sendable()
             || (self.confirmed
                 && (self.ka_due || self.recv.ack_deadline().is_some_and(|d| d <= now)))
+    }
+
+    /// Conservative upper bound on the bytes needed to encode the next frame
+    /// for carrier `cid` (so [`Pool`] only reserves 1 block for control/small TX).
+    pub fn tx_size_hint(&self, cid: CarrierId, now: Instant) -> usize {
+        if let Some(r) = self.redundant.as_ref().filter(|r| r.cid == cid) {
+            if r.hello {
+                return FRAME_MAX;
+            }
+            if r.rst_due.is_some()
+                || r.ack_due
+                || r.fin_due.is_some_and(|off| self.send.acked() == off)
+            {
+                return BLOCK;
+            }
+            if let Some((_, len)) = r.dup.peek_due(now) {
+                return len.saturating_add(18).clamp(BLOCK, FRAME_MAX);
+            }
+            return BLOCK;
+        }
+        if self.carrier != Some(cid) {
+            return BLOCK;
+        }
+        if self.hello.is_some() {
+            return FRAME_MAX;
+        }
+        if self.rst.is_some() || !self.confirmed {
+            return BLOCK;
+        }
+        if self.recv.ack_deadline().is_some_and(|d| d <= now)
+            || (self.ka_due && !self.send.has_sendable())
+        {
+            return BLOCK;
+        }
+        self.send.pending_send_hint()
     }
 
     /// Next frame for carrier `cid`, if any.
@@ -1777,13 +1825,21 @@ impl ClientSession {
             } else {
                 if let Some(at) = r.demoted_at {
                     put(Some(at + t.t_detached_standby));
+                    if writable
+                        && self.confirmed
+                        && self.state == State::Active
+                        && !r.ack_due
+                        && r.rst_due.is_none()
+                    {
+                        put(r.next_probe);
+                    }
                 }
                 if self.confirmed && self.state == State::Active {
                     if r.demoted_at.is_none() && r.progressed_at.is_some_and(|p| p > self.last_rx) {
                         put(Some(self.last_rx + self.stall_limit()));
                     }
                     put(r.dup.next_due_unacked(acked));
-                    if !r.ack_due && r.rst_due.is_none() {
+                    if r.demoted_at.is_none() && !r.ack_due && r.rst_due.is_none() {
                         if let Some(ka) = ka_ai {
                             put(Some(r.last_activity + ka));
                         }
@@ -1888,13 +1944,23 @@ impl ClientSession {
             }
         }
         if self.confirmed && self.state == State::Active {
-            if let Some(ka_ai) = t.keepalive_ai_for(self.params.exit_class) {
+            let ka_ai = t.keepalive_ai_for(self.params.exit_class);
+            if let Some(ka_ai) = ka_ai {
                 if now >= self.last_sent.max(self.last_rx) + ka_ai {
                     self.ka_due = true;
                 }
-                if let Some(r) = self.redundant.as_mut() {
-                    if r.bound && r.rst_due.is_none() && now >= r.last_activity + ka_ai {
-                        r.ack_due = true;
+            }
+            if let Some(r) = self.redundant.as_mut() {
+                if r.bound && r.rst_due.is_none() {
+                    if r.demoted_at.is_some() {
+                        if r.next_probe.is_some_and(|p| now >= p) {
+                            r.ack_due = true;
+                            r.next_probe = t.demoted_probe_interval().map(|d| now + d);
+                        }
+                    } else if let Some(ka_ai) = ka_ai {
+                        if now >= r.last_activity + ka_ai {
+                            r.ack_due = true;
+                        }
                     }
                 }
             }

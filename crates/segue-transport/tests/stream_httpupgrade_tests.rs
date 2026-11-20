@@ -225,4 +225,86 @@ mod stream_httpupgrade_tests {
             .expect("payload sent with the response must not be lost");
         assert_eq!(&buffer, b"HELLO");
     }
+
+    #[tokio::test]
+    async fn connect_httpupgrade_releases_record_alignment() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        struct SpyStream {
+            inner: TcpStream,
+            released: Arc<AtomicBool>,
+        }
+        impl AsyncRead for SpyStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+        impl AsyncWrite for SpyStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+        impl segue_transport::TransportStream for SpyStream {
+            fn poll_read_direct(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                AsyncRead::poll_read(self, cx, buf)
+            }
+            fn poll_write_direct(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                AsyncWrite::poll_write(self, cx, buf)
+            }
+            fn release_record_alignment(&mut self) {
+                self.released.store(true, Ordering::Release);
+            }
+        }
+
+        let (listener, addr) = loopback().await;
+        let _recorded = serve_once(
+            listener,
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        );
+
+        let released = Arc::new(AtomicBool::new(false));
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let _upgraded = connect_httpupgrade(
+            Box::new(SpyStream {
+                inner: stream,
+                released: released.clone(),
+            }),
+            &config("/ws"),
+        )
+        .await
+        .expect("upgrade must succeed");
+        assert!(released.load(Ordering::Acquire));
+    }
 }

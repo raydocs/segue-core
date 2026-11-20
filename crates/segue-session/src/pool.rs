@@ -100,6 +100,8 @@ pub struct Pool {
     transport_used: AtomicUsize,
     /// Tickets waiting for the transport region, oldest first.
     queue: Mutex<TicketQueue>,
+    /// Mirror of `queue.ids.len()` so `give_blocks` skips locking when empty.
+    queued: AtomicUsize,
     /// How long a frame may hold transport blocks without progress, and
     /// at most (milliseconds).
     hold_ms: AtomicU64,
@@ -132,6 +134,7 @@ impl Pool {
             transport: blocks - relay_top,
             transport_used: AtomicUsize::new(0),
             queue: Mutex::new(TicketQueue::default()),
+            queued: AtomicUsize::new(0),
             hold_ms: AtomicU64::new(TRANSPORT_HOLD.as_millis() as u64),
             hold_max_ms: AtomicU64::new(TRANSPORT_HOLD_MAX.as_millis() as u64),
             sessions: AtomicUsize::new(0),
@@ -311,7 +314,7 @@ impl Pool {
         if n == 0 {
             return;
         }
-        c.fetch_sub(n, Ordering::AcqRel);
+        c.fetch_sub(n, Ordering::SeqCst);
         self.wake();
     }
 
@@ -323,6 +326,9 @@ impl Pool {
     }
 
     fn wake_head(&self) {
+        if self.queued.load(Ordering::SeqCst) == 0 {
+            return;
+        }
         if let Some((_, w)) = self.queue.lock().unwrap().ids.front() {
             w.notify_one();
         }
@@ -339,6 +345,7 @@ impl Pool {
             q.need = 1;
         }
         q.ids.push_back((id, wake.clone()));
+        self.queued.store(q.ids.len(), Ordering::SeqCst);
         Ticket {
             pool: self.clone(),
             id,
@@ -371,7 +378,7 @@ impl Pool {
 
     /// Tickets waiting for the transport region.
     pub fn queued(&self) -> usize {
-        self.queue.lock().unwrap().ids.len()
+        self.queued.load(Ordering::Acquire)
     }
 
     /// Resolves when blocks are returned (or spuriously).
@@ -444,6 +451,7 @@ impl Drop for Ticket {
             let mut q = self.pool.queue.lock().unwrap();
             let head = q.ids.front().is_some_and(|(i, _)| *i == self.id);
             q.ids.retain(|(i, _)| *i != self.id);
+            self.pool.queued.store(q.ids.len(), Ordering::SeqCst);
             if head {
                 // Unknown until the new first in line asks.
                 q.need = 1;

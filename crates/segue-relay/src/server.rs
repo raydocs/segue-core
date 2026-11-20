@@ -58,24 +58,39 @@ impl AsyncRead for Counted {
     }
 }
 
+/// Maximum pre-authentication bytes buffered while reading the first carrier
+/// frame (covers any valid hello/open frame plus coalesced initial data while
+/// bounding unauthenticated ignorable-frame floods against OOM).
+const FIRST_FRAME_MAX_PRE_BYTES: usize = segue_session::pool::FRAME_MAX + 4096;
+
 /// Read until one complete frame has been decoded (or the bytes cannot be
 /// a frame: the table answers that, e.g. `REJECT(version)`). Returns the
-/// bytes read; `None` on EOF / error before a full frame.
+/// bytes read; `None` on EOF / error before a full frame or when exceeding
+/// [`FIRST_FRAME_MAX_PRE_BYTES`].
 async fn read_first_frame(s: &mut TcpStream) -> Option<Vec<u8>> {
     use segue_session::codec::FrameDecoder;
     use tokio::io::AsyncReadExt as _;
     let mut dec = FrameDecoder::new();
     let mut pre = Vec::new();
-    let mut buf = vec![0u8; 4096];
+    let mut buf = [0u8; 4096];
     loop {
-        let n = s.read(&mut buf).await.ok()?;
+        let remaining = FIRST_FRAME_MAX_PRE_BYTES.saturating_sub(pre.len());
+        if remaining == 0 {
+            return None;
+        }
+        let to_read = buf.len().min(remaining);
+        let n = s.read(&mut buf[..to_read]).await.ok()?;
         if n == 0 {
             return None;
         }
         pre.extend_from_slice(&buf[..n]);
         dec.push(&buf[..n]);
         match dec.next_frame() {
-            Ok(None) => {}
+            Ok(None) => {
+                if pre.len() >= FIRST_FRAME_MAX_PRE_BYTES {
+                    return None;
+                }
+            }
             Ok(Some(_)) | Err(_) => return Some(pre),
         }
     }
@@ -440,4 +455,72 @@ pub async fn serve(relay: Arc<Relay>, listener: TcpListener, mut shutdown: watch
     drop(ctrl_tx);
     drop(notes);
     crate::log!("info", "relay stopped", "metrics" = relay.metrics.render());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use segue_session::codec::{put_varint, Frame, Kind, Open, Target, FLAG_IGNORABLE, VERSION};
+
+    #[tokio::test]
+    async fn read_first_frame_rejects_unauthenticated_ignorable_flood() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            let mut frame = Vec::new();
+            frame.push(0x7f); // unknown frame type
+            frame.push(FLAG_IGNORABLE);
+            put_varint(&mut frame, 1024);
+            frame.resize(frame.len() + 1024, 0xaa);
+            let chunks = (FIRST_FRAME_MAX_PRE_BYTES / frame.len()) + 4;
+            for _ in 0..chunks {
+                if s.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let (mut srv, _) = l.accept().await.unwrap();
+        let res = read_first_frame(&mut srv).await;
+        assert!(
+            res.is_none(),
+            "expected bounded ignorable flood to return None"
+        );
+        drop(srv);
+        let _ = client.await;
+    }
+
+    #[tokio::test]
+    async fn read_first_frame_accepts_valid_open_after_ignorable_frame() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            let mut out = Vec::new();
+            out.push(0x7f);
+            out.push(FLAG_IGNORABLE);
+            put_varint(&mut out, 8);
+            out.extend_from_slice(&[0u8; 8]);
+            Frame::Open(Open {
+                version: VERSION,
+                ticket: vec![1, 2, 3],
+                session_id: [7; 16],
+                resume_secret: [9; 32],
+                attach_gen: 0,
+                retry: false,
+                anchor_instance_id: 0,
+                kind: Kind::Tcp,
+                target: Target::Domain("example.com".into(), 443),
+                exit_class: 0,
+                t_stall_ms: None,
+                first_data: vec![],
+            })
+            .encode(&mut out);
+            s.write_all(&out).await.unwrap();
+        });
+        let (mut srv, _) = l.accept().await.unwrap();
+        let res = read_first_frame(&mut srv).await;
+        assert!(res.is_some());
+        client.await.unwrap();
+    }
 }

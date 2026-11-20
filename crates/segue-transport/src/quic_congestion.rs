@@ -395,7 +395,9 @@ impl Controller for XrayBbr {
 /// sender, which needs no switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Installed {
-    /// quinn's BBR, which `standard` keeps (see [`bbr_for_profile`]).
+    /// quinn's BBR, retained for tests and A/B diagnostics when
+    /// `STANDARD_RUNS_XRAY_BBR` is off.
+    #[cfg_attr(not(test), allow(dead_code))]
     QuinnBbr,
     /// Xray's BBR sender.
     XrayBbr(BbrProfile),
@@ -403,11 +405,9 @@ pub(crate) enum Installed {
 }
 
 /// Whether `bbrProfile: standard`, the default, runs the port of Xray's
-/// sender, switching from quic-go's startup Reno like the other profiles,
-/// rather than quinn's BBR from the first packet. The port is complete for
-/// `standard` too, but this moves every default Hysteria and XHTTP H3
-/// connection to another congestion controller, so it waits for a decision.
-pub(crate) const STANDARD_RUNS_XRAY_BBR: bool = false;
+/// sender (`XrayBbr(BbrProfile::Standard)`) rather than quinn's BBR. Matches
+/// Xray-core and sing-box on lossy WAN links.
+pub(crate) const STANDARD_RUNS_XRAY_BBR: bool = true;
 
 /// The BBR Xray's `UseBBR` installs for `profile`.
 pub(crate) const fn bbr_for_profile(profile: BbrProfile) -> Installed {
@@ -834,12 +834,14 @@ pub(crate) fn controller_name(controller: Box<dyn Controller>) -> &'static str {
 
 /// quinn's BBR as this project configures it: quic-go's 32-datagram initial
 /// window of 1,280 bytes.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn quinn_bbr() -> Arc<BbrConfig> {
     let mut bbr = BbrConfig::default();
     bbr.initial_window(QUINN_BBR_INITIAL_WINDOW);
     Arc::new(bbr)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 const QUINN_BBR_INITIAL_WINDOW: u64 = 32 * 1280;
 
 #[cfg(test)]
@@ -1035,9 +1037,12 @@ mod tests {
     }
 
     #[test]
-    fn standard_keeps_quinn_bbr_and_other_profiles_run_xray_bbr() {
-        assert_eq!(bbr_for_profile(BbrProfile::Standard), Installed::QuinnBbr);
-        for profile in [BbrProfile::Conservative, BbrProfile::Aggressive] {
+    fn all_profiles_run_xray_bbr() {
+        for profile in [
+            BbrProfile::Conservative,
+            BbrProfile::Standard,
+            BbrProfile::Aggressive,
+        ] {
             assert_eq!(bbr_for_profile(profile), Installed::XrayBbr(profile));
             let switch = Arc::new(ControllerSwitch::default());
             switch.install(bbr_for_profile(profile));
@@ -1363,7 +1368,7 @@ mod tests {
         );
         assert_eq!(
             negotiated(MIB, H3BbrProfile::Standard).installed_controller(Some(0)),
-            Some(Installed::QuinnBbr)
+            Some(Installed::XrayBbr(BbrProfile::Standard))
         );
         let forced = config(H3Congestion::ForceBrutal {
             bytes_per_second: 10 * MIB,
@@ -1375,7 +1380,7 @@ mod tests {
         );
         assert_eq!(
             config(H3Congestion::BbrStandard).installed_controller(None),
-            None
+            Some(Installed::XrayBbr(BbrProfile::Standard))
         );
         assert_eq!(
             config(H3Congestion::Reno).installed_controller(Some(MIB)),

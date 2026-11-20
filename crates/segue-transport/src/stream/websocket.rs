@@ -121,9 +121,12 @@ pub struct WebSocketConfig {
 }
 
 pub async fn connect_websocket(
-    stream: BoxedTransportStream,
+    mut stream: BoxedTransportStream,
     config: &WebSocketConfig,
 ) -> Result<BoxedTransportStream, TransportError> {
+    // WebSocket runs over TLS/REALITY and never runs Vision directly; release
+    // the 8 KiB handshake record alignment cap as soon as the wrapper owns it.
+    stream.release_record_alignment();
     if config.early_data_bytes == 0 {
         let ready = handshake(stream, config.clone(), None).await?;
         return Ok(Box::new(ready));
@@ -523,6 +526,10 @@ impl TransportStream for WebSocketStream {
     ) -> Poll<io::Result<usize>> {
         AsyncWrite::poll_write(self, cx, input)
     }
+
+    fn release_record_alignment(&mut self) {
+        self.inner.release_record_alignment();
+    }
 }
 
 // ---- The deferred dial, for `ed > 0` ----------------------------------------
@@ -741,6 +748,14 @@ impl TransportStream for DeferredWebSocketStream {
         input: &[u8],
     ) -> Poll<io::Result<usize>> {
         AsyncWrite::poll_write(self, cx, input)
+    }
+
+    fn release_record_alignment(&mut self) {
+        match &mut self.state {
+            DeferredState::Waiting(held) => held.0.release_record_alignment(),
+            DeferredState::Ready(stream) => stream.release_record_alignment(),
+            DeferredState::Dialing(_) | DeferredState::Failed => {}
+        }
     }
 }
 

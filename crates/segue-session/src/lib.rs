@@ -188,6 +188,18 @@ impl Timing {
             None
         }
     }
+
+    /// Periodic lightweight ACK probe interval for a stall-demoted standby
+    /// carrier so a recovered path clears `demoted_at` before
+    /// [`Self::t_detached_standby`] expires.
+    pub(crate) fn demoted_probe_interval(&self) -> Option<Duration> {
+        if self.t_detached_standby < Duration::from_millis(250) {
+            return None;
+        }
+        Some(
+            (self.t_detached_standby / 5).clamp(Duration::from_millis(100), Duration::from_secs(2)),
+        )
+    }
 }
 
 impl Default for Timing {

@@ -46,6 +46,9 @@ pub async fn connect_httpupgrade(
     mut stream: BoxedTransportStream,
     config: &HttpUpgradeConfig,
 ) -> Result<BoxedTransportStream, TransportError> {
+    // HTTPUpgrade runs over TLS/REALITY and never runs Vision directly; release
+    // the 8 KiB handshake record alignment cap as soon as the upgrade begins.
+    stream.release_record_alignment();
     let mut headers = HeaderMap::new();
     for (key, value) in &config.headers {
         headers.set(key, value);
@@ -247,5 +250,9 @@ impl TransportStream for PrefixedStream {
         input: &[u8],
     ) -> Poll<io::Result<usize>> {
         AsyncWrite::poll_write(self, cx, input)
+    }
+
+    fn release_record_alignment(&mut self) {
+        self.inner.release_record_alignment();
     }
 }

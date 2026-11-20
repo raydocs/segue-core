@@ -1767,3 +1767,96 @@ fn frame_of(bytes: &[u8]) -> Frame {
     d.push(bytes);
     d.next_frame().unwrap().unwrap()
 }
+
+#[test]
+fn demoted_carrier_recovers_via_periodic_probe_without_resume() {
+    let (mut client, mut relay, current, spare, mut now) = open_ai_with_bound_spare();
+    let gen = client.gen();
+    let sid = client.session_id();
+
+    // Send 1 small uplink message and silence `current` so client promotes `spare`
+    // and demotes `current` cleanly at `t_stall_ai`.
+    assert_eq!(client.write(b"hi"), 2);
+    while client.poll_transmit(current, now).is_some() {}
+    now += Config::default().timing.t_stall_ai;
+    client.handle_timeout(now);
+    assert_eq!(client.carrier(), Some(spare));
+    assert_eq!(client.redundant_carrier(), Some(current));
+    // `b"hi"` delivers progress on `spare` at `now == t0 + 5s >= s.carrier_rx + live`,
+    // swapping relay onto `spare` and demoting `current` cleanly; send ACK back.
+    while let Some(f) = client.poll_transmit(spare, now) {
+        relay.on_frame(spare, f, now);
+    }
+    now += Duration::from_millis(30);
+    relay.handle_timeout(now);
+    while let Some(f) = relay.poll_transmit(spare, now) {
+        client.on_frame(spare, f, now).unwrap();
+    }
+    assert_eq!(relay.current_carrier(&sid), Some(spare));
+    assert_eq!(relay.redundant_carrier(&sid), Some(current));
+    // Advance ~2.5 s across the recovered `current` path with NO in-flight data;
+    // periodic probe ACK clears `demoted_at` before `t_detached_standby` (10 s)
+    // without causing a spurious swap back on non-progressing ACK probes.
+    now += Duration::from_millis(2500);
+    client.handle_timeout(now);
+    relay.handle_timeout(now);
+    while let Some(f) = client.poll_transmit(current, now) {
+        relay.on_frame(current, f, now);
+    }
+    while let Some(f) = relay.poll_transmit(current, now) {
+        client.on_frame(current, f, now).unwrap();
+    }
+    assert_eq!(client.carrier(), Some(spare));
+    assert_eq!(relay.current_carrier(&sid), Some(spare));
+
+    // Now stall the newly promoted `spare`: both sides swap back onto `current`
+    // with 0 RESUMEs because `demoted_at` was cleared by the periodic probe.
+    assert_eq!(client.write(b"again"), 5);
+    while client.poll_transmit(spare, now).is_some() {}
+    now += Config::default().timing.t_stall_ai;
+    client.handle_timeout(now);
+    assert_eq!(client.carrier(), Some(current));
+    assert_eq!(client.gen(), gen, "demoted probe avoided RESUME");
+    while let Some(f) = client.poll_transmit(current, now) {
+        relay.on_frame(current, f, now);
+    }
+    let mut got = [0u8; 16];
+    let n = relay.read(&sid, &mut got, now);
+    assert_eq!(&got[..n], b"hiagain");
+}
+
+#[test]
+fn spare_ahead_of_primary_frame_is_parked_and_delivered_on_gap_fill() {
+    let (client, mut relay, current, spare, now) = open_ai_with_bound_spare();
+    let sid = client.session_id();
+
+    let first = pattern(100, 0x11);
+    let second = pattern(100, 0x22);
+    // Spare delivers `[100..200)` ahead of `[0..100)`.
+    relay.on_frame(
+        spare,
+        Frame::Data {
+            offset: 100,
+            data: second.clone(),
+            pad: 0,
+        },
+        now,
+    );
+    let mut buf = [0u8; 256];
+    assert_eq!(relay.read(&sid, &mut buf, now), 0);
+
+    // Primary fills `[0..100)`: relay immediately delivers all 200 bytes.
+    relay.on_frame(
+        current,
+        Frame::Data {
+            offset: 0,
+            data: first.clone(),
+            pad: 0,
+        },
+        now,
+    );
+    let n = relay.read(&sid, &mut buf, now);
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert_eq!(&buf[..n], &expected[..]);
+}
