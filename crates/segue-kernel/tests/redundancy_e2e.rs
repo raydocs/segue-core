@@ -437,6 +437,8 @@ fn session_dialer(
             name: "exit".into(),
             carrier: "tcp".into(),
             redundant_carrier: None,
+            dgram_carriers: Vec::new(),
+            dgram_relay: None,
             relay: proxy,
             node_id: 1,
             egress_group: String::new(),

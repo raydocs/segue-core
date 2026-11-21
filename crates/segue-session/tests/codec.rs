@@ -296,24 +296,26 @@ mod redundant_frames {
         }
     }
 
-    /// An old decoder has no arm for 0x3C/0x3D. Both frames are encoded with
-    /// FLAG_IGNORABLE, so that decoder takes the same skip path as any other
-    /// unknown ignorable type (here 0x3E stands in for "not in the old match").
+    /// An old decoder has no arm for 0x3C/0x3D (or 0x3E/0x3F). Those frames
+    /// carry FLAG_IGNORABLE, so an older decoder takes the same skip path as
+    /// any unknown ignorable type (here 0x4E stands in for "unrecognized").
     #[test]
     fn old_decoder_skips_both_frames() {
         assert_eq!(ty::REDUNDANT_ATTACH, 0x3C);
         assert_eq!(ty::REDUNDANT_OK, 0x3D);
+        assert_eq!(ty::DGRAM_BIND, 0x3E);
+        assert_eq!(ty::DGRAM_BIND_OK, 0x3F);
         assert_eq!(
-            Frame::decode(0x3E, 0, &[]),
-            Err(ProtoError::UnknownFrame(0x3E))
+            Frame::decode(0x4E, 0, &[]),
+            Err(ProtoError::UnknownFrame(0x4E))
         );
-        assert_eq!(Frame::decode(0x3E, FLAG_IGNORABLE, &[]), Ok(None));
+        assert_eq!(Frame::decode(0x4E, FLAG_IGNORABLE, &[]), Ok(None));
 
         let mut skipped = Vec::new();
         for f in [attach(), ok()] {
             let b = f.to_bytes();
             assert_eq!(b[1] & FLAG_IGNORABLE, FLAG_IGNORABLE);
-            skipped.push(0x3E);
+            skipped.push(0x4E);
             skipped.push(b[1]);
             skipped.extend_from_slice(&b[2..]);
         }
@@ -329,8 +331,8 @@ mod redundant_frames {
 #[test]
 fn to_bytes_allocates_exact_capacity_and_encode_with_round_trips() {
     use segue_session::codec::{
-        ty, Kind, Open, Opened, ParkAckEntry, ParkEntry, RedundantAttach, RedundantOk, Reject,
-        Resume, Resumed, Target, WakeEntry, VERSION,
+        ty, DgramBind, DgramBindOk, Kind, Open, Opened, ParkAckEntry, ParkEntry, RedundantAttach,
+        RedundantOk, Reject, Resume, Resumed, Target, WakeEntry, VERSION,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -440,6 +442,15 @@ fn to_bytes_allocates_exact_capacity_and_encode_with_round_trips() {
             attach_gen: 2,
             recv_offset: 0,
             max_offset: 16_384,
+        }),
+        Frame::DgramBind(DgramBind {
+            session_id: [8; 16],
+            attach_gen: 2,
+            nonce: [4; 16],
+        }),
+        Frame::DgramBindOk(DgramBindOk {
+            attach_gen: 2,
+            nonce: [4; 16],
         }),
         Frame::Control {
             ty: ty::CTRL_HELLO,

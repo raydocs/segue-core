@@ -397,6 +397,28 @@ impl SendHalf {
         true
     }
 
+    /// Return the unacked `(start_offset, len)` currently still inside the
+    /// replay buffer for `[offset, offset + len)`, if non-empty.
+    pub(crate) fn range_unacked_len(&self, offset: u64, len: usize) -> Option<(u64, usize)> {
+        self.dup_slice_bounds(offset, len)
+            .map(|(start_off, _, n)| (start_off, n))
+    }
+
+    /// Copy the unacked intersection of `[offset, offset + len)` from the
+    /// replay buffer into `out`, returning `(start_offset, copied_len)`.
+    pub(crate) fn copy_range(
+        &self,
+        offset: u64,
+        len: usize,
+        out: &mut Vec<u8>,
+    ) -> Option<(u64, usize)> {
+        let (start_off, start, n) = self.dup_slice_bounds(offset, len)?;
+        let [a, b] = deque_range(&self.buf, start, n);
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        Some((start_off, n))
+    }
+
     /// Something could be sent now (window permitting).
     pub fn has_sendable(&self) -> bool {
         let end = self.data_end();
@@ -1027,6 +1049,12 @@ impl RecvHalf {
             added += fresh.len();
         }
         added
+    }
+
+    /// Populate `out` with up to `max` buffered out-of-order segment offsets.
+    pub(crate) fn ooo_offsets(&self, max: usize, out: &mut Vec<u64>) {
+        out.clear();
+        out.extend(self.ooo.keys().copied().take(max));
     }
 
     pub fn on_fin(&mut self, offset: u64, now: Instant) -> Result<(), ProtoError> {

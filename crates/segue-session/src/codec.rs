@@ -82,6 +82,11 @@ pub mod ty {
     pub const REDUNDANT_ATTACH: u8 = 0x3C;
     /// Answer to [`REDUNDANT_ATTACH`]. Always encoded with [`super::FLAG_IGNORABLE`].
     pub const REDUNDANT_OK: u8 = 0x3D;
+    /// Enable per-session UDP datagram acceleration (`S1`, no version bump).
+    /// Always encoded with [`super::FLAG_IGNORABLE`].
+    pub const DGRAM_BIND: u8 = 0x3E;
+    /// Answer to [`DGRAM_BIND`]. Always encoded with [`super::FLAG_IGNORABLE`].
+    pub const DGRAM_BIND_OK: u8 = 0x3F;
 }
 
 /// Error codes (§8).
@@ -115,6 +120,7 @@ pub mod code {
 
 pub type SessionId = [u8; 16];
 pub type Secret = [u8; 32];
+pub type DgramNonce = [u8; 16];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -283,6 +289,38 @@ pub struct RedundantOk {
     pub max_offset: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DgramBind {
+    pub session_id: SessionId,
+    pub attach_gen: u32,
+    pub nonce: DgramNonce,
+}
+
+impl std::fmt::Debug for DgramBind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DgramBind")
+            .field("session_id", &self.session_id)
+            .field("attach_gen", &self.attach_gen)
+            .field("nonce", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DgramBindOk {
+    pub attach_gen: u32,
+    pub nonce: DgramNonce,
+}
+
+impl std::fmt::Debug for DgramBindOk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DgramBindOk")
+            .field("attach_gen", &self.attach_gen)
+            .field("nonce", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParkAckEntry {
     pub session_id: SessionId,
@@ -339,6 +377,10 @@ pub enum Frame {
     RedundantAttach(RedundantAttach),
     /// The second carrier is bound (v0.6 draft). Encoded with [`FLAG_IGNORABLE`].
     RedundantOk(RedundantOk),
+    /// Arm UDP datagram acceleration for this generation. Encoded with [`FLAG_IGNORABLE`].
+    DgramBind(DgramBind),
+    /// Acknowledge UDP datagram binding. Encoded with [`FLAG_IGNORABLE`].
+    DgramBindOk(DgramBindOk),
     /// A recognised control frame whose payload this crate does not parse
     /// (CTRL_HELLO, RESOLVE, RESOLVED, REFRESH, REFRESHED, REVOKED).
     Control {
@@ -623,6 +665,8 @@ impl Frame {
             Frame::Stall(_) => ty::STALL,
             Frame::RedundantAttach(_) => ty::REDUNDANT_ATTACH,
             Frame::RedundantOk(_) => ty::REDUNDANT_OK,
+            Frame::DgramBind(_) => ty::DGRAM_BIND,
+            Frame::DgramBindOk(_) => ty::DGRAM_BIND_OK,
             Frame::Control { ty, .. } => *ty,
         }
     }
@@ -640,7 +684,10 @@ impl Frame {
         match self {
             Frame::Data { pad, .. } if *pad > 0 => FLAG_PADDED,
             Frame::Wake { full, .. } => u8::from(*full),
-            Frame::RedundantAttach(_) | Frame::RedundantOk(_) => FLAG_IGNORABLE,
+            Frame::RedundantAttach(_)
+            | Frame::RedundantOk(_)
+            | Frame::DgramBind(_)
+            | Frame::DgramBindOk(_) => FLAG_IGNORABLE,
             _ => 0,
         }
     }
@@ -774,6 +821,8 @@ impl Frame {
             Frame::RedundantOk(a) => {
                 size_of_val(&a.attach_gen) + varint_len(a.recv_offset) + varint_len(a.max_offset)
             }
+            Frame::DgramBind(b) => b.session_id.len() + size_of_val(&b.attach_gen) + b.nonce.len(),
+            Frame::DgramBindOk(b) => size_of_val(&b.attach_gen) + b.nonce.len(),
             Frame::Control { payload, .. } => payload.len(),
         }
     }
@@ -928,6 +977,15 @@ impl Frame {
                 p.extend_from_slice(&a.attach_gen.to_be_bytes());
                 put_varint(p, a.recv_offset);
                 put_varint(p, a.max_offset);
+            }
+            Frame::DgramBind(b) => {
+                p.extend_from_slice(&b.session_id);
+                p.extend_from_slice(&b.attach_gen.to_be_bytes());
+                p.extend_from_slice(&b.nonce);
+            }
+            Frame::DgramBindOk(b) => {
+                p.extend_from_slice(&b.attach_gen.to_be_bytes());
+                p.extend_from_slice(&b.nonce);
             }
             Frame::Control { payload, .. } => p.extend_from_slice(payload),
         }
@@ -1190,6 +1248,15 @@ impl Frame {
                 attach_gen: r.u32()?,
                 recv_offset: r.varint()?,
                 max_offset: r.varint()?,
+            }),
+            ty::DGRAM_BIND => Frame::DgramBind(DgramBind {
+                session_id: r.arr()?,
+                attach_gen: r.u32()?,
+                nonce: r.arr()?,
+            }),
+            ty::DGRAM_BIND_OK => Frame::DgramBindOk(DgramBindOk {
+                attach_gen: r.u32()?,
+                nonce: r.arr()?,
             }),
             ty::CTRL_HELLO
             | ty::RESOLVE

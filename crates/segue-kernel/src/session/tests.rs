@@ -58,6 +58,9 @@ struct Node {
     hang_next: Arc<Mutex<Option<Duration>>>,
 }
 
+type UdpOpener =
+    Arc<dyn Fn(Option<&str>, &TargetAddr, u16) -> Result<Datagrams, DialError> + Send + Sync>;
+
 /// Engine stand-in: `dial(Some(carrier), relay)` → a pipe into that
 /// carrier's relay; anything else is recorded and refused.
 #[derive(Default)]
@@ -65,6 +68,7 @@ struct Engine {
     nodes: HashMap<String, Node>,
     other_tcp: Mutex<Vec<Option<String>>>,
     udp: Mutex<Vec<Option<String>>>,
+    udp_opener: Option<UdpOpener>,
 }
 
 /// A carrier that moves itself from the carrier count to the control
@@ -288,10 +292,13 @@ impl Dialer for Engine {
     async fn dial_udp(
         &self,
         tag: Option<&str>,
-        _addr: &TargetAddr,
-        _port: u16,
+        addr: &TargetAddr,
+        port: u16,
     ) -> Result<Datagrams, DialError> {
         self.udp.lock().unwrap().push(tag.map(String::from));
+        if let Some(open) = &self.udp_opener {
+            return open(tag, addr, port);
+        }
         Ok(Box::new(NoUdp))
     }
 }
@@ -432,6 +439,8 @@ fn lab_full(
             name: "la".into(),
             carrier: "reality-la".into(),
             redundant_carrier: None,
+            dgram_carriers: Vec::new(),
+            dgram_relay: None,
             relay: "127.0.0.1:7443".parse().unwrap(),
             node_id: 1,
             egress_group: String::new(),
@@ -440,6 +449,8 @@ fn lab_full(
             name: "ny".into(),
             carrier: "hy2-ny".into(),
             redundant_carrier: None,
+            dgram_carriers: Vec::new(),
+            dgram_relay: None,
             relay: "127.0.0.1:7444".parse().unwrap(),
             node_id: 2,
             egress_group: String::new(),
@@ -2908,6 +2919,8 @@ async fn standby_uses_redundant_carrier_without_racing() {
         name: "la".into(),
         carrier: "la-main".into(),
         redundant_carrier: Some("la-alt".into()),
+        dgram_carriers: Vec::new(),
+        dgram_relay: None,
         relay: "127.0.0.1:7443".parse().unwrap(),
         node_id: 1,
         egress_group: String::new(),
@@ -2943,4 +2956,238 @@ async fn standby_uses_redundant_carrier_without_racing() {
         "standby dial started parallel carrier race"
     );
     roundtrip(s).await;
+}
+
+#[tokio::test]
+async fn dgram_skips_stream_encapsulated_udp_carrier() {
+    struct StreamEncapUdp {
+        sends: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl UdpSession for StreamEncapUdp {
+        fn max_payload(&self, _: &TargetAddr, _: u16) -> usize {
+            1200
+        }
+        fn loses_datagrams(&self) -> bool {
+            false
+        }
+        async fn send(&self, _: &TargetAddr, _: u16, _: &[u8]) -> Result<(), DialError> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn recv(&self, _: &mut Vec<u8>) -> Result<(TargetAddr, u16), DialError> {
+            std::future::pending().await
+        }
+    }
+
+    let relay_cfg = Config {
+        dgram: segue_session::DgramConfig::for_ai_default(),
+        ..Config::default()
+    };
+    let la = node(Box::new(AllowAll), None, relay_cfg);
+    let sends = Arc::new(AtomicUsize::new(0));
+    let engine = Arc::new(Engine {
+        nodes: [("la".to_string(), la)].into(),
+        udp_opener: Some(Arc::new({
+            let sends = sends.clone();
+            move |_tag, _addr, _port| {
+                Ok(Box::new(StreamEncapUdp {
+                    sends: sends.clone(),
+                }))
+            }
+        })),
+        ..Default::default()
+    });
+    let exits = vec![Exit {
+        name: "la".into(),
+        carrier: "la".into(),
+        redundant_carrier: None,
+        dgram_carriers: Vec::new(),
+        dgram_relay: Some("127.0.0.1:9".parse().unwrap()),
+        relay: "127.0.0.1:7443".parse().unwrap(),
+        node_id: 1,
+        egress_group: String::new(),
+    }];
+    let routes = [(
+        "ai".to_string(),
+        SegueRoute {
+            ticket: b"ticket".to_vec(),
+            exit_class: EXIT_AI,
+        },
+    )]
+    .into();
+    let dialer = KernelDialer::new(engine.clone(), exits, routes, ["ai".to_string()].into());
+    let mut s = dialer.dial(Some("ai"), &site(), 443).await.unwrap();
+    spin_until(|| !engine.udp.lock().unwrap().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        0,
+        "stream-encapsulated UDP outbound must never send datagram accelerator packets"
+    );
+    let payload = b"reliable-stream-fallback-payload";
+    tokio::io::AsyncWriteExt::write_all(&mut s, payload)
+        .await
+        .unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::io::AsyncReadExt::read_exact(&mut s, &mut echoed)
+        .await
+        .unwrap();
+    assert_eq!(&echoed, payload);
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn dgram_accelerates_ai_session_over_unreliable_udp_carrier() {
+    struct LoopbackUdpSession {
+        sock: tokio::net::UdpSocket,
+        tx_pkts: Arc<AtomicUsize>,
+        rx_pkts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl UdpSession for LoopbackUdpSession {
+        fn max_payload(&self, _: &TargetAddr, _: u16) -> usize {
+            1200
+        }
+        fn loses_datagrams(&self) -> bool {
+            true
+        }
+        async fn send(
+            &self,
+            addr: &TargetAddr,
+            port: u16,
+            payload: &[u8],
+        ) -> Result<(), DialError> {
+            let ip = match addr {
+                TargetAddr::Ip(ip) => *ip,
+                TargetAddr::Domain(d) => {
+                    return Err(DialError(format!("unexpected domain {d}")));
+                }
+            };
+            self.sock
+                .send_to(payload, std::net::SocketAddr::new(ip, port))
+                .await
+                .map_err(|e| DialError(e.to_string()))?;
+            self.tx_pkts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn recv(&self, buf: &mut Vec<u8>) -> Result<(TargetAddr, u16), DialError> {
+            buf.clear();
+            buf.resize(2048, 0);
+            let (n, src) = self
+                .sock
+                .recv_from(buf)
+                .await
+                .map_err(|e| DialError(e.to_string()))?;
+            buf.truncate(n);
+            self.rx_pkts.fetch_add(1, Ordering::SeqCst);
+            Ok((TargetAddr::Ip(src.ip()), src.port()))
+        }
+    }
+
+    let relay_udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_udp_addr = relay_udp.local_addr().unwrap();
+
+    let relay_cfg = Config {
+        dgram: segue_session::DgramConfig::for_ai_default(),
+        ..Config::default()
+    };
+    let (accept_tx, accept_rx) = mpsc::channel(16);
+    let sites = Arc::new(AtomicUsize::new(0));
+    let table = RelayTable::new(relay_cfg, Pool::new(8 << 20), Box::new(AllowAll), 9);
+    let site_conn = echo_site(sites.clone());
+    let dev_site: segue_session::driver::DeviceSiteConnector =
+        Arc::new(move |r: SiteRequest| site_conn(r.target, r.kind));
+    let (ctrl_tx, ctrl_rx) = mpsc::channel(4);
+    tokio::spawn(segue_session::driver::run_relay_ctl_dgram(
+        table,
+        accept_rx,
+        dev_site,
+        None,
+        Some(ctrl_rx),
+        Some(relay_udp),
+    ));
+    let la = Node {
+        ctrl: ctrl_tx,
+        accept: accept_tx,
+        up: Arc::new(AtomicBool::new(true)),
+        carriers: Arc::default(),
+        controls: Arc::default(),
+        holes: Holes::default(),
+        sites,
+        cut: Arc::default(),
+        drop_next: Arc::default(),
+        drop_plan: Arc::default(),
+        slow_next: Arc::default(),
+        dials: Arc::default(),
+        hang_next: Arc::default(),
+    };
+
+    let tx_pkts = Arc::new(AtomicUsize::new(0));
+    let rx_pkts = Arc::new(AtomicUsize::new(0));
+    let engine = Arc::new(Engine {
+        nodes: [("la".to_string(), la)].into(),
+        udp_opener: Some(Arc::new({
+            let tx_pkts = tx_pkts.clone();
+            let rx_pkts = rx_pkts.clone();
+            move |_tag, _addr, _port| {
+                let std_sock = std::net::UdpSocket::bind("127.0.0.1:0")
+                    .map_err(|e| DialError(e.to_string()))?;
+                std_sock
+                    .set_nonblocking(true)
+                    .map_err(|e| DialError(e.to_string()))?;
+                let sock = tokio::net::UdpSocket::from_std(std_sock)
+                    .map_err(|e| DialError(e.to_string()))?;
+                Ok(Box::new(LoopbackUdpSession {
+                    sock,
+                    tx_pkts: tx_pkts.clone(),
+                    rx_pkts: rx_pkts.clone(),
+                }))
+            }
+        })),
+        ..Default::default()
+    });
+    let exits = vec![Exit {
+        name: "la".into(),
+        carrier: "la".into(),
+        redundant_carrier: None,
+        dgram_carriers: vec!["la-udp".into()],
+        dgram_relay: Some(relay_udp_addr),
+        relay: "127.0.0.1:7443".parse().unwrap(),
+        node_id: 1,
+        egress_group: String::new(),
+    }];
+    let routes = [(
+        "ai".to_string(),
+        SegueRoute {
+            ticket: b"ticket".to_vec(),
+            exit_class: EXIT_AI,
+        },
+    )]
+    .into();
+    let dialer = KernelDialer::new(engine.clone(), exits, routes, ["ai".to_string()].into());
+    let mut s = dialer.dial(Some("ai"), &site(), 443).await.unwrap();
+    spin_until(|| tx_pkts.load(Ordering::SeqCst) > 0 && rx_pkts.load(Ordering::SeqCst) > 0).await;
+
+    let mut sent_all = Vec::new();
+    for i in 0u8..8 {
+        let chunk = vec![i.wrapping_add(0x31); 96];
+        sent_all.extend_from_slice(&chunk);
+        tokio::io::AsyncWriteExt::write_all(&mut s, &chunk)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut echoed = vec![0u8; sent_all.len()];
+    tokio::io::AsyncReadExt::read_exact(&mut s, &mut echoed)
+        .await
+        .unwrap();
+    assert_eq!(echoed, sent_all);
+    assert!(tx_pkts.load(Ordering::SeqCst) > 0);
+    assert!(rx_pkts.load(Ordering::SeqCst) > 0);
+    let recorded = engine.udp.lock().unwrap().clone();
+    assert!(!recorded.is_empty());
+    assert!(recorded.iter().all(|t| t.as_deref() == Some("la-udp")));
 }

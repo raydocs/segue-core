@@ -66,6 +66,11 @@ pub trait UdpSession: Send + Sync {
     /// Largest payload `send` accepts towards `addr:port`. Callers drop
     /// bigger datagrams themselves (counted, not silently).
     fn max_payload(&self, addr: &TargetAddr, port: u16) -> usize;
+    /// Whether datagrams on this flow travel unreliably (UDP/QUIC datagrams)
+    /// rather than encapsulated over a reliable stream.
+    fn loses_datagrams(&self) -> bool {
+        true
+    }
     /// Errors for a payload above `max_payload`; any other error means the
     /// flow is broken.
     async fn send(&self, addr: &TargetAddr, port: u16, payload: &[u8]) -> Result<(), DialError>;
@@ -211,6 +216,10 @@ impl UdpSession for EngineUdp {
     fn max_payload(&self, addr: &TargetAddr, port: u16) -> usize {
         self.0
             .max_payload(&Target::new(addr.clone(), port, Network::Udp))
+    }
+
+    fn loses_datagrams(&self) -> bool {
+        self.0.loses_datagrams()
     }
 
     async fn send(&self, addr: &TargetAddr, port: u16, payload: &[u8]) -> Result<(), DialError> {
@@ -364,6 +373,8 @@ mod tests {
                 name: "test".into(),
                 carrier: "carrier".into(),
                 redundant_carrier: None,
+                dgram_carriers: Vec::new(),
+                dgram_relay: None,
                 relay: "127.0.0.1:9000".parse().unwrap(),
                 node_id: 1,
                 egress_group: String::new(),
