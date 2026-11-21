@@ -157,6 +157,10 @@ struct RawLimits {
     first_frame_timeout_ms: u64,
     connect_timeout_ms: u64,
     dns_timeout_ms: u64,
+    dns_cache_ttl_ms: u64,
+    dns_cache_stale_ms: u64,
+    dns_cache_max_entries: usize,
+    happy_eyeballs_delay_ms: u64,
     line_units: usize,
     line_units_failover: usize,
     line_fail_threshold: u32,
@@ -178,6 +182,10 @@ impl Default for RawLimits {
             first_frame_timeout_ms: d.first_frame_timeout.as_millis() as u64,
             connect_timeout_ms: d.connect_timeout.as_millis() as u64,
             dns_timeout_ms: d.dns_timeout.as_millis() as u64,
+            dns_cache_ttl_ms: d.dns_cache_ttl.as_millis() as u64,
+            dns_cache_stale_ms: d.dns_cache_stale.as_millis() as u64,
+            dns_cache_max_entries: d.dns_cache_max_entries,
+            happy_eyeballs_delay_ms: d.happy_eyeballs_delay.as_millis() as u64,
             line_units: d.line_units,
             line_units_failover: d.line_units_failover,
             line_fail_threshold: d.line_fail_threshold,
@@ -204,6 +212,10 @@ pub struct Limits {
     pub first_frame_timeout: Duration,
     pub connect_timeout: Duration,
     pub dns_timeout: Duration,
+    pub dns_cache_ttl: Duration,
+    pub dns_cache_stale: Duration,
+    pub dns_cache_max_entries: usize,
+    pub happy_eyeballs_delay: Duration,
     /// D2: hard cap of billing units per line.
     pub line_units: usize,
     /// D2: temporary cap while failed over.
@@ -232,6 +244,10 @@ impl Default for Limits {
             first_frame_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
             dns_timeout: Duration::from_secs(5),
+            dns_cache_ttl: Duration::from_millis(30_000),
+            dns_cache_stale: Duration::from_millis(60_000),
+            dns_cache_max_entries: 4096,
+            happy_eyeballs_delay: Duration::from_millis(200),
             line_units: 5,
             line_units_failover: 7,
             line_fail_threshold: 3,
@@ -415,6 +431,10 @@ impl Config {
             first_frame_timeout: Duration::from_millis(r.first_frame_timeout_ms),
             connect_timeout: Duration::from_millis(r.connect_timeout_ms),
             dns_timeout: Duration::from_millis(r.dns_timeout_ms),
+            dns_cache_ttl: Duration::from_millis(r.dns_cache_ttl_ms),
+            dns_cache_stale: Duration::from_millis(r.dns_cache_stale_ms),
+            dns_cache_max_entries: r.dns_cache_max_entries,
+            happy_eyeballs_delay: Duration::from_millis(r.happy_eyeballs_delay_ms),
             line_units: r.line_units,
             line_units_failover: r.line_units_failover,
             line_fail_threshold: r.line_fail_threshold.max(1),
@@ -452,6 +472,11 @@ impl Config {
             || limits.dns_timeout.is_zero()
         {
             return Err("limits: timeouts must be > 0".into());
+        }
+        if !limits.dns_cache_ttl.is_zero() && limits.dns_cache_max_entries == 0 {
+            return Err(
+                "limits: dns_cache_max_entries must be > 0 when dns_cache_ttl_ms > 0".into(),
+            );
         }
         let mode = match raw.redundancy.mode.as_str() {
             "off" => segue_session::RedundancyMode::Off,
@@ -597,5 +622,26 @@ mod tests {
         assert_eq!(on.dgram.max_bytes_per_sec, 65536);
 
         assert!(parse_with_extra(r#", "dgram": {"enabled": true, "flows": 3}"#).is_err());
+    }
+
+    #[test]
+    fn dns_cache_and_happy_eyeballs_defaults_and_validation() {
+        let def = parse_with_extra("").unwrap();
+        assert_eq!(def.limits.dns_cache_ttl, Duration::from_millis(30_000));
+        assert_eq!(def.limits.dns_cache_stale, Duration::from_millis(60_000));
+        assert_eq!(def.limits.dns_cache_max_entries, 4096);
+        assert_eq!(def.limits.happy_eyeballs_delay, Duration::from_millis(200));
+
+        let off = parse_with_extra(
+            r#", "limits": {"dns_cache_ttl_ms": 0, "dns_cache_max_entries": 0, "happy_eyeballs_delay_ms": 0}"#,
+        )
+        .unwrap();
+        assert!(off.limits.dns_cache_ttl.is_zero());
+        assert!(off.limits.happy_eyeballs_delay.is_zero());
+
+        assert!(parse_with_extra(
+            r#", "limits": {"dns_cache_ttl_ms": 5000, "dns_cache_max_entries": 0}"#,
+        )
+        .is_err());
     }
 }

@@ -335,6 +335,40 @@ async fn dial(
     }
 }
 
+async fn dial_with_first_data(
+    kernel: &Kernel,
+    tag: Option<&str>,
+    addr: &TargetAddr,
+    port: u16,
+    first_data: &[u8],
+    ai_reason: Option<&str>,
+) -> Option<(Stream, usize)> {
+    match tokio::time::timeout(
+        DIAL_TIMEOUT,
+        kernel
+            .dialer
+            .dial_with_first_data(tag, addr, port, first_data),
+    )
+    .await
+    {
+        Ok(Ok(res)) => Some(res),
+        Ok(Err(e)) => {
+            eprintln!(
+                "segue-kernel: dial via {} failed: {e}",
+                dial_via(tag, ai_reason)
+            );
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "segue-kernel: dial via {} timed out",
+                dial_via(tag, ai_reason)
+            );
+            None
+        }
+    }
+}
+
 /// Bare-IP CONNECT with sniffing (§5.2a.1).
 async fn sniffed(
     mut conn: TcpStream,
@@ -368,18 +402,19 @@ async fn sniffed(
         return reset(conn);
     }
     let tag = choice.tag.as_deref();
-    let Some(mut upstream) = dial(
+    let Some((mut upstream, consumed)) = dial_with_first_data(
         kernel,
         tag,
         &choice.target,
         port,
+        &first,
         choice.ai_reason.as_deref(),
     )
     .await
     else {
         return reset(conn);
     };
-    if !first.is_empty() && upstream.write_all(&first).await.is_err() {
+    if consumed < first.len() && upstream.write_all(&first[consumed..]).await.is_err() {
         return reset(conn);
     }
     splice(conn, upstream).await

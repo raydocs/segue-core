@@ -27,6 +27,9 @@ use segue_session::relay::Grant;
 /// Resolves a host name to addresses (injectable for tests).
 pub type Resolver = Arc<dyn Fn(String) -> BoxFuture<io::Result<Vec<IpAddr>>> + Send + Sync>;
 
+/// Connects a single resolved target address (injectable for deterministic tests).
+pub type TcpConnector = Arc<dyn Fn(SocketAddr) -> BoxFuture<io::Result<TcpStream>> + Send + Sync>;
+
 pub fn system_resolver() -> Resolver {
     Arc::new(|host: String| {
         Box::pin(async move {
@@ -141,10 +144,12 @@ pub struct Dialer {
     pub clock: Clock,
     pub metrics: Arc<Metrics>,
     pub resolver: Resolver,
+    pub tcp_connector: Option<TcpConnector>,
     pub devices: Arc<DeviceCounts>,
     pub max_sessions_per_device: usize,
     pub connect_timeout: Duration,
     pub dns_timeout: Duration,
+    pub happy_eyeballs_delay: Duration,
 }
 
 /// A normalized, resolved target.
@@ -301,12 +306,29 @@ impl Dialer {
             Metrics::inc(&self.metrics.ssrf_blocked);
             return Err(code::TARGET_DENIED);
         }
+        let ordered = crate::dns_cache::interleave_addrs(allowed);
         Ok(Route::Overseas(
-            allowed
+            ordered
                 .into_iter()
                 .map(|ip| SocketAddr::new(ip, port))
                 .collect(),
         ))
+    }
+
+    fn tcp_attempt(&self, addr: SocketAddr) -> BoxFuture<Result<TcpStream, u8>> {
+        let timeout = self.connect_timeout;
+        let custom = self.tcp_connector.clone();
+        Box::pin(async move {
+            let fut = match custom {
+                Some(f) => f(addr),
+                None => Box::pin(TcpStream::connect(addr)),
+            };
+            match tokio::time::timeout(timeout, fut).await {
+                Ok(Ok(s)) => Ok(s),
+                Ok(Err(_)) => Err(code::CONNECT_REFUSED),
+                Err(_) => Err(code::CONNECT_TIMEOUT),
+            }
+        })
     }
 
     pub async fn connect(&self, r: SiteRequest) -> io::Result<BoxCarrier> {
@@ -328,41 +350,106 @@ impl Dialer {
         let mut route = self
             .classify(&r.grant, &resolved, r.exit_class, true)
             .map_err(|c| self.deny(c))?;
+        fn next_overseas(route: &Route, tried: &[SocketAddr]) -> Option<SocketAddr> {
+            match route {
+                Route::Home(_) => None,
+                Route::Overseas(addrs) => {
+                    if tried.len() >= MAX_CONNECT_ADDRS {
+                        return None;
+                    }
+                    addrs.iter().find(|a| !tried.contains(a)).copied()
+                }
+            }
+        }
+
         let mut tried: Vec<SocketAddr> = Vec::new();
         let mut last = code::CONNECT_REFUSED;
-        loop {
-            let a = match &route {
-                Route::Home(_) => break,
-                Route::Overseas(addrs) => addrs.iter().find(|a| !tried.contains(a)).copied(),
-            };
-            // Bound the total connect time: a name with many dead
-            // addresses must not hold the slot for `n × timeout`.
-            let Some(a) = a.filter(|_| tried.len() < MAX_CONNECT_ADDRS) else {
+        let mut in_flight: tokio::task::JoinSet<Result<TcpStream, u8>> =
+            tokio::task::JoinSet::new();
+        let mut stagger: Option<Pin<Box<tokio::time::Sleep>>> = None;
+
+        if !matches!(route, Route::Home(_)) {
+            let Some(a) = next_overseas(&route, &tried) else {
                 Metrics::inc(&self.metrics.connect_failures);
                 return Err(self.deny(last));
             };
             tried.push(a);
-            match tokio::time::timeout(self.connect_timeout, TcpStream::connect(a)).await {
-                Ok(Ok(s)) => {
-                    let _ = s.set_nodelay(true);
-                    Metrics::inc(&self.metrics.connects_overseas);
-                    return Ok(Box::new(Site {
-                        inner: s,
-                        _slot: slot,
-                        home: None,
-                        _lease: None,
-                        bytes: AtomicU64::new(0),
-                    }));
-                }
-                Ok(Err(_)) => last = code::CONNECT_REFUSED,
-                Err(_) => last = code::CONNECT_TIMEOUT,
+            in_flight.spawn(self.tcp_attempt(a));
+            if !self.happy_eyeballs_delay.is_zero() && next_overseas(&route, &tried).is_some() {
+                stagger = Some(Box::pin(tokio::time::sleep(self.happy_eyeballs_delay)));
             }
-            // The attempt took time: re-check the policy before the next
-            // one (review r6 R1). A target that became AI goes Home; one
-            // whose bundle expired is refused.
-            route = self
-                .classify(&r.grant, &resolved, r.exit_class, false)
-                .map_err(|c| self.deny(c))?;
+        }
+
+        loop {
+            if matches!(route, Route::Home(_)) {
+                break;
+            }
+            if in_flight.is_empty() {
+                stagger = None;
+                // All started attempts failed: re-check policy before trying
+                // the next address (review r6 R1).
+                route = self
+                    .classify(&r.grant, &resolved, r.exit_class, false)
+                    .map_err(|c| self.deny(c))?;
+                if matches!(route, Route::Home(_)) {
+                    break;
+                }
+                let Some(a) = next_overseas(&route, &tried) else {
+                    Metrics::inc(&self.metrics.connect_failures);
+                    return Err(self.deny(last));
+                };
+                tried.push(a);
+                in_flight.spawn(self.tcp_attempt(a));
+                if !self.happy_eyeballs_delay.is_zero() && next_overseas(&route, &tried).is_some() {
+                    stagger = Some(Box::pin(tokio::time::sleep(self.happy_eyeballs_delay)));
+                }
+            }
+
+            tokio::select! {
+                biased;
+                joined = in_flight.join_next() => match joined {
+                    Some(Ok(Ok(s))) => {
+                        in_flight.abort_all();
+                        let _ = s.set_nodelay(true);
+                        Metrics::inc(&self.metrics.connects_overseas);
+                        return Ok(Box::new(Site {
+                            inner: s,
+                            _slot: slot,
+                            home: None,
+                            _lease: None,
+                            bytes: AtomicU64::new(0),
+                        }));
+                    }
+                    Some(Ok(Err(c))) => {
+                        last = c;
+                    }
+                    Some(Err(_)) => {
+                        last = code::CONNECT_REFUSED;
+                    }
+                    None => {}
+                },
+                _ = async { stagger.as_mut().expect("guarded").as_mut().await }, if stagger.is_some() => {
+                    stagger = None;
+                    route = match self.classify(&r.grant, &resolved, r.exit_class, false) {
+                        Ok(r) => r,
+                        Err(c) => {
+                            in_flight.abort_all();
+                            return Err(self.deny(c));
+                        }
+                    };
+                    if matches!(route, Route::Home(_)) {
+                        in_flight.abort_all();
+                        break;
+                    }
+                    if let Some(next_a) = next_overseas(&route, &tried) {
+                        tried.push(next_a);
+                        in_flight.spawn(self.tcp_attempt(next_a));
+                        if !self.happy_eyeballs_delay.is_zero() && next_overseas(&route, &tried).is_some() {
+                            stagger = Some(Box::pin(tokio::time::sleep(self.happy_eyeballs_delay)));
+                        }
+                    }
+                }
+            }
         }
         match route {
             Route::Overseas(_) => unreachable!("overseas attempts return above"),

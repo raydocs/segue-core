@@ -26,6 +26,7 @@
 pub mod cidr;
 pub mod config;
 pub mod dial;
+pub mod dns_cache;
 pub mod guard;
 pub mod home;
 pub mod log;

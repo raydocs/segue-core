@@ -3191,3 +3191,68 @@ async fn dgram_accelerates_ai_session_over_unreliable_udp_carrier() {
     assert!(!recorded.is_empty());
     assert!(recorded.iter().all(|t| t.as_deref() == Some("la-udp")));
 }
+
+#[tokio::test]
+async fn dial_with_first_data_piggybacks_in_open_and_arrives_before_stream_write() {
+    let payload = b"GET /v1/models HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+    let observed: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let site_conn: SiteConnector = {
+        let observed = observed.clone();
+        Arc::new(move |_t, _k| {
+            let observed = observed.clone();
+            Box::pin(async move {
+                let (a, far) = tokio::io::duplex(64 << 10);
+                tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(far);
+                    let mut got = vec![0u8; payload.len()];
+                    if tokio::io::AsyncReadExt::read_exact(&mut r, &mut got)
+                        .await
+                        .is_ok()
+                    {
+                        *observed.lock().unwrap() = got;
+                        let _ = tokio::io::AsyncWriteExt::write_all(&mut w, b"OK").await;
+                        let _ = tokio::io::AsyncWriteExt::flush(&mut w).await;
+                    }
+                    let mut drain = Vec::new();
+                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut r, &mut drain).await;
+                });
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+    let l = lab_parts(Box::new(AllowAll), Some(site_conn));
+    let (mut s, consumed) =
+        l.d.dial_with_first_data(Some("overseas"), &site(), 443, payload)
+            .await
+            .unwrap();
+    assert_eq!(consumed, payload.len());
+    // Intentionally read before calling `s.write_all`: only OPEN.first_data could deliver `payload`.
+    let mut ack = [0u8; 2];
+    tokio::io::AsyncReadExt::read_exact(&mut s, &mut ack)
+        .await
+        .unwrap();
+    assert_eq!(&ack, b"OK");
+    assert_eq!(&*observed.lock().unwrap(), payload);
+}
+
+#[tokio::test]
+async fn dial_with_first_data_caps_at_max_and_preserves_order() {
+    let payload: Vec<u8> = (0..5000usize)
+        .map(|i| (i.wrapping_mul(37) & 0xff) as u8)
+        .collect();
+    let l = lab_with(Box::new(AllowAll));
+    let (mut s, consumed) =
+        l.d.dial_with_first_data(Some("overseas"), &site(), 443, &payload)
+            .await
+            .unwrap();
+    assert_eq!(consumed, super::MAX_OPEN_FIRST_DATA);
+    tokio::io::AsyncWriteExt::write_all(&mut s, &payload[consumed..])
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::shutdown(&mut s).await.unwrap();
+    let mut echoed = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut s, &mut echoed)
+        .await
+        .unwrap();
+    assert_eq!(echoed, payload);
+}
