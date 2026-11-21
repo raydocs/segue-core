@@ -3753,3 +3753,246 @@ async fn slow_tcp_carriers_full_pool_and_a_healthy_tun_flow_over_loopback() {
     acceptor.abort();
     proxy.abort();
 }
+
+#[tokio::test]
+async fn tun_sniffed_flow_piggybacks_first_data_in_open() {
+    use segue_kernel::session::{Exit, KernelDialer, SegueRoute};
+    use segue_session::codec::{Frame, FrameDecoder, Kind, Target};
+    use segue_session::driver::{run_relay, BoxCarrier, SiteConnector};
+    use segue_session::pool::Pool;
+    use segue_session::relay::{AllowAll, RelayTable};
+    use segue_transport::TransportStream;
+
+    struct TeeStream(tokio::io::DuplexStream);
+    impl tokio::io::AsyncRead for TeeStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+    impl tokio::io::AsyncWrite for TeeStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+    impl TransportStream for TeeStream {
+        fn poll_read_direct(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            output: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            tokio::io::AsyncRead::poll_read(self, cx, output)
+        }
+        fn poll_write_direct(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            input: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            tokio::io::AsyncWrite::poll_write(self, cx, input)
+        }
+    }
+
+    struct SpyEngine {
+        accept: mpsc::Sender<BoxCarrier>,
+        wire_tx: mpsc::UnboundedSender<Vec<u8>>,
+    }
+    #[async_trait::async_trait]
+    impl Dialer for SpyEngine {
+        async fn dial(
+            &self,
+            _tag: Option<&str>,
+            _addr: &TargetAddr,
+            _port: u16,
+        ) -> Result<segue_kernel::dial::Stream, DialError> {
+            let (client, a) = tokio::io::duplex(64 << 10);
+            let (b, relay) = tokio::io::duplex(64 << 10);
+            let wire_tx = self.wire_tx.clone();
+            tokio::spawn(async move {
+                let (mut ar, mut aw) = tokio::io::split(a);
+                let (mut br, mut bw) = tokio::io::split(b);
+                let up = async {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match ar.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let _ = wire_tx.send(buf[..n].to_vec());
+                                if bw.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                };
+                let down = tokio::io::copy(&mut br, &mut aw);
+                let (_, _) = tokio::join!(up, down);
+            });
+            let _ = self.accept.send(Box::new(relay)).await;
+            Ok(Box::new(TeeStream(client)))
+        }
+    }
+
+    let hello = client_hello_for_test(Some("chat.openai.com"), 0);
+    let follow = b"POST-0RTT-TAIL";
+    let (accept_tx, accept_rx) = mpsc::channel(8);
+    let (wire_tx, mut wire_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    let hello_len = hello.len();
+    let follow_len = follow.len();
+    let site_seen = Arc::new(Mutex::new(Vec::new()));
+    let site: SiteConnector = {
+        let site_seen = site_seen.clone();
+        Arc::new(move |_t: Target, _k: Kind| {
+            let site_seen = site_seen.clone();
+            Box::pin(async move {
+                let (a, b) = tokio::io::duplex(64 << 10);
+                tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(b);
+                    let mut first = vec![0u8; hello_len];
+                    r.read_exact(&mut first).await.unwrap();
+                    site_seen.lock().unwrap().extend_from_slice(&first);
+                    w.write_all(b"SERVER-HELLO").await.unwrap();
+                    w.flush().await.unwrap();
+                    let mut rest = vec![0u8; follow_len];
+                    r.read_exact(&mut rest).await.unwrap();
+                    site_seen.lock().unwrap().extend_from_slice(&rest);
+                    w.write_all(&rest).await.unwrap();
+                    let _ = w.shutdown().await;
+                });
+                Ok(Box::new(a) as BoxCarrier)
+            })
+        })
+    };
+
+    let table = RelayTable::new(
+        segue_session::Config::default(),
+        Pool::new(8 << 20),
+        Box::new(AllowAll),
+        9,
+    );
+    let relay = tokio::spawn(run_relay(table, accept_rx, site, None));
+    let pool = Pool::new(8 << 20);
+    let dialer = Arc::new(
+        KernelDialer::new(
+            Arc::new(SpyEngine {
+                accept: accept_tx,
+                wire_tx,
+            }),
+            vec![Exit {
+                name: "la".into(),
+                carrier: "relay".into(),
+                redundant_carrier: None,
+                dgram_carriers: Vec::new(),
+                dgram_relay: None,
+                relay: "127.0.0.1:7443".parse().unwrap(),
+                node_id: 1,
+                egress_group: String::new(),
+            }],
+            [(
+                "ai".to_string(),
+                SegueRoute {
+                    ticket: b"ticket".to_vec(),
+                    exit_class: 1,
+                },
+            )]
+            .into(),
+            Default::default(),
+        )
+        .with_pool(pool),
+    );
+
+    let policy = PolicyStore::inline(inline());
+    let kernel = Arc::new(Kernel {
+        policy,
+        dialer,
+        fake_ip: Some(fake_pool()),
+        sniff: Some(SniffSettings {
+            timeout: Duration::from_millis(300),
+            max_bytes: 16 * 1024,
+        }),
+        udp: None,
+        hidden: Default::default(),
+        flows: None,
+    });
+    let mut h = Harness::run(TunStack::for_kernel(kernel, None));
+
+    let sseq = connect(&mut h, SITE4).await;
+    h.send(tcp(CLIENT4, SITE4, ACK, 101, sseq, &hello)).await;
+
+    let mut down = Vec::new();
+    let mut cseq = 101 + hello.len() as u32;
+    let mut next_their = sseq;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while down.len() < b"SERVER-HELLO".len() {
+        let p = tokio::time::timeout_at(deadline, h.next_meaningful())
+            .await
+            .expect("timed out waiting for SERVER-HELLO");
+        if !p.payload.is_empty() && p.seq == next_their {
+            down.extend_from_slice(&p.payload);
+            next_their = p.seq.wrapping_add(p.payload.len() as u32);
+            h.send(tcp(CLIENT4, SITE4, ACK, cseq, next_their, b""))
+                .await;
+        }
+    }
+    assert_eq!(&down[..b"SERVER-HELLO".len()], b"SERVER-HELLO");
+
+    h.send(tcp(CLIENT4, SITE4, ACK, cseq, next_their, follow))
+        .await;
+    cseq = cseq.wrapping_add(follow.len() as u32);
+    while down.len() < b"SERVER-HELLO".len() + follow.len() {
+        let p = tokio::time::timeout_at(deadline, h.next_meaningful())
+            .await
+            .expect("timed out waiting for tail echo");
+        if !p.payload.is_empty() && p.seq == next_their {
+            down.extend_from_slice(&p.payload);
+            next_their = p.seq.wrapping_add(p.payload.len() as u32);
+            h.send(tcp(CLIENT4, SITE4, ACK, cseq, next_their, b""))
+                .await;
+        }
+    }
+    assert_eq!(
+        &down[b"SERVER-HELLO".len()..],
+        follow,
+        "post-0RTT payload corrupted or duplicated"
+    );
+
+    let mut want_site = hello.clone();
+    want_site.extend_from_slice(follow);
+    assert_eq!(&*site_seen.lock().unwrap(), &want_site);
+
+    let mut dec = FrameDecoder::default();
+    let mut saw_open_first = false;
+    while let Ok(chunk) = wire_rx.try_recv() {
+        dec.push(&chunk);
+        while let Some(frame) = dec.next_frame().unwrap() {
+            if let Frame::Open(o) = frame {
+                assert_eq!(
+                    o.first_data, hello,
+                    "sniffed bytes must travel in OPEN.first_data"
+                );
+                saw_open_first = true;
+            }
+        }
+    }
+    assert!(saw_open_first, "did not observe OPEN frame");
+    relay.abort();
+}

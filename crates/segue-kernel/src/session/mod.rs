@@ -100,6 +100,11 @@ pub fn process_pool() -> Arc<Pool> {
     static POOL: std::sync::OnceLock<Arc<Pool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| Pool::new(POOL_BYTES)).clone()
 }
+/// Maximum application bytes piggybacked into L5 `OPEN.first_data` (`0-RTT`).
+/// Bounded so `Frame::Open` fits inside one `4 KiB` pool block alongside
+/// headers/ticket while staying within `SendHalf`'s 4 KiB floor.
+pub(crate) const MAX_OPEN_FIRST_DATA: usize = 3072;
+
 /// Longest wait for OPENED (covers the session's own OPEN retries).
 const OPEN_WAIT: Duration = Duration::from_secs(20);
 /// Fresh sessions after an UNKNOWN_SESSION answer to an OPEN retry.
@@ -1181,13 +1186,17 @@ impl KernelDialer {
         r: &SegueRoute,
         addr: &TargetAddr,
         port: u16,
-    ) -> Result<crate::dial::Stream, DialError> {
+        first_data: &[u8],
+    ) -> Result<(crate::dial::Stream, usize), DialError> {
         let start = Instant::now();
         let mut tries = 0;
         let mut pin = None;
         loop {
             let mut exit = None;
-            match self.open_once(r, addr, port, pin, &mut exit).await {
+            match self
+                .open_once(r, addr, port, pin, &mut exit, first_data)
+                .await
+            {
                 Err((e, Some(c)))
                     if c == code::UNKNOWN_SESSION
                         && tries < FRESH_OPENS
@@ -1221,7 +1230,8 @@ impl KernelDialer {
         port: u16,
         pin: Option<(usize, u64)>,
         exit: &mut Option<(usize, u64)>,
-    ) -> Result<crate::dial::Stream, (DialError, Option<u8>)> {
+        first_data: &[u8],
+    ) -> Result<(crate::dial::Stream, usize), (DialError, Option<u8>)> {
         let groups: Vec<String> = self.exits.iter().map(|e| e.group().to_string()).collect();
         let i = {
             let mut st = self.state.lock().unwrap();
@@ -1299,8 +1309,19 @@ impl KernelDialer {
         if dgram_ctl.is_some() {
             sess_cfg.dgram.enabled = true;
         }
-        let s = ClientSession::new(sess_cfg, &self.pool, params, Instant::now())
+        let mut s = ClientSession::new(sess_cfg, &self.pool, params, Instant::now())
             .ok_or_else(|| (DialError("refused: session memory exhausted".into()), None))?;
+        let consumed = if !first_data.is_empty() {
+            let want = first_data.len().min(MAX_OPEN_FIRST_DATA);
+            let cap = s.write_capacity_for(want);
+            if cap > 0 {
+                s.write(&first_data[..cap])
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         // Pool-charged and released when drained (tokio's duplex keeps a
         // burst's capacity for the life of the stream); its reserved blocks
         // are taken here, so a spent pool refuses instead of overcommitting.
@@ -1358,7 +1379,7 @@ impl KernelDialer {
                 Ok(()) => {
                     // Only a working route gets (and keeps) a control stream.
                     self.ensure_channel(i, &r.ticket);
-                    Ok(Box::new(SessionStream::new(app, closed_rx)))
+                    Ok((Box::new(SessionStream::new(app, closed_rx)), consumed))
                 }
                 Err(_) => Err(self.refused(i, (&mut closed_rx).await.ok())),
             },
@@ -1564,12 +1585,28 @@ impl Dialer for KernelDialer {
         port: u16,
     ) -> Result<crate::dial::Stream, DialError> {
         if let Some(r) = tag.and_then(|t| self.routes.get(t)) {
-            return self.open(r, addr, port).await;
+            return self.open(r, addr, port, &[]).await.map(|(s, _)| s);
         }
         if tag.is_some() && *self.off.borrow() {
             return Err(DialError("refused: disconnected".into()));
         }
         self.engine.dial(tag, addr, port).await
+    }
+
+    async fn dial_with_first_data(
+        &self,
+        tag: Option<&str>,
+        addr: &TargetAddr,
+        port: u16,
+        first_data: &[u8],
+    ) -> Result<(crate::dial::Stream, usize), DialError> {
+        if let Some(r) = tag.and_then(|t| self.routes.get(t)) {
+            return self.open(r, addr, port, first_data).await;
+        }
+        if tag.is_some() && *self.off.borrow() {
+            return Err(DialError("refused: disconnected".into()));
+        }
+        self.engine.dial(tag, addr, port).await.map(|s| (s, 0))
     }
 
     async fn dial_udp(

@@ -2877,9 +2877,30 @@ async fn relay(
     mut down: mpsc::Receiver<Chunk>,
     up: mpsc::Sender<Up>,
 ) {
+    let mut first_data: Vec<u8> = Vec::new();
     let dial = match plan {
         TcpPlan::Dns => return dns_tcp(&ctx, &link, down, up).await,
-        TcpPlan::Dial(d) => d,
+        TcpPlan::Dial(d) => {
+            if d.tag.is_some() && matches!(key.dst.port(), 80 | 443 | 8080 | 8443) {
+                if let Ok(Some(c)) = tokio::time::timeout(
+                    Duration::from_millis(5),
+                    request(
+                        &ctx,
+                        &link,
+                        &mut down,
+                        1,
+                        crate::session::MAX_OPEN_FIRST_DATA,
+                    ),
+                )
+                .await
+                {
+                    let n = c.data.len().min(crate::session::MAX_OPEN_FIRST_DATA);
+                    first_data.extend_from_slice(&c.data[..n]);
+                }
+                withdraw(&link, &mut down);
+            }
+            d
+        }
         TcpPlan::Hold(d, guard) => {
             let Some(d) = hold_dial(&ctx, d, guard, &up).await else {
                 send_up(&ctx, &up, Up::Abort).await;
@@ -2900,6 +2921,9 @@ async fn relay(
                     _ = &mut deadline => break,
                 };
                 let Some(c) = c else { break };
+                let keep = c.data.len().min(crate::session::MAX_OPEN_FIRST_DATA);
+                first_data.clear();
+                first_data.extend_from_slice(&c.data[..keep]);
                 found = sniff(&c.data);
                 match found {
                     // Shorter than asked: the application finished (or
@@ -2925,6 +2949,7 @@ async fn relay(
                     return;
                 }
                 PrepareDial::Hold(d, guard) => {
+                    first_data = Vec::new();
                     let Some(d) = hold_dial(&ctx, d, guard, &up).await else {
                         send_up(&ctx, &up, Up::Abort).await;
                         return;
@@ -2936,14 +2961,20 @@ async fn relay(
     };
     let dialed = tokio::time::timeout(
         ctx.dial_timeout,
-        ctx.dialer
-            .dial(dial.tag.as_deref(), &dial.target, key.dst.port()),
+        ctx.dialer.dial_with_first_data(
+            dial.tag.as_deref(),
+            &dial.target,
+            key.dst.port(),
+            &first_data,
+        ),
     )
     .await;
-    let Ok(Ok(stream)) = dialed else {
+    drop(first_data);
+    let Ok(Ok((stream, consumed))) = dialed else {
         send_up(&ctx, &up, Up::Abort).await;
         return;
     };
+    wrote(&ctx, &link, consumed);
     let (mut r, mut w) = tokio::io::split(stream);
     let abort = up.clone();
     let to_app = async {

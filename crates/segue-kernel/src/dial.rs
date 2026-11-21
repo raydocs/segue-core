@@ -43,6 +43,22 @@ pub trait Dialer: Send + Sync {
         port: u16,
     ) -> Result<Stream, DialError>;
 
+    /// Dial `addr:port` through outbound `tag`, optionally piggybacking up to
+    /// `first_data.len()` leading application bytes into L5 `OPEN.first_data`.
+    /// Returns `(stream, consumed)` where `consumed` bytes from `first_data`
+    /// have already been queued and must not be written again to `stream`.
+    async fn dial_with_first_data(
+        &self,
+        tag: Option<&str>,
+        addr: &TargetAddr,
+        port: u16,
+        first_data: &[u8],
+    ) -> Result<(Stream, usize), DialError> {
+        let _ = first_data;
+        let stream = self.dial(tag, addr, port).await?;
+        Ok((stream, 0))
+    }
+
     /// Open a UDP flow to `addr:port` through outbound `tag`, or directly
     /// when `tag` is None. None means direct, so callers pass None only for
     /// a Direct rule, never as a fallback for a failed or refused proxy.

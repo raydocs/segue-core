@@ -1286,3 +1286,78 @@ fn site_flush_bounds_are_configurable() {
         assert!(Config::parse_in(&json(bad), &dir.0).is_err(), "{bad}");
     }
 }
+
+#[tokio::test]
+async fn happy_eyeballs_connects_second_addr_when_first_stalls() {
+    use segue_relay::dial::{DeviceCounts, Dialer, TcpConnector};
+    use segue_session::driver::SiteRequest;
+
+    let (echo_addr, echo_n) = echo().await;
+    let first_ip: IpAddr = "2001:db8::1".parse().unwrap();
+    let second_ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+    let e = env("127.0.0.1:1", false, "");
+    let resolver: Resolver =
+        Arc::new(move |_h: String| Box::pin(async move { Ok(vec![first_ip, second_ip]) }));
+    let first_attempts = Arc::new(AtomicUsize::new(0));
+    let tcp_connector: TcpConnector = {
+        let first_attempts = first_attempts.clone();
+        Arc::new(move |addr: SocketAddr| {
+            let first_attempts = first_attempts.clone();
+            Box::pin(async move {
+                if addr.ip() == first_ip {
+                    first_attempts.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending().await
+                } else {
+                    TcpStream::connect(SocketAddr::new(second_ip, echo_addr.port())).await
+                }
+            })
+        })
+    };
+    let guard = Guard {
+        extra_blocked: vec![],
+        exceptions: vec![
+            Cidr::parse("127.0.0.1/32").unwrap(),
+            Cidr::parse("2001:db8::1/128").unwrap(),
+        ],
+    };
+    let dialer = Dialer {
+        node_id: 1,
+        guard,
+        ai: e.relay.ai.clone(),
+        home: e.relay.home.clone(),
+        clock: e.relay.clock.clone(),
+        metrics: e.relay.metrics.clone(),
+        resolver,
+        tcp_connector: Some(tcp_connector),
+        devices: Arc::new(DeviceCounts::default()),
+        max_sessions_per_device: 16,
+        connect_timeout: Duration::from_secs(3),
+        dns_timeout: Duration::from_secs(2),
+        happy_eyeballs_delay: Duration::from_millis(80),
+    };
+
+    let t0 = Instant::now();
+    let mut site = dialer
+        .connect(SiteRequest {
+            session_id: [0x55; 16],
+            grant: grant_of(&claims(9, vec![ExitClass::Overseas])),
+            target: Target::Domain("stalled-v6.test".into(), echo_addr.port()),
+            kind: Kind::Tcp,
+            exit_class: 0,
+        })
+        .await
+        .expect("Happy Eyeballs should race and connect via second address");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "Happy Eyeballs waited {elapsed:?} instead of staggering around 80 ms"
+    );
+    assert_eq!(first_attempts.load(Ordering::SeqCst), 1);
+
+    site.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    site.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+    assert_eq!(echo_n.load(Ordering::SeqCst), 1);
+}

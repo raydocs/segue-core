@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::config::Config;
 use crate::dial::{system_resolver, DeviceCounts, Dialer, Resolver};
+use crate::dns_cache::{cached_resolver, DnsCacheConfig};
 use crate::guard::Guard;
 use crate::home::HomePool;
 use crate::metrics::Metrics;
@@ -194,6 +195,27 @@ impl Relay {
             cfg.home_auto_failover,
             metrics.clone(),
         )?);
+        let resolver = match resolver {
+            Some(r) => r,
+            None => {
+                let base = system_resolver();
+                if !cfg.limits.dns_cache_ttl.is_zero() {
+                    cached_resolver(
+                        base,
+                        clock.clone(),
+                        DnsCacheConfig {
+                            ttl: cfg.limits.dns_cache_ttl,
+                            stale_ttl: cfg.limits.dns_cache_stale,
+                            max_entries: cfg.limits.dns_cache_max_entries,
+                            refresh_timeout: cfg.limits.dns_timeout,
+                        },
+                        Some(metrics.clone()),
+                    )
+                } else {
+                    base
+                }
+            }
+        };
         let dialer = Arc::new(Dialer {
             node_id: cfg.node_id,
             guard: guard.unwrap_or_else(|| Guard {
@@ -204,11 +226,13 @@ impl Relay {
             home: home.clone(),
             clock: clock.clone(),
             metrics: metrics.clone(),
-            resolver: resolver.unwrap_or_else(system_resolver),
+            resolver,
+            tcp_connector: None,
             devices: Arc::new(DeviceCounts::default()),
             max_sessions_per_device: cfg.limits.max_sessions_per_device,
             connect_timeout: cfg.limits.connect_timeout,
             dns_timeout: cfg.limits.dns_timeout,
+            happy_eyeballs_delay: cfg.limits.happy_eyeballs_delay,
         });
         let verifier = Arc::new(Verifier::new(cfg.ticket_keys.clone()));
         Ok(Self {
